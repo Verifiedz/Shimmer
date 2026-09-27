@@ -9,6 +9,7 @@ members = [
     "crates/mockd",
     "crates/cli",
     "crates/modules/records",
+    "crates/modules/workspaces",
     "crates/app",
 ]
 
