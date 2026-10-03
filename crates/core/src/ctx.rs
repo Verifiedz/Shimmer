@@ -66,8 +66,9 @@ pub struct Ctx {
     /// startup. Use with [`crate::time::local_date`] to derive a calendar date for stamping
     /// or display; never store a local-time timestamp — event and file timestamps stay UTC.
     pub local_tz: LocalTimezone,
-    /// Spawn `launch.sh`/`cleanup.sh` (ADR 0010). Defaults to [`Launcher::unavailable`] —
-    /// the daemon has no real backend or capability-scoped wiring yet; that follows in a
+    /// Spawn a workspace's numbered launch steps (`steps/<index>-<name>.{sh,ps1}`) and its
+    /// `cleanup.{sh,ps1}` (ADR 0010 §2a). Defaults to [`Launcher::unavailable`] — the
+    /// daemon has no real backend or capability-scoped wiring yet; that follows in a
     /// separate change once ADR 0010 is signed off. Modules must never call
     /// `std::process::Command` directly (§12 rule 4).
     pub launcher: Launcher,
