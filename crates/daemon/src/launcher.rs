@@ -1,6 +1,7 @@
 //! The real `LaunchBackend` (ADR 0010). Lands incrementally, one `SpawnMode`/concern per
-//! sub-branch of the `m3-launch-backend` umbrella; this slice adds `SpawnMode::Supervised`
-//! on top of the previous one's `Detached`.
+//! sub-branch of the `m3-launch-backend` umbrella; this slice adds the full injected-env
+//! build (all six `SHIMMER_*` vars) plus `workspace.toml`'s `[env]` merge and its override
+//! guard, on top of the previous slices' `Detached`/`Supervised` spawn mechanics.
 //!
 //! Linux/macOS (`cfg(unix)`) only, same scoping as ADR 0010 §7 — Windows is sketched there,
 //! not implemented. Not yet wired into any `Ctx` (that is the capability-scoped-wiring
@@ -27,11 +28,14 @@ pub struct RealLaunchBackend {
     /// `$SHIMMER_HOME`. The backend is the one place allowed to hold this as a raw path
     /// (ADR 0010 §4) — nothing upstream of it ever sees one.
     home: PathBuf,
+    /// `$SHIMMER_SOCKET`, injected into every spawned script so it can call back in
+    /// (CLAUDE.md §10.1).
+    socket: PathBuf,
 }
 
 impl RealLaunchBackend {
-    pub fn new(home: PathBuf) -> Self {
-        Self { home }
+    pub fn new(home: PathBuf, socket: PathBuf) -> Self {
+        Self { home, socket }
     }
 }
 
@@ -39,9 +43,14 @@ impl RealLaunchBackend {
 impl LaunchBackend for RealLaunchBackend {
     async fn run(&self, step: &LaunchStep, cancel: &CancellationToken) -> Result<StepOutcome> {
         let script = resolve_script(&self.home, &step.workspace_dir, &step.step)?;
+        // Placeholder — minted for real from `Ctx`'s clock in the session-id sub-branch.
+        // Threaded through once so that change touches one line, not every call site.
+        let session_id = String::new();
         match step.mode {
-            SpawnMode::Detached => run_detached(&script, step).await,
-            SpawnMode::Supervised { timeout } => run_supervised(&self.home, &script, step, timeout, cancel).await,
+            SpawnMode::Detached => run_detached(&self.home, &self.socket, &script, step, &session_id).await,
+            SpawnMode::Supervised { timeout } => {
+                run_supervised(&self.home, &self.socket, &script, step, &session_id, timeout, cancel).await
+            }
         }
     }
 }
@@ -67,13 +76,19 @@ fn resolve_script(home: &Path, workspace_dir: &str, step: &Step) -> Result<PathB
 /// `crates/cli/src/autostart.rs` already uses for the daemon autostart spawn), `run` returns
 /// as soon as the process is spawned, and a second task reaps it independently so it never
 /// becomes a zombie — without ever retaining a handle (§10.2: "no handle retained").
-async fn run_detached(script: &Path, step: &LaunchStep) -> Result<StepOutcome> {
+async fn run_detached(
+    home: &Path,
+    socket: &Path,
+    script: &Path,
+    step: &LaunchStep,
+    session_id: &str,
+) -> Result<StepOutcome> {
     if !script.exists() {
         return Err(Error::unavailable(format!("launch script not found: {}", script.display())));
     }
     let mut cmd = Command::new("sh");
     cmd.arg(script);
-    inject_env(&mut cmd, step);
+    inject_env(&mut cmd, home, socket, step, session_id);
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     #[cfg(unix)]
     cmd.process_group(0);
@@ -84,8 +99,7 @@ async fn run_detached(script: &Path, step: &LaunchStep) -> Result<StepOutcome> {
         let _ = child.wait().await;
     });
     Ok(StepOutcome {
-        // Placeholder — minted for real from `Ctx`'s clock in the session-id sub-branch.
-        session_id: String::new(),
+        session_id: session_id.to_string(),
         exit_code: None,
         timed_out: false,
         // Detached stdio goes to null (above), so there is nothing to capture.
@@ -99,8 +113,10 @@ async fn run_detached(script: &Path, step: &LaunchStep) -> Result<StepOutcome> {
 /// whose stdio goes to null, this captures the child's stdout/stderr to `logs/` (§3 "Logs").
 async fn run_supervised(
     home: &Path,
+    socket: &Path,
     script: &Path,
     step: &LaunchStep,
+    session_id: &str,
     timeout: Duration,
     cancel: &CancellationToken,
 ) -> Result<StepOutcome> {
@@ -117,7 +133,7 @@ async fn run_supervised(
 
     let mut cmd = Command::new("sh");
     cmd.arg(script);
-    inject_env(&mut cmd, step);
+    inject_env(&mut cmd, home, socket, step, session_id);
     cmd.stdin(Stdio::null()).stdout(Stdio::from(stdout_file)).stderr(Stdio::from(stderr_file));
     #[cfg(unix)]
     cmd.process_group(0);
@@ -141,13 +157,7 @@ async fn run_supervised(
         }
     };
 
-    Ok(StepOutcome {
-        // Placeholder — minted for real from `Ctx`'s clock in the session-id sub-branch.
-        session_id: String::new(),
-        exit_code,
-        timed_out,
-        log_path: log_rel,
-    })
+    Ok(StepOutcome { session_id: session_id.to_string(), exit_code, timed_out, log_path: log_rel })
 }
 
 /// Relative to `$SHIMMER_HOME`, matching `docs/protocol.md`'s `workspace_dirty` detail shape
@@ -171,12 +181,28 @@ fn kill_process_group(pid: Option<u32>) {
     }
 }
 
-/// The five vars every spawned script gets (CLAUDE.md §10.1). `step.user_env` is not merged
-/// in yet — that, and the override guard, land in the env-injection sub-branch.
-fn inject_env(cmd: &mut Command, step: &LaunchStep) {
-    cmd.env(env_names::WORKSPACE_ID, &step.workspace_id);
-    cmd.env(env_names::WORKSPACE_DIR, &step.workspace_dir);
-    cmd.env(env_names::PLATFORM, platform());
+/// The six vars every spawned script gets (CLAUDE.md §10.1), then `workspace.toml`'s
+/// `[env]` for every key that is not one of those six — the override guard (ADR 0010 §2):
+/// "a `workspace.toml` that (accidentally or otherwise) declares `SHIMMER_SOCKET = "..."`
+/// cannot redirect a script's daemon connection." Checked by membership, not by call order,
+/// since `Command::env` is last-write-wins for a repeated key.
+fn inject_env(cmd: &mut Command, home: &Path, socket: &Path, step: &LaunchStep, session_id: &str) {
+    let injected = [
+        (env_names::WORKSPACE_ID, step.workspace_id.clone()),
+        (env_names::WORKSPACE_DIR, step.workspace_dir.clone()),
+        (env_names::HOME, home.display().to_string()),
+        (env_names::SOCKET, socket.display().to_string()),
+        (env_names::SESSION_ID, session_id.to_string()),
+        (env_names::PLATFORM, platform().to_string()),
+    ];
+    for (k, v) in &injected {
+        cmd.env(k, v);
+    }
+    for (k, v) in &step.user_env {
+        if !injected.iter().any(|(ik, _)| ik == k) {
+            cmd.env(k, v);
+        }
+    }
 }
 
 fn platform() -> &'static str {
@@ -194,6 +220,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    fn backend(home: &TempDir) -> RealLaunchBackend {
+        RealLaunchBackend::new(home.path().to_path_buf(), home.path().join("d.sock"))
+    }
 
     fn write_step_script(home: &Path, workspace_dir: &str, name: &str, body: &str) -> PathBuf {
         let dir = home.join("data/workspaces").join(workspace_dir).join("steps");
@@ -220,7 +250,7 @@ mod tests {
         write_step_script(home.path(), "deep-work", "setup", &format!("sleep 0.3 && touch {}\n", marker.display()));
 
         {
-            let backend = RealLaunchBackend::new(home.path().to_path_buf());
+            let backend = backend(&home);
             let outcome = backend.run(&step("deep-work", "setup"), &CancellationToken::new()).await.unwrap();
             assert_eq!(outcome.exit_code, None);
             assert!(!outcome.timed_out);
@@ -233,29 +263,55 @@ mod tests {
         assert!(marker.exists(), "detached process did not outlive the backend that spawned it");
     }
 
+    const ECHO_ALL_INJECTED: &str = "echo \"$SHIMMER_WORKSPACE_ID|$SHIMMER_WORKSPACE_DIR|$SHIMMER_HOME|$SHIMMER_SOCKET|$SHIMMER_SESSION_ID|$SHIMMER_PLATFORM\"";
+
     #[tokio::test]
-    async fn injects_workspace_id_dir_and_platform() {
+    async fn injects_all_six_env_names() {
+        let home = TempDir::new().unwrap();
+        let out = home.path().join("out");
+        write_step_script(home.path(), "deep-work", "setup", &format!("{ECHO_ALL_INJECTED} > {}\n", out.display()));
+
+        let b = backend(&home);
+        b.run(&step("deep-work", "setup"), &CancellationToken::new()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let seen = std::fs::read_to_string(&out).unwrap();
+        let expected = format!(
+            "deep-work|deep-work|{}|{}||{}",
+            home.path().display(),
+            home.path().join("d.sock").display(),
+            platform()
+        );
+        assert_eq!(seen.trim(), expected, "SHIMMER_SESSION_ID is an empty placeholder until the session-id sub-branch");
+    }
+
+    #[tokio::test]
+    async fn user_env_cannot_override_an_injected_name() {
         let home = TempDir::new().unwrap();
         let out = home.path().join("out");
         write_step_script(
             home.path(),
             "deep-work",
             "setup",
-            &format!("echo \"$SHIMMER_WORKSPACE_ID $SHIMMER_WORKSPACE_DIR $SHIMMER_PLATFORM\" > {}\n", out.display()),
+            &format!("echo \"$SHIMMER_SOCKET|$MY_VAR\" > {}\n", out.display()),
         );
 
-        let backend = RealLaunchBackend::new(home.path().to_path_buf());
-        backend.run(&step("deep-work", "setup"), &CancellationToken::new()).await.unwrap();
+        let mut s = step("deep-work", "setup");
+        s.user_env = vec![
+            ("SHIMMER_SOCKET".into(), "attacker-controlled".into()),
+            ("MY_VAR".into(), "from-workspace-toml".into()),
+        ];
+        backend(&home).run(&s, &CancellationToken::new()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let seen = std::fs::read_to_string(&out).unwrap();
-        assert_eq!(seen.trim(), format!("deep-work deep-work {}", platform()));
+        assert_eq!(seen.trim(), format!("{}|from-workspace-toml", home.path().join("d.sock").display()));
     }
 
     #[tokio::test]
     async fn missing_script_fails_closed_without_spawning() {
         let home = TempDir::new().unwrap();
-        let backend = RealLaunchBackend::new(home.path().to_path_buf());
+        let backend = backend(&home);
         let e = backend.run(&step("deep-work", "nope"), &CancellationToken::new()).await.unwrap_err();
         assert_eq!(e.code, shimmer_core::ErrorCode::Unavailable);
     }
@@ -285,7 +341,7 @@ mod tests {
         let home = TempDir::new().unwrap();
         write_step_script(home.path(), "deep-work", "setup", "echo hello-from-setup\n");
 
-        let backend = RealLaunchBackend::new(home.path().to_path_buf());
+        let backend = backend(&home);
         let outcome = backend
             .run(&supervised_step("deep-work", "setup", Duration::from_secs(5)), &CancellationToken::new())
             .await
@@ -311,7 +367,7 @@ mod tests {
             &format!("(sleep 1 && touch {}) &\nsleep 5\n", grandchild_marker.display()),
         );
 
-        let backend = RealLaunchBackend::new(home.path().to_path_buf());
+        let backend = backend(&home);
         let outcome = backend
             .run(&supervised_step("deep-work", "setup", Duration::from_millis(200)), &CancellationToken::new())
             .await
@@ -334,7 +390,7 @@ mod tests {
             &format!("(sleep 1 && touch {}) &\nsleep 5\n", grandchild_marker.display()),
         );
 
-        let backend = RealLaunchBackend::new(home.path().to_path_buf());
+        let backend = backend(&home);
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
         tokio::spawn(async move {
