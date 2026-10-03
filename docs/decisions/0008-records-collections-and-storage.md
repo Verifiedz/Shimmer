@@ -1,6 +1,6 @@
 # 0008. Records: where collections live, the file layout, and the ops
 
-Status: proposed (M1) · Raised by Dev B · Needs sign-off: Dev A (changes a path in CLAUDE.md §7) ·
+Status: accepted (M1, #2) · Raised by Dev B · Signed off: Dev A (changes a path in CLAUDE.md §7) ·
 Dev C notified (item shape on the wire)
 
 > **Renamed since:** `swe`, `swe-*` and `SWE_*` in this ADR are now `shimmer`, `shimmer-*` and

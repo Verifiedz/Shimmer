@@ -1,11 +1,10 @@
 # 0009. Deriving a local calendar date without storing local time
 
-Status: proposed (Dev A approved, awaiting Dev B) · Raised by Dev A (CLAUDE.md §4, changes `core`)
+Status: accepted (M1, #5; landed on master in #6) · Raised by Dev A (CLAUDE.md §4, changes `core`)
 
-Implemented on `utc-local-date-adr` (off `post-m1-fixes`): `crates/core/src/time.rs`,
-`Ctx.local_tz`, `Config::load`'s detect-and-persist step, and
-`crates/modules/records/src/lib.rs`'s `complete` now stamping via `local_date`. Dev B's
-sign-off is still needed per §4 before this merges past `post-m1-fixes`.
+Implemented in #5 and merged to master in #6: `crates/core/src/time.rs`, `Ctx.local_tz`,
+`Config::load`'s detect-and-persist step, and `crates/modules/records/src/lib.rs`'s `complete`
+now stamping via `local_date`.
 
 > **Renamed since:** `swe`, `swe-*` and `SWE_*` in this ADR are now `shimmer`, `shimmer-*` and
 > `SHIMMER_*` (ADR 0011). The text below is kept as written.

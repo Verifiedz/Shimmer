@@ -1,6 +1,6 @@
 # 0005. Fallback targets `notify.*` only, and never nests
 
-Status: proposed · Needs sign-off: Dev A, Dev B
+Status: accepted (M2, #1) · Signed off: Dev A, Dev B (recorded in #6)
 
 > **Renamed since:** `swe`, `swe-*` and `SWE_*` in this ADR are now `shimmer`, `shimmer-*` and
 > `SHIMMER_*` (ADR 0011). The text below is kept as written.

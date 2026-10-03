@@ -1,6 +1,6 @@
 # 0007. CLI command surface and daemon auto-start
 
-Status: proposed (M0) · Raised by Dev B · Needs sign-off: Dev A (touches `crates/app`)
+Status: accepted (M0, #2) · Raised by Dev B · Signed off: Dev A (touches `crates/app`)
 
 > **Renamed since:** `swe`, `swe-*` and `SWE_*` in this ADR are now `shimmer`, `shimmer-*` and
 > `SHIMMER_*` (ADR 0011). The text below is kept as written.
