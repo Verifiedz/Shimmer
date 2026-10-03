@@ -2,7 +2,9 @@
 
 Status: proposed · Raised by Dev A · Needs sign-off: Dev A, Dev B (CLAUDE.md §4, changes `core`)
 · Amended after PR review: §2a (multi-step launches), and code/doc drift on `session_id`
-resolved (§2, §9, "Not done here")
+resolved (§2, §9, "Not done here") · Amended during the real `LaunchBackend`'s
+implementation (`m3-launch-backend`): §9's `session_id` random field is no longer
+`rand::random()` — see §9 "Amendment: `instance_id`, not pure `rand::random()`".
 
 > **Renamed since:** `swe`, `swe-*` and `SWE_*` in this ADR are now `shimmer`, `shimmer-*` and
 > `SHIMMER_*` (ADR 0011). The text below is kept as written.
@@ -411,6 +413,38 @@ window).
 `52b6863`) originally lagged this doc, still carrying `session_id` as a `LaunchStep` input —
 that drift is fixed in the same commit as the §2a multi-step amendment, so code and doc agree
 again as of this revision.
+
+**Amendment (during the real `LaunchBackend`'s implementation, `m3-launch-backend`):
+`instance_id`, not pure `rand::random()`, for the 80-bit random field.** The sketch above —
+`Ulid::from_parts(clock.now().timestamp_millis(), rand::random())` — turned out to be in
+tension with a real requirement raised during implementation: a module needs to write
+*deterministic* tests against session ordering (same sequence of calls against a fake clock
+reset to the same start must reproduce the same ids). Fresh OS randomness on every call
+can't give that; it is reproducible by construction in neither draw.
+
+The first implementation swapped `rand::random()` for an in-process monotonic counter
+(`sequence`) instead, which *is* reproducible — but that traded away collision resistance.
+`sequence` resets to 0 every time a `RealLaunchBackend` is constructed, i.e. every daemon
+start, so two separate daemon lifetimes (a restart, or two machines sharing a git-synced
+`$SHIMMER_HOME`, §1.4's portability goal) whose clocks happen to agree on the millisecond
+for the same call index would mint the *identical* `session_id`. That is a real
+correctness bug, not a cosmetic one: `session_id` is not only a display value — it lands in
+`workspaces.session.launched`/`.dirty` event payloads (durable, git-syncable) and in a log
+file's name, so a collision there means two distinguishable launch attempts become
+indistinguishable, or one log file silently overwrites another's.
+
+**Decision: split the 80-bit random field into two parts instead of choosing one property
+over the other.** The high 48 bits are `instance_id` — drawn fresh and random exactly once
+per real daemon process (the caller's job, e.g. `rand::random()` at daemon startup; never
+generated inside the backend itself, so it stays injected rather than hidden, the same
+posture as `clock`). The low 32 bits are `sequence`, as before. Two different daemon
+lifetimes essentially never collide even if their clocks and sequences happen to agree,
+because they almost certainly don't share an `instance_id`; within one process, `sequence`
+alone still gives the exact, deterministic ordering a module's tests need, since a fresh
+backend's `sequence` always starts at 0. Implemented in `crates/daemon/src/launcher.rs`'s
+`mint_session_id`; `RealLaunchBackend::new` takes `instance_id` as an explicit parameter,
+not an internal `rand::random()` call, for the same reason tests pass `clock` explicitly
+rather than this type reaching for `Clock::system()` on its own.
 
 ### 10. Tests Dev A will write against the real `LaunchBackend`
 
