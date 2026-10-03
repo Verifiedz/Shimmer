@@ -93,9 +93,46 @@ impl std::str::FromStr for TaskId {
     }
 }
 
+fn valid_id_shaped(s: &str, first_ok: impl Fn(char) -> bool) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if first_ok(c))
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
 /// True for `[a-z][a-z0-9_-]*`: safe as a module id, a data namespace and a path segment.
 pub fn is_valid_name(s: &str) -> bool {
-    let mut chars = s.chars();
-    matches!(chars.next(), Some(c) if c.is_ascii_lowercase())
-        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+    valid_id_shaped(s, |c| c.is_ascii_lowercase())
+}
+
+/// True for `[a-z0-9][a-z0-9_-]*` (ADR 0008): a record id, a workspace launch step name, or
+/// anything else sharing that charset but — unlike [`is_valid_name`] — allowing a leading
+/// digit, so `1-two-sum` or `01-setup` work.
+pub fn is_valid_id(s: &str) -> bool {
+    valid_id_shaped(s, |c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
+#[cfg(test)]
+mod id_shape_tests {
+    use super::*;
+
+    #[test]
+    fn is_valid_name_requires_a_leading_letter() {
+        assert!(is_valid_name("deep-work"));
+        assert!(is_valid_name("a1"));
+        assert!(!is_valid_name("1-two-sum"), "is_valid_name does not allow a leading digit");
+        assert!(!is_valid_name(""));
+        assert!(!is_valid_name("Setup"));
+        assert!(!is_valid_name("a/b"));
+    }
+
+    #[test]
+    fn is_valid_id_allows_a_leading_digit() {
+        assert!(is_valid_id("1-two-sum"));
+        assert!(is_valid_id("01-setup"));
+        assert!(is_valid_id("deep-work"));
+        assert!(!is_valid_id(""));
+        assert!(!is_valid_id("Setup.v2"));
+        assert!(!is_valid_id("../x"));
+        assert!(!is_valid_id("a/b"));
+    }
 }

@@ -768,6 +768,7 @@ dependencies = [
  "chrono",
  "cron",
  "nix",
+ "rand 0.9.5",
  "serde",
  "serde_json",
  "shimmer-core",

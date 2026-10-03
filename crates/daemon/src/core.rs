@@ -2,6 +2,7 @@
 //! `(op, params, queue control)` and leave as a `Result<Value>`.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Instant;
@@ -14,6 +15,8 @@ use shimmer_core::{
     Origin, Priority, ProgressFn, QueueHandle, Result,
 };
 use shimmer_core::{EnqueueRequest, TaskId, TaskSubmitter};
+#[cfg(unix)]
+use shimmer_core::{LaunchBackend, Launcher};
 use shimmer_proto::{ops, ManifestData, ModuleInfo, PingData, QueueControl, QueuePriority, QueuedHandle};
 use tokio_util::sync::CancellationToken;
 
@@ -45,7 +48,23 @@ impl Core {
         backend: Arc<Backend>,
         clock: Clock,
         shutdown: CancellationToken,
+        socket: &Path,
     ) -> Arc<Self> {
+        // A module gets a populated, usable `Launcher` only if its manifest declares the
+        // `"process"` capability (ADR 0010 §4); every other module keeps `Ctx::new`'s
+        // default `Launcher::unavailable`, the same fails-closed posture `ctx.http` already
+        // has. One real backend, shared across every such module: `instance_id` (ADR 0010
+        // §9's amendment) only needs to be collision-resistant per daemon process, not per
+        // module, and sharing it means every minted session id in one daemon run draws from
+        // the same sequence, not a separate one per module.
+        #[cfg(unix)]
+        let real_launcher: Arc<dyn LaunchBackend> = Arc::new(crate::launcher::RealLaunchBackend::new(
+            backend.store.home().to_path_buf(),
+            socket.to_path_buf(),
+            clock.clone(),
+            rand::random(),
+        ));
+
         Arc::new_cyclic(|weak: &Weak<Core>| {
             let ops = registry
                 .entries
@@ -68,7 +87,8 @@ impl Core {
                 .iter()
                 .map(|e| {
                     let id = e.manifest.id.clone();
-                    let ctx = Ctx::new(
+                    #[allow(unused_mut)]
+                    let mut ctx = Ctx::new(
                         NamespacedStore::new(e.manifest.namespace.clone(), id.clone(), backend.clone(), clock.clone()),
                         HttpGateway::new(id.clone(), Arc::new(DisabledHttp)),
                         Emitter::new(id.clone(), backend.clone(), clock.clone()),
@@ -79,6 +99,10 @@ impl Core {
                         ModuleConfig::new(config.modules.get(id.as_str()).cloned().unwrap_or_else(|| json!({}))),
                         id.clone(),
                     );
+                    #[cfg(unix)]
+                    if e.manifest.capabilities.iter().any(|c| c == "process") {
+                        ctx.launcher = Launcher::new(real_launcher.clone());
+                    }
                     (id, ctx)
                 })
                 .collect();

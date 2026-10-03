@@ -1,7 +1,8 @@
-//! Spawning `launch.sh`/`cleanup.sh` (ADR 0010) — `core`'s one sanctioned exception to "no
-//! raw I/O in a module" (§2). A module never calls `std::process::Command`, `setsid`, or any
-//! spawning primitive directly; it only ever sees [`Launcher`], backed by a [`LaunchBackend`]
-//! the daemon implements for real and tests replace with a fake (§12 rule 13).
+//! Spawning a workspace's numbered launch steps (`steps/<index>-<name>.{sh,ps1}`) and its
+//! `cleanup.{sh,ps1}` (ADR 0010 §2a) — `core`'s one sanctioned exception to "no raw I/O in a
+//! module" (§2). A module never calls `std::process::Command`, `setsid`, or any spawning
+//! primitive directly; it only ever sees [`Launcher`], backed by a [`LaunchBackend`] the
+//! daemon implements for real and tests replace with a fake (§12 rule 13).
 //!
 //! Interface only here — no real backend and no daemon code. `Ctx.launcher` defaults to
 //! [`Launcher::unavailable`] so every existing `Ctx::new` call site (daemon and tests alike)

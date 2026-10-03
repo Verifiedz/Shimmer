@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
+use shimmer_core::ids::is_valid_id;
 use shimmer_core::{Error, Result};
 
 use crate::schema::Collection;
@@ -36,13 +37,10 @@ pub struct Item {
     pub fields: BTreeMap<String, Value>,
 }
 
-/// A record id is its file name: `[a-z0-9][a-z0-9_-]*`, so `1-two-sum` works too.
+/// A record id is its file name: `[a-z0-9][a-z0-9_-]*` (`shimmer_core::ids::is_valid_id`,
+/// ADR 0008), so `1-two-sum` works too.
 pub fn check_id(id: &str) -> Result<()> {
-    let mut chars = id.chars();
-    let ok = id.len() <= MAX_ID_LEN
-        && chars.next().is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
-    if ok {
+    if id.len() <= MAX_ID_LEN && is_valid_id(id) {
         Ok(())
     } else {
         Err(Error::invalid_params(format!(

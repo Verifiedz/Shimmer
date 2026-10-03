@@ -160,6 +160,53 @@ impl Module for Notify {
     }
 }
 
+/// Its manifest's `capabilities` is configurable so a test can start the *same* op logic
+/// with and without `"process"` declared, to prove `Core::new`'s capability-scoped
+/// `ctx.launcher` wiring (ADR 0010 §4) rather than anything about spawn behaviour itself
+/// (covered by `crates/daemon/src/launcher.rs`'s own tests).
+pub struct ProcessUser {
+    pub declares_capability: bool,
+}
+
+#[async_trait]
+impl Module for ProcessUser {
+    fn manifest(&self) -> Manifest {
+        Manifest {
+            id: "procuser".into(),
+            version: "0.0.1".into(),
+            namespace: "procuser".into(),
+            topics: vec![],
+            capabilities: if self.declares_capability { vec!["process".into()] } else { vec![] },
+        }
+    }
+
+    async fn init(&self, _ctx: &Ctx) -> Result<()> {
+        Ok(())
+    }
+
+    fn commands(&self) -> Vec<CommandSpec> {
+        vec![spec("procuser.launch", Execution::Inline)]
+    }
+
+    async fn handle(&self, op: &str, params: Value, ctx: &Ctx) -> Result<Value> {
+        match op {
+            "procuser.launch" => {
+                let workspace_dir = params["workspace_dir"].as_str().unwrap_or("deep-work").to_string();
+                let step = shimmer_core::LaunchStep {
+                    workspace_id: workspace_dir.clone(),
+                    workspace_dir,
+                    step: shimmer_core::Step::Cleanup,
+                    mode: shimmer_core::SpawnMode::Detached,
+                    user_env: vec![],
+                };
+                let outcome = ctx.launcher.run(&step, &ctx.cancel).await?;
+                Ok(json!({"session_id_is_empty": outcome.session_id.is_empty()}))
+            }
+            _ => Err(Error::unknown_op(op)),
+        }
+    }
+}
+
 // ---------------------------------------------------------------- a raw client
 
 pub struct Client {
