@@ -8,6 +8,10 @@ no `docs/protocol.md` change — `fetchers.item.found`'s payload shape (§3) is 
 Amended (issue #128, CLI surface): the "Not done here" CLI/TUI deferral below is only ever
 true for the TUI now — see §11. Three additive ops, `docs/protocol.md` updated, no `core`
 change, no version bump (additive, same as §9's own ops).
+Amended (`shimmer fetchers items`): §11's own deferred `items` command, built — see §12.
+One new, module-agnostic op (`core.events.list`), `docs/protocol.md` updated, no version
+bump, no `crates/proto` *type* change beyond the new op's own response struct (`Event`
+itself, already shared and already serializable, is unchanged).
 
 ## Context
 
@@ -386,11 +390,47 @@ subscribe-then-follow pattern `workspaces.rs` already established).
 **Not done in this amendment either:** `fetchers.item.found` events themselves still have no
 CLI-visible history — "`shimmer fetchers items`" (recent found items, e.g. for "what did the
 last run actually find") needs a new, module-agnostic op backed by the index's events table,
-which is a `crates/proto` change (CLAUDE.md §4: needs explicit sign-off, a
-`docs/protocol.md` addition, a version bump, and Dev C's notification) — stopping and
-reporting that rather than building around it, same posture §2a already took on the
-per-method rate-limit floor. The TUI surface remains entirely out of scope, as originally
-stated.
+which is a `crates/proto` change. Built in §12. The TUI surface remains entirely out of
+scope, as originally stated.
+
+### 12. Amendment: `core.events.list`, and `shimmer fetchers items`
+
+§11's deferred `items` command, built. Confirmed live-testing need (ADR 0028's own reference
+sources turned up real postings worth re-reading after the fact), and resolved exactly as
+§11 flagged: a new, module-agnostic op, not a `fetchers`-owned one — any module's event
+history is the same shape, and `fetchers` has no more special claim to "list recent events"
+than `records` or `workspaces` do.
+
+- **`core.events.list`** (inline): `{"topic"?, "limit"?}` → `{"events":[Event…]}`, oldest
+  first, capped to the `limit` most recent matches (default 100, max 1000 —
+  `crates/daemon/src/core.rs`'s `DEFAULT_EVENTS_LIMIT`/`MAX_EVENTS_LIMIT`). `topic` is a
+  subscription-style pattern (`a.b.c`, `a.*`, `*`, default `*`; `crates/proto/src/topic.rs`'s
+  `is_valid_pattern`, the same grammar a live subscription already uses) —
+  `invalid_params` on anything else. Backed by `crates/store/src/index.rs`'s
+  `events_matching_recent`, a sibling to the already-existing `events_matching` that answers
+  "most recent," not "oldest" — the derived index, not a log scan, so it answers fast
+  regardless of how much history has piled up (CLAUDE.md §1.4). `crates/daemon/src/core.rs`'s
+  `Core` now holds the shared index handle (`SharedIndex`) the indexer task already kept
+  current, opened before `Core::new` instead of only after it.
+- **Found along the way, fixed at the `store` layer, not here:** `events_matching`'s own
+  `ORDER BY id` assumed a `Ulid`'s sort order reflects insertion order, which is only true
+  *between* milliseconds — `Ulid::from_datetime` (`crates/core/src/event.rs`) fills the rest
+  of the id with random bits, so two events applied within the same millisecond (a real
+  shape: one `fetchers` run's items all commit in a single transaction, §4) can sort in
+  either order relative to each other. Caught by this amendment's own test coming back
+  shuffled. Fixed by sorting on SQLite's own implicit `rowid` instead, which always reflects
+  insertion order — `events_matching`'s existing behavior and tests are unaffected (nothing
+  depended on same-millisecond tie order; `events_matching_recent` is new).
+- **`shimmer fetchers items [SOURCE]`** (`crates/cli/src/fetchers.rs`): calls
+  `core.events.list` with `topic: "fetchers.item.found"` (a literal, not an import —
+  `crates/cli` must not depend on `crates/modules/fetchers`, CLAUDE.md §3's dependency
+  rules), then filters client-side by `payload.source_name` when `SOURCE` is given. Displays
+  newest-first (reversed from the op's own oldest-first convention — a feed/log-tail
+  reads naturally newest-on-top; the raw op keeps the event-log's own ordering). No
+  `fetchers`-side change at all: every new behavior lives in `core.events.list` or the CLI.
+- **Additive, no `docs/protocol.md` version bump** — same reasoning §9's own ops used: `v`
+  is bumped only for breaking changes (`docs/protocol.md`'s own header), and an unknown
+  client never asked for `core.events.list` before, so nothing it already does changes.
 
 ## Not done here
 

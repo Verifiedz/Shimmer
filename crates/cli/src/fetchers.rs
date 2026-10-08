@@ -19,10 +19,16 @@ commands:
   status               per-source last-run time and whether it is running
   test SOURCE          fetch one page and show its parsed items; never saves or marks anything seen
   run SOURCE [--wait]  fetch one source now
+  items [SOURCE]       items a real run has actually found and kept, most recent first
 
 A source is either one of the built-in ones (hn-whoishiring, weworkremotely) or a configured
 kind (ADR 0028 §2a) under [modules.fetchers.sources.<id>] in config.toml. Add --json to any
 command for raw output.";
+
+/// `core.events.list`'s own query limit for `items` -- generous enough to cover several runs
+/// across every source before filtering down to one, well under the daemon's own cap
+/// (`MAX_EVENTS_LIMIT`, `crates/daemon/src/core.rs`).
+const ITEMS_QUERY_LIMIT: usize = 200;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum FetchersCmd {
@@ -31,6 +37,7 @@ pub enum FetchersCmd {
     Status,
     Test { source: String },
     Run { source: String, wait: bool },
+    Items { source: Option<String> },
 }
 
 /// `words` are what follows `shimmer fetchers`.
@@ -57,6 +64,11 @@ pub fn parse(words: Vec<String>) -> std::result::Result<FetchersCmd, String> {
             };
             Ok(FetchersCmd::Run { source, wait: flags.has("--wait") })
         }
+        "items" => match rest.as_slice() {
+            [] => Ok(FetchersCmd::Items { source: None }),
+            [source] => Ok(FetchersCmd::Items { source: Some(source.clone()) }),
+            _ => Err("usage: shimmer fetchers items [SOURCE]".into()),
+        },
         other => Err(format!("unknown fetchers command '{other}'; see 'shimmer fetchers --help'")),
     }
 }
@@ -97,6 +109,23 @@ pub async fn run(client: &mut Client, cmd: &FetchersCmd, json_out: bool) -> Resu
             }
             let result = follow(client, task).await?;
             Ok(if json_out { render::json(&result) } else { fetched(source, &result) })
+        }
+        FetchersCmd::Items { source } => {
+            // fetchers.item.found is a plain string literal, not an import from shimmer-fetchers
+            // -- a client crate must not depend on a module crate (CLAUDE.md §3's dependency
+            // rules), same reason every other op name in this file is also a literal.
+            let data = client
+                .call("core.events.list", json!({"topic": "fetchers.item.found", "limit": ITEMS_QUERY_LIMIT}))
+                .await?;
+            let events = data["events"].as_array().cloned().unwrap_or_default();
+            let matching: Vec<Value> = events
+                .into_iter()
+                .filter(|e| match source {
+                    None => true,
+                    Some(s) => e["payload"]["source_name"].as_str() == Some(s.as_str()),
+                })
+                .collect();
+            Ok(if json_out { render::json(&json!({"items": matching})) } else { items(source.as_deref(), &matching) })
         }
     }
 }
@@ -221,6 +250,35 @@ fn test_items(source: &str, result: &Value) -> String {
     out.trim_end().to_string()
 }
 
+/// Every `fetchers.item.found` event matched, most recent first -- `core.events.list` itself
+/// returns oldest-first (the event-log's own convention), reversed here only for display,
+/// same reasoning as a feed or a log tail: what just happened belongs on top.
+fn items(source: Option<&str>, events: &[Value]) -> String {
+    if events.is_empty() {
+        return match source {
+            Some(s) => format!("{s}: no items found yet"),
+            None => "no items found yet".into(),
+        };
+    }
+    let n = events.len();
+    let mut out = match source {
+        Some(s) => format!("{s}: {n} item{}\n", if n == 1 { "" } else { "s" }),
+        None => format!("{n} item{}\n", if n == 1 { "" } else { "s" }),
+    };
+    for ev in events.iter().rev() {
+        let p = &ev["payload"];
+        // Never truncated, same reasoning as test_items's own url handling.
+        let url = p["url"].as_str().unwrap_or_default();
+        let _ = match source {
+            Some(_) => writeln!(out, "  {}  {url}", render::cell(&p["title"])),
+            None => {
+                writeln!(out, "  [{}] {}  {url}", p["source_name"].as_str().unwrap_or("?"), render::cell(&p["title"]))
+            }
+        };
+    }
+    out.trim_end().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +301,8 @@ mod tests {
             p(&["run", "hn-whoishiring", "--wait"]),
             Ok(FetchersCmd::Run { source: "hn-whoishiring".into(), wait: true })
         );
+        assert_eq!(p(&["items"]), Ok(FetchersCmd::Items { source: None }));
+        assert_eq!(p(&["items", "jobbank-canada"]), Ok(FetchersCmd::Items { source: Some("jobbank-canada".into()) }));
     }
 
     #[test]
@@ -252,6 +312,7 @@ mod tests {
         assert!(p(&["test"]).unwrap_err().contains("usage: shimmer fetchers test SOURCE"));
         assert!(p(&["run"]).unwrap_err().contains("usage: shimmer fetchers run SOURCE"));
         assert!(p(&["run", "a", "--bogus"]).unwrap_err().contains("unknown option '--bogus'"));
+        assert!(p(&["items", "a", "b"]).unwrap_err().contains("usage: shimmer fetchers items"));
         assert!(p(&["frob"]).unwrap_err().contains("unknown fetchers command 'frob'"));
     }
 
@@ -308,6 +369,37 @@ mod tests {
         let out = test_items("jobbank-canada", &data);
         assert!(out.ends_with(&long_url), "the full url must survive untouched:\n{out}");
         assert!(out.contains('…'), "the long title should still be shortened for display");
+    }
+
+    fn found(source: &str, title: &str, url: &str) -> Value {
+        json!({"topic": "fetchers.item.found", "payload": {"source_name": source, "title": title, "url": url}})
+    }
+
+    #[test]
+    fn items_groups_by_source_when_none_is_given_and_shows_newest_first() {
+        let events = vec![
+            found("hn-whoishiring", "Acme hiring", "https://x/1"),
+            found("weworkremotely", "Rust role", "https://x/2"),
+        ];
+        let out = items(None, &events);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "2 items");
+        // events arrive oldest-first; display must flip to newest-first.
+        assert!(lines[1].contains("weworkremotely") && lines[1].contains("Rust role"), "{out}");
+        assert!(lines[2].contains("hn-whoishiring") && lines[2].contains("Acme hiring"), "{out}");
+    }
+
+    #[test]
+    fn items_for_one_source_omits_the_source_label() {
+        let events = vec![found("jobbank-canada", "Software Engineer", "https://x/1")];
+        let out = items(Some("jobbank-canada"), &events);
+        assert_eq!(out, "jobbank-canada: 1 item\n  Software Engineer  https://x/1");
+    }
+
+    #[test]
+    fn items_with_nothing_found_says_so_either_way() {
+        assert_eq!(items(None, &[]), "no items found yet");
+        assert_eq!(items(Some("jobbank-canada"), &[]), "jobbank-canada: no items found yet");
     }
 
     #[test]

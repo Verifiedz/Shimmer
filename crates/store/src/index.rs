@@ -179,15 +179,43 @@ impl Index {
 
     /// Events matching a subscription-style pattern (`a.b.c`, `a.*`, `*`), oldest first.
     pub fn events_matching(&self, pattern: &str, limit: usize) -> Result<Vec<Event>> {
+        self.query_events(pattern, limit, "ASC")
+    }
+
+    /// The most recent `limit` events matching `pattern`, still returned oldest-first for a
+    /// reader -- unlike `events_matching`, whose ascending sort means its own `LIMIT` returns
+    /// the OLDEST matches once there are more than `limit`, the wrong end for "what did the
+    /// last run just find."
+    pub fn events_matching_recent(&self, pattern: &str, limit: usize) -> Result<Vec<Event>> {
+        let mut events = self.query_events(pattern, limit, "DESC")?;
+        events.reverse();
+        Ok(events)
+    }
+
+    /// Ordered by `rowid`, SQLite's own implicit insertion-order column, not `id` -- two
+    /// events applied within the same millisecond share a `Ulid::from_datetime` timestamp
+    /// prefix, and the random suffix that breaks the tie is not insertion order (confirmed by
+    /// a flaky-until-fixed test: a tight loop of `fetchers`-style same-run events sorted by
+    /// `id` alone came back shuffled). `rowid` always reflects the order rows were inserted,
+    /// which is always the order events were applied, so it is the correct tiebreaker.
+    ///
+    /// `order` is never user input -- only `"ASC"`/`"DESC"`, passed by the two methods above --
+    /// so formatting it directly into the SQL text is safe.
+    fn query_events(&self, pattern: &str, limit: usize, order: &str) -> Result<Vec<Event>> {
         let (sql, arg) = match pattern.strip_suffix(".*") {
-            _ if pattern == "*" => ("SELECT json FROM events ORDER BY id LIMIT ?2", String::new()),
+            _ if pattern == "*" => (format!("SELECT json FROM events ORDER BY rowid {order} LIMIT ?2"), String::new()),
             Some(prefix) => (
-                "SELECT json FROM events WHERE substr(topic, 1, length(?1)) = ?1 ORDER BY id LIMIT ?2",
+                format!(
+                    "SELECT json FROM events WHERE substr(topic, 1, length(?1)) = ?1 ORDER BY rowid {order} LIMIT ?2"
+                ),
                 format!("{prefix}."),
             ),
-            None => ("SELECT json FROM events WHERE topic = ?1 ORDER BY id LIMIT ?2", pattern.to_owned()),
+            None => (
+                format!("SELECT json FROM events WHERE topic = ?1 ORDER BY rowid {order} LIMIT ?2"),
+                pattern.to_owned(),
+            ),
         };
-        let mut stmt = self.conn.prepare(sql).map_err(db_err)?;
+        let mut stmt = self.conn.prepare(&sql).map_err(db_err)?;
         let rows = stmt.query_map(params![arg, limit as i64], |r| r.get::<_, String>(0)).map_err(db_err)?;
         rows.map(|r| {
             let json = r.map_err(db_err)?;
@@ -259,6 +287,23 @@ mod tests {
         let after: Vec<_> =
             ["records.*", "records.item.completed", "*"].iter().map(|p| idx.events_matching(p, 100).unwrap()).collect();
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn events_matching_recent_returns_the_newest_not_the_oldest() {
+        let home = TempDir::new().unwrap();
+        let store = Store::open(home.path()).unwrap();
+        let mut idx = Index::open(&store.index_path()).unwrap();
+        for i in 0..5 {
+            let e = ev("records.item.created", i);
+            store.append_event(&e).unwrap();
+            idx.apply(&e).unwrap();
+        }
+        // events_matching's own LIMIT, after an ascending sort, would return n=0,1 here --
+        // the oldest two, not what actually happened most recently.
+        let recent = idx.events_matching_recent("records.item.created", 2).unwrap();
+        let ns: Vec<u64> = recent.iter().map(|e| e.payload["n"].as_u64().unwrap()).collect();
+        assert_eq!(ns, vec![3, 4], "must be the newest two, oldest-first");
     }
 
     #[test]

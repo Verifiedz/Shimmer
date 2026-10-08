@@ -227,6 +227,60 @@ async fn lane_concurrency_and_cancellation() {
     stop(d).await;
 }
 
+// ---------------------------------------------------------------- core.events.list
+
+/// Polls `core.events.list` until the index has caught up to at least `want` matches --
+/// indexing happens on its own task, off the bus, so it can briefly lag behind an op's own
+/// response (same reasoning as `subscription_filters_by_topic_pattern`'s `queue.task` poll).
+async fn wait_for_events(c: &mut Client, topic: &str, want: usize, limit: usize) -> Vec<Value> {
+    for _ in 0..50 {
+        let events = c.call("core.events.list", json!({"topic": topic, "limit": limit})).await.unwrap()["events"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if events.len() >= want {
+            return events;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("core.events.list never reached {want} matches for '{topic}'");
+}
+
+#[tokio::test]
+async fn events_list_returns_the_most_recent_matches_oldest_first() {
+    let env = Env::new();
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    for (key, val) in [("a", "1"), ("b", "2"), ("c", "3")] {
+        c.call("demo.put", json!({"key": key, "val": val})).await.unwrap();
+    }
+
+    // Asking for only the 2 most recent of 3 saved must come back as b, c -- not a, b (what
+    // an oldest-first LIMIT would give) and not c, b (newest-first).
+    let events = wait_for_events(&mut c, "demo.item.saved", 3, 100).await;
+    assert_eq!(events.len(), 3, "sanity: all three must have landed before narrowing to 2");
+    let recent = c.call("core.events.list", json!({"topic": "demo.item.saved", "limit": 2})).await.unwrap();
+    let keys: Vec<_> =
+        recent["events"].as_array().unwrap().iter().map(|e| e["payload"]["key"].as_str().unwrap()).collect();
+    assert_eq!(keys, vec!["b", "c"]);
+    stop(d).await;
+}
+
+#[tokio::test]
+async fn events_list_defaults_to_every_topic_and_rejects_a_bad_pattern() {
+    let env = Env::new();
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    c.call("demo.put", json!({"key": "a", "val": "1"})).await.unwrap();
+
+    let events = wait_for_events(&mut c, "*", 1, 100).await;
+    assert!(events.iter().any(|e| e["topic"] == "demo.item.saved"), "{events:?}");
+
+    let err = c.call("core.events.list", json!({"topic": "not valid *"})).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidParams);
+    stop(d).await;
+}
+
 // ---------------------------------------------------------------- durability and lifecycle
 
 #[tokio::test]
