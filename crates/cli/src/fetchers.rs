@@ -212,7 +212,11 @@ fn test_items(source: &str, result: &Value) -> String {
     }
     let mut out = format!("{source}: {} item{}\n", items.len(), if items.len() == 1 { "" } else { "s" });
     for item in &items {
-        let _ = writeln!(out, "  {}  {}", render::cell(&item["title"]), render::cell(&item["url"]));
+        // The url must survive copy/paste intact -- render::cell's truncation is fine for a
+        // title (a preview), but a truncated url is a different, invalid url, not a shorter
+        // version of the real one, and silently hands back a 404 instead of the job posting.
+        let url = item["url"].as_str().unwrap_or_default();
+        let _ = writeln!(out, "  {}  {url}", render::cell(&item["title"]));
     }
     out.trim_end().to_string()
 }
@@ -292,6 +296,18 @@ mod tests {
         let out = test_items("hn-whoishiring", &data);
         assert_eq!(out, "hn-whoishiring: 1 item\n  Acme is hiring  https://x/1");
         assert_eq!(test_items("hn-whoishiring", &json!({"items": []})), "hn-whoishiring: no items parsed");
+    }
+
+    #[test]
+    fn test_items_never_truncates_the_url_even_when_the_title_does() {
+        // A truncated title is still a readable preview; a truncated url is a different,
+        // invalid url that 404s if anyone follows it -- the two must not be treated the same.
+        let long_title = "x".repeat(80);
+        let long_url = format!("https://www.jobbank.gc.ca/jobsearch/jobposting/{}", "1".repeat(80));
+        let data = json!({"items": [{"title": long_title, "url": long_url}]});
+        let out = test_items("jobbank-canada", &data);
+        assert!(out.ends_with(&long_url), "the full url must survive untouched:\n{out}");
+        assert!(out.contains('…'), "the long title should still be shortened for display");
     }
 
     #[test]
