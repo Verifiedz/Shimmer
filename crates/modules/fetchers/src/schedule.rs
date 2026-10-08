@@ -84,17 +84,23 @@ pub struct SourceConfig {
 }
 
 impl SourceConfig {
-    /// Whether an item's title should be kept, given this source's own filter lists. A
-    /// title matching nothing in `title_contains` is dropped only when that list is
-    /// non-empty; a title matching anything in `title_excludes` is always dropped,
-    /// regardless of `title_contains`.
+    /// Whether an item's title should be kept, given this source's own filter lists. See
+    /// [`matches_title`] for the matching rule itself.
     pub fn matches_title(&self, title: &str) -> bool {
-        let lower = title.to_lowercase();
-        let included =
-            self.title_contains.is_empty() || self.title_contains.iter().any(|w| lower.contains(&w.to_lowercase()));
-        let excluded = self.title_excludes.iter().any(|w| lower.contains(&w.to_lowercase()));
-        included && !excluded
+        matches_title(title, &self.title_contains, &self.title_excludes)
     }
+}
+
+/// A title matching nothing in `contains` is dropped only when that list is non-empty; a
+/// title matching anything in `excludes` is always dropped, regardless of `contains`. Both
+/// are case-insensitive substrings, OR'd within each list. A free function, not only
+/// [`SourceConfig::matches_title`], so an ad-hoc CLI override (ADR 0028 §14) can run the
+/// identical rule against lists that never came from `config.toml` at all.
+pub fn matches_title(title: &str, contains: &[String], excludes: &[String]) -> bool {
+    let lower = title.to_lowercase();
+    let included = contains.is_empty() || contains.iter().any(|w| lower.contains(&w.to_lowercase()));
+    let excluded = excludes.iter().any(|w| lower.contains(&w.to_lowercase()));
+    included && !excluded
 }
 
 #[derive(Debug, Deserialize, PartialEq)]

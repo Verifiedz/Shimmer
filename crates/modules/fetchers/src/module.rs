@@ -75,7 +75,11 @@ impl Module for Fetchers {
                 summary: "Fetch one source now".into(),
                 params_schema: json!({
                     "type": "object", "required": ["source"],
-                    "properties": {"source": {"type": "string"}},
+                    "properties": {
+                        "source": {"type": "string"},
+                        "title_contains": {"type": "array", "items": {"type": "string"}},
+                        "title_excludes": {"type": "array", "items": {"type": "string"}},
+                    },
                 }),
                 execution: Execution::Queued { lane: LANE.into() },
             },
@@ -98,7 +102,11 @@ impl Module for Fetchers {
                         .into(),
                 params_schema: json!({
                     "type": "object", "required": ["source"],
-                    "properties": {"source": {"type": "string"}},
+                    "properties": {
+                        "source": {"type": "string"},
+                        "title_contains": {"type": "array", "items": {"type": "string"}},
+                        "title_excludes": {"type": "array", "items": {"type": "string"}},
+                    },
                 }),
                 execution: Execution::Queued { lane: LANE.into() },
             },
@@ -108,10 +116,16 @@ impl Module for Fetchers {
     async fn handle(&self, op: &str, params: Value, ctx: &Ctx) -> Result<Value> {
         match op {
             TICK_OP => self.tick(ctx).await,
-            FETCH_OP => self.fetch(ctx, decode::<FetchParams>(params)?.source).await,
+            FETCH_OP => {
+                let p: FetchParams = decode(params)?;
+                self.fetch(ctx, p.source, TitleFilterOverride::from_params(p.title_contains, p.title_excludes)).await
+            }
             LIST_OP => self.list(ctx).await,
             STATUS_OP => self.status(ctx).await,
-            TEST_OP => self.test(ctx, decode::<FetchParams>(params)?.source).await,
+            TEST_OP => {
+                let p: FetchParams = decode(params)?;
+                self.test(ctx, p.source, TitleFilterOverride::from_params(p.title_contains, p.title_excludes)).await
+            }
             _ => Err(Error::unknown_op(format!("fetchers has no op '{op}'"))),
         }
     }
@@ -120,6 +134,27 @@ impl Module for Fetchers {
 #[derive(Deserialize)]
 struct FetchParams {
     source: String,
+    #[serde(default)]
+    title_contains: Option<Vec<String>>,
+    #[serde(default)]
+    title_excludes: Option<Vec<String>>,
+}
+
+/// An ad-hoc title filter from a `fetchers.fetch`/`fetchers.test` caller (the CLI's
+/// `--contains`/`--excludes` flags), scoped to one call -- it replaces, never merges with,
+/// whatever `[modules.fetchers.sources.<id>]` configures for this source (ADR 0028 §14).
+/// `None` means neither flag was given at all, so the configured filter (if any) applies
+/// exactly as before this existed.
+struct TitleFilterOverride {
+    contains: Vec<String>,
+    excludes: Vec<String>,
+}
+
+impl TitleFilterOverride {
+    fn from_params(contains: Option<Vec<String>>, excludes: Option<Vec<String>>) -> Option<Self> {
+        (contains.is_some() || excludes.is_some())
+            .then(|| Self { contains: contains.unwrap_or_default(), excludes: excludes.unwrap_or_default() })
+    }
 }
 
 impl Fetchers {
@@ -147,7 +182,7 @@ impl Fetchers {
         Ok(json!({"enqueued": enqueued, "already_running": already_running}))
     }
 
-    async fn fetch(&self, ctx: &Ctx, source_id: String) -> Result<Value> {
+    async fn fetch(&self, ctx: &Ctx, source_id: String, filter_override: Option<TitleFilterOverride>) -> Result<Value> {
         if source_id.trim().is_empty() {
             return Err(Error::invalid_params("source must not be empty"));
         }
@@ -158,7 +193,7 @@ impl Fetchers {
             .try_acquire(&source_id)
             .ok_or_else(|| Error::module_error(format!("source '{source_id}' is already fetching")))?;
 
-        let outcome = self.run_source(ctx, source.as_ref()).await;
+        let outcome = self.run_source(ctx, source.as_ref(), filter_override.as_ref()).await;
         // Recorded regardless of outcome -- including failure -- so a broken source is
         // retried at most once per interval (ADR 0028 §5, §6: "after that, wait for the
         // next trigger"), not hammered every tick. Held only across this call -- up to 8
@@ -228,21 +263,21 @@ impl Fetchers {
     /// anything seen"). Deliberately simpler than [`Fetchers::run_source`]: a dry run has no
     /// state of its own to protect, so it skips the overlap guard too -- a `test` can run
     /// alongside a real `fetch` of the same source without conflict.
-    async fn test(&self, ctx: &Ctx, source_id: String) -> Result<Value> {
+    async fn test(&self, ctx: &Ctx, source_id: String, filter_override: Option<TitleFilterOverride>) -> Result<Value> {
         if source_id.trim().is_empty() {
             return Err(Error::invalid_params("source must not be empty"));
         }
         let source =
             source::resolve(ctx, &source_id)?.ok_or_else(|| Error::not_found(format!("no source '{source_id}'")))?;
         let page = source.fetch_page(ctx, None).await?;
-        // Applied here too (§13), not just in `run_source` -- a preview that shows items a
-        // real run would never keep is a misleading preview.
+        // Applied here too (§13/§14), not just in `run_source` -- a preview that shows items
+        // a real run would never keep is a misleading preview.
         let config = FetchersConfig::load(ctx)?;
-        let filter = config.sources.get(&source_id);
+        let configured = config.sources.get(&source_id);
         let items: Vec<Value> = page
             .items
             .iter()
-            .filter(|item| filter.is_none_or(|f| f.matches_title(&item.title)))
+            .filter(|item| passes_title_filter(&item.title, filter_override.as_ref(), configured))
             .map(|item| item_payload(&source_id, item))
             .collect();
         Ok(json!({"source": source_id, "items": items}))
@@ -254,17 +289,23 @@ impl Fetchers {
     /// `fetchers.item.found` per genuinely new item in a single transaction (ADR 0028 §4,
     /// §7.1) -- so a failure partway through this function leaves the previous run's state
     /// exactly as it was, never a half-updated one.
-    async fn run_source(&self, ctx: &Ctx, source: &dyn Source) -> Result<usize> {
+    async fn run_source(
+        &self,
+        ctx: &Ctx,
+        source: &dyn Source,
+        filter_override: Option<&TitleFilterOverride>,
+    ) -> Result<usize> {
         let source_id = source.id();
         let mut seen = dedup::load(ctx, source_id)?;
         let now = ctx.clock.now();
         let mut found: Vec<RawItem> = Vec::new();
         let mut cursor: Option<String> = None;
-        // A title this source's own config excludes (§13) is marked seen like any other
-        // examined item, so it is never re-examined on a later run -- but it is a deliberate
-        // exclusion, not a capacity miss, so (unlike the cap below) it is never retried.
+        // A title this source's own config excludes, or that `filter_override` excludes for
+        // this one call (§13/§14), is marked seen like any other examined item, so it is
+        // never re-examined on a later run -- but it is a deliberate exclusion, not a
+        // capacity miss, so (unlike the cap below) it is never retried.
         let config = FetchersConfig::load(ctx)?;
-        let filter = config.sources.get(source_id);
+        let configured = config.sources.get(source_id);
 
         for page_index in 0..source::MAX_PAGES {
             // A full run can issue up to `MAX_PAGES * PAGE_SIZE` HTTP calls (CLAUDE.md §12
@@ -281,7 +322,7 @@ impl Fetchers {
             let page = source.fetch_page(ctx, cursor.as_deref()).await?;
             for item in page.items {
                 if seen.is_new(&item.source_id) {
-                    if !filter.is_none_or(|f| f.matches_title(&item.title)) {
+                    if !passes_title_filter(&item.title, filter_override, configured) {
                         seen.touch(item.source_id.clone(), now);
                         continue;
                     }
@@ -339,6 +380,21 @@ fn classify_failure(ctx: &Ctx, err: &Error) -> &'static str {
         "blocked"
     } else {
         "parse_empty"
+    }
+}
+
+/// Whether an item's title should be kept: `filter_override` (ADR 0028 §14), when given,
+/// completely replaces `configured`'s own `title_contains`/`title_excludes` for this one
+/// call -- the two are never merged. With neither present, everything passes, exactly as
+/// before either of them existed.
+fn passes_title_filter(
+    title: &str,
+    filter_override: Option<&TitleFilterOverride>,
+    configured: Option<&schedule::SourceConfig>,
+) -> bool {
+    match filter_override {
+        Some(f) => schedule::matches_title(title, &f.contains, &f.excludes),
+        None => configured.is_none_or(|c| c.matches_title(title)),
     }
 }
 
@@ -411,6 +467,15 @@ mod tests {
         assert_eq!(err.code, ErrorCode::UnknownOp);
     }
 
+    #[test]
+    fn title_filter_override_is_none_only_when_neither_flag_was_given() {
+        assert!(TitleFilterOverride::from_params(None, None).is_none());
+        let f = TitleFilterOverride::from_params(Some(vec!["junior".into()]), None).unwrap();
+        assert_eq!((f.contains, f.excludes), (vec!["junior".to_string()], Vec::new()));
+        let f = TitleFilterOverride::from_params(None, Some(vec!["senior".into()])).unwrap();
+        assert_eq!((f.contains, f.excludes), (Vec::new(), vec!["senior".to_string()]));
+    }
+
     fn source_config(enabled: bool, interval_s: u64) -> schedule::SourceConfig {
         schedule::SourceConfig {
             enabled,
@@ -461,7 +526,7 @@ mod tests {
         let fetchers = Fetchers::default();
         let _permit = fetchers.running.try_acquire("hn-whoishiring").unwrap();
 
-        let err = fetchers.fetch(&env.ctx, "hn-whoishiring".into()).await.unwrap_err();
+        let err = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::ModuleError);
         // Refused before doing anything -- no run recorded.
         assert!(schedule::load_last_run(&env.ctx).unwrap().is_empty());
@@ -470,14 +535,14 @@ mod tests {
     #[tokio::test]
     async fn an_empty_source_is_rejected() {
         let env = TestEnv::new("fetchers");
-        let err = Fetchers::default().fetch(&env.ctx, "  ".into()).await.unwrap_err();
+        let err = Fetchers::default().fetch(&env.ctx, "  ".into(), None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidParams);
     }
 
     #[tokio::test]
     async fn an_unregistered_source_is_not_found() {
         let env = TestEnv::new("fetchers");
-        let err = Fetchers::default().fetch(&env.ctx, "not-a-real-source".into()).await.unwrap_err();
+        let err = Fetchers::default().fetch(&env.ctx, "not-a-real-source".into(), None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);
         // Not even an attempt -- no permit taken, no run recorded.
         assert!(schedule::load_last_run(&env.ctx).unwrap().is_empty());
@@ -521,7 +586,7 @@ mod tests {
         stub_one_hn_comment(&env, 10, "<p>Acme | Remote<p>Hiring Rust engineers.");
 
         let fetchers = Fetchers::default();
-        let out = fetchers.fetch(&env.ctx, "hn-whoishiring".into()).await.unwrap();
+        let out = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None).await.unwrap();
         assert_eq!((out["source"].as_str(), out["new_items"].as_u64()), (Some("hn-whoishiring"), Some(1)));
 
         let events = env.backend.events();
@@ -536,7 +601,7 @@ mod tests {
         assert!(!fetchers.running.is_running("hn-whoishiring"), "the permit must be released on success");
 
         // Re-running with the identical comment still present must not re-emit it.
-        let second = fetchers.fetch(&env.ctx, "hn-whoishiring".into()).await.unwrap();
+        let second = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None).await.unwrap();
         assert_eq!(second["new_items"].as_u64(), Some(0));
         let found_after_second = env.backend.events().iter().filter(|e| e.topic == "fetchers.item.found").count();
         assert_eq!(found_after_second, 1, "an already-seen item must never be emitted twice");
@@ -567,7 +632,7 @@ mod tests {
         }
 
         let fetchers = Fetchers::default();
-        let out = fetchers.fetch(&env.ctx, "hn-whoishiring".into()).await.unwrap();
+        let out = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None).await.unwrap();
         assert_eq!(out["new_items"], 1, "only the junior posting should count as new");
 
         let found: Vec<_> = env.backend.events().into_iter().filter(|e| e.topic == "fetchers.item.found").collect();
@@ -581,7 +646,7 @@ mod tests {
         assert!(!seen.is_new("11"));
 
         // Re-running finds nothing new: the excluded item was never queued for a retry.
-        let second = fetchers.fetch(&env.ctx, "hn-whoishiring".into()).await.unwrap();
+        let second = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None).await.unwrap();
         assert_eq!(second["new_items"], 0);
     }
 
@@ -609,10 +674,71 @@ mod tests {
             );
         }
 
-        let out = Fetchers::default().test(&env.ctx, "hn-whoishiring".into()).await.unwrap();
+        let out = Fetchers::default().test(&env.ctx, "hn-whoishiring".into(), None).await.unwrap();
         let items = out["items"].as_array().unwrap();
         assert_eq!(items.len(), 1, "{items:?}");
         assert!(items[0]["title"].as_str().unwrap().contains("Junior"));
+    }
+
+    #[tokio::test]
+    async fn an_override_filter_replaces_rather_than_merges_with_the_configured_one() {
+        let mut env = TestEnv::new("fetchers");
+        // Configured to want only "junior" titles -- the override below asks for the
+        // opposite (anything but "junior") and must win outright, not combine with this.
+        env.ctx.config = ModuleConfig::new(json!({
+            "sources": {"hn-whoishiring": {"enabled": true, "interval": "daily", "title_contains": ["junior"]}}
+        }));
+        const BASE: &str = "https://hacker-news.firebaseio.com/v0";
+        {
+            let mut responses = env.http.responses.lock().unwrap();
+            responses.insert(format!("{BASE}/user/whoishiring.json"), json_response(json!({"submitted": [1]})));
+            responses.insert(
+                format!("{BASE}/item/1.json"),
+                json_response(json!({"id": 1, "title": "Ask HN: Who is hiring? (October 2026)", "kids": [10, 11]})),
+            );
+            responses.insert(
+                format!("{BASE}/item/10.json"),
+                json_response(json!({"id": 10, "by": "acme", "text": "<p>Senior Rust Engineer"})),
+            );
+            responses.insert(
+                format!("{BASE}/item/11.json"),
+                json_response(json!({"id": 11, "by": "acme", "text": "<p>Junior Rust Engineer"})),
+            );
+        }
+
+        let override_filter = TitleFilterOverride { contains: vec!["senior".into()], excludes: Vec::new() };
+        let out = Fetchers::default().test(&env.ctx, "hn-whoishiring".into(), Some(override_filter)).await.unwrap();
+        let items = out["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert!(items[0]["title"].as_str().unwrap().contains("Senior"), "the override must win, not merge with config");
+    }
+
+    #[tokio::test]
+    async fn an_override_filter_on_a_real_run_also_marks_the_dropped_item_seen() {
+        let env = TestEnv::new("fetchers"); // no config.toml filter at all -- the override is the only one
+        const BASE: &str = "https://hacker-news.firebaseio.com/v0";
+        {
+            let mut responses = env.http.responses.lock().unwrap();
+            responses.insert(format!("{BASE}/user/whoishiring.json"), json_response(json!({"submitted": [1]})));
+            responses.insert(
+                format!("{BASE}/item/1.json"),
+                json_response(json!({"id": 1, "title": "Ask HN: Who is hiring? (October 2026)", "kids": [10, 11]})),
+            );
+            responses.insert(
+                format!("{BASE}/item/10.json"),
+                json_response(json!({"id": 10, "by": "acme", "text": "<p>Senior Rust Engineer"})),
+            );
+            responses.insert(
+                format!("{BASE}/item/11.json"),
+                json_response(json!({"id": 11, "by": "acme", "text": "<p>Junior Rust Engineer"})),
+            );
+        }
+
+        let override_filter = TitleFilterOverride { contains: Vec::new(), excludes: vec!["senior".into()] };
+        let out = Fetchers::default().fetch(&env.ctx, "hn-whoishiring".into(), Some(override_filter)).await.unwrap();
+        assert_eq!(out["new_items"], 1);
+        let seen = dedup::load(&env.ctx, "hn-whoishiring").unwrap();
+        assert!(!seen.is_new("10"), "the ad-hoc override must mark a dropped item seen, same as a configured filter");
     }
 
     #[tokio::test]
@@ -653,7 +779,7 @@ mod tests {
         );
 
         let fetchers = Fetchers::default();
-        let out = fetchers.fetch(&env.ctx, "my-team-blog".into()).await.unwrap();
+        let out = fetchers.fetch(&env.ctx, "my-team-blog".into(), None).await.unwrap();
         assert_eq!((out["source"].as_str(), out["new_items"].as_u64()), (Some("my-team-blog"), Some(1)));
 
         let found: Vec<_> = env.backend.events().into_iter().filter(|e| e.topic == "fetchers.item.found").collect();
@@ -665,7 +791,7 @@ mod tests {
     #[tokio::test]
     async fn an_id_that_is_neither_a_fixed_source_nor_a_configured_kind_is_not_found() {
         let env = TestEnv::new("fetchers");
-        let err = Fetchers::default().fetch(&env.ctx, "not-a-real-source".into()).await.unwrap_err();
+        let err = Fetchers::default().fetch(&env.ctx, "not-a-real-source".into(), None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);
     }
 
@@ -709,7 +835,7 @@ mod tests {
         let env = TestEnv::new("fetchers");
         let fetchers = Fetchers::default();
         stub_one_hn_comment(&env, 10, "<p>Acme | Remote<p>Hiring.");
-        fetchers.fetch(&env.ctx, "hn-whoishiring".into()).await.unwrap();
+        fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None).await.unwrap();
 
         let out = fetchers.status(&env.ctx).await.unwrap();
         let sources = out["sources"].as_array().unwrap();
@@ -726,7 +852,7 @@ mod tests {
         let env = TestEnv::new("fetchers");
         stub_one_hn_comment(&env, 10, "<p>Acme | Remote<p>Hiring Rust engineers.");
 
-        let out = Fetchers::default().test(&env.ctx, "hn-whoishiring".into()).await.unwrap();
+        let out = Fetchers::default().test(&env.ctx, "hn-whoishiring".into(), None).await.unwrap();
         assert_eq!(out["source"], "hn-whoishiring");
         let items = out["items"].as_array().unwrap();
         assert_eq!(items.len(), 1);
@@ -748,7 +874,7 @@ mod tests {
         // A real fetch would be refused right now (see
         // `a_source_already_fetching_is_refused_not_double_run`); `test` must not be, since
         // it never touches the state the overlap guard protects.
-        let out = fetchers.test(&env.ctx, "hn-whoishiring".into()).await.unwrap();
+        let out = fetchers.test(&env.ctx, "hn-whoishiring".into(), None).await.unwrap();
         assert_eq!(out["items"].as_array().unwrap().len(), 1);
     }
 
@@ -758,7 +884,7 @@ mod tests {
         let env = TestEnv::new("fetchers");
         let fetchers = Fetchers::default();
 
-        let err = fetchers.fetch(&env.ctx, "hn-whoishiring".into()).await.unwrap_err();
+        let err = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::Unavailable);
 
         let last_run = schedule::load_last_run(&env.ctx).unwrap();
@@ -796,7 +922,7 @@ mod tests {
         let fetchers = Fetchers::default();
 
         let source = source::find("hn-whoishiring").unwrap();
-        let err = fetchers.run_source(&env.ctx, source.as_ref()).await.unwrap_err();
+        let err = fetchers.run_source(&env.ctx, source.as_ref(), None).await.unwrap_err();
         assert!(env.ctx.cancel.is_cancelled());
         assert_eq!(classify_failure(&env.ctx, &err), "cancelled");
     }
@@ -807,7 +933,7 @@ mod tests {
         env.ctx.cancel.cancel();
         let fetchers = Fetchers::default();
 
-        let err = fetchers.fetch(&env.ctx, "hn-whoishiring".into()).await.unwrap_err();
+        let err = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None).await.unwrap_err();
         assert_eq!(classify_failure(&env.ctx, &err), "cancelled");
         let failed: Vec<_> = env.backend.events().into_iter().filter(|e| e.topic == "fetchers.fetch.failed").collect();
         assert_eq!(failed[0].payload["reason"], "cancelled");
@@ -840,7 +966,7 @@ mod tests {
         let fetchers = Fetchers::default();
 
         let source = source::find("hn-whoishiring").unwrap();
-        fetchers.run_source(&ctx, source.as_ref()).await.unwrap();
+        fetchers.run_source(&ctx, source.as_ref(), None).await.unwrap();
 
         let reported = progress.lock().unwrap();
         assert!(!reported.is_empty(), "at least the first page must report progress");

@@ -15,6 +15,8 @@ itself, already shared and already serializable, is unchanged).
 Amended (per-source title filtering): `title_contains`/`title_excludes` on every source's
 config entry — see §13. No `core`/`proto` change, no new op; `SourceConfig` and
 `fetchers.list`'s existing payload only.
+Amended (ad-hoc filter override): `--contains`/`--excludes` on `shimmer fetchers test`/`run`
+— see §14. No `core`/`proto` change; two new optional params on two existing ops.
 
 ## Context
 
@@ -470,6 +472,34 @@ fix, this generalizes to every current and future source, config-only, no code p
   engineers" in a senior posting from an actual junior posting — a known, accepted limit,
   not a gap to close here. Both are explicitly deferred, not ruled out, if a source's real
   data later makes title-only filtering insufficient.
+
+### 14. Amendment: an ad-hoc `--contains`/`--excludes` override
+
+§13's filter is config-only by design, which has a real cost: trying a different filter
+means editing `config.toml` and restarting the daemon (`CONTRIBUTING.md`: "the daemon keeps
+running the binary it was started from"). Exploring a filter interactively needs a lighter
+path.
+
+- **`fetchers.fetch`/`fetchers.test` gain optional `title_contains`/`title_excludes`
+  params**, alongside the existing `source`. Present (either one, or both): **replaces**
+  the source's configured filter outright for this one call, never merges with it — asking
+  for "senior" when the config says "junior" must show senior postings, not the
+  intersection (empty) or the union (confusing). Absent (neither given): behavior is
+  unchanged from §13, the configured filter (if any) applies exactly as before this existed.
+- `Fetchers::run_source`/`Fetchers::test` take this override as a parameter rather than
+  reading it from `config.toml` a second way — one `passes_title_filter` decision point,
+  not two filter code paths to keep in sync. A dropped item is marked seen exactly as in
+  §13, override or not: an ad-hoc exclusion is still a decision, not a capacity miss, so it
+  is never retried either.
+- **`shimmer fetchers test SOURCE --contains W,W --excludes W,W`** and
+  **`shimmer fetchers run SOURCE [--wait] --contains W,W --excludes W,W`**
+  (`crates/cli/src/fetchers.rs`): comma-separated term lists, parsed client-side, sent only
+  when the flag was actually given — an absent flag must send nothing at all, not an empty
+  array (an empty `title_contains` array is itself meaningful: "no inclusion filter," which
+  is not the same as "use whatever `config.toml` says").
+- **No `core`/`proto` change** — two new optional fields on two existing module ops' own
+  params, already advisory-schema (`CommandSpec.params_schema`, CLAUDE.md §5: "JSON Schema;
+  advisory before M3").
 
 ## Not done here
 

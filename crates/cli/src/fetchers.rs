@@ -17,9 +17,16 @@ pub const USAGE: &str = "usage: shimmer fetchers <command>
 commands:
   list                 every known source and its configured state
   status               per-source last-run time and whether it is running
-  test SOURCE          fetch one page and show its parsed items; never saves or marks anything seen
-  run SOURCE [--wait]  fetch one source now
+  test SOURCE [FILTER]   fetch one page and show its parsed items; never saves or marks anything seen
+  run SOURCE [--wait] [FILTER]  fetch one source now
   items [SOURCE]       items a real run has actually found and kept, most recent first
+
+FILTER (test and run only):
+  --contains W,W,...   keep only a title containing at least one of these (case-insensitive)
+  --excludes W,W,...   drop a title containing any of these, even one --contains would keep
+
+When given, FILTER replaces -- never merges with -- whatever title_contains/title_excludes
+the source's own [modules.fetchers.sources.<id>] entry configures, for that one call only.
 
 A source is either one of the built-in ones (hn-whoishiring, weworkremotely) or a configured
 kind (ADR 0028 §2a) under [modules.fetchers.sources.<id>] in config.toml. Add --json to any
@@ -35,9 +42,16 @@ pub enum FetchersCmd {
     Help,
     List,
     Status,
-    Test { source: String },
-    Run { source: String, wait: bool },
+    Test { source: String, title_contains: Option<Vec<String>>, title_excludes: Option<Vec<String>> },
+    Run { source: String, wait: bool, title_contains: Option<Vec<String>>, title_excludes: Option<Vec<String>> },
     Items { source: Option<String> },
+}
+
+/// `--contains a, b ,c` (or `--excludes`) as a term list -- comma-separated, each term
+/// trimmed. `None` means the flag was not given at all, not "given but empty" (`Flags`
+/// itself already rejects an empty value, e.g. `--contains=`).
+fn terms(value: Option<&str>) -> Option<Vec<String>> {
+    value.map(|s| s.split(',').map(|t| t.trim().to_owned()).collect())
 }
 
 /// `words` are what follows `shimmer fetchers`.
@@ -45,24 +59,38 @@ pub fn parse(words: Vec<String>) -> std::result::Result<FetchersCmd, String> {
     let mut words = words.into_iter();
     let Some(sub) = words.next() else { return Ok(FetchersCmd::Help) };
     let rest: Vec<String> = words.collect();
-    let one = |what: &str| match rest.as_slice() {
-        [source] => Ok(source.clone()),
-        _ => Err(format!("usage: shimmer fetchers {sub} {what}")),
-    };
     match sub.as_str() {
         "help" => Ok(FetchersCmd::Help),
         "list" if rest.is_empty() => Ok(FetchersCmd::List),
         "list" => Err("'fetchers list' takes no arguments".into()),
         "status" if rest.is_empty() => Ok(FetchersCmd::Status),
         "status" => Err("'fetchers status' takes no arguments".into()),
-        "test" => Ok(FetchersCmd::Test { source: one("SOURCE")? }),
-        "run" => {
-            let flags = Flags::split(rest, &[], &["--wait"]).map_err(|e| format!("fetchers run: {e}"))?;
+        "test" => {
+            let flags =
+                Flags::split(rest, &["--contains", "--excludes"], &[]).map_err(|e| format!("fetchers test: {e}"))?;
             let source = match flags.positional.as_slice() {
                 [s] => s.clone(),
-                _ => return Err("usage: shimmer fetchers run SOURCE [--wait]".into()),
+                _ => return Err("usage: shimmer fetchers test SOURCE [--contains W,W] [--excludes W,W]".into()),
             };
-            Ok(FetchersCmd::Run { source, wait: flags.has("--wait") })
+            Ok(FetchersCmd::Test {
+                source,
+                title_contains: terms(flags.value("--contains")),
+                title_excludes: terms(flags.value("--excludes")),
+            })
+        }
+        "run" => {
+            let flags = Flags::split(rest, &["--contains", "--excludes"], &["--wait"])
+                .map_err(|e| format!("fetchers run: {e}"))?;
+            let source = match flags.positional.as_slice() {
+                [s] => s.clone(),
+                _ => return Err("usage: shimmer fetchers run SOURCE [--wait] [--contains W,W] [--excludes W,W]".into()),
+            };
+            Ok(FetchersCmd::Run {
+                source,
+                wait: flags.has("--wait"),
+                title_contains: terms(flags.value("--contains")),
+                title_excludes: terms(flags.value("--excludes")),
+            })
         }
         "items" => match rest.as_slice() {
             [] => Ok(FetchersCmd::Items { source: None }),
@@ -84,21 +112,21 @@ pub async fn run(client: &mut Client, cmd: &FetchersCmd, json_out: bool) -> Resu
             let data = client.call("fetchers.status", json!({})).await?;
             Ok(if json_out { render::json(&data) } else { status(&data, Utc::now()) })
         }
-        FetchersCmd::Test { source } => {
+        FetchersCmd::Test { source, title_contains, title_excludes } => {
             // Always follows: a dry run that returned immediately with just a task id would
             // defeat its own point, unlike `run`, which has something useful to say either way.
             client.subscribe(&["queue.task.*"]).await?;
-            let handle = client.call("fetchers.test", json!({"source": source})).await?;
+            let handle = client.call("fetchers.test", filter_params(source, title_contains, title_excludes)).await?;
             let task = task_id(&handle)?;
             let result = follow(client, task).await?;
             Ok(if json_out { render::json(&result) } else { test_items(source, &result) })
         }
-        FetchersCmd::Run { source, wait } => {
+        FetchersCmd::Run { source, wait, title_contains, title_excludes } => {
             if *wait {
                 // Before the request, so not even the first event can be missed.
                 client.subscribe(&["queue.task.*"]).await?;
             }
-            let handle = client.call("fetchers.fetch", json!({"source": source})).await?;
+            let handle = client.call("fetchers.fetch", filter_params(source, title_contains, title_excludes)).await?;
             let task = task_id(&handle)?;
             if !*wait {
                 return Ok(if json_out {
@@ -128,6 +156,21 @@ pub async fn run(client: &mut Client, cmd: &FetchersCmd, json_out: bool) -> Resu
             Ok(if json_out { render::json(&json!({"items": matching})) } else { items(source.as_deref(), &matching) })
         }
     }
+}
+
+/// `fetchers.fetch`/`fetchers.test`'s params: `source`, plus `title_contains`/
+/// `title_excludes` only when a `--contains`/`--excludes` flag was actually given --
+/// omitted entirely, not sent as an empty list, so the module falls back to the source's
+/// own configured filter (ADR 0028 §14) rather than overriding it with "nothing allowed."
+fn filter_params(source: &str, title_contains: &Option<Vec<String>>, title_excludes: &Option<Vec<String>>) -> Value {
+    let mut params = json!({"source": source});
+    if let Some(c) = title_contains {
+        params["title_contains"] = json!(c);
+    }
+    if let Some(e) = title_excludes {
+        params["title_excludes"] = json!(e);
+    }
+    params
 }
 
 fn task_id(handle: &Value) -> Result<&str> {
@@ -292,14 +335,44 @@ mod tests {
         assert_eq!(p(&[]), Ok(FetchersCmd::Help));
         assert_eq!(p(&["list"]), Ok(FetchersCmd::List));
         assert_eq!(p(&["status"]), Ok(FetchersCmd::Status));
-        assert_eq!(p(&["test", "hn-whoishiring"]), Ok(FetchersCmd::Test { source: "hn-whoishiring".into() }));
+        assert_eq!(
+            p(&["test", "hn-whoishiring"]),
+            Ok(FetchersCmd::Test { source: "hn-whoishiring".into(), title_contains: None, title_excludes: None })
+        );
         assert_eq!(
             p(&["run", "hn-whoishiring"]),
-            Ok(FetchersCmd::Run { source: "hn-whoishiring".into(), wait: false })
+            Ok(FetchersCmd::Run {
+                source: "hn-whoishiring".into(),
+                wait: false,
+                title_contains: None,
+                title_excludes: None
+            })
         );
         assert_eq!(
             p(&["run", "hn-whoishiring", "--wait"]),
-            Ok(FetchersCmd::Run { source: "hn-whoishiring".into(), wait: true })
+            Ok(FetchersCmd::Run {
+                source: "hn-whoishiring".into(),
+                wait: true,
+                title_contains: None,
+                title_excludes: None
+            })
+        );
+        assert_eq!(
+            p(&["run", "hn-whoishiring", "--contains", "junior, entry level", "--excludes", "senior,staff"]),
+            Ok(FetchersCmd::Run {
+                source: "hn-whoishiring".into(),
+                wait: false,
+                title_contains: Some(vec!["junior".into(), "entry level".into()]),
+                title_excludes: Some(vec!["senior".into(), "staff".into()]),
+            })
+        );
+        assert_eq!(
+            p(&["test", "hn-whoishiring", "--contains", "junior"]),
+            Ok(FetchersCmd::Test {
+                source: "hn-whoishiring".into(),
+                title_contains: Some(vec!["junior".into()]),
+                title_excludes: None,
+            })
         );
         assert_eq!(p(&["items"]), Ok(FetchersCmd::Items { source: None }));
         assert_eq!(p(&["items", "jobbank-canada"]), Ok(FetchersCmd::Items { source: Some("jobbank-canada".into()) }));
@@ -406,5 +479,26 @@ mod tests {
     fn fetched_pluralises_new_items() {
         assert_eq!(fetched("hn-whoishiring", &json!({"new_items": 0})), "✓ fetched hn-whoishiring: 0 new items");
         assert_eq!(fetched("hn-whoishiring", &json!({"new_items": 1})), "✓ fetched hn-whoishiring: 1 new item");
+    }
+
+    #[test]
+    fn terms_splits_and_trims_a_comma_list_or_is_none_when_the_flag_was_absent() {
+        assert_eq!(terms(None), None);
+        let expected: Vec<String> = ["junior", "entry level", "new grad"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(terms(Some("junior, entry level ,new grad")), Some(expected));
+        assert_eq!(terms(Some("junior")), Some(vec!["junior".to_string()]));
+    }
+
+    #[test]
+    fn filter_params_omits_a_field_entirely_when_its_flag_was_not_given() {
+        assert_eq!(filter_params("hn-whoishiring", &None, &None), json!({"source": "hn-whoishiring"}));
+        assert_eq!(
+            filter_params("hn-whoishiring", &Some(vec!["junior".into()]), &None),
+            json!({"source": "hn-whoishiring", "title_contains": ["junior"]})
+        );
+        assert_eq!(
+            filter_params("hn-whoishiring", &None, &Some(vec!["senior".into()])),
+            json!({"source": "hn-whoishiring", "title_excludes": ["senior"]})
+        );
     }
 }
