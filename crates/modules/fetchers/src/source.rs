@@ -65,6 +65,7 @@ pub fn registry() -> Vec<std::sync::Arc<dyn Source>> {
     vec![
         std::sync::Arc::new(crate::sources::hn::HnWhoIsHiring),
         std::sync::Arc::new(crate::sources::wwr::WeWorkRemotely),
+        std::sync::Arc::new(crate::sources::jobbank::JobBankCanada),
     ]
 }
 
@@ -122,12 +123,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_registry_has_both_reference_sources_and_only_known_ids_resolve() {
+    fn the_registry_has_every_reference_source_and_only_known_ids_resolve() {
         let all = registry();
         let ids: Vec<_> = all.iter().map(|s| s.id()).collect();
-        assert_eq!(ids, vec!["hn-whoishiring", "weworkremotely"]);
+        assert_eq!(ids, vec!["hn-whoishiring", "weworkremotely", "jobbank-canada"]);
         assert!(find("hn-whoishiring").is_some());
         assert!(find("weworkremotely").is_some());
+        assert!(find("jobbank-canada").is_some());
         assert!(find("not-a-real-source").is_none());
     }
 
@@ -135,7 +137,7 @@ mod tests {
     fn known_includes_the_fixed_registry_with_no_config_at_all() {
         let env = TestEnv::new("fetchers");
         let ids: Vec<_> = known(&env.ctx).unwrap().iter().map(|s| s.id().to_string()).collect();
-        assert_eq!(ids, vec!["hn-whoishiring", "weworkremotely"]);
+        assert_eq!(ids, vec!["hn-whoishiring", "weworkremotely", "jobbank-canada"]);
     }
 
     #[test]
@@ -147,6 +149,6 @@ mod tests {
             }
         }));
         let ids: Vec<_> = known(&env.ctx).unwrap().iter().map(|s| s.id().to_string()).collect();
-        assert_eq!(ids, vec!["hn-whoishiring", "weworkremotely", "my-team-blog"]);
+        assert_eq!(ids, vec!["hn-whoishiring", "weworkremotely", "jobbank-canada", "my-team-blog"]);
     }
 }

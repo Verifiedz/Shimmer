@@ -3,8 +3,11 @@
 //! (ADR 0027).
 //!
 //! [`source`] is the `Source` trait (ADR 0028 §2); [`sources`] holds one file per
-//! implementation -- `hn-whoishiring` (`Method::Api`) and `weworkremotely`
-//! (`Method::Scrape`), both reference sources from ADR 0028 §10. [`dedup`] has the
+//! implementation -- `hn-whoishiring` (`Method::Api`), `weworkremotely` and
+//! `jobbank-canada` (both `Method::Scrape`), the fixed reference sources from ADR 0028 §10
+//! that [`source::registry`] always compiles in, plus `rss`, a configured *kind* (ADR 0028
+//! §2a) [`source::resolve`] builds on demand and [`source::known`] reports alongside them.
+//! [`dedup`] has the
 //! per-source "seen" bookkeeping and [`RunGuard`](dedup::RunGuard), the overlap guard
 //! (ADR 0028 §4, §5). [`http`] is the retry wrapper around `ctx.http.get` (ADR 0028 §6);
 //! [`html`] and [`robots`] are the scraping and robots.txt helpers `weworkremotely` uses,

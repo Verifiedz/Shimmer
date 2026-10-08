@@ -1,0 +1,8 @@
+<!-- A 200 response whose page structure no longer matches what select_or_fail expects --
+     e.g. a site redesign that renamed or removed the results container entirely. Used to
+     prove this is a reported parse_empty failure, not a quietly empty success. -->
+<html><body>
+<div id="some-other-layout">
+  <p>We couldn't find this page.</p>
+</div>
+</body></html>

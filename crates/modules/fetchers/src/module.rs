@@ -581,7 +581,7 @@ mod tests {
 
         let out = Fetchers::default().list(&env.ctx).await.unwrap();
         let sources = out["sources"].as_array().unwrap();
-        assert_eq!(sources.len(), 3, "{sources:?}");
+        assert_eq!(sources.len(), 4, "{sources:?}");
 
         let hn = sources.iter().find(|s| s["id"] == "hn-whoishiring").unwrap();
         assert_eq!(

@@ -5,6 +5,9 @@ per handoff) · Needs sign-off: Dev A · Dev C notified (protocol change: a new 
 shapes — see §9) · No `core` change · Amended (issue #127, source kinds): §2's `Source::id()`
 signature and the registry's construction model change — see §2a. Still no `core` change and
 no `docs/protocol.md` change — `fetchers.item.found`'s payload shape (§3) is unaffected.
+Amended (issue #128, CLI surface): the "Not done here" CLI/TUI deferral below is only ever
+true for the TUI now — see §11. Three additive ops, `docs/protocol.md` updated, no `core`
+change, no version bump (additive, same as §9's own ops).
 
 ## Context
 
@@ -169,7 +172,8 @@ hand" (CLAUDE.md §1.4).
 - §7's per-method rate-limit floor (currently a uniform, provisional 900s) — a kind-aware
   registry could eventually expose each instance's `Method` to the scheduling layer and make
   this precise, but that's not decided or built here.
-- CLI/TUI surface — already out of scope per this ADR's "Not done here"; unchanged.
+- CLI/TUI surface — out of scope for this amendment specifically; the CLI half later shipped
+  separately (issue #128) — see §11. TUI is still untouched.
 
 ### 3. Item event
 
@@ -343,6 +347,50 @@ Both public, no login, no API key, verified live on 2026-10-06:
   pager), so pagination walks the site's own category slugs
   (`remote-programming-jobs` → `remote-devops-sysadmin-jobs` → …) as the trait's
   `next_cursor`, rather than inventing a page number the site doesn't have.
+- **`jobbank-canada`** (`Method::Scrape`, added later, same reference-source bar). Job Bank
+  Canada (`jobbank.gc.ca`), the federal job board — confirmed live on 2026-10-08:
+  `robots.txt` is `User-agent: *` / `Crawl-delay: 5`, no `Disallow` at all; no login wall on
+  search results. Unlike `weworkremotely`, this site does paginate (`?page=N` on a search),
+  and its results container is present even past the last page, so an empty page of
+  listings ends pagination cleanly rather than looking like a structure change. A listing's
+  own link carries a session id that changes on every fetch, so the dedup key and canonical
+  URL are built from the listing's numeric posting id instead, confirmed to resolve on its
+  own with no session id needed. Live testing against this host is what surfaced §6's
+  `RealHttpBackend` gap (PR #126 review): a request with no `User-Agent` header at all was
+  503'd by this host's bot-defense outright, while the identical request with any
+  ordinary-looking `User-Agent` succeeded — not a problem with this source's own code.
+
+### 11. Amendment (issue #128): CLI surface
+
+The CLI deferral in this ADR's original "Not done here" was correct when written but is no
+longer the whole story — the CLI half shipped in a later, separate PR. Three new, additive
+ops, all `Inline` except `test` (consistent with `fetch` already being queued — a real
+network call never answers inline):
+
+- **`fetchers.list`** — every source `fetch`/`status` could ever resolve (the fixed
+  registry, §10, plus every configured `kind` instance, §2a), cross-referenced with its
+  `config.toml` state: `{id, method, kind, enabled, interval_s}`. `kind`/`interval_s` are
+  `null` for a fixed source with no config entry of its own.
+- **`fetchers.status`** — the same source universe, but `{id, last_run_at, running}`:
+  per-source last-run time and whether it is currently mid-fetch (the §4/§5 overlap guard).
+- **`fetchers.test`** — fetches exactly one page from a source and returns its parsed items
+  (`{source, items}`), touching none of `seen.toml`, `last_run.toml`, or the overlap guard,
+  and emitting no `fetchers.item.found`. A dry run with no state of its own to protect, so
+  (unlike `fetch`) it can run alongside a real fetch of the same source without conflict.
+
+`crates/cli/src/fetchers.rs` gives these, plus the pre-existing `fetchers.fetch`, a real
+`shimmer fetchers list|status|test|run` subcommand — `list`/`status` render as tables,
+`test`/`run` support `--wait` to follow a queued op to completion client-side (the same
+subscribe-then-follow pattern `workspaces.rs` already established).
+
+**Not done in this amendment either:** `fetchers.item.found` events themselves still have no
+CLI-visible history — "`shimmer fetchers items`" (recent found items, e.g. for "what did the
+last run actually find") needs a new, module-agnostic op backed by the index's events table,
+which is a `crates/proto` change (CLAUDE.md §4: needs explicit sign-off, a
+`docs/protocol.md` addition, a version bump, and Dev C's notification) — stopping and
+reporting that rather than building around it, same posture §2a already took on the
+per-method rate-limit floor. The TUI surface remains entirely out of scope, as originally
+stated.
 
 ## Not done here
 
@@ -356,8 +404,7 @@ Both public, no login, no API key, verified live on 2026-10-06:
   follow-up before it can exist, regardless of anything here.
 - `records` inbox/triage (matching a found item to a saved record) — a `records` feature,
   separate from this module.
-- TUI surface, CLI surface (`crates/cli` commands for `fetchers.*`) — out of scope for this
-  ADR.
+- TUI surface — out of scope for this ADR. (CLI surface shipped later — see §11.)
 - Headless-browser scraping for JS-rendered sites.
 - A `core` change that would let `Module::triggers()` read config directly (§5's finding) —
   would affect every module, not just this one; not proposed here.

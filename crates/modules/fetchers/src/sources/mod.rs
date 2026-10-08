@@ -3,5 +3,6 @@
 //! `registry`, built on demand per configured instance by [`crate::source::resolve`].
 
 pub mod hn;
+pub mod jobbank;
 pub mod rss;
 pub mod wwr;

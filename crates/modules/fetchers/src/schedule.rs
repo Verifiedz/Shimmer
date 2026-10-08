@@ -402,7 +402,7 @@ mod tests {
 
     #[test]
     fn a_kind_entry_whose_id_collides_with_a_fixed_source_fails_at_load_time() {
-        for id in ["hn-whoishiring", "weworkremotely"] {
+        for id in ["hn-whoishiring", "weworkremotely", "jobbank-canada"] {
             let err = FetchersConfig::from_value(&json!({
                 "sources": {id: {"enabled": true, "interval": "hourly", "kind": "rss", "url": "https://example.test/feed.xml"}}
             }))
