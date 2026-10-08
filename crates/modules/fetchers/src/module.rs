@@ -201,6 +201,8 @@ impl Fetchers {
                     // 0: already validated at load time (§126 review's per-method floor);
                     // this is read-only display, not re-validation, same as `due_sources`.
                     "interval_s": cfg.and_then(|c| c.interval.resolve(0).ok()),
+                    "title_contains": cfg.map(|c| c.title_contains.clone()).unwrap_or_default(),
+                    "title_excludes": cfg.map(|c| c.title_excludes.clone()).unwrap_or_default(),
                 })
             })
             .collect();
@@ -233,7 +235,16 @@ impl Fetchers {
         let source =
             source::resolve(ctx, &source_id)?.ok_or_else(|| Error::not_found(format!("no source '{source_id}'")))?;
         let page = source.fetch_page(ctx, None).await?;
-        let items: Vec<Value> = page.items.iter().map(|item| item_payload(&source_id, item)).collect();
+        // Applied here too (§13), not just in `run_source` -- a preview that shows items a
+        // real run would never keep is a misleading preview.
+        let config = FetchersConfig::load(ctx)?;
+        let filter = config.sources.get(&source_id);
+        let items: Vec<Value> = page
+            .items
+            .iter()
+            .filter(|item| filter.is_none_or(|f| f.matches_title(&item.title)))
+            .map(|item| item_payload(&source_id, item))
+            .collect();
         Ok(json!({"source": source_id, "items": items}))
     }
 
@@ -249,6 +260,11 @@ impl Fetchers {
         let now = ctx.clock.now();
         let mut found: Vec<RawItem> = Vec::new();
         let mut cursor: Option<String> = None;
+        // A title this source's own config excludes (§13) is marked seen like any other
+        // examined item, so it is never re-examined on a later run -- but it is a deliberate
+        // exclusion, not a capacity miss, so (unlike the cap below) it is never retried.
+        let config = FetchersConfig::load(ctx)?;
+        let filter = config.sources.get(source_id);
 
         for page_index in 0..source::MAX_PAGES {
             // A full run can issue up to `MAX_PAGES * PAGE_SIZE` HTTP calls (CLAUDE.md §12
@@ -265,6 +281,10 @@ impl Fetchers {
             let page = source.fetch_page(ctx, cursor.as_deref()).await?;
             for item in page.items {
                 if seen.is_new(&item.source_id) {
+                    if !filter.is_none_or(|f| f.matches_title(&item.title)) {
+                        seen.touch(item.source_id.clone(), now);
+                        continue;
+                    }
                     if found.len() < dedup::MAX_NEW_PER_RUN {
                         seen.touch(item.source_id.clone(), now);
                         found.push(item);
@@ -392,7 +412,14 @@ mod tests {
     }
 
     fn source_config(enabled: bool, interval_s: u64) -> schedule::SourceConfig {
-        schedule::SourceConfig { enabled, interval: IntervalSpec::Seconds(interval_s), kind: None, url: None }
+        schedule::SourceConfig {
+            enabled,
+            interval: IntervalSpec::Seconds(interval_s),
+            kind: None,
+            url: None,
+            title_contains: Vec::new(),
+            title_excludes: Vec::new(),
+        }
     }
 
     #[tokio::test]
@@ -513,6 +540,79 @@ mod tests {
         assert_eq!(second["new_items"].as_u64(), Some(0));
         let found_after_second = env.backend.events().iter().filter(|e| e.topic == "fetchers.item.found").count();
         assert_eq!(found_after_second, 1, "an already-seen item must never be emitted twice");
+    }
+
+    #[tokio::test]
+    async fn run_source_drops_an_excluded_title_and_never_retries_it() {
+        let mut env = TestEnv::new("fetchers");
+        env.ctx.config = ModuleConfig::new(json!({
+            "sources": {"hn-whoishiring": {"enabled": true, "interval": "daily", "title_excludes": ["senior"]}}
+        }));
+        const BASE: &str = "https://hacker-news.firebaseio.com/v0";
+        {
+            let mut responses = env.http.responses.lock().unwrap();
+            responses.insert(format!("{BASE}/user/whoishiring.json"), json_response(json!({"submitted": [1]})));
+            responses.insert(
+                format!("{BASE}/item/1.json"),
+                json_response(json!({"id": 1, "title": "Ask HN: Who is hiring? (October 2026)", "kids": [10, 11]})),
+            );
+            responses.insert(
+                format!("{BASE}/item/10.json"),
+                json_response(json!({"id": 10, "by": "acme", "text": "<p>Senior Rust Engineer<p>5+ years."})),
+            );
+            responses.insert(
+                format!("{BASE}/item/11.json"),
+                json_response(json!({"id": 11, "by": "acme", "text": "<p>Junior Rust Engineer<p>New grad welcome."})),
+            );
+        }
+
+        let fetchers = Fetchers::default();
+        let out = fetchers.fetch(&env.ctx, "hn-whoishiring".into()).await.unwrap();
+        assert_eq!(out["new_items"], 1, "only the junior posting should count as new");
+
+        let found: Vec<_> = env.backend.events().into_iter().filter(|e| e.topic == "fetchers.item.found").collect();
+        assert_eq!(found.len(), 1);
+        assert!(found[0].payload["title"].as_str().unwrap().contains("Junior"), "{:?}", found[0].payload);
+
+        // The excluded item is marked seen -- never re-examined -- same as a kept one, not
+        // left unmarked the way a cap-overflow miss would be.
+        let seen = dedup::load(&env.ctx, "hn-whoishiring").unwrap();
+        assert!(!seen.is_new("10"), "an excluded title must still be marked seen");
+        assert!(!seen.is_new("11"));
+
+        // Re-running finds nothing new: the excluded item was never queued for a retry.
+        let second = fetchers.fetch(&env.ctx, "hn-whoishiring".into()).await.unwrap();
+        assert_eq!(second["new_items"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_applies_the_same_title_filter_a_real_run_would() {
+        let mut env = TestEnv::new("fetchers");
+        env.ctx.config = ModuleConfig::new(json!({
+            "sources": {"hn-whoishiring": {"enabled": true, "interval": "daily", "title_contains": ["junior"]}}
+        }));
+        const BASE: &str = "https://hacker-news.firebaseio.com/v0";
+        {
+            let mut responses = env.http.responses.lock().unwrap();
+            responses.insert(format!("{BASE}/user/whoishiring.json"), json_response(json!({"submitted": [1]})));
+            responses.insert(
+                format!("{BASE}/item/1.json"),
+                json_response(json!({"id": 1, "title": "Ask HN: Who is hiring? (October 2026)", "kids": [10, 11]})),
+            );
+            responses.insert(
+                format!("{BASE}/item/10.json"),
+                json_response(json!({"id": 10, "by": "acme", "text": "<p>Senior Rust Engineer"})),
+            );
+            responses.insert(
+                format!("{BASE}/item/11.json"),
+                json_response(json!({"id": 11, "by": "acme", "text": "<p>Junior Rust Engineer"})),
+            );
+        }
+
+        let out = Fetchers::default().test(&env.ctx, "hn-whoishiring".into()).await.unwrap();
+        let items = out["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert!(items[0]["title"].as_str().unwrap().contains("Junior"));
     }
 
     #[tokio::test]

@@ -12,6 +12,9 @@ Amended (`shimmer fetchers items`): §11's own deferred `items` command, built �
 One new, module-agnostic op (`core.events.list`), `docs/protocol.md` updated, no version
 bump, no `crates/proto` *type* change beyond the new op's own response struct (`Event`
 itself, already shared and already serializable, is unchanged).
+Amended (per-source title filtering): `title_contains`/`title_excludes` on every source's
+config entry — see §13. No `core`/`proto` change, no new op; `SourceConfig` and
+`fetchers.list`'s existing payload only.
 
 ## Context
 
@@ -431,6 +434,42 @@ than `records` or `workspaces` do.
 - **Additive, no `docs/protocol.md` version bump** — same reasoning §9's own ops used: `v`
   is bumped only for breaking changes (`docs/protocol.md`'s own header), and an unknown
   client never asked for `core.events.list` before, so nothing it already does changes.
+
+### 13. Amendment: per-source title filtering
+
+Live testing against real job-board data (§10) turned up the obvious next want: most
+postings a source returns are not ones worth tracking. Rather than a `jobbank-canada`-only
+fix, this generalizes to every current and future source, config-only, no code per source:
+
+- **`title_contains`/`title_excludes`** (`SourceConfig`, `crates/modules/fetchers/src/
+  schedule.rs`): two optional string lists under a source's existing
+  `[modules.fetchers.sources.<id>]` entry. Matching is case-insensitive substring, OR'd
+  within each list: an item's title must contain *at least one* `title_contains` term when
+  that list is non-empty (empty means no inclusion filter at all), and must contain *none*
+  of `title_excludes` — which always applies, and always wins over `title_contains` when
+  both would otherwise keep an item. Checked against `RawItem::title` only, nothing in
+  `raw_data` — a source whose parsed title doesn't carry the distinguishing word (e.g. a
+  level buried only in a longer description field) needs a source-level change to surface
+  it in the title first, not a smarter filter here.
+- **Applied once, in `Fetchers::run_source`**, not inside any `Source::fetch_page` — the
+  same mechanism covers every source, present and future (an email source, say), with zero
+  source-specific code. A title that fails the filter is marked seen in the same statement
+  as a kept one (so it is never re-examined on a later run) but never pushed into `found`,
+  so it is never counted toward the per-run cap (§4/§8) and never emitted. Distinct from a
+  cap-overflow miss, which is deliberately left *unmarked* so a later run retries it (§8) —
+  an excluded title is a decision, not a capacity problem, so it is never retried.
+- **`Fetchers::test` applies the identical filter** before returning its preview. A dry run
+  that shows items a real run would never keep is a misleading preview of what `run` would
+  actually do.
+- **Surfaced in `fetchers.list`'s existing payload** (`title_contains`/`title_excludes`
+  alongside `enabled`/`interval_s`) rather than a new op — it is config state about a
+  source, the same category of thing `fetchers.list` already answers.
+- **Not done here:** matching against anything beyond the title (a longer description in
+  `raw_data`, location, salary); a smarter-than-substring match (synonyms, stemming, an
+  actual seniority classifier). Keyword substring matching cannot tell "mentors junior
+  engineers" in a senior posting from an actual junior posting — a known, accepted limit,
+  not a gap to close here. Both are explicitly deferred, not ruled out, if a source's real
+  data later makes title-only filtering insufficient.
 
 ## Not done here
 

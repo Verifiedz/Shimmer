@@ -71,6 +71,30 @@ pub struct SourceConfig {
     /// and left unvalidated, when `kind` is absent or any other value.
     #[serde(default)]
     pub url: Option<String>,
+    /// A title must contain at least one of these (case-insensitive substring, OR-matched)
+    /// to be kept. Empty means no inclusion filter at all -- everything passes this stage.
+    #[serde(default)]
+    pub title_contains: Vec<String>,
+    /// A title containing any of these (same matching as `title_contains`) is dropped, even
+    /// if `title_contains` would have kept it. Checked against every source's own title
+    /// only (ADR 0028 §13) -- a source whose `raw_data` carries a longer description is not
+    /// searched.
+    #[serde(default)]
+    pub title_excludes: Vec<String>,
+}
+
+impl SourceConfig {
+    /// Whether an item's title should be kept, given this source's own filter lists. A
+    /// title matching nothing in `title_contains` is dropped only when that list is
+    /// non-empty; a title matching anything in `title_excludes` is always dropped,
+    /// regardless of `title_contains`.
+    pub fn matches_title(&self, title: &str) -> bool {
+        let lower = title.to_lowercase();
+        let included =
+            self.title_contains.is_empty() || self.title_contains.iter().any(|w| lower.contains(&w.to_lowercase()));
+        let excluded = self.title_excludes.iter().any(|w| lower.contains(&w.to_lowercase()));
+        included && !excluded
+    }
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -323,6 +347,49 @@ mod tests {
     }
 
     #[test]
+    fn a_title_filter_round_trips_through_config() {
+        let cfg = FetchersConfig::from_value(&json!({
+            "sources": {
+                "hn-whoishiring": {
+                    "enabled": true, "interval": "daily",
+                    "title_contains": ["junior", "entry level"],
+                    "title_excludes": ["senior", "staff"],
+                },
+            }
+        }))
+        .unwrap();
+        let hn = &cfg.sources["hn-whoishiring"];
+        assert_eq!(hn.title_contains, vec!["junior".to_string(), "entry level".to_string()]);
+        assert_eq!(hn.title_excludes, vec!["senior".to_string(), "staff".to_string()]);
+    }
+
+    #[test]
+    fn matches_title_with_no_filter_configured_keeps_everything() {
+        let s = source(true, MIN_INTERVAL_API_S);
+        assert!(s.matches_title("Senior Staff Engineer"));
+        assert!(s.matches_title(""));
+    }
+
+    #[test]
+    fn matches_title_requires_one_of_contains_case_insensitively() {
+        let mut s = source(true, MIN_INTERVAL_API_S);
+        s.title_contains = vec!["junior".into(), "entry level".into()];
+        assert!(s.matches_title("Junior Software Engineer"));
+        assert!(s.matches_title("JUNIOR SOFTWARE ENGINEER"), "must be case-insensitive");
+        assert!(s.matches_title("Entry Level Developer"));
+        assert!(!s.matches_title("Senior Software Engineer"), "matches neither term");
+    }
+
+    #[test]
+    fn matches_title_excludes_always_wins_over_contains() {
+        let mut s = source(true, MIN_INTERVAL_API_S);
+        s.title_contains = vec!["engineer".into()];
+        s.title_excludes = vec!["senior".into()];
+        assert!(s.matches_title("Junior Engineer"));
+        assert!(!s.matches_title("Senior Engineer"), "excludes must win even though 'engineer' is in title_contains");
+    }
+
+    #[test]
     fn a_bad_interval_fails_at_load_time_not_on_the_first_tick() {
         let err = FetchersConfig::from_value(&json!({
             "sources": {"hn-whoishiring": {"enabled": true, "interval": "fortnightly"}}
@@ -423,7 +490,14 @@ mod tests {
     }
 
     fn source(enabled: bool, interval_s: u64) -> SourceConfig {
-        SourceConfig { enabled, interval: IntervalSpec::Seconds(interval_s), kind: None, url: None }
+        SourceConfig {
+            enabled,
+            interval: IntervalSpec::Seconds(interval_s),
+            kind: None,
+            url: None,
+            title_contains: Vec::new(),
+            title_excludes: Vec::new(),
+        }
     }
 
     #[test]
