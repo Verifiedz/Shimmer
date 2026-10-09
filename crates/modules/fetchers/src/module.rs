@@ -482,6 +482,13 @@ mod tests {
             interval: IntervalSpec::Seconds(interval_s),
             kind: None,
             url: None,
+            items_path: None,
+            id_field: None,
+            title_field: None,
+            url_field: None,
+            url_base: None,
+            pagination: None,
+            page_size: None,
             title_contains: Vec::new(),
             title_excludes: Vec::new(),
         }

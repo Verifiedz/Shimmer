@@ -17,6 +17,8 @@ config entry — see §13. No `core`/`proto` change, no new op; `SourceConfig` a
 `fetchers.list`'s existing payload only.
 Amended (ad-hoc filter override): `--contains`/`--excludes` on `shimmer fetchers test`/`run`
 — see §14. No `core`/`proto` change; two new optional params on two existing ops.
+Amended (issue #127's own follow-up): the `json-api` kind, named in §2a and never built
+until now — see §15. No `core`/`proto` change, no new op.
 
 ## Context
 
@@ -175,7 +177,7 @@ hand" (CLAUDE.md §1.4).
 **Not done in this amendment:**
 
 - The `json-api` and `html-list` kinds — a later batch (issue #127, umbrella PR's own
-  done-when).
+  done-when). `json-api` is built later, in §15; `html-list` remains undone.
 - Migrating `hn-whoishiring`/`weworkremotely` onto the new kind system — they stay hand-written
   `Source` impls exactly as today; only `id()`'s return type changes.
 - §7's per-method rate-limit floor (currently a uniform, provisional 900s) — a kind-aware
@@ -500,6 +502,81 @@ path.
 - **No `core`/`proto` change** — two new optional fields on two existing module ops' own
   params, already advisory-schema (`CommandSpec.params_schema`, CLAUDE.md §5: "JSON Schema;
   advisory before M3").
+
+### 15. Amendment (issue #127's own follow-up): the `json-api` kind
+
+§2a named `json-api` as a later batch and did not build it. Built now: a declarative,
+field-path-mapped kind for any endpoint that answers with a JSON array of job-shaped
+objects — an ATS's public job-board API (Greenhouse, Lever) or a company's own public job
+search endpoint (Amazon) — covering each with configuration, not a new `Source` impl, the
+same "point at data, not code" `rss` already established for feeds.
+
+**Config** (`SourceConfig`, `crates/modules/fetchers/src/schedule.rs`): reuses the existing
+`url` field (already there for `rss`) as the endpoint, plus five new fields —
+`items_path`, `id_field`, `title_field`, `url_field`, `url_base`, `pagination`, `page_size`.
+`id_field`/`title_field`/`url_field` are required and checked non-empty at load time, same
+as `rss`'s `url`.
+
+```toml
+[modules.fetchers.sources.figma-jobs]        # Greenhouse: one response, already-absolute urls
+kind = "json-api"
+enabled = true
+interval = "daily"
+url = "https://boards-api.greenhouse.io/v1/boards/figma/jobs"
+items_path = "jobs"
+id_field = "id"
+title_field = "title"
+url_field = "absolute_url"
+
+[modules.fetchers.sources.amazon-swe]        # Amazon: paginated, relative urls
+kind = "json-api"
+enabled = true
+interval = "daily"
+url = "https://www.amazon.jobs/en/search.json?base_query=software+engineer&offset={offset}&result_limit=50"
+items_path = "jobs"
+id_field = "id"
+title_field = "title"
+url_field = "job_path"
+url_base = "https://www.amazon.jobs"
+pagination = "offset"
+page_size = 50
+```
+
+- **`items_path`** — a dot-separated path of object keys from the response root to the
+  items array. Empty (the default) means the response root is already that array (Lever's
+  bare `[...]`, unlike Greenhouse's `{"jobs": [...]}`). Nested field mapping stops there
+  deliberately: `raw_data` is the whole matched item object, unfiltered, so a field that
+  isn't `id`/`title`/`url` never needs its own path — only those three are ever extracted
+  individually, and in every real case checked so far (Greenhouse, Lever, Amazon) all three
+  are flat, top-level fields, so the path language stays "one key" for them, not a general
+  JSONPath.
+- **`id_field`/`title_field`/`url_field`** — top-level field names; a missing field on one
+  item skips just that item (same "a page is a reported failure only when something
+  structural broke, not when one row happens to be thin" posture `jobbank-canada` already
+  takes), not the whole page. A JSON number (Greenhouse's own numeric `id`) is coerced to a
+  string, the same way a string field already is — anything else (an object, an array,
+  `null`) is treated as absent.
+- **`url_base`**, when present, is prepended to `url_field`'s value — for an API (Amazon's)
+  whose own url field is a site-relative path, not already absolute. Omitted means the
+  field is already a full url, used as-is (Greenhouse, Lever).
+- **`pagination`**: `"none"` (default — one response has everything, e.g. Greenhouse,
+  Lever) or `"offset"` (e.g. Amazon). `"offset"` requires `page_size > 0` and a literal
+  `{offset}` placeholder in `url`, both checked at load time — the `Source` substitutes
+  `0`, then `page_size`, then `2 * page_size`, … until a response returns fewer than
+  `page_size` items, the same "a short page is the last page" signal `jobbank-canada`'s own
+  `page=N` scheme uses, just expressed as a running offset instead of a page number.
+- **`Method::Api`** always — a url the caller configured deliberately, the same reasoning
+  as `rss` (§2a) and `hn-whoishiring` (§10): not a crawled page, so no robots.txt check
+  applies.
+- **Where this stops being generic, on purpose:** an HTML response (`weworkremotely`,
+  `jobbank-canada` stay hand-written `Method::Scrape` sources — `html-list`, §2a's other
+  deferred kind, remains undone); an endpoint needing an auth header, a POST body, or
+  cursor-token pagination (a response-supplied token to echo back, rather than a
+  client-computed offset) — none of those fit the "GET a url, get back a flat JSON array"
+  shape this kind covers, and none are built here.
+- **No `core`/`proto` change, no new op** — `SourceConfig`, `crate::source::resolve`, and a
+  new `crates/modules/fetchers/src/sources/json_api.rs`, the same shape `rss` already
+  established.
 
 ## Not done here
 

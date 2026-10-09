@@ -92,6 +92,40 @@ fn resolve_from(config: &FetchersConfig, id: &str) -> Result<Option<std::sync::A
             })?;
             Ok(Some(std::sync::Arc::new(crate::sources::rss::Rss::new(id.to_string(), url.to_string()))))
         }
+        Some("json-api") => {
+            let cfg = config.sources.get(id).ok_or_else(|| {
+                Error::internal(format!(
+                    "sources.{id}: kind \"json-api\" has no config despite passing load-time validation"
+                ))
+            })?;
+            let missing = |field: &str| {
+                Error::internal(format!(
+                    "sources.{id}: kind \"json-api\" has no {field} despite passing load-time validation"
+                ))
+            };
+            let url = cfg.url.clone().ok_or_else(|| missing("url"))?;
+            let id_field = cfg.id_field.clone().ok_or_else(|| missing("id_field"))?;
+            let title_field = cfg.title_field.clone().ok_or_else(|| missing("title_field"))?;
+            let url_field = cfg.url_field.clone().ok_or_else(|| missing("url_field"))?;
+            let items_path = cfg.items_path.clone().unwrap_or_default();
+            let pagination = match cfg.pagination.as_deref().unwrap_or("none") {
+                "offset" => {
+                    let page_size = cfg.page_size.ok_or_else(|| missing("page_size"))?;
+                    crate::sources::json_api::Pagination::Offset { page_size }
+                }
+                _ => crate::sources::json_api::Pagination::None,
+            };
+            Ok(Some(std::sync::Arc::new(crate::sources::json_api::JsonApi::new(
+                id.to_string(),
+                url,
+                items_path,
+                id_field,
+                title_field,
+                url_field,
+                cfg.url_base.clone(),
+                pagination,
+            ))))
+        }
         Some(other) => {
             Err(Error::internal(format!("sources.{id}: unknown kind \"{other}\" despite passing load-time validation")))
         }
@@ -150,5 +184,25 @@ mod tests {
         }));
         let ids: Vec<_> = known(&env.ctx).unwrap().iter().map(|s| s.id().to_string()).collect();
         assert_eq!(ids, vec!["hn-whoishiring", "weworkremotely", "jobbank-canada", "my-team-blog"]);
+    }
+
+    #[test]
+    fn resolve_builds_a_json_api_instance_from_its_own_config_entry() {
+        let mut env = TestEnv::new("fetchers");
+        env.ctx.config = ModuleConfig::new(serde_json::json!({
+            "sources": {
+                "figma-jobs": {
+                    "enabled": true, "interval": "daily", "kind": "json-api",
+                    "url": "https://boards-api.greenhouse.io/v1/boards/figma/jobs",
+                    "items_path": "jobs", "id_field": "id", "title_field": "title", "url_field": "absolute_url",
+                },
+            }
+        }));
+        let source = resolve(&env.ctx, "figma-jobs").unwrap().expect("a configured json-api kind must resolve");
+        assert_eq!(source.id(), "figma-jobs");
+        assert_eq!(source.method(), Method::Api);
+
+        let ids: Vec<_> = known(&env.ctx).unwrap().iter().map(|s| s.id().to_string()).collect();
+        assert_eq!(ids, vec!["hn-whoishiring", "weworkremotely", "jobbank-canada", "figma-jobs"]);
     }
 }

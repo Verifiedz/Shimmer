@@ -67,10 +67,35 @@ pub struct SourceConfig {
     /// instance of this *kind* instead (ADR 0028 §2a) -- currently only `"rss"`.
     #[serde(default)]
     pub kind: Option<String>,
-    /// The `rss` kind's one required setting (ADR 0028 §2a): the feed's url. Meaningless,
-    /// and left unvalidated, when `kind` is absent or any other value.
+    /// The `rss` kind's one required setting (ADR 0028 §2a), and the `json-api` kind's own
+    /// endpoint (ADR 0028 §15, which also reuses this field rather than inventing a second
+    /// one). Meaningless, and left unvalidated, when `kind` is absent or neither of those.
     #[serde(default)]
     pub url: Option<String>,
+    /// `json-api` only (ADR 0028 §15): dot-separated path from the response root to the
+    /// items array. Omitted (or empty) means the response root is already that array.
+    #[serde(default)]
+    pub items_path: Option<String>,
+    /// `json-api` only: the field within each item holding its dedup key.
+    #[serde(default)]
+    pub id_field: Option<String>,
+    /// `json-api` only: the field within each item holding its title.
+    #[serde(default)]
+    pub title_field: Option<String>,
+    /// `json-api` only: the field within each item holding its url.
+    #[serde(default)]
+    pub url_field: Option<String>,
+    /// `json-api` only: prepended to `url_field`'s value when that field is a site-relative
+    /// path rather than already absolute (e.g. Amazon's own job search endpoint).
+    #[serde(default)]
+    pub url_base: Option<String>,
+    /// `json-api` only: `"none"` (default, everything in one response) or `"offset"` (`url`
+    /// must contain a literal `{offset}` placeholder, driven by `page_size`).
+    #[serde(default)]
+    pub pagination: Option<String>,
+    /// `json-api` only: required, and must be greater than 0, when `pagination = "offset"`.
+    #[serde(default)]
+    pub page_size: Option<u32>,
     /// A title must contain at least one of these (case-insensitive substring, OR-matched)
     /// to be kept. Empty means no inclusion filter at all -- everything passes this stage.
     #[serde(default)]
@@ -201,9 +226,54 @@ impl FetchersConfig {
                             }
                             MIN_INTERVAL_API_S
                         }
+                        "json-api" => {
+                            let url = source.url.as_deref().unwrap_or_default().trim();
+                            if url.is_empty() {
+                                return Err(Error::invalid_params(format!(
+                                    "sources.{id}: kind \"json-api\" needs a non-empty url"
+                                )));
+                            }
+                            if !is_http_url(url) {
+                                return Err(Error::invalid_params(format!(
+                                    "sources.{id}: kind \"json-api\" url must be a well-formed http:// or https:// url, got '{url}'"
+                                )));
+                            }
+                            for (field_name, value) in [
+                                ("id_field", &source.id_field),
+                                ("title_field", &source.title_field),
+                                ("url_field", &source.url_field),
+                            ] {
+                                if value.as_deref().unwrap_or_default().trim().is_empty() {
+                                    return Err(Error::invalid_params(format!(
+                                        "sources.{id}: kind \"json-api\" needs a non-empty {field_name}"
+                                    )));
+                                }
+                            }
+                            match source.pagination.as_deref().unwrap_or("none") {
+                                "none" => {}
+                                "offset" => {
+                                    if source.page_size.unwrap_or(0) == 0 {
+                                        return Err(Error::invalid_params(format!(
+                                            "sources.{id}: kind \"json-api\" pagination \"offset\" needs page_size > 0"
+                                        )));
+                                    }
+                                    if !url.contains("{offset}") {
+                                        return Err(Error::invalid_params(format!(
+                                            "sources.{id}: kind \"json-api\" pagination \"offset\" needs a literal '{{offset}}' placeholder in url"
+                                        )));
+                                    }
+                                }
+                                other => {
+                                    return Err(Error::invalid_params(format!(
+                                        "sources.{id}: kind \"json-api\" has unknown pagination \"{other}\" (known: none, offset)"
+                                    )));
+                                }
+                            }
+                            MIN_INTERVAL_API_S
+                        }
                         other => {
                             return Err(Error::invalid_params(format!(
-                                "sources.{id}: unknown kind \"{other}\" (known: rss)"
+                                "sources.{id}: unknown kind \"{other}\" (known: rss, json-api)"
                             )));
                         }
                     }
@@ -495,12 +565,87 @@ mod tests {
         assert!(err.message.contains("carrier-pigeon"), "{}", err.message);
     }
 
+    #[test]
+    fn a_json_api_kind_with_every_required_field_parses() {
+        let cfg = FetchersConfig::from_value(&json!({
+            "sources": {
+                "figma-jobs": {
+                    "enabled": true, "interval": "daily", "kind": "json-api",
+                    "url": "https://boards-api.greenhouse.io/v1/boards/figma/jobs",
+                    "items_path": "jobs", "id_field": "id", "title_field": "title", "url_field": "absolute_url",
+                },
+            }
+        }))
+        .unwrap();
+        assert_eq!(cfg.sources["figma-jobs"].kind.as_deref(), Some("json-api"));
+    }
+
+    #[test]
+    fn a_json_api_kind_missing_a_required_field_is_rejected() {
+        for missing in ["id_field", "title_field", "url_field"] {
+            let mut fields = json!({
+                "enabled": true, "interval": "daily", "kind": "json-api",
+                "url": "https://example.test/jobs",
+                "items_path": "jobs", "id_field": "id", "title_field": "title", "url_field": "url",
+            });
+            fields.as_object_mut().unwrap().remove(missing);
+            let err = FetchersConfig::from_value(&json!({"sources": {"acme-jobs": fields}})).unwrap_err();
+            assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams, "missing {missing}");
+            assert!(err.message.contains(missing), "{missing}: {}", err.message);
+        }
+    }
+
+    #[test]
+    fn a_json_api_kind_with_offset_pagination_needs_page_size_and_a_placeholder() {
+        let base = |extra: Value| {
+            let mut fields = json!({
+                "enabled": true, "interval": "daily", "kind": "json-api",
+                "url": "https://example.test/jobs", "id_field": "id", "title_field": "title", "url_field": "url",
+                "pagination": "offset",
+            });
+            for (k, v) in extra.as_object().unwrap() {
+                fields.as_object_mut().unwrap().insert(k.clone(), v.clone());
+            }
+            FetchersConfig::from_value(&json!({"sources": {"acme-jobs": fields}}))
+        };
+
+        let err = base(json!({"page_size": 0})).unwrap_err();
+        assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams);
+        assert!(err.message.contains("page_size"), "{}", err.message);
+
+        let err = base(json!({"page_size": 50, "url": "https://example.test/jobs"})).unwrap_err();
+        assert!(err.message.contains("{offset}"), "{}", err.message);
+
+        base(json!({"page_size": 50, "url": "https://example.test/jobs?offset={offset}"})).unwrap();
+    }
+
+    #[test]
+    fn a_json_api_kind_with_an_unknown_pagination_is_rejected() {
+        let err = FetchersConfig::from_value(&json!({
+            "sources": {"acme-jobs": {
+                "enabled": true, "interval": "daily", "kind": "json-api",
+                "url": "https://example.test/jobs", "id_field": "id", "title_field": "title", "url_field": "url",
+                "pagination": "cursor",
+            }}
+        }))
+        .unwrap_err();
+        assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams);
+        assert!(err.message.contains("cursor"), "{}", err.message);
+    }
+
     fn source(enabled: bool, interval_s: u64) -> SourceConfig {
         SourceConfig {
             enabled,
             interval: IntervalSpec::Seconds(interval_s),
             kind: None,
             url: None,
+            items_path: None,
+            id_field: None,
+            title_field: None,
+            url_field: None,
+            url_base: None,
+            pagination: None,
+            page_size: None,
             title_contains: Vec::new(),
             title_excludes: Vec::new(),
         }
