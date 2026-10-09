@@ -21,6 +21,8 @@ Amended (issue #127's own follow-up): the `json-api` kind, named in §2a and nev
 until now — see §15. No `core`/`proto` change, no new op.
 Amended (configurable search term): `jobbank-canada`'s query is no longer a compiled-in
 constant — see §16. No `core`/`proto` change, no new op; one new `SourceConfig` field.
+Amended (ad-hoc search term override): `--search-term` on `shimmer fetchers test`/`run`
+— see §17. No `core`/`proto` change; one new optional param on two existing ops.
 
 ## Context
 
@@ -612,6 +614,39 @@ query cannot recover what a *different* query already surfaces directly.
   regardless of what the configured term contains.
 - **No `core`/`proto` change, no new op** — one new `SourceConfig` field and a change
   confined to `crates/modules/fetchers/src/sources/jobbank.rs`.
+
+### 17. Amendment: an ad-hoc `--search-term` override
+
+§16 made `search_term` a persistent `config.toml` setting; trying a different phrasing
+still meant an edit plus a daemon restart (same cost §14 already solved for
+`title_contains`/`title_excludes`). This is that same fix, for `search_term`.
+
+- **`fetchers.fetch`/`fetchers.test` gain an optional `search_term` param**, alongside the
+  existing `title_contains`/`title_excludes` (§14). Present: replaces the source's
+  configured `search_term` outright for this one call — same "replace, never merge"
+  posture §14 already established. Absent: unchanged from §16.
+- **No change to the `Source` trait.** `jobbank-canada` already reads `search_term` from
+  `ctx.config` itself (§16); the override is applied by handing it a *different* `Ctx` for
+  this one call, built by `ctx_with_search_term_override` — clones `ctx`, patches a copy of
+  the real `[modules.fetchers]` JSON so `sources.<id>.search_term` is the override, and
+  swaps that onto the clone's `config` field. A source that never reads `search_term`
+  (every source but `jobbank-canada`, today) is completely unaffected by this — the patch
+  changes a value nothing of theirs looks at.
+- **`FetchersConfig::from_value`'s validation requires every entry to have an `interval`.**
+  The patch supplies a harmless placeholder (`"daily"`) only when the source has no real
+  `config.toml` entry at all, since this override never reaches any scheduling code —
+  `fetch`/`test` are both triggered by a direct call, never by a trigger reading the
+  patched config back out.
+- **`shimmer fetchers test SOURCE --search-term TERM`** and the same flag on
+  **`run [--wait]`** (`crates/cli/src/fetchers.rs`): a third flag alongside
+  `--contains`/`--excludes`, same `Flags::split` call, forwarded only when actually given.
+- **No `core`/`proto` change, no new op** — one new optional field on two existing ops' own
+  params.
+
+Confirmed live: `shimmer fetchers test jobbank-canada --search-term "entry level software
+developer"` reaches the real site with that exact query and returns real results, while a
+plain `shimmer fetchers test jobbank-canada` immediately after still uses the configured
+`"junior software developer"` — the override touched nothing persistent.
 
 ## Not done here
 
