@@ -10,8 +10,9 @@
 //! `article` element's own `id` attribute), confirmed live to resolve on its own with no
 //! session id needed.
 //!
-//! Pagination walks the site's own `page=` query parameter for the one fixed search term
-//! below -- broad enough to surface "software developer" and "full-stack" postings too,
+//! Pagination walks the site's own `page=` query parameter for one search term -- the
+//! configured `search_term` (ADR 0028 §16), or `DEFAULT_SEARCH_TERM` when none is set. The
+//! default is broad enough to surface "software developer" and "full-stack" postings too,
 //! confirmed live. The results container (`#results-list-content`) is present even past the
 //! last page (confirmed live against `page=50` on a 3-page result set), so a page with zero
 //! listings ends pagination cleanly; only a missing container is treated as a structure
@@ -21,11 +22,14 @@ use async_trait::async_trait;
 use serde_json::json;
 use shimmer_core::{Ctx, Error, Result};
 
+use crate::schedule::FetchersConfig;
 use crate::source::{Method, Page, RawItem, Source};
 use crate::{html, http, robots};
 
 const BASE: &str = "https://www.jobbank.gc.ca";
-const SEARCH_TERM: &str = "software+engineer";
+/// Used when `[modules.fetchers.sources.jobbank-canada]` sets no `search_term` of its own
+/// (ADR 0028 §16) -- the only query this source ever ran before that became configurable.
+const DEFAULT_SEARCH_TERM: &str = "software engineer";
 
 pub struct JobBankCanada;
 
@@ -44,7 +48,24 @@ impl Source for JobBankCanada {
             Some(c) => c.parse::<u32>().map_err(|_| Error::invalid_params(format!("bad cursor '{c}'")))?,
             None => 1,
         };
-        let url = format!("{BASE}/jobsearch/jobsearch?searchstring={SEARCH_TERM}&locationstring=Canada&page={page}");
+        // Blank-after-trim (not just absent) also means "use the default" -- an empty
+        // search_term = "" in config.toml is as meaningless as no search_term key at all,
+        // and must not become a literal empty query to the real site.
+        let configured = FetchersConfig::load(ctx)?.sources.get(self.id()).and_then(|c| c.search_term.clone());
+        let search_term = match configured.as_deref().map(str::trim) {
+            Some(t) if !t.is_empty() => t,
+            _ => DEFAULT_SEARCH_TERM,
+        };
+        // Built with `url::Url`'s own query encoder, not a hand-formatted string, so a
+        // configured term with spaces or punctuation is encoded correctly rather than
+        // producing a malformed request the way naive string interpolation would once the
+        // term stopped being a fixed, pre-encoded literal.
+        let mut url = url::Url::parse(&format!("{BASE}/jobsearch/jobsearch")).expect("a fixed, valid base url");
+        url.query_pairs_mut()
+            .append_pair("searchstring", search_term)
+            .append_pair("locationstring", "Canada")
+            .append_pair("page", &page.to_string());
+        let url = url.to_string();
 
         // Method::Scrape's own obligation (ADR 0028 §7): the host has no way to know this
         // URL ahead of time to check it centrally, so the source checks it itself.
@@ -98,7 +119,7 @@ fn collapse(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use shimmer_core::testing::TestEnv;
-    use shimmer_core::{ErrorCode, HttpResponse};
+    use shimmer_core::{ErrorCode, HttpResponse, ModuleConfig};
 
     use super::*;
 
@@ -124,8 +145,20 @@ mod tests {
         stub(env, &format!("{BASE}/robots.txt"), ok("User-agent: *\nCrawl-delay: 5\n"));
     }
 
+    /// Built the same way the source itself builds a request url -- via `url::Url`'s own
+    /// query encoder, not a hand-formatted string -- so a test asserting on an exact url
+    /// can't drift from how the source actually encodes one.
+    fn url_for_search(term: &str, page: u32) -> String {
+        let mut url = url::Url::parse(&format!("{BASE}/jobsearch/jobsearch")).unwrap();
+        url.query_pairs_mut()
+            .append_pair("searchstring", term)
+            .append_pair("locationstring", "Canada")
+            .append_pair("page", &page.to_string());
+        url.to_string()
+    }
+
     fn url_for_page(page: u32) -> String {
-        format!("{BASE}/jobsearch/jobsearch?searchstring={SEARCH_TERM}&locationstring=Canada&page={page}")
+        url_for_search(DEFAULT_SEARCH_TERM, page)
     }
 
     #[test]
@@ -169,6 +202,34 @@ mod tests {
 
         let page = JobBankCanada.fetch_page(&env.ctx, Some("3")).await.unwrap();
         assert_eq!(page.items.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_configured_search_term_replaces_the_default_and_is_url_encoded() {
+        let mut env = TestEnv::new("fetchers");
+        env.ctx.config = ModuleConfig::new(json!({
+            "sources": {"jobbank-canada": {"enabled": false, "interval": "daily", "search_term": "junior software developer"}}
+        }));
+        allow_robots(&env);
+        stub(&env, &url_for_search("junior software developer", 1), ok(EMPTY_PAGE));
+
+        // No stub at the default-term url: if the configured term were ignored, this would
+        // fail with "no stub for...", not the empty-page success this asserts.
+        let page = JobBankCanada.fetch_page(&env.ctx, None).await.unwrap();
+        assert_eq!(page.items.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_blank_configured_search_term_falls_back_to_the_default() {
+        let mut env = TestEnv::new("fetchers");
+        env.ctx.config = ModuleConfig::new(json!({
+            "sources": {"jobbank-canada": {"enabled": false, "interval": "daily", "search_term": "   "}}
+        }));
+        allow_robots(&env);
+        stub(&env, &url_for_page(1), ok(PAGE1));
+
+        let page = JobBankCanada.fetch_page(&env.ctx, None).await.unwrap();
+        assert_eq!(page.items.len(), 2, "a blank search_term must behave exactly like none at all");
     }
 
     #[tokio::test]

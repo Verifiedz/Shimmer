@@ -491,6 +491,7 @@ mod tests {
             page_size: None,
             title_contains: Vec::new(),
             title_excludes: Vec::new(),
+            search_term: None,
         }
     }
 

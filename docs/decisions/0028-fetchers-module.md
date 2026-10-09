@@ -19,6 +19,8 @@ Amended (ad-hoc filter override): `--contains`/`--excludes` on `shimmer fetchers
 — see §14. No `core`/`proto` change; two new optional params on two existing ops.
 Amended (issue #127's own follow-up): the `json-api` kind, named in §2a and never built
 until now — see §15. No `core`/`proto` change, no new op.
+Amended (configurable search term): `jobbank-canada`'s query is no longer a compiled-in
+constant — see §16. No `core`/`proto` change, no new op; one new `SourceConfig` field.
 
 ## Context
 
@@ -577,6 +579,39 @@ page_size = 50
 - **No `core`/`proto` change, no new op** — `SourceConfig`, `crate::source::resolve`, and a
   new `crates/modules/fetchers/src/sources/json_api.rs`, the same shape `rss` already
   established.
+
+### 16. Amendment: a configurable `search_term` for `jobbank-canada`
+
+Live use turned up a real gap: `jobbank-canada`'s search query (`"software engineer"`) was
+a compiled-in constant, so there was no way to point the same source at a different query
+— e.g. `"junior software developer"` — without a code change. Confirmed live that this
+matters: Job Bank's own search does more than literal title matching (results for
+`"junior software developer"` are mostly titled plainly "software developer," matched on
+something beyond the title text — likely a NOC-code or description-level match), so
+`title_contains`/`title_excludes` (§13) filtering *after* a fixed `"software engineer"`
+query cannot recover what a *different* query already surfaces directly.
+
+- **`search_term`** (`SourceConfig`): a free-text override of a fixed source's own
+  built-in query, read by the source itself rather than validated or interpreted by
+  `FetchersConfig::from_value` — there is nothing to validate beyond "is it a string," the
+  same posture `title_contains`/`title_excludes` already take. Blank after trimming is
+  treated identically to absent: both fall back to `jobbank-canada`'s own
+  `DEFAULT_SEARCH_TERM` ("software engineer"), so an empty string in `config.toml` can
+  never become a literal empty query to the real site.
+- **Scoped generically on `SourceConfig`, read only by `jobbank-canada` today** — the same
+  shape `title_contains`/`title_excludes` already have (defined once, any source *could*
+  read them, only some do). No other fixed source currently reads `search_term`;
+  `weworkremotely` has no equivalent free-text query to override (§10: it walks a fixed
+  category-slug rotation, not a search string), and a `json-api`-kind source's query lives
+  in its own configured `url` already.
+- **Built with `url::Url`'s own query encoder, not string interpolation.** The previous
+  hardcoded query was a pre-encoded literal (`"software+engineer"`); once the term became
+  configurable and free-text, naive `format!` interpolation would silently produce a
+  malformed request for any term containing a space, `&`, or other character needing
+  percent-encoding. `url::Url::query_pairs_mut().append_pair(...)` encodes correctly
+  regardless of what the configured term contains.
+- **No `core`/`proto` change, no new op** — one new `SourceConfig` field and a change
+  confined to `crates/modules/fetchers/src/sources/jobbank.rs`.
 
 ## Not done here
 
