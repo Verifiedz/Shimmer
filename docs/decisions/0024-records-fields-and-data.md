@@ -1,7 +1,7 @@
 # 0024. Records: datetime, list and reference fields; import and export; query follow-ups
 
-Status: proposed · Raised by Dev B (records roadmap, items 7, 8, 11, 13 and the follow-ups left by
-ADRs 0017–0021) · Needs sign-off: Dev A (new field types and ops in `records`,
+Status: accepted (records roadmap, #101) · Raised by Dev B (records roadmap, items 7, 8, 11, 13 and
+the follow-ups left by ADRs 0017–0021) · Signed off: Dev A (new field types and ops in `records`,
 docs/protocol.md) · Dev C notified (new wire shapes) · No `core` or `proto` change
 
 ## Context

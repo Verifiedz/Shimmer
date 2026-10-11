@@ -9,6 +9,7 @@ mod autostart;
 mod client;
 mod csv;
 mod flags;
+mod follow;
 pub mod packs;
 mod queue;
 mod records;

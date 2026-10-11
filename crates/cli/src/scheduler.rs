@@ -141,8 +141,10 @@ pub async fn run(client: &mut Client, cmd: &SchedulerCmd, json: bool) -> Result<
                 return Ok(render::json(&data));
             }
             let id = data["trigger_id"].as_str().unwrap_or("?").to_string();
-            let all = client.call("scheduler.list", json!({})).await?;
-            return Ok(added(&id, find(&all, &id), now));
+            // Just the new trigger, as `show` gets it (#104). It's already added, so if this
+            // fails, say so plainly rather than failing the command.
+            let new = client.call("scheduler.get", json!({"trigger_id": id})).await.ok();
+            return Ok(added(&id, new.as_ref(), now));
         }
         SchedulerCmd::Pause { id } => one(id, "scheduler.pause"),
         SchedulerCmd::Resume { id } => one(id, "scheduler.resume"),
@@ -161,10 +163,6 @@ pub async fn run(client: &mut Client, cmd: &SchedulerCmd, json: bool) -> Result<
         "scheduler.resume" => format!("✓ resumed {id}: it fires again from now on"),
         _ => format!("✓ removed {id}"),
     })
-}
-
-fn find<'a>(data: &'a Value, id: &str) -> Option<&'a Value> {
-    data["triggers"].as_array()?.iter().find(|t| t["id"].as_str() == Some(id))
 }
 
 fn added(id: &str, t: Option<&Value>, now: DateTime<Utc>) -> String {
@@ -372,17 +370,19 @@ mod tests {
     fn show_and_added_read_naturally() {
         let now = Utc::now();
         let data = sample(now);
-        let out = trigger(find(&data, "usr-1").unwrap(), now);
+        let usr1 = &data["triggers"][0];
+        assert_eq!(usr1["id"], "usr-1");
+        let out = trigger(usr1, now);
         assert!(out.starts_with("usr-1  (active)\n  op        records.list\n  params    {\"collection\":\"leetcode\"}\n  schedule  every 2d"), "{out}");
         assert!(
             out.contains("  lane      the op's own") && out.contains("(in 2h)") && out.contains("  last run  never"),
             "{out}"
         );
-        let msg = added("usr-1", find(&data, "usr-1"), now);
+        let msg = added("usr-1", Some(usr1), now);
         assert!(
             msg.starts_with("✓ added trigger usr-1: records.list every 2d, catch-up run-once\n  first run: in 2h ("),
             "{msg}"
         );
-        assert!(find(&data, "nope").is_none());
+        assert_eq!(added("usr-9", None, now), "✓ added trigger usr-9", "still says it was added");
     }
 }

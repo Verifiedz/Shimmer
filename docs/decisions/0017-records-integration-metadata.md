@@ -1,8 +1,8 @@
 # 0017. Collections describe what their data means: title, roles, unique, related, extra
 
-Status: proposed · Raised by Dev B (records roadmap, item 2) · Needs sign-off: Dev A (event
-payloads, docs/protocol.md) · Dev C notified (new collection keys and event fields) · No `core`
-or `proto` change
+Status: accepted (records roadmap, #101) · Raised by Dev B (records roadmap, item 2) · Signed off:
+Dev A (event payloads, docs/protocol.md) · Dev C notified (new collection keys and event fields) ·
+No `core` or `proto` change
 
 ## Context
 

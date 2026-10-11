@@ -1,7 +1,8 @@
 # 0018. Records without inventing ids: generated ids and renaming
 
-Status: proposed · Raised by Dev B (records roadmap, item 5) · Needs sign-off: Dev A (a new op
-and topic in `records`, docs/protocol.md) · Dev C notified · No `core` or `proto` change
+Status: accepted (records roadmap, #101) · Raised by Dev B (records roadmap, item 5) · Signed off:
+Dev A (a new op and topic in `records`, docs/protocol.md) · Dev C notified · No `core` or `proto`
+change
 
 ## Context
 

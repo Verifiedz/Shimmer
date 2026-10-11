@@ -1,6 +1,6 @@
 # 0026. Workspaces: stopping one, and removing one with an undo
 
-Status: proposed · Raised by Dev B (while testing ADR 0025's `web-project`) · Needs sign-off:
+Status: accepted (M3, #96) · Raised by Dev B (while testing ADR 0025's `web-project`) · Signed off:
 Dev A (a new transition in CLAUDE.md §10.3's state machine; three new ops in `workspaces`,
 docs/protocol.md) · Dev C notified · No `core` or `proto` change
 
