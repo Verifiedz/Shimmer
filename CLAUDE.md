@@ -30,7 +30,7 @@ Everything a user sees is a specialisation of one of these.
 | `scheduler` | *When* work happens: recurring, one-shot, calendar-driven triggers | Triggers registered by any module |
 | `workspaces` | Launching configured sessions from user scripts | Per-setup scripts (Hyprland, macOS, Windows) |
 | `records` | Typed collections: schema, storage, filtering, completion metrics | Job apps, LeetCode, OSS repos, outreach, docs, career fairs, saved links |
-| `fetchers` | Reaching outward: rate limits, caching, dedup, backoff | Job boards, tech news, docs sites, transcript APIs |
+| `fetchers` | Reaching outward: scheduling, dedup, backoff (rate limits and caching live in `ctx.http`, ADR 0027) | Job boards, tech news, docs sites, transcript APIs |
 | `notify` | Delivering messages: batching, retry, quiet hours, fallback sinks | Email, phone push, desktop, webhook |
 | `calendar` | Shared dated entries other mechanisms read and write | Deadlines, career fairs, scheduled sessions |
 
@@ -157,7 +157,7 @@ crates/
                  IPC server, indexer.
   modules/
     records/     Collection trait + generic record storage, filtering, metrics.
-    fetchers/    Source trait + fetch execution, dedup, caching.
+    fetchers/    Source trait + fetch execution, dedup.
     workspaces/  Workspace manifests, state machine, script execution.
     notify/      Sink trait + delivery, batching, fallback sinks.
     calendar/    Shared dated entries; registers triggers with the scheduler.
@@ -171,6 +171,9 @@ docs/
   protocol.md    IPC contract. Change-controlled.
   decisions/     ADRs, one file per decision, numbered.
 ```
+
+This is the target layout, not all of it built yet. `crates/app`'s `run_daemon` lists the
+modules actually registered.
 
 ### Dependency rules (enforced, not advisory)
 

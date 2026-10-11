@@ -18,7 +18,11 @@ Unix domain socket, stream mode.
 | macOS | `$SHIMMER_HOME/daemon.sock` |
 | Windows | Named pipe `\\.\pipe\shimmer-daemon` (deferred; not before M6) |
 
-The path is also exported to workspace scripts as `SHIMMER_SOCKET`.
+The path is also exported to workspace scripts as `SHIMMER_SOCKET`. A client reads that
+variable too: when `SHIMMER_SOCKET` is set and non-empty it wins over the table above
+(`crates/proto/src/paths.rs`), so a script calling `shimmer` reaches the daemon that launched
+it. The CLI's `--socket PATH` overrides both, and a command given `--socket` never auto-starts a
+daemon.
 
 If the socket file exists but connecting returns `ECONNREFUSED`, the daemon died without
 cleaning up. Clients should unlink it and start a daemon.
@@ -529,7 +533,8 @@ daemon: a `confirmation_required` round-trip, a `workspace_dirty` failure, a
 
 ```
 $ shimmer mockd --fixtures crates/mockd/fixtures --socket /tmp/shimmer-mock.sock
-$ shimmer tui --socket /tmp/shimmer-mock.sock
+$ shimmer --socket /tmp/shimmer-mock.sock manifest    # any CLI command works against it today
+$ shimmer tui --socket /tmp/shimmer-mock.sock         # once crates/tui exists (M5)
 ```
 
 Both flags are required, so the mock can never silently take over the real daemon's socket.
