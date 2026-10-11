@@ -15,9 +15,12 @@ fn bin(home: &Home) -> PathBuf {
     home.dir.path().join("fakehome/.local/bin")
 }
 
-/// Run `program args…` with the test's environment, `PATH` starting with the link folder.
+/// Run `program args…` with the test's environment. `PATH` is the test's own link folder and
+/// nothing else: never the real `PATH`, nor the system's folders. A developer who has used a
+/// pack has its aliases linked in `~/.local/bin`, and the linker rightly refuses to shadow a
+/// command that's already on `PATH`, so the counts below would depend on the machine (#97).
 fn run(home: &Home, program: &Path, args: &[&str]) -> Output {
-    let path = format!("{}:{}", bin(home).display(), std::env::var("PATH").unwrap_or_default());
+    let path = bin(home);
     Command::new(program)
         .args(args)
         .env("SHIMMER_HOME", home.dir.path().join("home"))
@@ -77,8 +80,8 @@ fn no_pack_by_default_and_packs_need_no_daemon() {
 fn use_links_aliases_that_run_shimmer_and_the_whole_command() {
     let home = Home::with_leetcode();
     let out = ok(shimmer(&home, &["packs", "use", "short"]));
-    assert!(out.starts_with("✓ active pack: short (Short)\n  linked 28 commands into"), "{out}");
-    assert_eq!(links(&home).len(), 28);
+    assert!(out.starts_with("✓ active pack: short (Short)\n  linked 50 commands into"), "{out}");
+    assert_eq!(links(&home).len(), 50);
 
     // On their own, through the links: ping starts the daemon; a record goes in and is completed.
     assert!(ok(bare(&home, "up", &[])).starts_with("pong"));
@@ -106,7 +109,7 @@ fn switching_swaps_the_links_and_none_removes_them() {
     assert!(links(&home).contains(&"ikuzo".to_string()));
 
     let out = ok(shimmer(&home, &["packs", "use", "ship-it"]));
-    assert!(out.contains("linked 28") && out.contains("removed 28"), "{out}");
+    assert!(out.contains("linked 50") && out.contains("removed 50"), "{out}");
     assert!(links(&home).contains(&"deploy".to_string()) && !links(&home).contains(&"ikuzo".to_string()));
 
     ok(shimmer(&home, &["packs", "use", "starship", "--no-link"]));
@@ -126,7 +129,7 @@ fn nothing_of_the_users_is_ever_overwritten_or_removed() {
     std::fs::write(bin(&home).join("deploy"), "my own deploy script").unwrap();
 
     let out = ok(shimmer(&home, &["packs", "use", "ship-it"]));
-    assert!(out.contains("linked 27") && out.contains("skipped deploy: it already exists"), "{out}");
+    assert!(out.contains("linked 49") && out.contains("skipped deploy: it already exists"), "{out}");
     ok(shimmer(&home, &["packs", "use", "none"]));
     assert_eq!(links(&home), ["deploy"]);
     assert_eq!(std::fs::read_to_string(bin(&home).join("deploy")).unwrap(), "my own deploy script");
