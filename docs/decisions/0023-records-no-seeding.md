@@ -1,8 +1,8 @@
 # 0023. A fresh install has no collections; LeetCode is a template like the others
 
-Status: proposed · Raised by Dev B (records roadmap) · Needs sign-off: Dev A (changes ADR 0008's
-seeding rule; small changes to end-to-end tests in `crates/app`) · Dev C notified · No `core` or
-`proto` change
+Status: accepted (records roadmap, #101) · Raised by Dev B (records roadmap) · Signed off: Dev A
+(changes ADR 0008's seeding rule; small changes to end-to-end tests in `crates/app`) · Dev C
+notified · No `core` or `proto` change
 
 ## Context
 

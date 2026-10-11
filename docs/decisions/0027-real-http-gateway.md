@@ -1,7 +1,7 @@
 # 0027. The real HTTP gateway: `RealHttpBackend`
 
-Status: proposed · Raised by Dev A · Needs sign-off: Dev A, Dev B (CLAUDE.md §4, changes `core`)
-· No protocol change
+Status: accepted (M6, #109) · Raised by Dev A · Signed off: Dev A, Dev B (CLAUDE.md §4, changes
+`core`) · No protocol change
 
 ## Context
 

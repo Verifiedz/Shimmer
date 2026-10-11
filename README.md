@@ -8,7 +8,8 @@ you can read, edit, copy to another computer or commit to git. There is no serve
 and no network requirement.
 
 Today Shimmer is a background daemon plus a command-line client. You use it to define trackers
-and add, list, filter, update and complete records in them.
+and add, list, filter, update and complete records in them, to launch workspaces (your own
+scripts that set up a work session), and to schedule and watch background work.
 
 ## Overview
 
@@ -19,11 +20,13 @@ code today:
 | Mechanism | What it does |
 |---|---|
 | **records** | Typed collections. Each collection is a TOML file that declares its fields (`string`, `enum`, `date`, …); each record is its own TOML file. Handles add, list, filter, update, complete and remove. Ready-made templates (LeetCode, job applications, interviews, …) create a tracker with one command; a fresh install starts with none. |
+| **workspaces** | Launches a work session from your own scripts: numbered steps run in order, each either waited on or left running (an editor, a browser). A failed launch marks the workspace `dirty` until its cleanup script runs, so you never launch into a half-set-up session. |
 | **queue** | The single pipeline every unit of background work runs through. Work is split into lanes, each with its own concurrency limit. |
 | **scheduler** | Owns *when* work happens: recurring and one-shot triggers that enqueue tasks on the queue. It never runs anything itself. |
 | **event bus** | How the pieces react to each other. Every change is published as an event (`records.item.completed`, …) and appended to a log. Modules never call each other directly. |
 
-`records` is a module. The queue, scheduler and event bus are core services inside the daemon.
+`records` and `workspaces` are modules. The queue, scheduler and event bus are core services
+inside the daemon.
 The full design, including the mechanisms that aren't built yet, is in
 [`CLAUDE.md`](CLAUDE.md) §1.1.
 
@@ -70,9 +73,11 @@ commit it as-is.
 
 ## Running it
 
-You need Rust (installed with [rustup](https://rustup.rs)) and git, on Linux or macOS. Windows
-isn't supported yet. The repository pins the stable toolchain, so rustup fetches the right
-version on the first build.
+You need Rust 1.89 or newer (installed with [rustup](https://rustup.rs)), a C compiler and git,
+on Linux or macOS. Windows isn't supported yet. The repository pins the stable toolchain, so
+rustup fetches the right version on the first build. On Debian or Ubuntu, `sudo apt install
+build-essential curl git python3` and then rustup covers everything; see
+[CONTRIBUTING.md](CONTRIBUTING.md#on-debian-or-ubuntu).
 
 ```sh
 git clone https://github.com/Verifiedz/Shimmer.git
@@ -138,6 +143,26 @@ shimmer records list jobs --stage saved
 
 Every collection created from a template (`shimmer records new ID --from TEMPLATE`) lands in the
 same folder as an ordinary, commented file, and is a good reference. You can edit those too.
+
+### Workspaces, the queue and the scheduler
+
+```sh
+shimmer workspaces templates               # ready-made workspaces, by category
+shimmer workspaces peek web-project        # what one does before you use it
+shimmer workspaces new site --from web-project
+shimmer workspaces list                    # every workspace and its state (ready, active, dirty)
+shimmer workspaces activate site           # run its steps in order; add --wait to follow along
+shimmer workspaces status site             # steps, last session, and why it's dirty if it is
+shimmer workspaces stop site               # stop what it started
+shimmer queue list                     # what is running and waiting, per lane
+shimmer scheduler list                 # every trigger, when it next fires and its state
+shimmer scheduler add records.list '{"collection":"leetcode"}' --every 1d --catch-up skip
+```
+
+A workspace is a folder in `$SHIMMER_HOME/data/workspaces/<name>/` holding a `workspace.toml`
+and a `steps/` folder of scripts. [`CLAUDE.md`](CLAUDE.md) §10 shows an example and ADR 0012
+has every rule. `shimmer workspaces --help`, `shimmer queue --help` and
+`shimmer scheduler --help` cover the rest.
 
 ### Other commands
 
