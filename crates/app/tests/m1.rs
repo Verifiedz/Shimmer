@@ -116,3 +116,50 @@ fn a_broken_collection_file_breaks_only_itself() {
     assert_eq!(o.status.code(), Some(1));
     assert!(stderr(&o).contains("invalid_params: collection file 'broken.toml'"), "{}", stderr(&o));
 }
+
+#[test]
+fn an_unreadable_record_file_never_blocks_the_others() {
+    // #99, through the real binary: a record file that isn't valid UTF-8 (a bad hand-edit, a
+    // half-synced file) is skipped and named, and every command keeps working.
+    let home = Home::with_leetcode();
+    let ok = |args: &[&str]| {
+        let o = home.shimmer(args);
+        assert!(o.status.success(), "shimmer {args:?} failed: {}", stderr(&o));
+        stdout(&o)
+    };
+    ok(&["records", "add", "leetcode", "two-sum", "--title", "Two Sum", "--difficulty", "easy"]);
+    ok(&["records", "add", "leetcode", "gone", "--title", "Gone", "--difficulty", "easy"]);
+    ok(&["records", "remove", "leetcode/gone"]);
+    let items = home.dir.path().join("home/data/records/items/leetcode");
+    std::fs::write(items.join("garbled.toml"), [0xff, 0xfe, b'x']).unwrap();
+    let trash = home.dir.path().join("home/data/records/trash/leetcode");
+    std::fs::write(trash.join("garbled-too.toml"), [0xff, 0xfe, b'y']).unwrap();
+
+    // Writes, which check unique values against every record, still work.
+    assert_eq!(
+        ok(&["records", "add", "leetcode", "lru", "--title", "LRU", "--difficulty", "medium"]).trim(),
+        "added leetcode/lru"
+    );
+    ok(&["records", "update", "leetcode/lru", "--difficulty", "hard"]);
+    ok(&["records", "rename", "leetcode/lru", "lru-cache"]);
+    ok(&["records", "restore", "leetcode/gone"]);
+    ok(&["records", "remove", "leetcode/gone"]);
+
+    // The list and the trash show what they can, and name what they can't.
+    let list = ok(&["records", "list", "leetcode"]);
+    assert!(list.contains("two-sum") && list.contains("lru-cache"), "{list}");
+    assert!(list.contains("skipped: record file 'garbled.toml'"), "{list}");
+    let shown = ok(&["records", "trash", "leetcode"]);
+    assert!(shown.contains("gone") && shown.contains("skipped: record file 'garbled-too.toml'"), "{shown}");
+
+    // Renaming a field renames everywhere it can and says which files keep the old name.
+    let renamed = ok(&["records", "rename-field", "leetcode", "difficulty", "level"]);
+    assert!(renamed.starts_with("✓ leetcode: field 'difficulty' is now 'level' (3 record(s) updated)"), "{renamed}");
+    assert!(renamed.contains("skipped, still has 'difficulty': record file 'garbled.toml'"), "{renamed}");
+    assert!(renamed.contains("skipped, still has 'difficulty': record file 'garbled-too.toml'"), "{renamed}");
+    assert!(renamed.contains("fix those files, then: shimmer records check leetcode"), "{renamed}");
+
+    // And check names it as a problem, as before.
+    let check = ok(&["records", "check", "leetcode"]);
+    assert!(check.contains("garbled") && check.contains("can't be read"), "{check}");
+}

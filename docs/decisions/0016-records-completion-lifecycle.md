@@ -1,8 +1,8 @@
 # 0016. Records completion lifecycle: reopen, complete with fields, repeated completions
 
-Status: proposed · Raised by Dev B (records roadmap, item 3) · Needs sign-off: Dev A (a new op
-and topic in `records`, docs/protocol.md) · Dev C notified (new op, new topic, new collection
-key) · No `core` or `proto` change
+Status: accepted (records roadmap, #101) · Raised by Dev B (records roadmap, item 3) · Signed off:
+Dev A (a new op and topic in `records`, docs/protocol.md) · Dev C notified (new op, new topic, new
+collection key) · No `core` or `proto` change
 
 ## Context
 

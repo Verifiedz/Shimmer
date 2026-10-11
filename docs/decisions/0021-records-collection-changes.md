@@ -1,8 +1,8 @@
 # 0021. Collections over time: reference lists, checking, renaming, removing
 
-Status: proposed · Raised by Dev B (records roadmap, items 9 and 10; issue #81) · Needs sign-off:
-Dev A (new ops and topics in `records`, docs/protocol.md, a new dependency) · Dev C notified
-(items can lack `status`) · No `core` or `proto` change
+Status: accepted (records roadmap, #101) · Raised by Dev B (records roadmap, items 9 and 10; issue
+#81) · Signed off: Dev A (new ops and topics in `records`, docs/protocol.md, a new dependency) ·
+Dev C notified (items can lack `status`) · No `core` or `proto` change
 
 ## Context
 
