@@ -60,6 +60,8 @@ commands:
 --wait  follow the launch until it ends and show how it went. Without it the command
         returns once the launch is queued; check on it with 'shimmer workspaces status NAME'.
         Don't use --wait from a workspace's own step scripts: launches run one at a time.
+        With --json: the op's result, or {\"result_missed\": true, \"task\": {…}} when it
+        succeeded but its result was lost to dropped events (then fields like log are absent).
 --yes   skip the question. Needed when no one is at the keyboard (scripts).
 
 A workspace is a folder under data/workspaces/ in your Shimmer folder, holding a
@@ -683,7 +685,7 @@ async fn queued(client: &mut Client, kind: Queued, id: &str, wait: bool, json: b
         Ok(Followed::ResultMissed(task)) => Ok(if json {
             render::json(&json!({"result_missed": true, "task": task}))
         } else {
-            format!("{}\n  (its output was missed: some events were dropped; see {look})", kind.done(id))
+            format!("{}\n  (its output was missed: some events were dropped; see '{look}')", kind.done(id))
         }),
         Err(e) if json => Err(e),
         Err(e) => Err(explain(e, id)),
@@ -729,7 +731,9 @@ fn explain(e: Error, id: &str) -> Error {
     if e.code != ErrorCode::WorkspaceDirty {
         return e;
     }
-    let detail = e.detail.clone().unwrap_or(Value::Null);
+    // After a lagged stream the error has its code but no detail (#157): which ways out apply
+    // (is there a cleanup script?) is unknown, and its message already names where to look.
+    let Some(detail) = e.detail.clone() else { return e };
     let mut message = e.message.clone();
     if let Some(log) = detail["log"].as_str().filter(|l| !l.is_empty()) {
         // Why it failed is the end of the step's log (a template's check step says it in one line).
@@ -1910,6 +1914,22 @@ mod tests {
         let without = ways_out("deep-work", false);
         assert!(!without.contains("cleanup deep-work"), "{without}");
         assert!(without.contains("force-relaunch deep-work") && without.contains("reset deep-work"), "{without}");
+    }
+
+    #[test]
+    fn a_dirty_error_without_detail_points_at_status_instead_of_guessing() {
+        // After a lagged stream (#157) the code survives but the detail doesn't: whether there is
+        // a cleanup script is unknown, so no ways out are offered; the message names `status`.
+        let lagged = Error::new(
+            ErrorCode::WorkspaceDirty,
+            "step 1 failed (some events were dropped, so details may be missing: see 'shimmer workspaces status s')",
+        );
+        let e = explain(lagged.clone(), "s");
+        assert_eq!((e.code, &e.message), (ErrorCode::WorkspaceDirty, &lagged.message));
+        assert!(!e.message.contains("fix it with one of"), "{}", e.message);
+        // With detail, as before: the ways out, cleanup included when there's a script.
+        let full = lagged.with_detail(json!({"has_cleanup_script": true}));
+        assert!(explain(full, "s").message.contains("shimmer workspaces cleanup s"));
     }
 
     #[test]
