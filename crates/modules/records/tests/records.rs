@@ -1025,24 +1025,33 @@ async fn every_template_is_listed_and_creates_a_valid_collection() {
     assert_eq!(
         ids,
         [
-            "addresses",
-            "certifications",
-            "charity",
-            "documents",
-            "education",
-            "employment",
+            // By category (ADR 0030 §1), then id.
             "interview-questions",
             "interviews",
             "job-applications",
-            "leetcode",
             "networking-events",
             "offers",
             "outreach",
-            "projects",
             "stories",
+            "leetcode",
+            "certifications",
+            "education",
+            "employment",
+            "projects",
+            "addresses",
+            "charity",
+            "documents",
             "subscriptions"
         ]
     );
+    let categories: Vec<&str> =
+        data["categories"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
+    assert_eq!(categories, ["job-hunt", "practice", "career", "life"]);
+    for t in data["templates"].as_array().unwrap() {
+        assert!(categories.contains(&t["category"].as_str().unwrap()), "{t}");
+        assert!(t["examples"].as_array().is_some_and(|e| !e.is_empty()), "{}: no examples", t["id"]);
+        assert!(t.get("file").is_none(), "{}: the file only when asked", t["id"]);
+    }
 
     for template in &ids {
         let id = format!("my-{template}");
@@ -1060,6 +1069,30 @@ async fn every_template_is_listed_and_creates_a_valid_collection() {
     // And each one is usable right away.
     let check = call(&r, &env, "records.check", json!({"collection": "my-job-applications"})).await.unwrap();
     assert_eq!(check["checked"], 0);
+}
+
+#[tokio::test]
+async fn templates_gives_one_in_full_with_its_notes_and_file() {
+    let (r, env) = setup().await;
+    let data = call(&r, &env, "records.templates", json!({"id": "addresses", "file": true})).await.unwrap();
+    let all = data["templates"].as_array().unwrap();
+    assert_eq!(all.len(), 1);
+    let t = &all[0];
+    assert_eq!((t["id"].as_str(), t["category"].as_str()), (Some("addresses"), Some("life")));
+    // The header's privacy paragraph, as one line; the examples as written.
+    let notes = t["notes"].as_array().unwrap();
+    assert!(notes.iter().any(|n| n.as_str().unwrap().starts_with("Private information: this file")), "{notes:?}");
+    assert!(!notes.iter().any(|n| n.as_str().unwrap().contains("Created from")), "{notes:?}");
+    assert!(t["examples"][0].as_str().unwrap().starts_with("shimmer records add <collection> --street"), "{t}");
+    // The file is the template exactly: what `records.create_collection` copies.
+    assert_eq!(t["file"].as_str().unwrap(), include_str!("../templates/addresses.toml"));
+    assert_eq!(data["categories"].as_array().unwrap().len(), 4, "the headings come along");
+
+    let e = call(&r, &env, "records.templates", json!({"id": "chess"})).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::NotFound);
+    assert!(e.message.contains("no template 'chess' (there are: addresses, certifications"), "{}", e.message);
+    // Nothing written, nothing emitted: it's a read.
+    assert!(env.backend.events().is_empty());
 }
 
 #[tokio::test]

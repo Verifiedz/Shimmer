@@ -10,6 +10,7 @@ mod item;
 mod lifecycle;
 mod query;
 mod schema;
+mod templates;
 mod values;
 
 use async_trait::async_trait;
@@ -22,27 +23,6 @@ use shimmer_core::{CommandSpec, Ctx, Error, ErrorCode, Execution, Manifest, Modu
 use crate::item::Item;
 use crate::schema::Collection;
 
-/// Built-in collection templates (ADR 0022), by id. Each is an ordinary collection file whose
-/// `[collection] id` is the template's id; creating one copies it with only the id (and label)
-/// changed.
-const TEMPLATES: &[(&str, &str)] = &[
-    ("addresses", include_str!("../templates/addresses.toml")),
-    ("certifications", include_str!("../templates/certifications.toml")),
-    ("charity", include_str!("../templates/charity.toml")),
-    ("documents", include_str!("../templates/documents.toml")),
-    ("education", include_str!("../templates/education.toml")),
-    ("employment", include_str!("../templates/employment.toml")),
-    ("interview-questions", include_str!("../templates/interview-questions.toml")),
-    ("interviews", include_str!("../templates/interviews.toml")),
-    ("job-applications", include_str!("../templates/job-applications.toml")),
-    ("leetcode", include_str!("../templates/leetcode.toml")),
-    ("networking-events", include_str!("../templates/networking-events.toml")),
-    ("offers", include_str!("../templates/offers.toml")),
-    ("outreach", include_str!("../templates/outreach.toml")),
-    ("projects", include_str!("../templates/projects.toml")),
-    ("stories", include_str!("../templates/stories.toml")),
-    ("subscriptions", include_str!("../templates/subscriptions.toml")),
-];
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 500;
 /// Most rows one `records.import` takes (ADR 0024 §4).
@@ -143,7 +123,11 @@ impl Module for Records {
                 "List a collection's removed records",
                 json!({"type": "object", "required": ["collection"], "properties": {"collection": {"type": "string"}}}),
             ),
-            ("records.templates", "List the built-in collection templates", json!({"type": "object"})),
+            (
+                "records.templates",
+                "List the built-in collection templates",
+                json!({"type": "object", "properties": {"id": {"type": "string"}, "file": {"type": "boolean"}}}),
+            ),
             (
                 "records.create_collection",
                 "Create a collection from a template",
@@ -221,7 +205,7 @@ impl Module for Records {
             "records.restore" => self.restore(ctx, decode(params)?),
             "records.trash" => self.trash(ctx, decode(params)?),
             "records.check" => self.check(ctx, decode(params)?),
-            "records.templates" => self.templates(),
+            "records.templates" => templates_of(decode(params)?),
             "records.create_collection" => self.create_collection(ctx, decode(params)?),
             "records.rename_field" => self.rename_field(ctx, decode(params)?),
             "records.rename_collection" => self.rename_collection(ctx, decode(params)?),
@@ -294,6 +278,49 @@ struct CreateCollection {
     template: String,
     #[serde(default)]
     label: Option<String>,
+}
+
+/// `records.templates` (ADR 0030 §1): every template, or only `id`; with `file`, each one's
+/// text exactly as `records.new` would copy it.
+#[derive(Deserialize, Default)]
+struct WhichTemplates {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    file: bool,
+}
+
+/// Every built-in, by category (in [`templates::CATEGORIES`]' order) then id, as
+/// `records.collections` shows a collection plus its `category`, `notes` and `examples` (from its
+/// header comment), and the categories' headings. Only `id` when it's given.
+fn templates_of(which: WhichTemplates) -> Result<Value> {
+    let mut all: Vec<_> = templates::TEMPLATES.iter().collect();
+    if let Some(id) = &which.id {
+        all.retain(|(t, _, _)| t == id);
+        if all.is_empty() {
+            return Err(no_template(id));
+        }
+    }
+    all.sort_by_key(|(id, category, _)| (templates::rank(category), *id));
+    let wire = |(id, category, text): &&(&str, &str, &str)| -> Result<Value> {
+        let mut out = serde_json::to_value(Collection::parse(id, text)?).unwrap_or_default();
+        let (notes, examples) = templates::header(text);
+        out["category"] = json!(category);
+        out["notes"] = json!(notes);
+        out["examples"] = json!(examples);
+        if which.file {
+            out["file"] = json!(text);
+        }
+        Ok(out)
+    };
+    let categories: Vec<Value> =
+        templates::CATEGORIES.iter().map(|(id, label)| json!({"id": id, "label": label})).collect();
+    Ok(json!({"templates": all.iter().map(wire).collect::<Result<Vec<_>>>()?, "categories": categories}))
+}
+
+/// `not_found` for a template that isn't built in, naming the ones that are.
+fn no_template(id: &str) -> Error {
+    Error::not_found(format!("no template '{id}' (there are: {})", templates::names().join(", ")))
 }
 
 #[derive(Deserialize)]
@@ -562,17 +589,6 @@ impl Records {
         Ok(wire)
     }
 
-    /// Every built-in template, as `records.collections` shows a collection (ADR 0022 §2).
-    fn templates(&self) -> Result<Value> {
-        let templates = TEMPLATES
-            .iter()
-            .map(|(id, text)| Collection::parse(id, text).map(|c| serde_json::to_value(c).unwrap_or_default()))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(json!({"templates": templates}))
-    }
-
-    /// A new collection from a template: its text copied with only the id (and label) changed,
-    /// checked, and written with its event in one transaction. Never overwrites (ADR 0022 §2).
     fn create_collection(&self, ctx: &Ctx, p: CreateCollection) -> Result<Value> {
         if !is_valid_name(&p.id) {
             return Err(Error::invalid_params(format!(
@@ -580,9 +596,8 @@ impl Records {
                 p.id
             )));
         }
-        let Some((_, text)) = TEMPLATES.iter().find(|(id, _)| *id == p.template) else {
-            let names: Vec<&str> = TEMPLATES.iter().map(|(id, _)| *id).collect();
-            return Err(Error::not_found(format!("no template '{}' (there are: {})", p.template, names.join(", "))));
+        let Some(text) = templates::find(&p.template) else {
+            return Err(no_template(&p.template));
         };
         let mut text = collections::set_id(&p.template, text, &p.id)?;
         if let Some(label) = &p.label {

@@ -9,7 +9,7 @@
 #   shimmer records list <collection> --filter "companies has shopify"                   where Shopify will be
 #   shimmer records complete <collection>/<id> --contacts-made 4 --follow-up-on 2026-10-24 --worth-it great
 #                                                                                       attended: stamps attended_on
-#   shimmer records list <collection> --filter "followed_up!=true" --sort follow_up_on  who you still owe a message
+#   shimmer records list <collection> --filter "followed_up!=true" --sort follow_up_on   who you still owe a message
 
 [collection]
 id = "networking-events"
