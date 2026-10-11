@@ -1812,3 +1812,63 @@ async fn a_file_that_cant_be_read_is_reported_and_hides_nothing() {
     assert_eq!(list["total"], 1);
     assert!(list["skipped"][0].as_str().unwrap().contains("garbled.toml"), "{list}");
 }
+
+/// A collection with a unique field and a reference between its own records, for #99.
+const UNREADABLE_PLAN: &str = "[collection]\nid = \"plan\"\nlabel = \"Plan\"\n\n\
+[[field]]\nname = \"title\"\ntype = \"string\"\nrequired = true\n\n\
+[[field]]\nname = \"url\"\ntype = \"string\"\nunique = true\n\n\
+[[field]]\nname = \"follows\"\ntype = \"ref\"\ncollection = \"plan\"\n";
+
+#[tokio::test]
+async fn one_unreadable_record_never_blocks_writes_renames_imports_or_the_trash() {
+    // #99: an unreadable record file (here invalid UTF-8) used to abort every op that scans the
+    // collection: unique checks on each write, reference checks, import, the trash and
+    // rename_field. Now it's skipped, and reported where the person would otherwise not know.
+    let (r, env) = setup().await;
+    env.ctx.store.write("collections/plan.toml", UNREADABLE_PLAN).unwrap();
+    let add = |id: &str, fields: Value| json!({"collection": "plan", "id": id, "fields": fields});
+    call(&r, &env, "records.add", add("a", json!({"title": "A", "url": "https://x"}))).await.unwrap();
+    call(&r, &env, "records.add", add("b", json!({"title": "B", "follows": "a"}))).await.unwrap();
+    call(&r, &env, "records.add", add("gone", json!({"title": "Gone"}))).await.unwrap();
+    call(&r, &env, "records.remove", json!({"collection": "plan", "id": "gone"})).await.unwrap();
+    env.ctx.store.write("items/plan/garbled.toml", vec![0xff, 0xfe, b'x']).unwrap();
+    env.ctx.store.write("trash/plan/garbled-too.toml", vec![0xff, 0xfe, b'y']).unwrap();
+
+    // Unique checks run on every write: they skip it, and still catch a real duplicate.
+    call(&r, &env, "records.add", add("c", json!({"title": "C", "url": "https://y"}))).await.unwrap();
+    let dup = call(&r, &env, "records.add", add("d", json!({"title": "D", "url": "https://x"}))).await.unwrap_err();
+    assert_eq!(dup.code, ErrorCode::Conflict, "{}", dup.message);
+    let update = json!({"collection": "plan", "id": "c", "fields": {"title": "C2"}});
+    call(&r, &env, "records.update", update).await.unwrap();
+
+    // Reference checks: renaming a still repoints b.
+    call(&r, &env, "records.rename", json!({"collection": "plan", "id": "a", "new_id": "a2"})).await.unwrap();
+    let b = call(&r, &env, "records.get", json!({"collection": "plan", "id": "b"})).await.unwrap();
+    assert_eq!(b["follows"], "a2");
+
+    // Import.
+    let rows = json!({"collection": "plan", "rows": [{"id": "e", "title": "E"}]});
+    assert_eq!(call(&r, &env, "records.import", rows).await.unwrap()["added"], json!(["e"]));
+
+    // The trash lists what it can read, and says what it couldn't.
+    let trash = call(&r, &env, "records.trash", json!({"collection": "plan"})).await.unwrap();
+    assert_eq!(trash["items"].as_array().unwrap().len(), 1, "{trash}");
+    assert_eq!(trash["items"][0]["id"], "gone");
+    assert!(trash["skipped"][0].as_str().unwrap().contains("garbled-too.toml"), "{trash}");
+
+    // rename_field renames everywhere it can, and names the files it couldn't (they keep the old
+    // name): the unreadable ones and one that's valid text but broken TOML.
+    env.ctx.store.write("items/plan/broken.toml", "title = [unclosed").unwrap();
+    let renamed = call(&r, &env, "records.rename_field", json!({"collection": "plan", "from": "title", "to": "name"}))
+        .await
+        .unwrap();
+    assert_eq!(renamed["updated"], 5, "a2, b, c, e and gone in the trash: {renamed}");
+    let skipped: Vec<&str> = renamed["skipped"].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
+    assert_eq!(skipped.len(), 3, "{skipped:?}");
+    for name in ["garbled.toml", "garbled-too.toml", "broken.toml"] {
+        assert!(skipped.iter().any(|s| s.contains(name)), "{name} not in {skipped:?}");
+    }
+    // Nothing unreadable: no `skipped` key at all, as in records.list.
+    let clean = call(&r, &env, "records.trash", json!({"collection": "leetcode"})).await.unwrap();
+    assert!(clean.get("skipped").is_none(), "{clean}");
+}

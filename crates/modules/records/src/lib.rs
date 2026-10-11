@@ -649,14 +649,20 @@ impl Records {
         let renamed = collections::rename_field(&c.id, &text, &p.from, &p.to)?;
         let new = Collection::parse(&c.id, &renamed)?;
 
-        let mut writes = Vec::new();
+        let (mut writes, mut skipped) = (Vec::new(), Vec::new());
         for dir in [format!("items/{}", c.id), format!("trash/{}", c.id)] {
             for path in ctx.store.list(&dir)? {
                 let Some(id) = path.strip_prefix(&format!("{dir}/")).and_then(|p| p.strip_suffix(".toml")) else {
                     continue;
                 };
-                let Some(Ok(mut item)) = ctx.store.read_string(&path)?.map(|text| Item::from_toml(id, &text)) else {
-                    continue;
+                // A file it can't read keeps the old name: say which, so it can be fixed (#99).
+                let mut item = match read_item(ctx, &path, id) {
+                    Some(Ok(item)) => item,
+                    Some(Err(e)) => {
+                        skipped.push(e.message);
+                        continue;
+                    }
+                    None => continue,
                 };
                 let Some(value) = item.fields.remove(&p.from) else { continue };
                 if item.fields.contains_key(&p.to) {
@@ -677,7 +683,11 @@ impl Records {
             }
             tx.emit("records.field.renamed", json!({"collection": c.id, "from": p.from, "to": p.to}))
         })?;
-        Ok(json!({"collection": new, "updated": updated}))
+        let mut out = json!({"collection": new, "updated": updated});
+        if !skipped.is_empty() {
+            out["skipped"] = json!(skipped);
+        }
+        Ok(out)
     }
 
     /// Move a collection, its records and its trash to a new id (ADR 0021 §4).
@@ -801,7 +811,7 @@ impl Records {
                 continue;
             };
             taken_ids.insert(id.to_owned());
-            if let Some(Ok(record)) = ctx.store.read_string(&path)?.map(|text| Item::from_toml(id, &text)) {
+            if let Some(Ok(record)) = read_item(ctx, &path, id) {
                 for (field, value) in c.unique_values(&record.fields_map()) {
                     taken_values.push((field.to_owned(), value.clone(), id.to_owned()));
                 }
@@ -994,17 +1004,24 @@ impl Records {
     fn trash(&self, ctx: &Ctx, p: CollectionOnly) -> Result<Value> {
         let c = load_collection(ctx, &p.collection)?;
         let dir = format!("trash/{}", c.id);
-        let mut items: Vec<Value> = Vec::new();
+        let (mut items, mut skipped): (Vec<Value>, Vec<String>) = (Vec::new(), Vec::new());
         for path in ctx.store.list(&dir)? {
             let Some(id) = path.strip_prefix(&format!("{dir}/")).and_then(|p| p.strip_suffix(".toml")) else {
                 continue;
             };
-            if let Some(Ok(item)) = ctx.store.read_string(&path)?.map(|text| Item::from_toml(id, &text)) {
-                items.push(item.to_wire(&c));
+            // As in `list`: one bad file is named, and hides nothing else (#99).
+            match read_item(ctx, &path, id) {
+                Some(Ok(item)) => items.push(item.to_wire(&c)),
+                Some(Err(e)) => skipped.push(e.message),
+                None => {}
             }
         }
         items.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
-        Ok(json!({"items": items}))
+        let mut out = json!({"items": items});
+        if !skipped.is_empty() {
+            out["skipped"] = json!(skipped);
+        }
+        Ok(out)
     }
 }
 
@@ -1036,7 +1053,7 @@ fn check_unique(ctx: &Ctx, c: &Collection, id: &str, values: &Map<String, Value>
         if other == id {
             continue;
         }
-        let Some(Ok(record)) = ctx.store.read_string(&path)?.map(|text| Item::from_toml(other, &text)) else {
+        let Some(Ok(record)) = read_item(ctx, &path, other) else {
             continue;
         };
         for (field, value) in &wanted {
@@ -1129,7 +1146,7 @@ fn referrers(ctx: &Ctx, target: &str, id: &str) -> Result<Vec<(Collection, Item)
             let Some(rid) = path.strip_prefix(&format!("{dir}/")).and_then(|p| p.strip_suffix(".toml")) else {
                 continue;
             };
-            let Some(Ok(record)) = ctx.store.read_string(&path)?.map(|text| Item::from_toml(rid, &text)) else {
+            let Some(Ok(record)) = read_item(ctx, &path, rid) else {
                 continue;
             };
             if c.refs_in(&record.fields).iter().any(|(_, t, i)| *t == target && *i == id) {
