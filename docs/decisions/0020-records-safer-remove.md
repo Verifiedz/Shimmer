@@ -1,8 +1,8 @@
 # 0020. Removing a record without losing it: trash, restore, and a full removal event
 
-Status: proposed · Raised by Dev B (records roadmap, item 6) · Needs sign-off: Dev A (an
-`records.item.removed` payload change, a new op and topic, docs/protocol.md) · Dev C notified ·
-No `core` or `proto` change
+Status: accepted (records roadmap, #101) · Raised by Dev B (records roadmap, item 6) · Signed off:
+Dev A (an `records.item.removed` payload change, a new op and topic, docs/protocol.md) · Dev C
+notified · No `core` or `proto` change
 
 ## Context
 
