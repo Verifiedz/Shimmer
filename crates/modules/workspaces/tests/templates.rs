@@ -204,27 +204,40 @@ fn state_dir(tmp: &std::path::Path, home: &str) -> std::result::Result<String, S
 #[test]
 fn run_time_files_live_in_a_private_folder_per_user_shimmer_folder_and_workspace() {
     use std::os::unix::fs::PermissionsExt;
+    /// Removes the test's folder even when an assert fails.
+    struct Gone(std::path::PathBuf);
+    impl Drop for Gone {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
     let tmp = std::env::temp_dir().join(format!("shimmer-state-test-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
+    let _gone = Gone(tmp.clone());
+    let uid = String::from_utf8(Command::new("id").arg("-u").output().unwrap().stdout).unwrap();
 
     let a = state_dir(&tmp, "/home/a/.local/share/shimmer").unwrap();
     let b = state_dir(&tmp, "/home/b/.local/share/shimmer").unwrap();
     assert_ne!(a, b, "two Shimmer folders with a workspace named 'site' must not share one");
     assert!(a.ends_with("-site"), "{a}");
+    let name = std::path::Path::new(&a).file_name().unwrap().to_string_lossy().into_owned();
+    assert!(name.starts_with(&format!("shimmer-{}-", uid.trim())), "named after the user: {name}");
     assert_eq!(state_dir(&tmp, "/home/a/.local/share/shimmer").unwrap(), a, "the same each time");
     let mode = std::fs::metadata(&a).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o700, "private: {mode:o}");
+    // Our own folder left with loose permissions is made private again.
+    std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o777)).unwrap();
+    state_dir(&tmp, "/home/a/.local/share/shimmer").unwrap();
+    assert_eq!(std::fs::metadata(&a).unwrap().permissions().mode() & 0o777, 0o700, "tightened again");
 
     // Something already at that path that isn't our own folder is refused.
     std::fs::remove_dir(&b).unwrap();
     std::os::unix::fs::symlink(&tmp, &b).unwrap();
     let e = state_dir(&tmp, "/home/b/.local/share/shimmer").unwrap_err();
-    assert!(e.contains("isn't a folder of your own"), "{e}");
+    assert!(e.contains("not a folder of your own") && e.contains("a reboot clears it"), "{e}");
     std::fs::remove_file(&b).unwrap();
     std::fs::write(&b, "1234").unwrap();
     assert!(state_dir(&tmp, "/home/b/.local/share/shimmer").is_err(), "a planted file too");
-
-    std::fs::remove_dir_all(&tmp).unwrap();
 }
 
 #[tokio::test]

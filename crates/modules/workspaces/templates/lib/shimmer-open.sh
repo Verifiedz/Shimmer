@@ -35,11 +35,17 @@ shimmer_home_tag() {
 }
 SHIMMER_STATE_DIR="${TMPDIR:-/tmp}/shimmer-$(id -u)-$(shimmer_home_tag)-$SHIMMER_WORKSPACE_ID"
 # Private, and ours: one that already exists as anything else (another user's folder, a link)
-# could make stop signal a process this workspace never started, so it's refused.
+# could make stop signal a process this workspace never started, so it's refused. Written so a
+# shell that can't run a test refuses rather than accepts.
 mkdir -m 700 "$SHIMMER_STATE_DIR" 2>/dev/null
-if [ -L "$SHIMMER_STATE_DIR" ] || [ ! -d "$SHIMMER_STATE_DIR" ] || [ ! -O "$SHIMMER_STATE_DIR" ]; then
-    shimmer_fail "$SHIMMER_STATE_DIR isn't a folder of your own; remove it and try again"
+if ! { [ ! -L "$SHIMMER_STATE_DIR" ] && [ -d "$SHIMMER_STATE_DIR" ] && [ -O "$SHIMMER_STATE_DIR" ]; }; then
+    if [ ! -d "${TMPDIR:-/tmp}" ]; then
+        shimmer_fail "can't keep this workspace's run-time files: ${TMPDIR:-/tmp} doesn't exist (check TMPDIR)"
+    fi
+    owner=$(ls -ld "$SHIMMER_STATE_DIR" 2>/dev/null | awk '{print $3}')
+    shimmer_fail "can't use $SHIMMER_STATE_DIR for this workspace's run-time files: something else is there (owned by ${owner:-someone else}), not a folder of your own. Remove it if you can; a reboot clears it."
 fi
+chmod 700 "$SHIMMER_STATE_DIR"
 
 # ---------------------------------------------------------------- where windows open
 

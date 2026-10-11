@@ -271,6 +271,11 @@ the folder, not a single `OPEN_PATH` file.
 ends the server. A detached step is its own process group (ADR 0010 §3), so cleanup stops the
 server and everything it started with one `kill` of that group.
 
+A workspace created before #165 keeps its own copy of the helper, with the old shared folder.
+To give it the fixed one without touching its steps, copy the built-in helper over its copy:
+`shimmer workspaces peek web-project --file lib/shimmer-open.sh > <Shimmer folder>/data/workspaces/<name>/lib/shimmer-open.sh`
+while the workspace is stopped, or create the workspace again.
+
 **Secrets never go in answers.** `workspace.toml` is meant to be committable with the rest of
 `$SHIMMER_HOME` (CLAUDE.md §7). API keys stay in the project's own `.env.local`. The template's
 header comment says so, as the personal-data record templates do.
