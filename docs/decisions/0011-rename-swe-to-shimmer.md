@@ -53,7 +53,7 @@ A handful of lines were fixed by hand: CLAUDE.md's header, the README title, a c
 and CONTRIBUTING.md saying the command would be renamed later. Hand-fixed lines never mention
 the old name, so running the script again leaves them alone.
 
-The script can be deleted once no branch from before the rename is still open.
+The script can be deleted once no branch from before the rename is still open. (Deleted under #51 once none was left; it's in the history at `ef6fc21`.)
 
 ## Not done here
 
