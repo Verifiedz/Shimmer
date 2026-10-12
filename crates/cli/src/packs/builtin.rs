@@ -65,4 +65,26 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn the_readme_table_matches_the_built_in_packs() {
+        // docs/packs/README.md lists every built-in alias by hand; this keeps it true.
+        let readme = include_str!("../../../../docs/packs/README.md");
+        let packs = all();
+        let header =
+            format!("| Command | {} |", packs.iter().map(|p| format!("`{}`", p.id)).collect::<Vec<_>>().join(" | "));
+        assert!(readme.contains(&header), "the table's columns should be {header}");
+        let rows: BTreeSet<&str> = readme.lines().filter(|l| l.starts_with("| ") && l.ends_with('|')).collect();
+        for target in TARGETS {
+            let aliases: Vec<String> = packs
+                .iter()
+                .map(|p| {
+                    let alias = p.aliases.iter().find(|(_, t)| t.op == target.op).map(|(a, _)| a.as_str());
+                    format!("`{}`", alias.unwrap_or_default())
+                })
+                .collect();
+            let row = format!("| {} | {} |", target.words.join(" "), aliases.join(" | "));
+            assert!(rows.contains(row.as_str()), "docs/packs/README.md should have the row\n{row}");
+        }
+    }
 }

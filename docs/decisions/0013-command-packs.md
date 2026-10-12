@@ -1,6 +1,7 @@
 # 0013. Command packs: opt-in aliases, the built-in packs, and how a pack is chosen and checked
 
-Status: accepted (M5, #70, #75) · Raised by Dev B (issue #35) · Signed off: Dev A (changes CLAUDE.md
+Status: accepted (M5, #70, #75), amended by ADR 0029 (every command can be aliased) · Raised by
+Dev B (issue #35) · Signed off: Dev A (changes CLAUDE.md
 §15 and §15.1, reads the "one writer" rule for client settings, and needs a small change in
 `crates/app`, §10 below) · No `core` or `proto` change · Dev C: FYI (§3, a client setting the TUI
 may also want to read)
