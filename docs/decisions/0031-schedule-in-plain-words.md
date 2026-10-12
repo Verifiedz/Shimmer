@@ -52,12 +52,23 @@ The schedule comes first, in words; then the command, exactly as you would run i
 Then the options that belong to the schedule, before the command: `--catch-up
 skip|run-once|backfill` (required, §5) and, rarely, `--lane LANE`.
 
-- **Where the command starts:** the CLI reads `WHEN` and the schedule's options, and the command
-  begins at the first word that is a command (`records`, `workspaces`, …) or an alias of the
-  active pack. Everything from there on is the command, with its own options, so nothing it takes
-  can clash with the schedule's and no `--` is needed. The schedule's words (`daily`, `weekdays`,
-  `weekends`, `every`, `once`, `cron`, `cron-local`, `mon`…`sun`) join the names a pack may not use
-  as an alias (ADR 0013's check), so the boundary is never ambiguous.
+- **Where the command starts: by position.** Every `WHEN` has a fixed shape, and each schedule
+  option takes exactly one value:
+
+  | `WHEN` | Words |
+  |---|---|
+  | `daily`, `weekdays`, `weekends` or a day list (`mon,wed,fri`), then `HH:MM` | 2 |
+  | `every DURATION`, `cron "EXPR"`, `cron-local "EXPR"` | 2 |
+  | `once DATE TIME` (`2026-10-20 18:00`) | 3 |
+  | `once RFC3339` (`2026-10-20T18:00:00Z`: one word, with a `T`) | 2 |
+
+  So the CLI reads `WHEN`, then `--option value` pairs, and the first word after them starts the
+  command. Everything from there on is the command, with its own options, so nothing it takes can
+  clash with the schedule's and no `--` is needed. An option's value is never mistaken for the
+  command: `--lane workspaces workspaces activate site` reads the first `workspaces` as the lane.
+  **Nothing is reserved:** a pack may alias `daily` or `mon`, because the command never starts where
+  the schedule's words go. A first command word that isn't a command or an alias is an error
+  naming it.
 - **How it becomes a trigger:** the CLI parses the command exactly as it does to run it, and takes
   the single op + params that run would send (`records::request`; workspaces gets the same
   function). Then it sends today's `scheduler.add`, and the daemon stores op + params as it does
@@ -98,9 +109,20 @@ Clock changes:
 - Both are tested in the scheduler with a fake clock before relying on the `cron` crate's handling
   of local times.
 
-`local_timezone` is read when the daemon starts. On start, the scheduler recomputes `next_due` for
-every `CronLocal` trigger in the current zone, so after a change of zone each runs at its local
-time from the next run on, not at the old zone's time.
+`local_timezone` is read when the daemon starts. A `CronLocal` trigger stores the zone its
+`next_due` was computed in. On start:
+
+- **Same zone:** `next_due` is kept exactly. It is never recomputed from "now": catch-up decides
+  from the stored `next_due` (§6.3), so recomputing would turn every run missed while the daemon was
+  down into a future one, and `run-once` and `backfill` would act like `skip`.
+- **Zone changed:** `next_due` becomes the same wall-clock time in the new zone (Monday 09:00 in
+  New York becomes Monday 09:00 in London; a time the clocks skip runs at the next valid minute, as
+  above). A run that was due while the daemon was down stays in the past, so catch-up still sees
+  it. It is never placed at or before `last_run`: then it is the next occurrence after `last_run`
+  in the new zone. Recomputing from `last_run` alone would lose the case of a trigger that has
+  never run.
+- Tested with a fake clock: a `CronLocal` trigger missed while the daemon was down still catches up
+  after a restart, with and without a zone change.
 
 `daily/weekdays/… HH:MM` and `cron-local` produce `CronLocal`; `cron` stays `Cron`; `every` and
 `once` are unchanged (`once` is converted to UTC by the CLI, as now).
@@ -154,12 +176,14 @@ Without a terminal (scripts, a workspace step) it is still an error naming the o
   read schedules back the same way. The UTC trap and the twice-yearly rewrite go away.
 - No field name is reserved, now or later: scheduling words sit before the command and never
   compete with a command's options.
-- The daemon gains one `Schedule` variant, a recompute of local triggers at start, and short-id
-  resolution. The CLI gains `schedule` (one parser for `WHEN` plus the existing command parsers)
+- The daemon gains one `Schedule` variant, a stored zone per local trigger (its `next_due` moved only
+  when the zone changed), and short-id resolution. The CLI gains `schedule` (one parser for `WHEN` plus the existing command parsers)
   and the workspaces equivalent of `records::request`. No new logic moves into the client: the op +
   params are what running the command already sends.
-- A few words (`daily`, `weekdays`, `weekends`, `every`, `once`, `cron`, `cron-local`, day names)
-  can no longer be pack aliases. None of the built-in packs uses them.
+- No word is reserved for the schedule. `schedule` itself becomes a command word, so a user's pack
+  that already uses `schedule` as an alias stops loading until it's renamed: Shimmer prints one
+  warning and runs with the real names (ADR 0013), and `shimmer packs check` names the problem.
+  No built-in pack uses it.
 - Protocol: `{"cron_local": …}` as a schedule, and id endings: both additive. protocol.md updated
   and Dev C told when each lands.
 - Built in small PRs after sign-off: the core and scheduler change (§2), short ids (§4), then the
