@@ -49,6 +49,10 @@ struct Stored {
     next_due: Option<DateTime<Utc>>,
     /// A finished `Once`. Kept, so a module re-declaring it does not fire it again.
     done: bool,
+    /// The zone a `CronLocal` trigger's `next_due` was computed in (ADR 0031 §2), so a restart
+    /// in another zone can move it. Absent for every other schedule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    zone: Option<String>,
 }
 
 struct Entry {
@@ -130,11 +134,15 @@ impl Scheduler {
                 .and_then(|s| Parsed::parse(&s.spec.schedule, self.local_tz).map(|p| (s, p)));
             match parsed {
                 Ok((mut stored, parsed)) => {
-                    // The zone is read at start and may have changed: place a local trigger's next
-                    // run at its local time in the zone now (ADR 0031 §2). Unchanged zone, same time.
+                    // The zone is read at start and may have changed (ADR 0031 §2). Same zone: the
+                    // stored next run is kept exactly, so a run missed while the daemon was down
+                    // is still caught up. Another zone: the same wall-clock time there.
                     if parsed.is_local() {
-                        if let Some(due) = stored.next_due {
-                            stored.next_due = parsed.next_after(due - chrono::Duration::seconds(1));
+                        let was = stored.zone.as_deref().and_then(|z| LocalTimezone::parse(z).ok());
+                        stored.zone = Some(self.local_tz.name().to_owned());
+                        if let Some(was) = was.filter(|was| *was != self.local_tz) {
+                            stored.next_due = stored.next_due.and_then(|due| parsed.rezoned(due, was, stored.last_run));
+                            self.write(&stored, None)?;
                         }
                     }
                     st.insert(stored.spec.id.to_string(), Entry { stored, parsed, pending: Vec::new() });
@@ -184,6 +192,7 @@ impl Scheduler {
                     if e.stored.spec.schedule != spec.schedule {
                         next.next_due = parsed.first_due(now);
                         next.done = false;
+                        next.zone = parsed.is_local().then(|| self.local_tz.name().to_owned());
                     }
                     next.spec = spec;
                     self.write(&next, None)?;
@@ -198,6 +207,7 @@ impl Scheduler {
                         paused: false,
                         last_run: None,
                         done: false,
+                        zone: parsed.is_local().then(|| self.local_tz.name().to_owned()),
                     };
                     self.write(&stored, Some(("scheduler.trigger.added", added_payload(&stored))))?;
                     st.insert(id, Entry { stored, parsed, pending: Vec::new() });
@@ -394,6 +404,7 @@ impl Scheduler {
             paused: false,
             last_run: None,
             done: false,
+            zone: parsed.is_local().then(|| self.local_tz.name().to_owned()),
         };
         self.write(&stored, Some(("scheduler.trigger.added", added_payload(&stored))))?;
         let id = stored.spec.id.clone();

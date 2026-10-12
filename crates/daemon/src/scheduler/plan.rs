@@ -55,9 +55,38 @@ impl Parsed {
         }
     }
 
-    /// Read in the local timezone, so worth recomputing when that may have changed.
+    /// Read in the local timezone, so its next run moves when that changes.
     pub fn is_local(&self) -> bool {
         matches!(self.0, Kind::CronLocal(..))
+    }
+
+    /// Where a local trigger's next run goes when it was computed in zone `was` and the
+    /// configured zone is now another (ADR 0031 §2): the same wall-clock time in the new zone, so a
+    /// run that fell due while the daemon was down stays due and catch-up still sees it. Never at or
+    /// before `last_run` (then the next occurrence after it). Anything but a `CronLocal`, or the
+    /// same zone, keeps `next_due` as it is: recomputing from now would hide missed runs.
+    pub fn rezoned(
+        &self,
+        next_due: DateTime<Utc>,
+        was: LocalTimezone,
+        last_run: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        let Kind::CronLocal(_, now_tz) = &self.0 else { return Some(next_due) };
+        if *now_tz == was {
+            return Some(next_due);
+        }
+        let wall = next_due.with_timezone(&was.tz()).naive_local();
+        let tz = now_tz.tz();
+        let at = match tz.from_local_datetime(&wall) {
+            LocalResult::Single(t) => t,
+            LocalResult::Ambiguous(first, _) => first,
+            LocalResult::None => first_existing_after(&tz, wall)?,
+        }
+        .with_timezone(&Utc);
+        match last_run {
+            Some(last) if at <= last => self.next_after(last),
+            _ => Some(at),
+        }
     }
 
     /// Where a trigger created at `now` first becomes due. `Every` counts from creation; a
@@ -207,6 +236,36 @@ mod tests {
 
     fn utc(s: &str) -> DateTime<Utc> {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn a_new_zone_keeps_the_wall_clock_time_so_a_missed_run_stays_missed() {
+        let ny = LocalTimezone::parse("America/New_York").unwrap();
+        let london =
+            Parsed::parse(&Schedule::CronLocal("0 9 * * *".into()), LocalTimezone::parse("Europe/London").unwrap())
+                .unwrap();
+        // Due Monday 09:00 in New York (13:00 UTC); in London that's Monday 09:00 there (08:00 UTC),
+        // earlier on the timeline: still in the past for a daemon starting later on Monday.
+        let due = utc("2026-10-12T13:00:00Z");
+        assert_eq!(london.rezoned(due, ny, None), Some(utc("2026-10-12T08:00:00Z")));
+        // Never at or before the last run: then the next one after it.
+        assert_eq!(london.rezoned(due, ny, Some(utc("2026-10-12T09:00:00Z"))), Some(utc("2026-10-13T08:00:00Z")));
+        // The same zone keeps it exactly; so does anything that isn't local.
+        assert_eq!(new_york("0 9 * * *").rezoned(due, ny, None), Some(due));
+        let utc_cron = Parsed::parse_utc(&Schedule::Cron("0 9 * * *".into())).unwrap();
+        assert_eq!(utc_cron.rezoned(due, ny, None), Some(due));
+    }
+
+    #[test]
+    fn a_new_zone_moves_a_skipped_time_to_the_next_minute_that_exists() {
+        // 02:30 every day, last computed in UTC; New York skips 02:00–03:00 on 2027-03-14.
+        let utc_zone = LocalTimezone::UTC;
+        let s = new_york("30 2 * * *");
+        assert_eq!(
+            s.rezoned(utc("2027-03-14T02:30:00Z"), utc_zone, None),
+            Some(utc("2027-03-14T07:00:00Z")),
+            "03:00 EDT"
+        );
     }
 
     #[test]
