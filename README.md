@@ -179,19 +179,56 @@ daemon on a socket other than the default.
 
 ### Tab completion
 
-Load it once in your shell's startup file, and Tab completes commands, options and your own
-workspaces, collections, records and templates (and the active pack's aliases):
+Tab can complete commands, options, and your own workspaces, collections, records and
+templates (and the active pack's aliases), the way it does for `git` or `cargo`:
 
 ```sh
-source <(shimmer completions bash)          # in ~/.bashrc
-source <(shimmer completions zsh)           # in ~/.zshrc, after compinit
-shimmer completions fish | source           # in ~/.config/fish/config.fish
+shimmer wor<Tab>                          # shimmer workspaces
+shimmer workspaces activate <Tab>         # your workspaces
+shimmer records complete <Tab>            # lc/   then <Tab> again: lc/two-sum
+shimmer records list lc --difficulty <Tab>   # easy  medium  hard
 ```
 
-In zsh, suggestions come in titled groups in the Shimmer colours, and the command line is
-coloured as you type: commands you can run in the name colour, a misspelt one in the error
-colour, options grey. fish colours the line with your fish theme; bash has no colours.
-Completion never starts the daemon: without one, you still get the commands and options.
+Set it up once, by adding one line to your shell's startup file:
+
+| Shell | Add this line | To |
+|---|---|---|
+| bash | `source <(shimmer completions bash)` | `~/.bashrc` |
+| zsh | `source <(shimmer completions zsh)` | `~/.zshrc`, after `compinit` |
+| fish | `shimmer completions fish \| source` | `~/.config/fish/config.fish` |
+
+Then open a new terminal and try `shimmer wor<Tab>`. In bash, press Tab twice to see the list
+when more than one thing matches.
+
+- **zsh needs `compinit`.** Most setups (oh-my-zsh, prezto, many distributions' `~/.zshrc`)
+  already run it. If yours doesn't, put `autoload -Uz compinit && compinit` above the line;
+  without it, loading says `shimmer: load completion after compinit`.
+- **bash** needs nothing else (not even the `bash-completion` package; macOS's bash 3.2 works).
+- **With the dev launcher,** that line would run `cargo` each time a terminal opens, rebuilding
+  first if the code changed. Save the script once instead, and load the file:
+  ```sh
+  shimmer completions bash > ~/.shimmer-completion.bash     # or zsh / fish
+  echo 'source ~/.shimmer-completion.bash' >> ~/.bashrc
+  ```
+  It calls the built binary directly, so Tab stays instant. Save it again after switching
+  pack (it lists the pack's aliases) and, in zsh, after commands are added (its colours list
+  them).
+- **After `shimmer packs use NAME`,** open a new terminal so the pack's aliases complete.
+- **Without a daemon running,** completion doesn't start one: you still get commands and
+  options, and your own names once the daemon is up (any `shimmer` command starts it).
+
+What each shell shows:
+
+| | bash | zsh | fish |
+|---|---|---|---|
+| The suggestions | ✓ | ✓ | ✓ |
+| What each one is, next to it | – | ✓ | ✓ |
+| Grouped and coloured | – | ✓ (Shimmer's colours) | your fish theme |
+| The line coloured as you type | – | ✓ (Shimmer's colours) | your fish theme |
+
+In zsh, the line you type is coloured as you go: `shimmer` in violet, each command you can run
+in lavender, a misspelt one in pink, options grey. A pack's `[colors]` changes these, and
+`NO_COLOR=1` turns them off. bash can't colour what you type or show descriptions.
 
 ### Contributing
 
