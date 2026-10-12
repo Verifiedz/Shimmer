@@ -559,7 +559,12 @@ fn vm_starts_and_stops_a_custom_vm_once_and_only_one_it_started() {
     sb.create("box", "vm", &answers);
     let out = sb.activate("box");
     assert!(up("http://127.0.0.1:18422"), "{out}");
-    assert!(sb.calls().contains("ssh -p 18422 127.0.0.1"), "the terminal runs ssh: {}", sb.calls());
+    // The terminal step is detached: activate returns once it's started, so wait for its call.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !sb.calls().contains("ssh -p 18422 127.0.0.1") {
+        assert!(Instant::now() < deadline, "the terminal runs ssh: {}", sb.calls());
+        std::thread::sleep(Duration::from_millis(50));
+    }
     settles(&sb, "box", "python3 -m http.server 18422", 1, "running");
 
     let again = sb.activate("box");
