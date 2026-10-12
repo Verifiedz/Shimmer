@@ -27,7 +27,7 @@ form that reserves nothing.
 
 **Rule: command options never take a name away from records' fields.** Records reserves only `id`
 and `status`. Where a command option and a field share a name, the option keeps its meaning and the
-CLI says how to reach the field (the `records list` case is #<records-list-issue>).
+CLI says how to reach the field (the `records list` case is #178).
 
 ## Decision
 
