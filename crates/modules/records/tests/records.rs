@@ -983,6 +983,94 @@ async fn rename_collection_moves_everything() {
     assert_eq!(e.code, ErrorCode::Conflict);
 }
 
+/// A collection whose records point at each other (`follows`) and at LeetCode problems.
+const PLAN: &str = "# My plan.\n[collection]\nid = \"plan\"\nlabel = \"Plan\" # what it's for\n\n\
+[[field]]\nname = \"title\"\ntype = \"string\"\nrequired = true\n\n\
+[[field]]\nname = \"follows\"\ntype = \"ref\"\ncollection = \"plan\"\n\n\
+[[field]]\nname = \"problem\"\ntype = \"ref\"\ncollection = \"leetcode\"\n";
+
+#[tokio::test]
+async fn copy_collection_copies_the_file_and_only_with_records_its_records() {
+    let (r, env) = setup().await;
+    add_two_sum(&r, &env).await;
+    env.ctx.store.write("collections/plan.toml", PLAN).unwrap();
+    for (id, fields) in [
+        ("week-1", json!({"title": "Week 1", "problem": "two-sum"})),
+        ("week-2", json!({"title": "Week 2", "follows": "week-1"})),
+    ] {
+        call(&r, &env, "records.add", json!({"collection": "plan", "id": id, "fields": fields})).await.unwrap();
+    }
+    call(&r, &env, "records.complete", json!({"collection": "plan", "id": "week-1"})).await.unwrap();
+    call(&r, &env, "records.remove", json!({"collection": "plan", "id": "week-2"})).await.unwrap();
+    call(&r, &env, "records.restore", json!({"collection": "plan", "id": "week-2"})).await.unwrap();
+    call(&r, &env, "records.add", json!({"collection": "plan", "id": "gone", "fields": {"title": "Gone"}}))
+        .await
+        .unwrap();
+    call(&r, &env, "records.remove", json!({"collection": "plan", "id": "gone"})).await.unwrap();
+    let before = env.backend.events().len();
+
+    // Empty: the file only, comments kept, refs into itself pointed at the copy, others not.
+    let empty = call(&r, &env, "records.copy_collection", json!({"id": "plan", "to": "plan-b"})).await.unwrap();
+    assert_eq!((empty["id"].as_str(), empty["records"].as_u64()), (Some("plan-b"), Some(0)));
+    let text = file(&env, "collections/plan-b.toml").unwrap();
+    assert_eq!(
+        text,
+        PLAN.replace("id = \"plan\"", "id = \"plan-b\"").replace("collection = \"plan\"", "collection = \"plan-b\"")
+    );
+    assert!(env.backend.list("records", "items/plan-b").unwrap().is_empty());
+    let events: Vec<_> = env.backend.events().into_iter().skip(before).collect();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].topic, "records.collection.copied");
+    assert_eq!(events[0].payload, json!({"collection": "plan-b", "from": "plan", "records": 0}));
+
+    // With records: every live record exactly as written (status, stamps), the trash left behind.
+    let before = env.backend.events().len();
+    let full = call(
+        &r,
+        &env,
+        "records.copy_collection",
+        json!({"id": "plan", "to": "plan-c", "label": "Plan C", "with_records": true}),
+    )
+    .await
+    .unwrap();
+    assert_eq!((full["label"].as_str(), full["records"].as_u64()), (Some("Plan C"), Some(2)));
+    assert!(file(&env, "collections/plan-c.toml").unwrap().contains("label = \"Plan C\" # what it's for"));
+    for id in ["week-1", "week-2"] {
+        assert_eq!(
+            file(&env, &format!("items/plan-c/{id}.toml")),
+            file(&env, &format!("items/plan/{id}.toml")),
+            "{id}"
+        );
+    }
+    assert!(file(&env, "items/plan-c/gone.toml").is_none() && file(&env, "trash/plan-c/gone.toml").is_none());
+    let week1 = call(&r, &env, "records.get", json!({"collection": "plan-c", "id": "week-1"})).await.unwrap();
+    assert_eq!((week1["status"].as_str(), week1["problem"].as_str()), (Some("done"), Some("two-sum")));
+    // The copy's refs resolve inside the copy: it all fits.
+    let check = call(&r, &env, "records.check", json!({"collection": "plan-c"})).await.unwrap();
+    assert_eq!(check["problems"], json!([]), "{check}");
+    let events: Vec<_> = env.backend.events().into_iter().skip(before).collect();
+    let topics: Vec<&str> = events.iter().map(|e| e.topic.as_str()).collect();
+    assert_eq!(topics, ["records.collection.copied", "records.item.created", "records.item.created"]);
+    assert!(events[1..].iter().all(|e| e.payload["collection"] == "plan-c"));
+    // The original is untouched.
+    assert_eq!(file(&env, "collections/plan.toml").unwrap(), PLAN);
+    assert_eq!(env.backend.list("records", "items/plan").unwrap().len(), 2);
+
+    // Mistakes change nothing.
+    let before = env.backend.events().len();
+    for (params, code) in [
+        (json!({"id": "plan", "to": "plan-b"}), ErrorCode::Conflict),
+        (json!({"id": "plan", "to": "Bad Id"}), ErrorCode::InvalidParams),
+        (json!({"id": "plan", "to": "../x"}), ErrorCode::InvalidParams),
+        (json!({"id": "nope", "to": "x"}), ErrorCode::NotFound),
+        (json!({"id": "plan", "to": "x", "label": " "}), ErrorCode::InvalidParams),
+    ] {
+        assert_eq!(call(&r, &env, "records.copy_collection", params.clone()).await.unwrap_err().code, code, "{params}");
+    }
+    assert_eq!(env.backend.events().len(), before);
+    assert!(file(&env, "collections/x.toml").is_none());
+}
+
 #[tokio::test]
 async fn remove_collection_asks_first_then_restore_brings_it_all_back() {
     let (r, env) = setup().await;

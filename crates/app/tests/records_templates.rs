@@ -277,3 +277,84 @@ fn renaming_moves_schedules_only_with_a_yes_and_removing_says_what_will_fail() {
     ok(&home, &["records", "new", "spare", "--from", "documents"]);
     assert!(!ok(&home, &["records", "remove-collection", "spare", "--yes"]).contains("schedule"));
 }
+
+// ---------------------------------------------------------------- ADR 0030 §3: copy
+
+/// Every event the daemon has logged, in order.
+fn logged(home: &Home) -> Vec<Value> {
+    let mut days: Vec<_> =
+        std::fs::read_dir(home.dir.path().join("home/events")).unwrap().flatten().map(|d| d.path()).collect();
+    days.sort();
+    days.iter()
+        .flat_map(|d| {
+            std::fs::read_to_string(d)
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect::<Vec<Value>>()
+        })
+        .collect()
+}
+
+#[test]
+fn a_copied_collection_is_independent_of_its_original_and_survives_a_restart() {
+    let home = Home::new();
+    ok(&home, &["records", "new", "jobs", "--from", "job-applications"]);
+    for (id, company) in [("amazon", "Amazon"), ("shopify", "Shopify")] {
+        ok(&home, &["records", "add", "jobs", id, "--position", "SDE Intern", "--company", company]);
+    }
+    ok(&home, &["records", "complete", "jobs/amazon"]);
+    ok(&home, &["records", "add", "jobs", "old", "--position", "x", "--company", "y"]);
+    ok(&home, &["records", "remove", "jobs/old"]);
+
+    // Empty: the same fields, ready to add to.
+    let out = ok(&home, &["records", "copy-collection", "jobs", "jobs-2027"]);
+    assert_eq!(
+        out.trim(),
+        "✓ copied jobs to jobs-2027: same fields, no records (--with-records copies them too)\n  \
+         add one: shimmer records add jobs-2027 --position … --company …"
+    );
+    assert!(ok(&home, &["records", "list", "jobs-2027"]).contains("no records"), "starts empty");
+
+    // With records: the same records, statuses kept, the trash left behind.
+    let out = ok(&home, &["records", "copy-collection", "jobs", "backup", "--with-records", "--label", "Jobs backup"]);
+    assert_eq!(out.trim(), "✓ copied jobs to backup with 2 record(s)");
+    let list = |c: &str| json(&home, &["records", "list", c])["items"].clone();
+    assert_eq!(list("backup"), list("jobs"));
+    assert!(ok(&home, &["records", "trash", "backup"]).contains("nothing in backup's trash"));
+    let collections = json(&home, &["records", "collections"]);
+    let label =
+        collections["collections"].as_array().unwrap().iter().find(|c| c["id"] == "backup").unwrap()["label"].clone();
+    assert_eq!(label, "Jobs backup");
+
+    // Independent: changing the copy leaves the original alone, and the other way round.
+    ok(&home, &["records", "update", "backup/shopify", "--stage", "interviewing"]);
+    ok(&home, &["records", "remove", "jobs/amazon"]);
+    assert_eq!(json(&home, &["records", "get", "jobs/shopify"])["stage"], Value::Null);
+    assert_eq!(json(&home, &["records", "get", "backup/amazon"])["status"], "done");
+
+    // Logged: the copy, then one created per record, in the copy.
+    let events = logged(&home);
+    let at = events
+        .iter()
+        .position(|e| e["topic"] == "records.collection.copied" && e["payload"]["collection"] == "backup")
+        .unwrap();
+    assert_eq!(events[at]["payload"], serde_json::json!({"collection": "backup", "from": "jobs", "records": 2}));
+    let created: Vec<&str> = events[at + 1..at + 3].iter().map(|e| e["payload"]["id"].as_str().unwrap()).collect();
+    assert!(events[at + 1..at + 3]
+        .iter()
+        .all(|e| e["topic"] == "records.item.created" && e["payload"]["collection"] == "backup"));
+    assert_eq!(created.len(), 2);
+
+    // Mistakes say so and change nothing.
+    assert!(fails(&home, &["records", "copy-collection", "jobs", "backup"]).contains("already a collection 'backup'"));
+    assert!(fails(&home, &["records", "copy-collection", "nope", "x"]).contains("no collection 'nope'"));
+    assert!(fails(&home, &["records", "copy-collection", "jobs", "Bad Id"]).contains("not a valid collection id"));
+    assert_eq!(logged(&home).len(), events.len());
+
+    // Files are the truth: after a restart it's all still there.
+    ok(&home, &["shutdown"]);
+    common::wait_gone(&home.socket());
+    assert_eq!(json(&home, &["records", "get", "backup/shopify"])["stage"], "interviewing");
+    assert_eq!(list("jobs-2027"), serde_json::json!([]));
+}

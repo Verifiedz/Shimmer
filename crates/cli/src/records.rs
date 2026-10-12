@@ -63,6 +63,8 @@ changing a collection:
   rename-field COLLECTION FROM TO      rename a field in the collection and every record
   rename-collection ID NEW_ID          give a collection a new id; offers to move schedules
        [--move-schedules]              that name it (--move-schedules: without asking)
+  copy-collection ID NEW_ID            a new collection with the same fields; --with-records
+       [--label TEXT] [--with-records] copies its records too (not its trash)
   remove-collection ID [--yes]         remove a collection and its records (asks first;
                                        restore-collection brings it back); lists the
                                        schedules that name it, which fail until restored
@@ -161,6 +163,12 @@ pub enum RecordsCmd {
         new_id: String,
         move_schedules: bool,
     },
+    CopyCollection {
+        id: String,
+        to: String,
+        label: Option<String>,
+        with_records: bool,
+    },
     /// `yes`: confirm without asking (`--yes`).
     RemoveCollection {
         id: String,
@@ -254,6 +262,7 @@ pub fn parse(words: Vec<String>) -> std::result::Result<RecordsCmd, String> {
     let yes = take_flag(&mut rest, matches!(sub.as_str(), "remove-collection" | "import" | "purge"), "--yes");
     let move_schedules =
         take_flag(&mut rest, matches!(sub.as_str(), "rename" | "rename-collection"), "--move-schedules");
+    let with_records = take_flag(&mut rest, sub == "copy-collection", "--with-records");
     let file = take_flag(&mut rest, sub == "peek", "--file");
     let dry_run = take_flag(&mut rest, sub == "import", "--dry-run");
     let skip_invalid = take_flag(&mut rest, sub == "import", "--skip-invalid");
@@ -383,6 +392,22 @@ pub fn parse(words: Vec<String>) -> std::result::Result<RecordsCmd, String> {
             let template = template.ok_or("records new needs --from TEMPLATE; see 'shimmer records templates'")?;
             Ok(RecordsCmd::New { id, template, label })
         }
+        "copy-collection" => {
+            let usage = "usage: shimmer records copy-collection ID NEW_ID [--label TEXT] [--with-records]";
+            let [id, to]: [String; 2] = positional.try_into().map_err(|_| usage)?;
+            let mut label = None;
+            for (name, value) in flags {
+                match name.as_str() {
+                    "label" => label = Some(value),
+                    other => {
+                        return Err(format!(
+                            "'records copy-collection' takes --label and --with-records, not '--{other}'"
+                        ))
+                    }
+                }
+            }
+            Ok(RecordsCmd::CopyCollection { id, to, label, with_records })
+        }
         "check" | "rename-field" | "rename-collection" | "remove-collection" | "restore-collection" => {
             no_flags()?;
             let usage = match sub.as_str() {
@@ -500,7 +525,10 @@ impl RecordsCmd {
             | Self::Import { collection, .. }
             | Self::Purge { collection, .. }
             | Self::Export { collection, .. } => Some(collection),
-            Self::RenameCollection { .. } | Self::RemoveCollection { .. } | Self::RestoreCollection { .. } => None,
+            Self::RenameCollection { .. }
+            | Self::CopyCollection { .. }
+            | Self::RemoveCollection { .. }
+            | Self::RestoreCollection { .. } => None,
         }
     }
 }
@@ -639,6 +667,16 @@ pub fn request(cmd: &RecordsCmd, schema: &Value) -> Result<(&'static str, Value)
         ),
         RecordsCmd::RenameCollection { id, new_id, .. } => {
             ("records.rename_collection", json!({"id": id, "new_id": new_id}))
+        }
+        RecordsCmd::CopyCollection { id, to, label, with_records } => {
+            let mut params = json!({"id": id, "to": to});
+            if let Some(label) = label {
+                params["label"] = json!(label);
+            }
+            if *with_records {
+                params["with_records"] = json!(true);
+            }
+            ("records.copy_collection", params)
         }
         RecordsCmd::RemoveCollection { id, .. } => ("records.remove_collection", json!({"id": id})),
         RecordsCmd::RestoreCollection { id } => ("records.restore_collection", json!({"id": id})),
@@ -1124,6 +1162,7 @@ pub fn show(cmd: &RecordsCmd, data: &Value, schema: &Value) -> String {
             cell(&data["updated"])
         ),
         RecordsCmd::RenameCollection { id, new_id, .. } => format!("✓ {id} is now {new_id}"),
+        RecordsCmd::CopyCollection { id, to, with_records, .. } => copied(id, to, *with_records, data),
         RecordsCmd::RemoveCollection { id, .. } => format!(
             "removed {id} ({} record(s); undo: shimmer records restore-collection {id})",
             cell(&data["records"])
@@ -1255,6 +1294,27 @@ fn template_in_full(t: &Value, categories: &[Value]) -> String {
 /// Everything comes from the new collection the daemon returned (§2).
 fn created(id: &str, template: &str, collection: &Value) -> String {
     let mut out = format!("✓ created collection {id} from {template}");
+    out.push_str(&add_one(id, collection));
+    for related in collection["related"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+        let _ = write!(out, "\n  goes with: {related} (shimmer records new {related} --from {related})");
+    }
+    out
+}
+
+/// What was copied: how many records, or that it starts empty and how to add one.
+fn copied(id: &str, to: &str, with_records: bool, collection: &Value) -> String {
+    match with_records {
+        true => format!("✓ copied {id} to {to} with {} record(s)", cell(&collection["records"])),
+        false => format!(
+            "✓ copied {id} to {to}: same fields, no records (--with-records copies them too){}",
+            add_one(to, collection)
+        ),
+    }
+}
+
+/// "\n  add one: shimmer records add ID --position … --company …": its required fields.
+fn add_one(id: &str, collection: &Value) -> String {
+    let mut out = String::new();
     let required: Vec<String> = collection["fields"]
         .as_array()
         .into_iter()
@@ -1265,9 +1325,6 @@ fn created(id: &str, template: &str, collection: &Value) -> String {
     let _ = write!(out, "\n  add one: shimmer records add {id}");
     if !required.is_empty() {
         let _ = write!(out, " {}", required.join(" "));
-    }
-    for related in collection["related"].as_array().into_iter().flatten().filter_map(Value::as_str) {
-        let _ = write!(out, "\n  goes with: {related} (shimmer records new {related} --from {related})");
     }
     out
 }
@@ -1933,6 +1990,44 @@ mod tests {
             show(&RecordsCmd::Peek { template: "leetcode".into(), file: true }, &file, &Value::Null),
             "# LeetCode\n[collection]\nid = \"leetcode\""
         );
+    }
+
+    #[test]
+    fn copy_collection_parses_and_reports() {
+        let cmd =
+            parse_words(&["copy-collection", "jobs", "jobs-2025", "--with-records", "--label", "Jobs 2025"]).unwrap();
+        assert_eq!(
+            cmd,
+            RecordsCmd::CopyCollection {
+                id: "jobs".into(),
+                to: "jobs-2025".into(),
+                label: Some("Jobs 2025".into()),
+                with_records: true
+            }
+        );
+        assert_eq!(
+            request(&cmd, &Value::Null).unwrap(),
+            (
+                "records.copy_collection",
+                json!({"id": "jobs", "to": "jobs-2025", "label": "Jobs 2025", "with_records": true})
+            )
+        );
+        let empty = parse_words(&["copy-collection", "jobs", "apps"]).unwrap();
+        assert_eq!(request(&empty, &Value::Null).unwrap().1, json!({"id": "jobs", "to": "apps"}));
+        assert!(parse_words(&["copy-collection", "jobs"]).unwrap_err().contains("usage"));
+        assert!(parse_words(&["copy-collection", "a", "b", "--colour", "red"])
+            .unwrap_err()
+            .contains("--label and --with-records"));
+        assert!(parse_words(&["rename-collection", "a", "b", "--with-records"]).is_err(), "only copy takes it");
+
+        let reply = json!({"id": "apps", "records": 0, "fields": [
+            {"name": "position", "type": "string", "required": true}, {"name": "url", "type": "string"}]});
+        assert_eq!(
+            show(&empty, &reply, &Value::Null),
+            "✓ copied jobs to apps: same fields, no records (--with-records copies them too)\n  \
+             add one: shimmer records add apps --position …"
+        );
+        assert_eq!(show(&cmd, &json!({"records": 12}), &Value::Null), "✓ copied jobs to jobs-2025 with 12 record(s)");
     }
 
     #[test]
