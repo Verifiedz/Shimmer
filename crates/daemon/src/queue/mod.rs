@@ -355,14 +355,14 @@ impl QueueInner {
                     "queue.task.cancelled",
                     json!({"task_id": id, "lane": task.lane, "op": task.op, "was": "queued"}),
                 );
-                Ok(json!({"cancelled": true, "was": "queued"}))
+                Ok(json!({"cancelled": true, "was": "queued", "task_id": id}))
             }
             Status::Running => {
                 // Cooperative: the task ends when it next polls `ctx.cancel`.
                 if let Some(t) = &st.records[&id].cancel {
                     t.cancel();
                 }
-                Ok(json!({"cancelled": true, "was": "running"}))
+                Ok(json!({"cancelled": true, "was": "running", "task_id": id}))
             }
             done => Err(Error::not_cancellable(format!("task {id} already {}", done.name()))),
         }
@@ -401,7 +401,7 @@ impl QueueInner {
                 json!({"task_id": id, "lane": lane, "before": before, "queue_version": new_version}),
             );
         }
-        Ok(json!({"queue_version": new_version}))
+        Ok(json!({"queue_version": new_version, "task_id": id}))
     }
 
     /// A task id as a client wrote it: the full id, or a unique ending of one, case insensitive

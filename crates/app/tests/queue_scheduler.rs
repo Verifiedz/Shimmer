@@ -84,10 +84,14 @@ fn real_launches_wait_in_the_queue_and_can_be_moved_and_cancelled() {
     let show = ok(&home, &["queue", "show", b]);
     assert!(show.starts_with(&format!("{b}  (queued)")) && show.contains("  op        workspaces.activate"), "{show}");
 
-    // c jumps ahead of b.
+    // c jumps ahead of b. The reply names both by the ending the list shows, and what they run.
     assert_eq!(
         ok(&home, &["queue", "move", c, "--before", b]).trim(),
-        format!("✓ moved {c} ahead of {b} in lane workspaces")
+        format!(
+            "✓ moved {} (workspaces.activate) ahead of {} (workspaces.activate) in lane workspaces",
+            shown(c),
+            shown(b)
+        )
     );
     let list = ok(&home, &["queue", "list", "--lane", "workspaces"]);
     let order: Vec<&str> = list.lines().filter(|l| l.starts_with("workspaces")).collect();
@@ -132,11 +136,13 @@ fn a_trigger_fires_and_can_be_paused_resumed_and_removed() {
     let show = wait_for(&home, &["scheduler", "show", &id], "  last run  20"); // a date, not "never"
     assert!(show.contains("  params    {\"collection\":\"leetcode\"}") && show.contains("  catch-up  skip"), "{show}");
 
-    assert!(ok(&home, &["scheduler", "pause", &id]).starts_with(&format!("✓ paused {id}")));
+    // Each reply names the trigger by the ending the list shows, and what it runs.
+    let what = format!("{} (records.list, every 1s)", shown(&id));
+    assert!(ok(&home, &["scheduler", "pause", &id]).starts_with(&format!("✓ paused {what}")));
     assert!(ok(&home, &["scheduler", "show", &id]).starts_with(&format!("{id}  (paused)")));
-    assert!(ok(&home, &["scheduler", "resume", &id]).starts_with(&format!("✓ resumed {id}")));
+    assert!(ok(&home, &["scheduler", "resume", &id]).starts_with(&format!("✓ resumed {what}")));
     assert!(ok(&home, &["scheduler", "show", &id]).starts_with(&format!("{id}  (active)")));
-    assert_eq!(ok(&home, &["scheduler", "remove", &id]).trim(), format!("✓ removed {id}"));
+    assert_eq!(ok(&home, &["scheduler", "remove", &id]).trim(), format!("✓ removed {what}"));
     assert!(ok(&home, &["scheduler", "list"]).starts_with("no triggers yet"));
 }
 
@@ -180,6 +186,11 @@ fn a_trigger_or_task_is_reached_by_the_ending_its_list_shows() {
     let id = out["✓ added trigger ".len()..].split(':').next().unwrap().to_string();
     let end = shown(&id);
     assert!(ok(&home, &["scheduler", "list"]).lines().any(|l| l.starts_with(end)), "the list shows {end}");
+    // Too short to be sure which one is meant, even when it ends only this one (#183's review).
+    let o = home.shimmer(&["scheduler", "remove", &end[5..]]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stderr(&o).contains("invalid_params") && stderr(&o).contains("at least 4"), "{}", stderr(&o));
+    assert!(ok(&home, &["scheduler", "list"]).lines().any(|l| l.starts_with(end)), "still there");
     ok(&home, &["scheduler", "pause", end]);
     assert!(ok(&home, &["scheduler", "show", &end.to_uppercase()]).contains("(paused)"), "any case");
     ok(&home, &["scheduler", "remove", end]);

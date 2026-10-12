@@ -157,7 +157,9 @@ pub fn short_ids(ids: &[String]) -> Vec<String> {
     ids.iter()
         .zip(&lower)
         .map(|(id, me)| {
-            if id.chars().count() <= 12 {
+            // Only a random id shortens well: a module's own trigger id (`fetchers.poll-hackernews`)
+            // is shown whole, since its end means nothing on its own.
+            if !is_random_id(id) {
                 return id.clone();
             }
             let mut n = 6;
@@ -167,6 +169,17 @@ pub fn short_ids(ids: &[String]) -> Vec<String> {
             id[id.len() - n..].to_owned()
         })
         .collect()
+}
+
+/// A ULID, or `usr-` plus one: the ids whose end is random, so a short ending tells them apart.
+fn is_random_id(id: &str) -> bool {
+    let ulid = id.strip_prefix("usr-").unwrap_or(id);
+    ulid.len() == 26 && ulid.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// The ending of one id that lists show (see [`short_ids`]), for saying which one a command hit.
+pub fn short_id(id: &str) -> String {
+    short_ids(&[id.to_owned()]).remove(0)
 }
 
 /// The templates a `*.templates` op sent (`records`, `workspaces`), grouped under their
@@ -257,11 +270,15 @@ mod tests {
     #[test]
     fn long_ids_show_their_unique_ending() {
         let ids: Vec<String> =
-            ["01M4PPHE00ABCDEF0123XK7P2X", "01M4PPK8K0QRSTUV4567HK7P2X", "usr-01m4ppm0003fq9tm", "digest"]
+            ["01M4PPHE00ABCDEF0123XK7P2X", "01M4PPK8K0QRSTUV4567HK7P2X", "usr-01m4ppm000nntaem1rv43fq9tm", "digest"]
                 .map(String::from)
                 .to_vec();
         // "k7p2x" ends both of the first two, so they need seven characters; the others don't.
         assert_eq!(short_ids(&ids), ["XK7P2X", "HK7P2X", "3fq9tm", "digest"]);
+        // A module's own trigger id isn't random: shown whole, however long (#183's review).
+        let named = ["fetchers.poll-hackernews".to_owned()];
+        assert_eq!(short_ids(&named), ["fetchers.poll-hackernews"]);
+        assert_eq!(short_id("usr-01m4ppm000nntaem1rv43fq9tm"), "3fq9tm");
         let close: Vec<String> =
             ["01M4PPHE00ABCDEF0123AK7P2X", "01M4PPK8K0QRSTUV4567BK7P2X"].map(String::from).to_vec();
         assert_eq!(short_ids(&close), ["AK7P2X", "BK7P2X"]);
