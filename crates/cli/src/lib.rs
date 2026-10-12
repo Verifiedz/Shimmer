@@ -17,6 +17,7 @@ mod records;
 mod render;
 mod scheduler;
 mod schedules;
+mod style;
 mod when;
 mod workspaces;
 
@@ -61,16 +62,21 @@ async fn run_line(alias: Option<String>, args: Vec<String>) -> ExitCode {
     let front = match packs::active::take_front_flags(args) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("shimmer: {e}\n\n{USAGE}");
+            style::init(false, false, &Default::default());
+            eprintln!("{} {e}\n\n{}", style::paint_err(style::Role::Error, "shimmer:"), style::decorate_err(USAGE));
             return ExitCode::from(2);
         }
     };
     let active = packs::active::load(front.pack.as_deref());
+    // Colour is decided once, as soon as the pack is known (#189): its warnings and a usage
+    // error are coloured too.
+    let colors = active.pack.as_ref().map(|p| p.colors.clone()).unwrap_or_default();
+    style::init(front.no_color, front.args.iter().any(|a| a == "--json"), &colors);
     // `shimmer packs …` reports pack problems itself, and needs no aliases: no warning there.
     let packs_command = packs::active::command_word(&front.args).is_some_and(|i| front.args[i] == "packs");
     if !packs_command {
         for warning in &active.warnings {
-            eprintln!("shimmer: {warning}");
+            eprintln!("{} {warning}", style::paint_err(style::Role::Warning, "shimmer:"));
         }
     }
     let help = match (&active.pack, front.canonical) {
@@ -98,18 +104,18 @@ async fn run_line(alias: Option<String>, args: Vec<String>) -> ExitCode {
     let args = match Args::parse(args) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("shimmer: {e}\n\n{usage}");
+            eprintln!("{} {e}\n\n{}", style::paint_err(style::Role::Error, "shimmer:"), style::decorate_err(usage));
             return ExitCode::from(2);
         }
     };
     match execute(&args, help).await {
         Ok(Some(text)) => {
-            println!("{text}");
+            println!("{}", style::decorate(&text));
             ExitCode::SUCCESS
         }
         Ok(None) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("shimmer: {}", render::error(&e));
+            eprintln!("{} {}", style::paint_err(style::Role::Error, "shimmer:"), render::error(&e));
             ExitCode::FAILURE
         }
     }

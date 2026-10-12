@@ -8,6 +8,7 @@ use shimmer_core::Result;
 use crate::client::Client;
 use crate::flags::Flags;
 use crate::render::{self, table};
+use crate::style::{paint, Role};
 use crate::when;
 
 pub const USAGE: &str = "usage: shimmer scheduler <command>
@@ -215,8 +216,9 @@ fn trigger(t: &Value, now: DateTime<Utc>) -> String {
     let time = |v: &Value, none: &str| {
         when::timestamp(v).map_or(none.to_string(), |at| format!("{} ({})", when::local(at), when::relative(at, now)))
     };
-    let mut out = format!("{}  ({})\n", render::cell(&t["id"]), state(t));
-    let mut line = |label: &str, value: String| out.push_str(&format!("  {label:<10}{value}\n"));
+    let id = paint(Role::Name, &render::cell(&t["id"]));
+    let mut out = format!("{id}  ({})\n", crate::style::state(&state(t)));
+    let mut line = |label: &str, value: String| out.push_str(&format!("  {}{value}\n", crate::style::label(label, 10)));
     line("op", render::cell(&t["op"]));
     line("params", serde_json::to_string(&t["params"]).unwrap_or_default());
     line("schedule", schedule(&t["schedule"]));

@@ -45,7 +45,7 @@ pub async fn follow(client: &mut Client, task: &str, notes: bool, look: &str) ->
             "queue.task.progress" => {
                 let note = ev.payload["note"].as_str().unwrap_or_default();
                 if notes && !note.is_empty() && note != last_note {
-                    eprintln!("  {note} …");
+                    eprintln!("  {}", crate::style::paint_err(crate::style::Role::Hint, &format!("{note} …")));
                     last_note = note.to_owned();
                 }
             }

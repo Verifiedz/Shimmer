@@ -15,6 +15,7 @@ use crate::csv;
 use crate::editor;
 use crate::render::{self, cell, table, wrap};
 use crate::schedules;
+use crate::style::{paint, Role};
 use crate::workspaces::Prompt;
 
 pub const USAGE: &str = "usage: shimmer records <command>
@@ -1189,13 +1190,16 @@ pub fn show(cmd: &RecordsCmd, data: &Value, schema: &Value) -> String {
         RecordsCmd::Collections => collections(data),
         // The id comes from the reply: the daemon may have made it (ADR 0018).
         // In full, never cut like a table cell: it's what the person types next.
-        RecordsCmd::Add { collection, .. } => format!("added {collection}/{}", data["id"].as_str().unwrap_or_default()),
+        RecordsCmd::Add { collection, .. } => {
+            format!("{} {collection}/{}", paint(Role::Success, "added"), data["id"].as_str().unwrap_or_default())
+        }
         RecordsCmd::Rename { collection, id, new_id, .. } => {
             format!("✓ {collection}/{id} renamed to {collection}/{new_id}")
         }
-        RecordsCmd::Update { collection, id, .. } => format!("updated {collection}/{id}"),
+        RecordsCmd::Update { collection, id, .. } => format!("{} {collection}/{id}", paint(Role::Success, "updated")),
         RecordsCmd::Remove { collection, id, .. } => {
-            format!("removed {collection}/{id} (undo: shimmer records restore {collection}/{id})")
+            let removed = paint(Role::Success, "removed");
+            format!("{removed} {collection}/{id} (undo: shimmer records restore {collection}/{id})")
         }
         RecordsCmd::Restore { collection, id } => format!("✓ {collection}/{id} restored"),
         RecordsCmd::Check { collection } => check_report(collection, data),
@@ -1306,7 +1310,7 @@ fn peek(data: &Value, id: &str) -> Result<String> {
 fn template_in_full(t: &Value, categories: &[Value]) -> String {
     let id = t["id"].as_str().unwrap_or_default();
     let list = |key: &str| t[key].as_array().cloned().unwrap_or_default();
-    let mut out = format!("{id}: {}", cell(&t["label"]));
+    let mut out = format!("{}: {}", paint(Role::Name, id), cell(&t["label"]));
     if let Some(category) = categories.iter().find(|c| c["id"] == t["category"]) {
         let _ = write!(out, "  ({})", cell(&category["label"]));
     }
@@ -1316,7 +1320,7 @@ fn template_in_full(t: &Value, categories: &[Value]) -> String {
     out.push('\n');
 
     let fields = list("fields");
-    let _ = writeln!(out, "\nFields ({}; * = required)", fields.len());
+    let _ = writeln!(out, "\n{}", paint(Role::Heading, &format!("Fields ({}; * = required)", fields.len())));
     let width =
         fields.iter().map(|f| cell(&f["name"]).chars().count() + usize::from(f["required"] == true)).max().unwrap_or(0);
     for f in &fields {
@@ -1328,29 +1332,32 @@ fn template_in_full(t: &Value, categories: &[Value]) -> String {
         if notes.is_empty() {
             notes.push("text".into());
         }
-        let _ = writeln!(out, "{}", format!("  {name:<width$}  {}", notes.join(", ")).trim_end());
+        let pad = " ".repeat(width.saturating_sub(name.chars().count()));
+        let name = paint(Role::Name, &name);
+        let _ = writeln!(out, "{}", format!("  {name}{pad}  {}", notes.join(", ")).trim_end());
     }
     if let Some(title) = t["title"].as_str() {
         let _ = writeln!(out, "  each record is shown as: {title}");
     }
 
-    let _ = writeln!(out, "\nWhen you complete a record\n  {}", wrap(&completing(t), 88, "  "));
+    let _ =
+        writeln!(out, "\n{}\n  {}", paint(Role::Heading, "When you complete a record"), wrap(&completing(t), 88, "  "));
 
     let notes = list("notes");
     if !notes.is_empty() {
-        out.push_str("\nGood to know\n");
+        let _ = writeln!(out, "\n{}", paint(Role::Heading, "Good to know"));
         for note in &notes {
             let _ = writeln!(out, "  • {}", wrap(note.as_str().unwrap_or_default(), 86, "    "));
         }
     }
     let examples = list("examples");
     if !examples.is_empty() {
-        out.push_str("\nHow it works (<collection> is the name you give it)\n");
+        let _ = writeln!(out, "\n{}", paint(Role::Heading, "How it works (<collection> is the name you give it)"));
         for line in &examples {
             let _ = writeln!(out, "{}", format!("  {}", line.as_str().unwrap_or_default()).trim_end());
         }
     }
-    let related: Vec<String> = list("related").iter().map(cell).collect();
+    let related: Vec<String> = list("related").iter().map(|r| paint(Role::Name, &cell(r))).collect();
     if !related.is_empty() {
         let _ = writeln!(out, "\nGoes with: {} (shimmer records peek NAME)", related.join(", "));
     }
@@ -1405,15 +1412,17 @@ fn check_report(collection: &str, data: &Value) -> String {
     let checked = data["checked"].as_u64().unwrap_or(0);
     let problems = data["problems"].as_array().cloned().unwrap_or_default();
     if problems.is_empty() {
-        return format!("checked {checked} record(s) in {collection}; all fit");
+        return format!("checked {checked} record(s) in {collection}; {}", paint(Role::Success, "all fit"));
     }
-    let mut out = format!("checked {checked} record(s) in {collection}; {} with problems", problems.len());
+    let with_problems = format!("{} with problems", problems.len());
+    let mut out = format!("checked {checked} record(s) in {collection}; {}", paint(Role::Warning, &with_problems));
     let width = problems.iter().map(|p| cell(&p["id"]).chars().count()).max().unwrap_or(0);
     for p in &problems {
         let id = cell(&p["id"]);
         for (i, problem) in p["problems"].as_array().into_iter().flatten().enumerate() {
             let shown = if i == 0 { id.as_str() } else { "" };
-            let _ = write!(out, "\n  {shown:width$}  {}", problem.as_str().unwrap_or_default());
+            let pad = " ".repeat(width - shown.chars().count());
+            let _ = write!(out, "\n  {}{pad}  {}", paint(Role::Name, shown), problem.as_str().unwrap_or_default());
         }
     }
     out
@@ -1507,14 +1516,15 @@ fn has_status(schema: &Value) -> bool {
 }
 
 fn item(collection: &str, id: &str, data: &Value, schema: &Value) -> String {
+    let name = paint(Role::Name, &format!("{collection}/{id}"));
     let mut out = match has_status(schema) {
-        true => format!("{collection}/{id}  ({})", cell(&data["status"])),
-        false => format!("{collection}/{id}"),
+        true => format!("{name}  ({})", crate::style::state(&cell(&data["status"]))),
+        false => name,
     };
     let keys = columns(data, schema);
     let width = keys.iter().map(|k| k.chars().count()).max().unwrap_or(0);
     for key in keys {
-        let _ = write!(out, "\n  {key:width$}  {}", shown(schema, &key, &data[key.as_str()]));
+        let _ = write!(out, "\n  {}  {}", crate::style::label(&key, width), shown(schema, &key, &data[key.as_str()]));
     }
     out
 }

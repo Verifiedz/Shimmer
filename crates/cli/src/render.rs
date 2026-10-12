@@ -7,32 +7,37 @@ use serde_json::Value;
 use shimmer_core::{Error, Execution};
 use shimmer_proto::{ManifestData, PingData};
 
+use crate::style::{paint, Role};
+
 pub fn ping(data: &Value) -> String {
     match serde_json::from_value::<PingData>(data.clone()) {
-        Ok(p) => format!("pong (daemon up {})", uptime(p.uptime_s)),
+        Ok(p) => format!("{} (daemon up {})", paint(Role::Success, "pong"), uptime(p.uptime_s)),
         Err(_) => json(data),
     }
 }
 
 pub fn manifest(data: &Value) -> String {
     let Ok(m) = serde_json::from_value::<ManifestData>(data.clone()) else { return json(data) };
-    let mut out = format!("protocol v{}\n\nlanes\n", m.protocol);
+    let mut out = format!("protocol v{}\n\n{}\n", m.protocol, paint(Role::Heading, "lanes"));
     let width = m.lanes.iter().map(|l| l.id.as_str().len()).max().unwrap_or(0);
     for l in &m.lanes {
-        let _ = writeln!(out, "  {:width$}  max {}", l.id.as_str(), l.max_concurrent);
+        let id = l.id.as_str();
+        let pad = " ".repeat(width - id.len());
+        let _ = writeln!(out, "  {}{pad}  max {}", paint(Role::Name, id), l.max_concurrent);
     }
-    out.push_str("\nmodules\n");
+    let _ = writeln!(out, "\n{}", paint(Role::Heading, "modules"));
     if m.modules.is_empty() {
         out.push_str("  (none registered)\n");
     }
     for module in &m.modules {
-        let _ = writeln!(out, "  {} {}", module.id, module.version);
+        let _ = writeln!(out, "  {} {}", paint(Role::Heading, &module.id.to_string()), module.version);
         let rows: Vec<(String, &str)> =
             module.commands.iter().map(|c| (execution(&c.execution), c.summary.as_str())).collect();
         let op_w = module.commands.iter().map(|c| c.op.len()).max().unwrap_or(0);
         let ex_w = rows.iter().map(|(e, _)| e.len()).max().unwrap_or(0);
         for (c, (ex, summary)) in module.commands.iter().zip(&rows) {
-            let _ = writeln!(out, "    {:op_w$}  {ex:ex_w$}  {summary}", c.op);
+            let pad = " ".repeat(op_w - c.op.len());
+            let _ = writeln!(out, "    {}{pad}  {ex:ex_w$}  {summary}", paint(Role::Name, &c.op));
         }
     }
     out.truncate(out.trim_end().len());
@@ -99,22 +104,34 @@ pub(crate) fn table(header: &[String], rows: &[Vec<String>]) -> String {
             *w = (*w).max(c.chars().count());
         }
     }
-    let line = |cells: &[String]| {
+    // Headers in the heading colour, the first named column (names and ids) in the name colour,
+    // and a STATUS or STATE column by what each state means (#189). Widths are measured on the
+    // plain text; colour goes around it.
+    let name_column = header.iter().position(|h| !h.is_empty()).unwrap_or(0);
+    let line = |cells: &[String], is_header: bool| {
         let mut s = String::new();
         for (i, (c, w)) in cells.iter().zip(&widths).enumerate() {
+            let shown = match (is_header, i) {
+                (true, _) => paint(Role::Heading, c),
+                (false, i) if i == name_column => paint(Role::Name, c),
+                (false, i) if matches!(header.get(i).map(String::as_str), Some("STATUS" | "STATE")) => {
+                    crate::style::state(c)
+                }
+                _ => c.clone(),
+            };
             if i + 1 == cells.len() {
-                s.push_str(c);
+                s.push_str(&shown);
             } else {
                 let pad = w - c.chars().count();
-                let _ = write!(s, "{c}{}  ", " ".repeat(pad));
+                let _ = write!(s, "{shown}{}  ", " ".repeat(pad));
             }
         }
         s
     };
-    let mut out = line(header);
+    let mut out = line(header, true);
     for row in rows {
         out.push('\n');
-        out.push_str(&line(row));
+        out.push_str(&line(row, false));
     }
     out
 }
@@ -193,10 +210,12 @@ pub fn templates_by_category(
     }
     let mut out = String::new();
     for (heading, ts) in &groups {
-        let _ = writeln!(out, "{heading}");
+        let _ = writeln!(out, "{}", paint(Role::Heading, heading));
         for t in ts {
             let id = t["id"].as_str().unwrap_or_default();
-            let _ = writeln!(out, "  {id:<id_width$}  {}", shorten(t["description"].as_str().unwrap_or_default()));
+            let pad = " ".repeat(id_width.saturating_sub(id.chars().count()));
+            let name = paint(Role::Name, id);
+            let _ = writeln!(out, "  {name}{pad}  {}", shorten(t["description"].as_str().unwrap_or_default()));
         }
         out.push('\n');
     }
