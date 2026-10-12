@@ -153,7 +153,7 @@ async fn run_line(alias: Option<String>, args: Vec<String>) -> ExitCode {
 /// `shimmer __complete WORDS…`: the suggestions for the last word (#188). `--pack` and
 /// `--socket` on the line count, as they would when it runs.
 async fn complete_line(words: &[String]) -> ExitCode {
-    let after = |flag: &str| words.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone());
+    let after = |flag: &str| flag_value(words, flag);
     let active = packs::active::load(after("--pack").as_deref());
     let socket = after("--socket").map(PathBuf::from).unwrap_or_else(shimmer_proto::paths::socket_path);
     let cx = complete::Context {
@@ -163,6 +163,16 @@ async fn complete_line(words: &[String]) -> ExitCode {
     let groups = complete::complete(words, &cx, &mut complete::Daemon::new(socket)).await;
     print!("{}", complete::print(&groups));
     ExitCode::SUCCESS
+}
+
+/// `flag`'s value on a command line: `--socket PATH` or `--socket=PATH`, as the CLI itself reads it.
+fn flag_value(words: &[String], flag: &str) -> Option<String> {
+    let inline = format!("{flag}=");
+    words.iter().enumerate().find_map(|(i, w)| match w.strip_prefix(&inline) {
+        Some(value) => Some(value.to_owned()),
+        None if w == flag => words.get(i + 1).cloned(),
+        None => None,
+    })
 }
 
 /// The help to show after a usage error: chosen by the command word the user typed, not by
@@ -305,6 +315,15 @@ mod tests {
 
     fn usage(args: &[&str]) -> &'static str {
         usage_for(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn completion_reads_socket_and_pack_in_either_form() {
+        let w = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(flag_value(&w(&["shimmer", "--socket", "/tmp/s", "ping"]), "--socket").as_deref(), Some("/tmp/s"));
+        assert_eq!(flag_value(&w(&["shimmer", "--socket=/tmp/s", "ping"]), "--socket").as_deref(), Some("/tmp/s"));
+        assert_eq!(flag_value(&w(&["shimmer", "--pack=short", "up"]), "--pack").as_deref(), Some("short"));
+        assert_eq!(flag_value(&w(&["shimmer", "ping"]), "--socket"), None);
     }
 
     #[test]

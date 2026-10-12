@@ -998,6 +998,14 @@ mod tests {
     }
 
     #[test]
+    fn completions_is_a_command_word_no_pack_may_take() {
+        // #193's review: like every command word (ADR 0013), so `shimmer completions` can't be shadowed.
+        let toml = "[pack]\nid = \"p\"\nlabel = \"P\"\n[alias]\n\"completions\" = \"core.ping\"\n";
+        let problems = crate::packs::pack::parse("p", toml).unwrap_err();
+        assert!(problems.iter().any(|p| p.contains("completions")), "{problems:?}");
+    }
+
+    #[test]
     fn printed_for_the_scripts() {
         let groups = vec![
             Group {

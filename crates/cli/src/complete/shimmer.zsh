@@ -112,4 +112,9 @@ _shimmer_highlight() {
     done
 }
 
-autoload -Uz add-zle-hook-widget 2>/dev/null && add-zle-hook-widget line-pre-redraw _shimmer_highlight
+# Colouring the line needs zsh 5.9 (region_highlight's memo=, so it never clears another
+# highlighter's colours). On an older zsh, Tab completion still works, just without it.
+autoload -Uz is-at-least add-zle-hook-widget 2>/dev/null
+if is-at-least 5.9; then
+    add-zle-hook-widget line-pre-redraw _shimmer_highlight
+fi

@@ -11,7 +11,7 @@ _shimmer() {
     [[ $line == *[[:space:]] || ${#words[@]} -eq 0 ]] && words+=("")
     local cur=${words[${#words[@]}-1]}
     COMPREPLY=()
-    local entry word files='' nospace=''
+    local entry word files='' words_seen=0 slashed=0
     while IFS= read -r entry; do
         case $entry in
             '>files'*) files=1 ;;
@@ -19,7 +19,8 @@ _shimmer() {
             *)
                 word=${entry%%$'\t'*}
                 COMPREPLY+=("$word")
-                [[ $word == */ ]] && nospace=1
+                (( words_seen++ ))
+                [[ $word == */ ]] && (( slashed++ ))
                 ;;
         esac
     done < <(@EXE@ __complete "${words[@]}" 2>/dev/null)
@@ -27,7 +28,9 @@ _shimmer() {
         local f
         while IFS= read -r f; do COMPREPLY+=("$f"); done < <(compgen -f -- "$cur")
     fi
-    if [[ -n $nospace ]] && type compopt &>/dev/null; then
+    # bash's nospace is for the whole list: only when every suggestion is a `collection/`, so
+    # picking a plain word still gets its space.
+    if (( words_seen > 0 && slashed == words_seen )) && type compopt &>/dev/null; then
         compopt -o nospace 2>/dev/null
     fi
 }
