@@ -19,6 +19,7 @@ use shimmer_core::{Error, ErrorCode, Result};
 
 use crate::client::Client;
 use crate::editor;
+use crate::follow::{follow, Followed};
 use crate::render::{self, cell, table, wrap};
 use crate::schedules;
 
@@ -61,6 +62,8 @@ commands:
 --wait  follow the launch until it ends and show how it went. Without it the command
         returns once the launch is queued; check on it with 'shimmer workspaces status NAME'.
         Don't use --wait from a workspace's own step scripts: launches run one at a time.
+        With --json: the op's result, or {\"result_missed\": true, \"task\": {…}} when it
+        succeeded but its result was lost to dropped events (then fields like log are absent).
 --yes   skip the question. Needed when no one is at the keyboard (scripts).
 
 A workspace is a folder under data/workspaces/ in your Shimmer folder, holding a
@@ -632,8 +635,18 @@ async fn queued(client: &mut Client, kind: Queued, id: &str, wait: bool, json: b
     if !wait {
         return Ok(if json { render::json(&handle) } else { queued_message(kind, id, task) });
     }
-    match follow(client, task, json).await {
-        Ok(result) => Ok(if json { render::json(&result) } else { with_log(kind.done(id), &result) }),
+    let look = format!("shimmer workspaces status {id}");
+    match follow(client, task, !json, &look).await {
+        Ok(Followed::Finished(result)) => {
+            Ok(if json { render::json(&result) } else { with_log(kind.done(id), &result) })
+        }
+        // It worked; only its log lines were missed (#142). With --json, `result_missed` says so,
+        // so a script reading the usual result's fields can tell why they're absent.
+        Ok(Followed::ResultMissed(task)) => Ok(if json {
+            render::json(&json!({"result_missed": true, "task": task}))
+        } else {
+            format!("{}\n  (its output was missed: some events were dropped; see '{look}')", kind.done(id))
+        }),
         Err(e) if json => Err(e),
         Err(e) => Err(explain(e, id)),
     }
@@ -672,72 +685,15 @@ fn queued_message(kind: Queued, id: &str, task: &str) -> String {
     format!("queued the {} of {id} (task {task})\ncheck on it with: shimmer workspaces status {id}", kind.what())
 }
 
-/// Follow task `task` over the subscription stream until it ends: its result, or the error it
-/// failed with (e.g. `workspace_dirty`, with its detail). Progress notes go to stderr.
-async fn follow(client: &mut Client, task: &str, json: bool) -> Result<Value> {
-    let mut last_note = String::new();
-    loop {
-        let ev = client.next_event().await?;
-        if ev.topic == "core.stream.lagged" {
-            // Events were dropped, maybe the one we wait for: ask directly instead.
-            if let Some(outcome) = finished_task(client, task).await? {
-                return outcome;
-            }
-            continue;
-        }
-        if ev.payload["task_id"] != task {
-            continue;
-        }
-        match ev.topic.as_str() {
-            "queue.task.progress" => {
-                let note = ev.payload["note"].as_str().unwrap_or_default();
-                if !json && !note.is_empty() && note != last_note {
-                    eprintln!("  {note} …");
-                    last_note = note.to_owned();
-                }
-            }
-            "queue.task.finished" => return Ok(ev.payload["result"].clone()),
-            "queue.task.failed" => return Err(task_error(&ev.payload)),
-            "queue.task.cancelled" => return Err(cancelled()),
-            _ => {}
-        }
-    }
-}
-
-/// After `core.stream.lagged`: has the task ended? `None` while it is still queued or running.
-async fn finished_task(client: &mut Client, task: &str) -> Result<Option<Result<Value>>> {
-    let t = client.call("queue.task", json!({"task_id": task})).await?;
-    Ok(match t["status"].as_str() {
-        Some("succeeded") => Some(Ok(t["result"].clone())),
-        Some("failed") => {
-            Some(Err(Error::new(ErrorCode::ModuleError, t["error"].as_str().unwrap_or("the task failed").to_owned())))
-        }
-        Some("cancelled") => Some(Err(cancelled())),
-        _ => None,
-    })
-}
-
-/// The error a `queue.task.failed` event carries, rebuilt as the daemon sent it.
-fn task_error(payload: &Value) -> Error {
-    let code: ErrorCode = serde_json::from_value(payload["code"].clone()).unwrap_or(ErrorCode::ModuleError);
-    let mut e = Error::new(code, payload["error"].as_str().unwrap_or("the task failed").to_owned());
-    if let Some(detail) = payload.get("detail").filter(|d| !d.is_null()) {
-        e = e.with_detail(detail.clone());
-    }
-    e
-}
-
-fn cancelled() -> Error {
-    Error::new(ErrorCode::ModuleError, "the task was cancelled")
-}
-
 /// For people: a dirty workspace's error says where to look and what to do (§10.3), instead
 /// of raw JSON detail. Other errors are shown as they are.
 fn explain(e: Error, id: &str) -> Error {
     if e.code != ErrorCode::WorkspaceDirty {
         return e;
     }
-    let detail = e.detail.clone().unwrap_or(Value::Null);
+    // After a lagged stream the error has its code but no detail (#157): which ways out apply
+    // (is there a cleanup script?) is unknown, and its message already names where to look.
+    let Some(detail) = e.detail.clone() else { return e };
     let mut message = e.message.clone();
     if let Some(log) = detail["log"].as_str().filter(|l| !l.is_empty()) {
         // Why it failed is the end of the step's log (a template's check step says it in one line).
@@ -1237,6 +1193,7 @@ fn first_line(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::follow::task_error;
 
     fn parse_words(words: &[&str]) -> std::result::Result<WorkspacesCmd, String> {
         parse(words.iter().map(|w| w.to_string()).collect())
@@ -1302,21 +1259,6 @@ mod tests {
             "queued the forced relaunch of deep-work (task 01TASK)\ncheck on it with: shimmer workspaces status deep-work"
         );
         assert!(!m.contains("--wait"), "{m}");
-    }
-
-    #[test]
-    fn a_failed_task_keeps_its_code_and_detail() {
-        let payload = json!({"task_id": "01", "error": "workspace 'deep-work' failed at step 1/3 setup (exit code 1)",
-                             "code": "workspace_dirty",
-                             "detail": {"workspace": "deep-work", "log": "logs/x.log", "has_cleanup_script": true}});
-        let e = task_error(&payload);
-        assert_eq!(e.code, ErrorCode::WorkspaceDirty);
-        assert_eq!(e.detail.as_ref().unwrap()["log"], "logs/x.log");
-
-        let other =
-            task_error(&json!({"task_id": "01", "error": "no launch backend registered", "code": "unavailable"}));
-        assert_eq!((other.code, other.detail), (ErrorCode::Unavailable, None));
-        assert_eq!(task_error(&json!({"task_id": "01"})).code, ErrorCode::ModuleError, "unknown code still fails");
     }
 
     #[test]
@@ -1764,6 +1706,22 @@ mod tests {
         let without = ways_out("deep-work", false);
         assert!(!without.contains("cleanup deep-work"), "{without}");
         assert!(without.contains("force-relaunch deep-work") && without.contains("reset deep-work"), "{without}");
+    }
+
+    #[test]
+    fn a_dirty_error_without_detail_points_at_status_instead_of_guessing() {
+        // After a lagged stream (#157) the code survives but the detail doesn't: whether there is
+        // a cleanup script is unknown, so no ways out are offered; the message names `status`.
+        let lagged = Error::new(
+            ErrorCode::WorkspaceDirty,
+            "step 1 failed (some events were dropped, so details may be missing: see 'shimmer workspaces status s')",
+        );
+        let e = explain(lagged.clone(), "s");
+        assert_eq!((e.code, &e.message), (ErrorCode::WorkspaceDirty, &lagged.message));
+        assert!(!e.message.contains("fix it with one of"), "{}", e.message);
+        // With detail, as before: the ways out, cleanup included when there's a script.
+        let full = lagged.with_detail(json!({"has_cleanup_script": true}));
+        assert!(explain(full, "s").message.contains("shimmer workspaces cleanup s"));
     }
 
     #[test]

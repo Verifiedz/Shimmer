@@ -1,8 +1,8 @@
 # 0025. Workspace templates: ready-made workspaces you fill in with your own answers
 
-Status: proposed · Raised by Dev B (issue #68) · Needs sign-off: Dev A (two new ops in
-`workspaces`, docs/protocol.md; the scripts run through his `Launcher`) · Dev C notified ·
-No `core` or `proto` change
+Status: accepted (M3, #96) · Raised by Dev B (issue #68) · Signed off: Dev A (two new ops in
+`workspaces`, docs/protocol.md; the scripts run through his `Launcher`) · Dev C notified · No `core`
+or `proto` change
 
 ## Context
 
