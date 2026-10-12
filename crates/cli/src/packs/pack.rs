@@ -26,23 +26,9 @@ pub const NO_PACK: &str = "none";
 /// Words an alias may never be: the CLI's own command words, words held for commands we expect
 /// (so a pack that is valid today can't break when they arrive), and the binary's own name.
 pub const RESERVED: &[&str] = &[
-    // `shimmer schedule` and the words its WHEN is made of (ADR 0031 §1): an alias that were one
-    // would make "where the scheduled command starts" ambiguous.
+    // `shimmer schedule` (ADR 0031 §1). The words its WHEN is made of (`daily`, `mon`…) are not
+    // reserved: the scheduled command starts by position, after WHEN and the schedule's options.
     "schedule",
-    "daily",
-    "weekdays",
-    "weekends",
-    "every",
-    "once",
-    "cron",
-    "cron-local",
-    "mon",
-    "tue",
-    "wed",
-    "thu",
-    "fri",
-    "sat",
-    "sun",
     "ping",
     "manifest",
     "shutdown",
