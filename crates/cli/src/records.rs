@@ -875,7 +875,7 @@ pub async fn run(client: &mut Client, cmd: &RecordsCmd, json: bool, prompt: &mut
         RecordsCmd::Templates { which } => {
             let data = client.call("records.templates", json!({})).await?;
             let text = templates(&data, which.as_deref())?;
-            return Ok(if json { render::json(&data) } else { text });
+            return Ok(if json { render::json(&render::templates_selected(&data, which.as_deref())) } else { text });
         }
         RecordsCmd::Peek { template, file } => {
             // The whole list first, so a category's name or a typo gets a helpful message.

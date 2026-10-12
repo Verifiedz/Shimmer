@@ -468,7 +468,7 @@ pub async fn run(client: &mut Client, cmd: &WorkspacesCmd, json: bool, prompt: &
         WorkspacesCmd::Templates { which } => {
             let data = client.call("workspaces.templates", json!({})).await?;
             let text = templates(&data, which.as_deref())?;
-            Ok(out(&data, text))
+            Ok(out(&render::templates_selected(&data, which.as_deref()), text))
         }
         WorkspacesCmd::Peek { template, scripts, file } => {
             let data = client.call("workspaces.templates", json!({})).await?;
