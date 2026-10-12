@@ -24,6 +24,8 @@ commands:
 WHEN is exactly one of:
   --every DURATION   e.g. 30s, 15m, 2h, 3d, 1w, 1h30m
   --cron \"EXPR\"      five fields, minute hour day month weekday; times are UTC
+  --cron-local \"EXPR\" the same, in your local timezone (config.toml's local_timezone):
+                     9am stays 9am when the clocks change
   --once TIME        2026-10-10 09:00 (your local time) or 2026-10-10T09:00:00Z
 
 --catch-up says what happens to runs missed while the machine was off or asleep. It has no
@@ -67,7 +69,8 @@ const CATCH_UP_HELP: &str = "skip (drop missed runs), run-once (one run on wakin
 pub fn parse(words: Vec<String>) -> std::result::Result<SchedulerCmd, String> {
     let mut words = words.into_iter();
     let Some(sub) = words.next() else { return Ok(SchedulerCmd::Help) };
-    let options: &[&str] = if sub == "add" { &["--every", "--cron", "--once", "--catch-up", "--lane"] } else { &[] };
+    let options: &[&str] =
+        if sub == "add" { &["--every", "--cron", "--cron-local", "--once", "--catch-up", "--lane"] } else { &[] };
     let flags = Flags::split(words.collect(), options, &[]).map_err(|e| format!("scheduler {sub}: {e}"))?;
     let id = || match flags.positional.as_slice() {
         [id] => Ok(id.clone()),
@@ -102,11 +105,19 @@ fn add(flags: &Flags) -> std::result::Result<NewTrigger, String> {
             )
         }
     };
-    let schedule = match (flags.value("--every"), flags.value("--cron"), flags.value("--once")) {
-        (Some(d), None, None) => json!({ "every": when::parse_duration(d)? }),
-        (None, Some(expr), None) => json!({ "cron": expr }),
-        (None, None, Some(t)) => json!({ "once": when::parse_once(t)?.to_rfc3339() }),
-        _ => return Err("'scheduler add' needs exactly one of --every DURATION, --cron \"EXPR\" or --once TIME".into()),
+    let given = [flags.value("--every"), flags.value("--cron"), flags.value("--cron-local"), flags.value("--once")];
+    let schedule = match given {
+        [Some(d), None, None, None] => json!({ "every": when::parse_duration(d)? }),
+        [None, Some(expr), None, None] => json!({ "cron": expr }),
+        [None, None, Some(expr), None] => json!({ "cron_local": expr }),
+        [None, None, None, Some(t)] => json!({ "once": when::parse_once(t)?.to_rfc3339() }),
+        _ => {
+            return Err(
+                "'scheduler add' needs exactly one of --every DURATION, --cron \"EXPR\", --cron-local \"EXPR\" \
+                        or --once TIME"
+                    .into(),
+            )
+        }
     };
     let catch_up = match flags.value("--catch-up") {
         Some("skip") => "skip",
@@ -236,6 +247,8 @@ fn schedule(v: &Value) -> String {
         format!("every {}", when::format_duration(secs))
     } else if let Some(expr) = v["cron"].as_str() {
         format!("cron {expr} (UTC)")
+    } else if let Some(expr) = v["cron_local"].as_str() {
+        format!("cron {expr} (local)")
     } else if let Some(at) = when::timestamp(&v["once"]) {
         format!("once {}", when::local(at))
     } else {
@@ -272,6 +285,18 @@ mod tests {
     use chrono::Duration;
 
     use super::*;
+
+    #[test]
+    fn cron_local_is_added_and_shown_as_local_time() {
+        let SchedulerCmd::Add(t) = p(&["add", "x.y", "--cron-local", "0 9 * * 1-5", "--catch-up", "skip"]).unwrap()
+        else {
+            panic!("not an add")
+        };
+        assert_eq!(t.schedule, json!({"cron_local": "0 9 * * 1-5"}));
+        assert_eq!(schedule(&t.schedule), "cron 0 9 * * 1-5 (local)");
+        let both = p(&["add", "x.y", "--cron", "0 9 * * *", "--cron-local", "0 9 * * *", "--catch-up", "skip"]);
+        assert!(both.unwrap_err().contains("exactly one of"));
+    }
 
     fn p(s: &[&str]) -> std::result::Result<SchedulerCmd, String> {
         parse(s.iter().map(|w| w.to_string()).collect())

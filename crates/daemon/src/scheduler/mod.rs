@@ -20,8 +20,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use shimmer_core::{
-    CatchUp, Clock, Emitter, EnqueueRequest, Error, Fallback, LaneId, ModuleId, NamespacedStore, Origin, Priority,
-    Result, Schedule, TaskId, TriggerId, TriggerSpec,
+    CatchUp, Clock, Emitter, EnqueueRequest, Error, Fallback, LaneId, LocalTimezone, ModuleId, NamespacedStore, Origin,
+    Priority, Result, Schedule, TaskId, TriggerId, TriggerSpec,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -66,6 +66,8 @@ pub struct Scheduler {
     queue: Arc<QueueInner>,
     known_ops: HashSet<String>,
     lanes: HashSet<LaneId>,
+    /// `[general] local_timezone`, for `CronLocal` schedules (ADR 0031 §2).
+    local_tz: LocalTimezone,
 }
 
 fn valid_trigger_id(id: &str) -> bool {
@@ -87,8 +89,9 @@ impl Scheduler {
         queue: Arc<QueueInner>,
         known_ops: HashSet<String>,
         lanes: HashSet<LaneId>,
+        local_tz: LocalTimezone,
     ) -> Self {
-        Self { state: Mutex::default(), store, emitter, clock, queue, known_ops, lanes }
+        Self { state: Mutex::default(), store, emitter, clock, queue, known_ops, lanes, local_tz }
     }
 
     fn lock(&self) -> MutexGuard<'_, BTreeMap<String, Entry>> {
@@ -124,9 +127,16 @@ impl Scheduler {
             let parsed = serde_json::from_str::<Stored>(&text)
                 .map_err(|e| Error::invalid_params(e.to_string()))
                 .and_then(|s| fallback::validate(&s.spec.op, s.spec.fallback.as_ref()).map(|()| s))
-                .and_then(|s| Parsed::parse(&s.spec.schedule).map(|p| (s, p)));
+                .and_then(|s| Parsed::parse(&s.spec.schedule, self.local_tz).map(|p| (s, p)));
             match parsed {
-                Ok((stored, parsed)) => {
+                Ok((mut stored, parsed)) => {
+                    // The zone is read at start and may have changed: place a local trigger's next
+                    // run at its local time in the zone now (ADR 0031 §2). Unchanged zone, same time.
+                    if parsed.is_local() {
+                        if let Some(due) = stored.next_due {
+                            stored.next_due = parsed.next_after(due - chrono::Duration::seconds(1));
+                        }
+                    }
                     st.insert(stored.spec.id.to_string(), Entry { stored, parsed, pending: Vec::new() });
                 }
                 Err(e) => tracing::error!(file, error = %e, "ignoring unreadable trigger file"),
@@ -154,7 +164,7 @@ impl Scheduler {
                 tracing::warn!(module = %module, trigger = %id, error = %e, "skipping trigger");
                 continue;
             }
-            let parsed = match Parsed::parse(&spec.schedule) {
+            let parsed = match Parsed::parse(&spec.schedule, self.local_tz) {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!(module = %module, trigger = %id, error = %e, "skipping trigger");
@@ -376,7 +386,7 @@ impl Scheduler {
             fallback: a.fallback,
         };
         self.check_target(&spec)?;
-        let parsed = Parsed::parse(&spec.schedule)?;
+        let parsed = Parsed::parse(&spec.schedule, self.local_tz)?;
         let stored = Stored {
             next_due: parsed.first_due(self.clock.now()),
             spec,

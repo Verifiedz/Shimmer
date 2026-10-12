@@ -157,6 +157,7 @@ impl Daemon {
             core.queue.clone(),
             known_ops,
             lane_ids,
+            cfg.local_timezone,
         ));
         scheduler.load()?;
         scheduler.register_module_triggers(declared)?;

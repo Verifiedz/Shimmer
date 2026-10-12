@@ -532,3 +532,28 @@ async fn module_triggers_with_an_invalid_fallback_are_not_registered() {
     assert_eq!(ids, ["good"], "a bad declaration degrades like any other, and never stops the daemon");
     stop(d).await;
 }
+
+#[tokio::test]
+async fn a_local_time_trigger_follows_the_timezone_after_a_restart() {
+    // ADR 0031 §2: a `cron_local` schedule is read in `[general] local_timezone`; that is read at
+    // start, so after a change of zone the next run moves to the same local time in the new zone.
+    let env = Env::fake_clock();
+    let config = env.home.path().join("config.toml");
+    std::fs::write(&config, "[general]\nlocal_timezone = \"America/New_York\"\n").unwrap();
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    let id = add(&mut c, json!({"cron_local": "0 9 * * *"}), "demo.echo", "skip").await;
+    let ny = trigger(&mut c, &id).await.unwrap()["next_due"].as_str().unwrap().to_owned();
+    assert!(ny.ends_with("13:00:00Z") || ny.ends_with("14:00:00Z"), "9am in New York is 13:00 or 14:00 UTC: {ny}");
+    assert_eq!(trigger(&mut c, &id).await.unwrap()["schedule"], json!({"cron_local": "0 9 * * *"}));
+    drop(c);
+    stop(d).await;
+
+    std::fs::write(&config, "[general]\nlocal_timezone = \"America/Los_Angeles\"\n").unwrap();
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    let la = trigger(&mut c, &id).await.unwrap()["next_due"].as_str().unwrap().to_owned();
+    let hours = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap();
+    assert_eq!((hours(&la) - hours(&ny)).num_hours(), 3, "9am Los Angeles is 3 hours after 9am New York: {ny} → {la}");
+    stop(d).await;
+}
