@@ -120,7 +120,7 @@ fn a_trigger_fires_and_can_be_paused_resumed_and_removed() {
     let list = ok(&home, &["scheduler", "list"]);
     let row = list.lines().find(|l| l.starts_with(shown(&id))).unwrap_or_else(|| panic!("{list}"));
     assert!(
-        row.contains("records.list")
+        row.contains("records list leetcode")
             && row.contains("every 1s")
             && row.contains("skip")
             && row.contains("active")

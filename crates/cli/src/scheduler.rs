@@ -209,7 +209,7 @@ fn list(data: &Value, now: DateTime<Utc>) -> String {
         .map(|(t, id)| {
             vec![
                 id,
-                render::cell(&t["op"]),
+                command_of(&t["op"], &t["params"]),
                 schedule(&t["schedule"]),
                 catch_up(&t["catch_up"]),
                 when::timestamp(&t["next_due"]).map_or("-".into(), |at| when::relative(at, now)),
@@ -219,7 +219,7 @@ fn list(data: &Value, now: DateTime<Utc>) -> String {
             ]
         })
         .collect();
-    let header = ["ID", "OP", "SCHEDULE", "CATCH-UP", "NEXT", "LAST", "STATE", "FROM"].map(String::from);
+    let header = ["ID", "COMMAND", "SCHEDULE", "CATCH-UP", "NEXT", "LAST", "STATE", "FROM"].map(String::from);
     table(&header, &rows)
 }
 
@@ -230,6 +230,7 @@ fn trigger(t: &Value, now: DateTime<Utc>) -> String {
     };
     let mut out = format!("{}  ({})\n", render::cell(&t["id"]), state(t));
     let mut line = |label: &str, value: String| out.push_str(&format!("  {label:<10}{value}\n"));
+    line("command", command_of(&t["op"], &t["params"]));
     line("op", render::cell(&t["op"]));
     line("params", serde_json::to_string(&t["params"]).unwrap_or_default());
     line("schedule", schedule(&t["schedule"]));
@@ -241,19 +242,84 @@ fn trigger(t: &Value, now: DateTime<Utc>) -> String {
     out.trim_end().to_string()
 }
 
-/// `every 2d`, `cron 0 9 * * 1 (UTC)` or `once 2026-10-10 09:00:00`.
+/// What a trigger runs, as the command you'd type (ADR 0031 §3): `workspaces activate site`,
+/// `records complete habits/stretch`. Rebuilt from its op with the command words packs already
+/// know (`TARGETS`) and its params: the collection and id as `COLLECTION/ID`, everything else
+/// as `--name value`. An op with no command is shown as op + params, as before. Presentation
+/// only: the daemon stores, and `--json` shows, op + params.
+fn command_of(op: &Value, params: &Value) -> String {
+    let op = render::cell(op);
+    let Some(target) = crate::packs::pack::TARGETS.iter().find(|t| t.op == op) else {
+        return format!("{op} {}", serde_json::to_string(params).unwrap_or_default());
+    };
+    let mut words: Vec<String> = target.words.iter().map(|w| w.to_string()).collect();
+    let text = |v: &Value| {
+        let s = v.as_str().map_or_else(|| v.to_string(), str::to_owned);
+        if s.contains(char::is_whitespace) || s.is_empty() {
+            format!("{s:?}")
+        } else {
+            s
+        }
+    };
+    match (params["collection"].as_str(), params["id"].as_str()) {
+        (Some(c), Some(id)) => words.push(format!("{c}/{id}")),
+        (Some(c), None) => words.push(c.into()),
+        (None, Some(id)) => words.push(id.into()),
+        (None, None) => {}
+    }
+    let mut flag = |name: &str, v: &Value| {
+        if !v.is_null() {
+            words.push(format!("--{}", name.replace('_', "-")));
+            words.push(text(v));
+        }
+    };
+    for (key, value) in params.as_object().into_iter().flatten() {
+        match key.as_str() {
+            "collection" | "id" | "scheduled_for" => {}
+            // A record's fields and a list's filter read as the flags that set them.
+            "fields" | "filter" => {
+                for (name, v) in value.as_object().into_iter().flatten() {
+                    flag(name, v);
+                }
+            }
+            other => flag(other, value),
+        }
+    }
+    words.join(" ")
+}
+
+/// `every 2d`, `weekdays 09:00 (local)`, `cron 0 9 * * 1 (UTC)` or `once 2026-10-10 09:00:00`.
 fn schedule(v: &Value) -> String {
     if let Some(secs) = v["every"].as_u64() {
         format!("every {}", when::format_duration(secs))
     } else if let Some(expr) = v["cron"].as_str() {
         format!("cron {expr} (UTC)")
     } else if let Some(expr) = v["cron_local"].as_str() {
-        format!("cron {expr} (local)")
+        local_words(expr).unwrap_or_else(|| format!("cron {expr} (local)"))
     } else if let Some(at) = when::timestamp(&v["once"]) {
         format!("once {}", when::local(at))
     } else {
         render::cell(v)
     }
+}
+
+/// A local cron as `shimmer schedule` writes it, when it is one of its forms: `0 9 * * 1-5` →
+/// `weekdays 09:00 (local)`.
+fn local_words(expr: &str) -> Option<String> {
+    const NAMES: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+    let [minute, hour, "*", "*", days] = expr.split_whitespace().collect::<Vec<_>>()[..] else { return None };
+    let (minute, hour): (u32, u32) = (minute.parse().ok()?, hour.parse().ok()?);
+    let days = match days {
+        "*" => "daily".to_owned(),
+        "1-5" => "weekdays".to_owned(),
+        "0,6" => "weekends".to_owned(),
+        list => list
+            .split(',')
+            .map(|d| d.parse::<usize>().ok().and_then(|i| NAMES.get(i)).copied())
+            .collect::<Option<Vec<_>>>()?
+            .join(","),
+    };
+    (hour < 24 && minute < 60).then(|| format!("{days} {hour:02}:{minute:02} (local)"))
 }
 
 /// The protocol's `run_once` as the CLI spells it.
@@ -293,7 +359,7 @@ mod tests {
             panic!("not an add")
         };
         assert_eq!(t.schedule, json!({"cron_local": "0 9 * * 1-5"}));
-        assert_eq!(schedule(&t.schedule), "cron 0 9 * * 1-5 (local)");
+        assert_eq!(schedule(&t.schedule), "weekdays 09:00 (local)");
         let both = p(&["add", "x.y", "--cron", "0 9 * * *", "--cron-local", "0 9 * * *", "--catch-up", "skip"]);
         assert!(both.unwrap_err().contains("exactly one of"));
     }
@@ -389,15 +455,50 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(
             lines[0].split_whitespace().collect::<Vec<_>>(),
-            ["ID", "OP", "SCHEDULE", "CATCH-UP", "NEXT", "LAST", "STATE", "FROM"]
+            ["ID", "COMMAND", "SCHEDULE", "CATCH-UP", "NEXT", "LAST", "STATE", "FROM"]
         );
         let row = |i: usize| lines[i].split("  ").map(str::trim).filter(|c| !c.is_empty()).collect::<Vec<_>>();
-        assert_eq!(row(1), ["usr-1", "records.list", "every 2d", "run-once", "in 2h", "never", "active", "you"]);
+        assert_eq!(
+            row(1),
+            ["usr-1", "records list leetcode", "every 2d", "run-once", "in 2h", "never", "active", "you"]
+        );
         assert_eq!(
             row(2),
-            ["digest", "notify.digest", "cron 0 9 * * 1 (UTC)", "skip", "-", "3m ago", "paused", "module notify"]
+            ["digest", "notify.digest {}", "cron 0 9 * * 1 (UTC)", "skip", "-", "3m ago", "paused", "module notify"]
         );
         assert!(list(&json!({"triggers": []}), now).starts_with("no triggers yet"));
+    }
+
+    #[test]
+    fn a_trigger_reads_as_the_command_it_runs() {
+        let c = |op: &str, params: Value| command_of(&json!(op), &params);
+        assert_eq!(c("workspaces.activate", json!({"id": "site"})), "workspaces activate site");
+        assert_eq!(
+            c("records.complete", json!({"collection": "habits", "id": "stretch", "scheduled_for": "x"})),
+            "records complete habits/stretch"
+        );
+        assert_eq!(
+            c(
+                "records.add",
+                json!({"collection": "jobs", "fields": {"position": "SDE Intern", "apply_by": "2026-11-01"}})
+            ),
+            "records add jobs --apply-by 2026-11-01 --position \"SDE Intern\""
+        );
+        assert_eq!(
+            c("records.list", json!({"collection": "jobs", "filter": {"stage": "offer"}})),
+            "records list jobs --stage offer"
+        );
+        assert_eq!(c("demo.echo", json!({"x": 1})), "demo.echo {\"x\":1}", "no command: op + params");
+    }
+
+    #[test]
+    fn local_schedules_read_as_they_were_written() {
+        let s = |expr: &str| schedule(&json!({"cron_local": expr}));
+        assert_eq!(s("0 9 * * 1-5"), "weekdays 09:00 (local)");
+        assert_eq!(s("30 18 * * *"), "daily 18:30 (local)");
+        assert_eq!(s("5 8 * * 0,6"), "weekends 08:05 (local)");
+        assert_eq!(s("0 7 * * 1,3,5"), "mon,wed,fri 07:00 (local)");
+        assert_eq!(s("*/15 9 * * 1"), "cron */15 9 * * 1 (local)", "anything else as cron");
     }
 
     #[test]
@@ -407,7 +508,7 @@ mod tests {
         let usr1 = &data["triggers"][0];
         assert_eq!(usr1["id"], "usr-1");
         let out = trigger(usr1, now);
-        assert!(out.starts_with("usr-1  (active)\n  op        records.list\n  params    {\"collection\":\"leetcode\"}\n  schedule  every 2d"), "{out}");
+        assert!(out.starts_with("usr-1  (active)\n  command   records list leetcode\n  op        records.list\n  params    {\"collection\":\"leetcode\"}\n  schedule  every 2d"), "{out}");
         assert!(
             out.contains("  lane      the op's own") && out.contains("(in 2h)") && out.contains("  last run  never"),
             "{out}"
