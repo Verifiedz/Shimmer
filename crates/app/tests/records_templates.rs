@@ -358,3 +358,110 @@ fn a_copied_collection_is_independent_of_its_original_and_survives_a_restart() {
     assert_eq!(json(&home, &["records", "get", "backup/shopify"])["stage"], "interviewing");
     assert_eq!(list("jobs-2027"), serde_json::json!([]));
 }
+
+// ---------------------------------------------------------------- ADR 0030 §4: edit and origin
+
+/// `shimmer ARGS` at a real terminal (a pty from `script`), with `$EDITOR` set to `editor`: the
+/// only way to reach `records edit`'s editor, which never runs without a person there. Its output,
+/// stdout and stderr together, as the terminal showed them.
+fn at_a_terminal(home: &Home, editor: &str, args: &[&str]) -> String {
+    let command = std::iter::once(env!("CARGO_BIN_EXE_shimmer"))
+        .chain(args.iter().copied())
+        .map(|w| format!("'{w}'"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    // util-linux (Linux) and BSD (macOS) `script` take different arguments.
+    let util_linux = std::process::Command::new("script").arg("--version").output().is_ok_and(|o| o.status.success());
+    let mut script = std::process::Command::new("script");
+    match util_linux {
+        true => script.args(["-qec", &command, "/dev/null"]),
+        false => script.args(["-q", "/dev/null", "sh", "-c", &command]),
+    };
+    let o = script
+        .env("SHIMMER_HOME", home.dir.path().join("home"))
+        .env("SHIMMER_SOCKET", home.socket())
+        .env("XDG_CONFIG_HOME", home.dir.path().join("config"))
+        .env("EDITOR", editor)
+        .env_remove("VISUAL")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&o.stdout).replace('\r', "")
+}
+
+#[test]
+fn edit_opens_the_file_then_checks_what_was_saved() {
+    let home = Home::new();
+    ok(&home, &["records", "new", "jobs", "--from", "job-applications"]);
+    ok(&home, &["records", "add", "jobs", "amazon", "--position", "SDE Intern", "--company", "Amazon"]);
+    let file = home.dir.path().join("home/data/records/collections/jobs.toml");
+
+    // --path: where it is, for any editor; no terminal needed.
+    assert_eq!(ok(&home, &["records", "edit", "jobs", "--path"]).trim(), file.display().to_string());
+    // Without a terminal it never waits on an editor: it says where the file is.
+    let err = fails(&home, &["records", "edit", "jobs"]);
+    assert!(
+        err.contains(&format!("records edit needs a terminal; edit the file directly: {}", file.display())),
+        "{err}"
+    );
+    // Only a collection that exists, and never a path outside the folder.
+    for bad in ["nope", "../config", "Jobs"] {
+        assert!(fails(&home, &["records", "edit", bad, "--path"]).contains(&format!("no collection '{bad}'")), "{bad}");
+    }
+
+    // An editor that adds a required field: saved, and the record that doesn't have it is named.
+    let editors = home.dir.path().join("editors");
+    std::fs::create_dir_all(&editors).unwrap();
+    let write = |name: &str, body: &str| {
+        let path = editors.join(name);
+        std::fs::write(&path, body).unwrap();
+        format!("sh {}", path.display())
+    };
+    let add_field = write(
+        "add-field.sh",
+        "printf '\\n[[field]]\\nname = \"region\"\\ntype = \"string\"\\nrequired = true\\n' >> \"$1\"\n",
+    );
+    let out = at_a_terminal(&home, &add_field, &["records", "edit", "jobs"]);
+    assert!(out.contains("✓ jobs saved; checked 1 record(s) in jobs; 1 with problems"), "{out}");
+    assert!(out.contains("amazon  required field 'region' is missing"), "{out}");
+    assert!(std::fs::read_to_string(&file).unwrap().contains("name = \"region\""));
+
+    // An editor that breaks the file: what's wrong, and how to get back in.
+    let before = std::fs::read_to_string(&file).unwrap();
+    let breaks = write("break.sh", "printf 'not toml [' >> \"$1\"\n");
+    let out = at_a_terminal(&home, &breaks, &["records", "edit", "jobs"]);
+    assert!(
+        out.contains("✗ jobs doesn't load now: ") && out.contains("fix it with: shimmer records edit jobs"),
+        "{out}"
+    );
+    std::fs::write(&file, &before).unwrap();
+
+    // An editor that fails: nothing checked.
+    let fails_to_open = write("fail.sh", "exit 3\n");
+    let out = at_a_terminal(&home, &fails_to_open, &["records", "edit", "jobs"]);
+    assert!(out.contains("exited with") && out.contains("nothing checked"), "{out}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), before, "untouched");
+}
+
+#[test]
+fn collections_show_the_template_they_came_from() {
+    let home = Home::with_leetcode();
+    // Written by hand: no column at all.
+    assert!(!ok(&home, &["records", "collections"]).contains("TEMPLATE"));
+
+    ok(&home, &["records", "new", "jobs", "--from", "job-applications"]);
+    ok(&home, &["records", "copy-collection", "jobs", "jobs-2027"]);
+    let table = ok(&home, &["records", "collections"]);
+    let row = |id: &str| {
+        table.lines().find(|l| l.starts_with(&format!("{id} "))).unwrap_or_else(|| panic!("{table}")).to_owned()
+    };
+    assert!(table.lines().next().unwrap().contains("TEMPLATE"), "{table}");
+    assert!(row("jobs").contains(" job-applications "), "{table}");
+    assert!(row("jobs-2027").contains(" job-applications "), "a copy says what its original came from: {table}");
+    assert!(row("leetcode").contains(" - "), "{table}");
+    let all = json(&home, &["records", "collections"]);
+    let jobs = all["collections"].as_array().unwrap().iter().find(|c| c["id"] == "jobs").unwrap();
+    assert_eq!(jobs["template"], "job-applications");
+    // Peek of that template is the way back to its notes and examples.
+    assert!(ok(&home, &["records", "peek", "job-applications"]).contains("How it works"));
+}

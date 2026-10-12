@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use shimmer_core::{Error, ErrorCode, Result};
 
 use crate::client::Client;
+use crate::editor;
 use crate::render::{self, cell, table, wrap};
 use crate::schedules;
 
@@ -438,21 +439,7 @@ pub async fn run(client: &mut Client, cmd: &WorkspacesCmd, json: bool, prompt: &
                     path.display()
                 )));
             }
-            let editor =
-                editor_command(std::env::var("VISUAL").ok().as_deref(), std::env::var("EDITOR").ok().as_deref(), |p| {
-                    which(p)
-                })
-                .ok_or_else(|| Error::invalid_params("no editor found: set $EDITOR (e.g. export EDITOR=nano)"))?;
-            let status = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!("{editor} \"$1\""))
-                .arg("sh")
-                .arg(&path)
-                .status()
-                .map_err(|e| Error::unavailable(format!("couldn't start {editor}: {e}")))?;
-            if !status.success() {
-                return Err(Error::unavailable(format!("{editor} exited with {status}; nothing checked")));
-            }
+            editor::open(&path)?;
             // The daemon reads the file fresh on every request, so this checks what was saved.
             let data = client.call("workspaces.status", id_params(id)).await?;
             Ok(out(&data, edited(id, &data)))
@@ -780,22 +767,6 @@ fn edit_path(home: &std::path::Path, id: &str, file: Option<&str>) -> Result<std
         )));
     }
     Ok(home.join("data/workspaces").join(id).join(file))
-}
-
-/// `$VISUAL`, then `$EDITOR`, then the first of `nano`, `vi` that exists. A GUI editor needs its
-/// wait flag (`EDITOR="code --wait"`), or the check runs before you've saved.
-fn editor_command(visual: Option<&str>, editor: Option<&str>, has: impl Fn(&str) -> bool) -> Option<String> {
-    [visual, editor]
-        .into_iter()
-        .flatten()
-        .map(str::trim)
-        .find(|e| !e.is_empty())
-        .map(str::to_owned)
-        .or_else(|| ["nano", "vi"].into_iter().find(|e| has(e)).map(str::to_owned))
-}
-
-fn which(program: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
 }
 
 /// After editing: fine, or exactly what's wrong now.
@@ -1528,15 +1499,6 @@ mod tests {
         for bad in ["../records/x.toml", "/etc/passwd", "steps/../../x", ""] {
             assert!(edit_path(home, "site", Some(bad)).is_err(), "{bad}");
         }
-    }
-
-    #[test]
-    fn the_editor_is_visual_then_editor_then_nano_or_vi() {
-        let has = |p: &str| p == "vi";
-        assert_eq!(editor_command(Some("code --wait"), Some("nano"), has).as_deref(), Some("code --wait"));
-        assert_eq!(editor_command(Some(" "), Some("nano"), has).as_deref(), Some("nano"));
-        assert_eq!(editor_command(None, None, has).as_deref(), Some("vi"));
-        assert_eq!(editor_command(None, None, |_| false), None);
     }
 
     #[test]

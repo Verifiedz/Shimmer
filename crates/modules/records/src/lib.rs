@@ -433,7 +433,15 @@ impl Records {
                 continue;
             }
             match load_collection(ctx, id) {
-                Ok(c) => out.push(serde_json::to_value(c).unwrap_or_default()),
+                Ok(c) => {
+                    let mut wire = serde_json::to_value(c).unwrap_or_default();
+                    // Where it came from, as its own header says (ADR 0030 §4): nothing stored.
+                    let text = collection_text(ctx, id).unwrap_or_default();
+                    if let Some(template) = templates::origin(&text) {
+                        wire["template"] = json!(template);
+                    }
+                    out.push(wire);
+                }
                 Err(e) if e.code == ErrorCode::InvalidParams => skipped.push(e.message),
                 Err(e) => return Err(e),
             }

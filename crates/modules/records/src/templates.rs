@@ -71,6 +71,18 @@ pub fn header(text: &str) -> (Vec<String>, Vec<String>) {
     (notes, examples)
 }
 
+/// The template a collection file was made from: the "Created from Shimmer's X template" its
+/// header comment starts with, when X is still a built-in. `None` for one made by hand, or
+/// whose comment was edited away.
+pub fn origin(text: &str) -> Option<&'static str> {
+    let named = text
+        .lines()
+        .take_while(|l| l.starts_with('#'))
+        .find_map(|l| l.split("Created from Shimmer's ").nth(1))
+        .and_then(|rest| rest.split_whitespace().next())?;
+    TEMPLATES.iter().find(|(id, _, _)| *id == named).map(|(id, _, _)| *id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,6 +94,7 @@ mod tests {
             let (_, examples) = header(text);
             assert!(!examples.is_empty(), "{id}: no 'How it works' examples");
             assert!(examples[0].starts_with("shimmer records "), "{id}: {examples:?}");
+            assert_eq!(origin(text), Some(*id), "{id}: its header names it");
         }
         for (c, _) in CATEGORIES {
             assert!(TEMPLATES.iter().any(|(_, tc, _)| tc == c), "category {c} has no templates");
@@ -96,5 +109,18 @@ mod tests {
         let (notes, examples) = header(text);
         assert_eq!(notes, ["Private: keep it private.", "After the examples."]);
         assert_eq!(examples, ["shimmer records add x", "    --more"]);
+    }
+
+    #[test]
+    fn origin_reads_the_created_from_line() {
+        assert_eq!(
+            origin("# Jobs.\n# Created from Shimmer's offers template. Yours now.\n[collection]\n"),
+            Some("offers")
+        );
+        // Wrapped onto the next word, an unknown template, below the header, or none at all.
+        assert_eq!(origin("# Created from Shimmer's offers\n"), Some("offers"));
+        assert_eq!(origin("# Created from Shimmer's chess template.\n"), None);
+        assert_eq!(origin("[collection]\n# Created from Shimmer's offers template.\n"), None);
+        assert_eq!(origin("[collection]\nid = \"x\"\n"), None);
     }
 }

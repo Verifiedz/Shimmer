@@ -1184,6 +1184,31 @@ async fn templates_gives_one_in_full_with_its_notes_and_file() {
 }
 
 #[tokio::test]
+async fn collections_say_which_template_they_came_from() {
+    let (r, env) = setup().await;
+    call(&r, &env, "records.create_collection", json!({"id": "jobs", "template": "job-applications"})).await.unwrap();
+    call(&r, &env, "records.copy_collection", json!({"id": "jobs", "to": "jobs-2"})).await.unwrap();
+    // One whose header was edited away, and one that names a template that isn't built in.
+    let text = file(&env, "collections/jobs.toml").unwrap();
+    let edited = text
+        .replace("Created from Shimmer's job-applications template.", "Mine.")
+        .replace("id = \"jobs\"", "id = \"mine\"");
+    env.ctx.store.write("collections/mine.toml", edited).unwrap();
+    let chess = text.replace("job-applications template", "chess template").replace("id = \"jobs\"", "id = \"chess\"");
+    env.ctx.store.write("collections/chess.toml", chess).unwrap();
+
+    let data = call(&r, &env, "records.collections", json!({})).await.unwrap();
+    let from = |id: &str| {
+        data["collections"].as_array().unwrap().iter().find(|c| c["id"] == id).unwrap().get("template").cloned()
+    };
+    assert_eq!(from("jobs"), Some(json!("job-applications")));
+    assert_eq!(from("jobs-2"), Some(json!("job-applications")), "a copy says what its original came from");
+    assert_eq!(from("leetcode"), None, "written by hand (the test fixture)");
+    assert_eq!(from("mine"), None);
+    assert_eq!(from("chess"), None);
+}
+
+#[tokio::test]
 async fn create_collection_never_overwrites_and_says_what_exists() {
     let (r, env) = setup().await;
     let before = topics(&env).len();

@@ -8,6 +8,7 @@ mod args;
 mod autostart;
 mod client;
 mod csv;
+mod editor;
 mod flags;
 pub mod packs;
 mod queue;

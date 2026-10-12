@@ -400,7 +400,7 @@ after a step has run leaves it `dirty`.
 
 | Op | Execution | Params | Returns |
 |---|---|---|---|
-| `records.collections` | inline | `{}` | `{"collections":[...]}`, each collection definition as JSON (+ `"skipped"` naming each malformed collection file). |
+| `records.collections` | inline | `{}` | `{"collections":[...]}`, each collection definition as JSON (+ `"skipped"` naming each malformed collection file). A collection made from a built-in template also has `"template"`: its id, read from the "Created from Shimmer's X template" line its file starts with (absent for one made by hand, or once that line is edited away). ADR 0030 §4. |
 | `records.add` | inline | `{"collection","id"?,"fields"?}` | The new item, which carries its `id`. Without an `id`, one is made from the collection's `title` (`"Two Sum"` → `two-sum`, then `two-sum-2`, …), or from today's date (`2026-10-05-1`) when there's no title to use. An explicit `id` that exists is `conflict`. ADR 0018. |
 | `records.get` | inline | `{"collection","id"}` | The item. |
 | `records.list` | inline | `{"collection","filter"?,"search"?,"sort"?,"limit"?,"offset"?}` | `{"items","total","titles"}` (+ `"skipped"` if a hand-edited file was unreadable). `titles` is `{id: title}` for the listed items (ADR 0024 §5). Ordered by `sort`, then by id. See below. |
