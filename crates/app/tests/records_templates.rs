@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{fails, ok, Home};
+use common::{fails, ok, stderr, Home};
 use serde_json::Value;
 
 fn json(home: &Home, args: &[&str]) -> Value {
@@ -174,4 +174,106 @@ fn every_templates_examples_work_as_written() {
         let check = ok(&home, &["records", "check", id]);
         assert!(check.contains("all fit"), "{id}: {check}");
     }
+}
+
+// ---------------------------------------------------------------- ADR 0030 §2: schedules
+
+/// The schedules you added (`usr-…`), not any a module registered for itself.
+fn schedules(home: &Home) -> Vec<Value> {
+    json(home, &["scheduler", "list"])["triggers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t["id"].as_str().is_some_and(|id| id.starts_with("usr-")))
+        .cloned()
+        .collect()
+}
+
+fn schedule(home: &Home, op: &str, params: &str, every: &str) -> String {
+    let out = ok(home, &["scheduler", "add", op, params, "--every", every, "--catch-up", "skip"]);
+    out["✓ added trigger ".len()..].split(':').next().unwrap().to_owned()
+}
+
+#[test]
+fn renaming_moves_schedules_only_with_a_yes_and_removing_says_what_will_fail() {
+    let home = Home::new();
+    ok(&home, &["records", "new", "jobs", "--from", "job-applications"]);
+    ok(&home, &["records", "new", "leetcode", "--from", "leetcode"]);
+    ok(&home, &["records", "add", "jobs", "amazon-sde", "--position", "SDE Intern", "--company", "Amazon"]);
+    schedule(&home, "records.list", r#"{"collection":"jobs"}"#, "1d");
+    let get = schedule(&home, "records.get", r#"{"collection":"jobs","id":"amazon-sde"}"#, "2d");
+    ok(&home, &["scheduler", "pause", &get]);
+    let other = schedule(&home, "records.list", r#"{"collection":"leetcode"}"#, "1d");
+    let collection_of = |id: &str| -> Vec<(String, String)> {
+        let mut found: Vec<(String, String)> = schedules(&home)
+            .iter()
+            .filter(|t| t["id"] != other)
+            .map(|t| {
+                (
+                    t["params"]["collection"].as_str().unwrap().to_owned(),
+                    t["params"]["id"].as_str().unwrap_or("").to_owned(),
+                )
+            })
+            .collect();
+        found.sort();
+        assert!(found.iter().all(|(c, _)| c == id), "{found:?}");
+        found
+    };
+
+    // A record. No terminal and no --move-schedules: renamed, its schedule named but left alone.
+    let out = ok(&home, &["records", "rename", "jobs/amazon-sde", "amazon"]);
+    assert!(
+        out.starts_with(
+            "✓ jobs/amazon-sde renamed to jobs/amazon\n  1 schedule still uses the old name amazon-sde:\n    usr-"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("records.get, every 172800s (paused)"), "{out}");
+    assert!(
+        out.contains("they'll fail until moved: run 'shimmer records rename jobs/amazon amazon-sde' to undo"),
+        "{out}"
+    );
+    assert!(!out.contains("records.list"), "the collection's list doesn't name the record: {out}");
+    assert_eq!(collection_of("jobs"), [("jobs".into(), "".into()), ("jobs".into(), "amazon-sde".into())]);
+    // The undo it gives works; then with --move-schedules it moves, still paused.
+    ok(&home, &["records", "rename", "jobs/amazon", "amazon-sde"]);
+    let out = ok(&home, &["records", "rename", "jobs/amazon-sde", "amazon", "--move-schedules"]);
+    assert_eq!(out.matches("\n  moved usr-").count(), 1, "{out}");
+    assert_eq!(collection_of("jobs"), [("jobs".into(), "".into()), ("jobs".into(), "amazon".into())]);
+    let moved = schedules(&home).into_iter().find(|t| t["op"] == "records.get").unwrap();
+    assert_eq!((moved["paused"].as_bool(), moved["schedule"]["every"].as_u64()), (Some(true), Some(172_800)));
+    assert_ne!(moved["id"], get.as_str(), "added again, the old one removed");
+
+    // A collection: both its schedules, never the other collection's.
+    let out = ok(&home, &["records", "rename-collection", "jobs", "apps"]);
+    assert!(out.starts_with("✓ jobs is now apps\n  2 schedules still use the old name jobs:"), "{out}");
+    assert!(out.contains("run 'shimmer records rename-collection apps jobs' to undo"), "{out}");
+    collection_of("jobs");
+    ok(&home, &["records", "rename-collection", "apps", "jobs"]);
+    let out = ok(&home, &["records", "rename-collection", "jobs", "apps", "--move-schedules"]);
+    assert_eq!(out.matches("\n  moved usr-").count(), 2, "{out}");
+    assert_eq!(collection_of("apps"), [("apps".into(), "".into()), ("apps".into(), "amazon".into())]);
+    assert_eq!(
+        schedules(&home).iter().filter(|t| t["id"] == other && t["params"]["collection"] == "leetcode").count(),
+        1
+    );
+    // The moved schedules work: their ops find what they name.
+    ok(&home, &["call", "records.get", r#"{"collection":"apps","id":"amazon"}"#]);
+
+    // --json stays JSON: the rename's own reply, nothing appended.
+    let o = home.shimmer(&["records", "rename-collection", "leetcode", "lc", "--json"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let reply: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(reply["id"], "lc");
+
+    // Removing lists what will fail and keeps the schedules: restoring makes them work again.
+    let out = ok(&home, &["records", "remove-collection", "apps", "--yes"]);
+    assert!(out.contains("\n  2 schedules still use apps:"), "{out}");
+    assert!(out.contains("they'll fail until you restore it (shimmer records restore-collection apps)"), "{out}");
+    assert_eq!(schedules(&home).len(), 3, "nothing removed");
+    ok(&home, &["records", "restore-collection", "apps"]);
+    ok(&home, &["call", "records.get", r#"{"collection":"apps","id":"amazon"}"#]);
+    // A removal nothing names says nothing about schedules.
+    ok(&home, &["records", "new", "spare", "--from", "documents"]);
+    assert!(!ok(&home, &["records", "remove-collection", "spare", "--yes"]).contains("schedule"));
 }

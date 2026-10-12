@@ -19,6 +19,7 @@ use shimmer_core::{Error, ErrorCode, Result};
 
 use crate::client::Client;
 use crate::render::{self, cell, table, wrap};
+use crate::schedules;
 
 pub const USAGE: &str = "usage: shimmer workspaces <command>
 
@@ -531,43 +532,15 @@ pub async fn run(client: &mut Client, cmd: &WorkspacesCmd, json: bool, prompt: &
             }
             // Schedules that activate (or stop…) it by its old name would now fail: say so, and
             // move them only when the person says yes.
-            let all = client.call("scheduler.list", json!({})).await.unwrap_or(Value::Null);
-            let old = schedules_for(&all, id);
-            if old.is_empty() {
-                return Ok(out(&data, text));
-            }
-            let verb = if old.len() == 1 { "uses" } else { "use" };
-            let mut listing = format!("\n  {} still {verb} the old name {id}:", plural(old.len(), "schedule"));
-            for t in &old {
-                let _ = write!(listing, "\n    {}", schedule_line(t));
-            }
-            let asked = !*move_schedules && prompt.interactive();
-            let go = *move_schedules || {
-                if asked {
-                    eprintln!("{}", listing.trim_start_matches('\n'));
-                    prompt.confirm(&format!("Move {} to {to}?", if old.len() == 1 { "it" } else { "them" }))
-                } else {
-                    false
-                }
+            let old = schedules::find(client, "workspaces.", &schedules::names(&[("id", id)])).await;
+            let rename = schedules::Rename {
+                from: id,
+                to,
+                changes: schedules::names(&[("id", to)]),
+                undo: format!("shimmer workspaces rename {to} {id}"),
+                yes: *move_schedules,
             };
-            if !asked {
-                text.push_str(&listing);
-            }
-            if !go {
-                let _ = write!(
-                    text,
-                    "\n  they'll fail until moved: run 'shimmer workspaces rename {to} {id}' to undo, or \
-                     remove each (shimmer scheduler remove ID) and add it again for {to}"
-                );
-                return Ok(out(&data, text));
-            }
-            for t in &old {
-                let line = match move_schedule(client, t, to).await {
-                    Ok(new) => format!("moved {} → {new}", cell(&t["id"])),
-                    Err(e) => format!("couldn't move {}: {} (it still uses {id})", cell(&t["id"]), e.message),
-                };
-                let _ = write!(text, "\n  {line}");
-            }
+            text.push_str(&schedules::follow_rename(client, prompt, &old, &rename).await);
             Ok(out(&data, text))
         }
         WorkspacesCmd::Reconfigure { id, set } => {
@@ -1099,66 +1072,6 @@ fn template_in_full(t: &Value, categories: &[Value]) -> String {
     }
     let _ = write!(out, "\nmake one: shimmer workspaces new NAME --from {id}");
     out
-}
-
-/// The schedules you added that run a `workspaces.*` op on workspace ID and haven't finished.
-fn schedules_for(all: &Value, id: &str) -> Vec<Value> {
-    all["triggers"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|t| {
-            t["source"]["type"] == "user"
-                && t["done"] != true
-                && t["op"].as_str().is_some_and(|op| op.starts_with("workspaces."))
-                && t["params"]["id"] == id
-        })
-        .cloned()
-        .collect()
-}
-
-/// "usr-01… workspaces.activate, cron 0 9 * * 1-5".
-fn schedule_line(t: &Value) -> String {
-    let s = &t["schedule"];
-    let when = if let Some(c) = s["cron"].as_str() {
-        format!("cron {c}")
-    } else if let Some(n) = s["every"].as_u64() {
-        format!("every {n}s")
-    } else if let Some(at) = s["once"].as_str() {
-        format!("once at {at}")
-    } else {
-        s.to_string()
-    };
-    let paused = if t["paused"] == true { " (paused)" } else { "" };
-    format!("{} {}, {when}{paused}", cell(&t["id"]), cell(&t["op"]))
-}
-
-/// Move one schedule to workspace TO: the same trigger added again with the new id (paused if
-/// it was), then the old one removed. The old one stays if adding fails. Its new id.
-async fn move_schedule(client: &mut Client, t: &Value, to: &str) -> Result<String> {
-    let mut params = t["params"].clone();
-    params["id"] = json!(to);
-    let mut add = json!({"schedule": t["schedule"], "op": t["op"], "params": params, "catch_up": t["catch_up"]});
-    for key in ["lane", "fallback"] {
-        if !t[key].is_null() {
-            add[key] = t[key].clone();
-        }
-    }
-    let new = client.call("scheduler.add", add).await?;
-    let new_id = new["trigger_id"].as_str().unwrap_or_default().to_owned();
-    if t["paused"] == true {
-        client.call("scheduler.pause", json!({"trigger_id": new_id})).await?;
-    }
-    client.call("scheduler.remove", json!({"trigger_id": t["id"]})).await?;
-    Ok(new_id)
-}
-
-fn plural(n: usize, word: &str) -> String {
-    if n == 1 {
-        format!("1 {word}")
-    } else {
-        format!("{n} {word}s")
-    }
 }
 
 /// The template's questions with each current answer as its default, so Enter keeps it.
@@ -1929,30 +1842,6 @@ mod tests {
             "✓ reconfigured site\n  CODE_EDITOR: vscode → cursor\n  LINKS: https://a.dev → (none)\n  it takes effect the next time you activate it"
         );
         assert_eq!(reconfigured("site", &json!({"changed": []})), "nothing changed in site");
-    }
-
-    #[test]
-    fn rename_finds_the_schedules_that_name_the_workspace() {
-        let all = json!({"triggers": [
-            {"id": "usr-1", "source": {"type": "user"}, "op": "workspaces.activate", "params": {"id": "site"},
-             "schedule": {"cron": "0 9 * * 1-5"}, "paused": false, "done": false},
-            {"id": "usr-2", "source": {"type": "user"}, "op": "workspaces.stop", "params": {"id": "site"},
-             "schedule": {"every": 3600}, "paused": true, "done": false},
-            {"id": "usr-3", "source": {"type": "user"}, "op": "workspaces.activate", "params": {"id": "other"},
-             "schedule": {"every": 60}, "done": false},
-            {"id": "usr-4", "source": {"type": "user"}, "op": "workspaces.activate", "params": {"id": "site"},
-             "schedule": {"once": "2026-10-01T09:00:00Z"}, "done": true},
-            {"id": "records-x", "source": {"type": "module", "id": "records"}, "op": "workspaces.activate",
-             "params": {"id": "site"}, "schedule": {"every": 60}, "done": false},
-            {"id": "usr-5", "source": {"type": "user"}, "op": "records.list", "params": {"id": "site"},
-             "schedule": {"every": 60}, "done": false}]});
-        let found: Vec<String> = schedules_for(&all, "site").iter().map(|t| cell(&t["id"])).collect();
-        assert_eq!(found, ["usr-1", "usr-2"], "yours, unfinished, a workspaces op, this workspace");
-        let lines: Vec<String> = schedules_for(&all, "site").iter().map(schedule_line).collect();
-        assert_eq!(
-            lines,
-            ["usr-1 workspaces.activate, cron 0 9 * * 1-5", "usr-2 workspaces.stop, every 3600s (paused)"]
-        );
     }
 
     #[test]

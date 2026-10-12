@@ -12,6 +12,7 @@ use shimmer_core::{Error, ErrorCode, Result};
 use crate::client::Client;
 use crate::csv;
 use crate::render::{self, cell, table, wrap};
+use crate::schedules;
 use crate::workspaces::Prompt;
 
 pub const USAGE: &str = "usage: shimmer records <command>
@@ -42,7 +43,8 @@ commands:
                                        mark done and stamp the collection's date field;
                                        a value for the date field back-dates it
   reopen COLLECTION/ID [--clear-stamp] mark a done record todo again
-  rename COLLECTION/ID NEW_ID          give a record a new id
+  rename COLLECTION/ID NEW_ID          give a record a new id; offers to move schedules that
+       [--move-schedules]              name it (--move-schedules: move them without asking)
   remove COLLECTION/ID [--force]       remove a record (it goes to the trash); --force even
                                        if other records refer to it
   restore COLLECTION/ID                bring a removed record back
@@ -59,9 +61,11 @@ moving data:
 changing a collection:
   check COLLECTION                     list records that don't fit the collection
   rename-field COLLECTION FROM TO      rename a field in the collection and every record
-  rename-collection ID NEW_ID          give a collection a new id
+  rename-collection ID NEW_ID          give a collection a new id; offers to move schedules
+       [--move-schedules]              that name it (--move-schedules: without asking)
   remove-collection ID [--yes]         remove a collection and its records (asks first;
-                                       restore-collection brings it back)
+                                       restore-collection brings it back); lists the
+                                       schedules that name it, which fail until restored
   restore-collection ID                bring a removed collection back
 
 A record can be written COLLECTION/ID or COLLECTION ID. Field names come from the
@@ -80,10 +84,12 @@ pub enum RecordsCmd {
         id: Option<String>,
         set: Flags,
     },
+    /// `move_schedules`: move the schedules that name it without asking (ADR 0030 §2).
     Rename {
         collection: String,
         id: String,
         new_id: String,
+        move_schedules: bool,
     },
     List {
         collection: String,
@@ -153,6 +159,7 @@ pub enum RecordsCmd {
     RenameCollection {
         id: String,
         new_id: String,
+        move_schedules: bool,
     },
     /// `yes`: confirm without asking (`--yes`).
     RemoveCollection {
@@ -245,6 +252,8 @@ pub fn parse(words: Vec<String>) -> std::result::Result<RecordsCmd, String> {
     }
     let force = take_flag(&mut rest, sub == "remove", "--force");
     let yes = take_flag(&mut rest, matches!(sub.as_str(), "remove-collection" | "import" | "purge"), "--yes");
+    let move_schedules =
+        take_flag(&mut rest, matches!(sub.as_str(), "rename" | "rename-collection"), "--move-schedules");
     let file = take_flag(&mut rest, sub == "peek", "--file");
     let dry_run = take_flag(&mut rest, sub == "import", "--dry-run");
     let skip_invalid = take_flag(&mut rest, sub == "import", "--skip-invalid");
@@ -272,13 +281,13 @@ pub fn parse(words: Vec<String>) -> std::result::Result<RecordsCmd, String> {
         }
         "rename" => {
             no_flags()?;
-            let usage = "usage: shimmer records rename COLLECTION/ID NEW_ID";
+            let usage = "usage: shimmer records rename COLLECTION/ID NEW_ID [--move-schedules]";
             let (target_words, new_id) = match positional.split_last() {
                 Some((new_id, rest)) if !rest.is_empty() => (rest.to_vec(), new_id.clone()),
                 _ => return Err(usage.into()),
             };
             let (collection, id) = target(&sub, target_words).map_err(|_| usage.to_owned())?;
-            Ok(RecordsCmd::Rename { collection, id, new_id })
+            Ok(RecordsCmd::Rename { collection, id, new_id, move_schedules })
         }
         "purge" => {
             no_flags()?;
@@ -379,7 +388,7 @@ pub fn parse(words: Vec<String>) -> std::result::Result<RecordsCmd, String> {
             let usage = match sub.as_str() {
                 "check" => "usage: shimmer records check COLLECTION",
                 "rename-field" => "usage: shimmer records rename-field COLLECTION FROM TO",
-                "rename-collection" => "usage: shimmer records rename-collection ID NEW_ID",
+                "rename-collection" => "usage: shimmer records rename-collection ID NEW_ID [--move-schedules]",
                 "remove-collection" => "usage: shimmer records remove-collection ID [--yes]",
                 _ => "usage: shimmer records restore-collection ID",
             };
@@ -390,7 +399,7 @@ pub fn parse(words: Vec<String>) -> std::result::Result<RecordsCmd, String> {
                     RecordsCmd::RenameField { collection: c.clone(), from: from.clone(), to: to.clone() }
                 }
                 ("rename-collection", [id, new_id]) => {
-                    RecordsCmd::RenameCollection { id: id.clone(), new_id: new_id.clone() }
+                    RecordsCmd::RenameCollection { id: id.clone(), new_id: new_id.clone(), move_schedules }
                 }
                 ("remove-collection", [id]) => RecordsCmd::RemoveCollection { id: id.clone(), yes },
                 ("restore-collection", [id]) => RecordsCmd::RestoreCollection { id: id.clone() },
@@ -550,7 +559,7 @@ pub fn request(cmd: &RecordsCmd, schema: &Value) -> Result<(&'static str, Value)
             }
             ("records.add", params)
         }
-        RecordsCmd::Rename { collection, id, new_id } => {
+        RecordsCmd::Rename { collection, id, new_id, .. } => {
             ("records.rename", json!({"collection": collection, "id": id, "new_id": new_id}))
         }
         RecordsCmd::List { collection, filter, limit, offset, refine } => {
@@ -628,7 +637,7 @@ pub fn request(cmd: &RecordsCmd, schema: &Value) -> Result<(&'static str, Value)
             "records.rename_field",
             json!({"collection": collection, "from": field_name(schema, from), "to": to.replace('-', "_")}),
         ),
-        RecordsCmd::RenameCollection { id, new_id } => {
+        RecordsCmd::RenameCollection { id, new_id, .. } => {
             ("records.rename_collection", json!({"id": id, "new_id": new_id}))
         }
         RecordsCmd::RemoveCollection { id, .. } => ("records.remove_collection", json!({"id": id})),
@@ -842,7 +851,50 @@ pub async fn run(client: &mut Client, cmd: &RecordsCmd, json: bool, prompt: &mut
         }
         other => other?,
     };
-    Ok(if json { render::json(&data) } else { show(cmd, &data, &schema) })
+    let mut text = if json { render::json(&data) } else { show(cmd, &data, &schema) };
+    let follow = schedules_after(client, prompt, cmd).await;
+    if !json {
+        text.push_str(&follow);
+    }
+    Ok(text)
+}
+
+/// After a rename or a collection's removal: the schedules that still name the old name (ADR
+/// 0030 §2). A rename offers to move them; a removal only lists them, since restoring the
+/// collection makes them work again. Empty for every other command.
+async fn schedules_after(client: &mut Client, prompt: &mut dyn Prompt, cmd: &RecordsCmd) -> String {
+    let (names, rename) = match cmd {
+        RecordsCmd::RenameCollection { id, new_id, move_schedules } => (
+            schedules::names(&[("collection", id)]),
+            Some(schedules::Rename {
+                from: id,
+                to: new_id,
+                changes: schedules::names(&[("collection", new_id)]),
+                undo: format!("shimmer records rename-collection {new_id} {id}"),
+                yes: *move_schedules,
+            }),
+        ),
+        RecordsCmd::Rename { collection, id, new_id, move_schedules } => (
+            schedules::names(&[("collection", collection), ("id", id)]),
+            Some(schedules::Rename {
+                from: id,
+                to: new_id,
+                changes: schedules::names(&[("id", new_id)]),
+                undo: format!("shimmer records rename {collection}/{new_id} {id}"),
+                yes: *move_schedules,
+            }),
+        ),
+        RecordsCmd::RemoveCollection { id, .. } => (schedules::names(&[("collection", id)]), None),
+        _ => return String::new(),
+    };
+    let old = schedules::find(client, "records.", &names).await;
+    match (rename, cmd) {
+        (Some(rename), _) => schedules::follow_rename(client, prompt, &old, &rename).await,
+        (None, RecordsCmd::RemoveCollection { id, .. }) => {
+            schedules::after_removal(&old, id, &format!("shimmer records restore-collection {id}"))
+        }
+        _ => String::new(),
+    }
 }
 
 /// The rows of an import file, as `records.import` takes them: `.json` is an array of objects,
@@ -1049,7 +1101,7 @@ pub fn show(cmd: &RecordsCmd, data: &Value, schema: &Value) -> String {
         // The id comes from the reply: the daemon may have made it (ADR 0018).
         // In full, never cut like a table cell: it's what the person types next.
         RecordsCmd::Add { collection, .. } => format!("added {collection}/{}", data["id"].as_str().unwrap_or_default()),
-        RecordsCmd::Rename { collection, id, new_id } => {
+        RecordsCmd::Rename { collection, id, new_id, .. } => {
             format!("✓ {collection}/{id} renamed to {collection}/{new_id}")
         }
         RecordsCmd::Update { collection, id, .. } => format!("updated {collection}/{id}"),
@@ -1071,7 +1123,7 @@ pub fn show(cmd: &RecordsCmd, data: &Value, schema: &Value) -> String {
             to.replace('-', "_"),
             cell(&data["updated"])
         ),
-        RecordsCmd::RenameCollection { id, new_id } => format!("✓ {id} is now {new_id}"),
+        RecordsCmd::RenameCollection { id, new_id, .. } => format!("✓ {id} is now {new_id}"),
         RecordsCmd::RemoveCollection { id, .. } => format!(
             "removed {id} ({} record(s); undo: shimmer records restore-collection {id})",
             cell(&data["records"])
@@ -1577,7 +1629,12 @@ mod tests {
 
     #[test]
     fn rename_takes_a_target_and_a_new_id() {
-        let want = RecordsCmd::Rename { collection: "jobs".into(), id: "amzon".into(), new_id: "amazon".into() };
+        let want = RecordsCmd::Rename {
+            collection: "jobs".into(),
+            id: "amzon".into(),
+            new_id: "amazon".into(),
+            move_schedules: false,
+        };
         assert_eq!(parse_words(&["rename", "jobs/amzon", "amazon"]).unwrap(), want);
         assert_eq!(parse_words(&["rename", "jobs", "amzon", "amazon"]).unwrap(), want);
         assert_eq!(
@@ -1585,6 +1642,9 @@ mod tests {
             ("records.rename", json!({"collection": "jobs", "id": "amzon", "new_id": "amazon"}))
         );
         assert_eq!(show(&want, &json!({}), &Value::Null), "✓ jobs/amzon renamed to jobs/amazon");
+        let moving = parse_words(&["rename", "--move-schedules", "jobs/amzon", "amazon"]).unwrap();
+        assert!(matches!(moving, RecordsCmd::Rename { move_schedules: true, .. }), "{moving:?}");
+        assert_eq!(request(&moving, &Value::Null).unwrap(), request(&want, &Value::Null).unwrap(), "not sent");
         for bad in [&["rename"][..], &["rename", "jobs/amzon"], &["rename", "jobs", "a", "b", "c"]] {
             assert!(parse_words(bad).unwrap_err().contains("NEW_ID"), "{bad:?}");
         }
@@ -1684,6 +1744,13 @@ mod tests {
             request(&parse_words(&["rename-collection", "jobs", "apps"]).unwrap(), &Value::Null).unwrap(),
             ("records.rename_collection", json!({"id": "jobs", "new_id": "apps"}))
         );
+        assert_eq!(
+            parse_words(&["rename-collection", "jobs", "apps", "--move-schedules"]).unwrap(),
+            RecordsCmd::RenameCollection { id: "jobs".into(), new_id: "apps".into(), move_schedules: true }
+        );
+        assert!(parse_words(&["remove-collection", "jobs", "--move-schedules", "x"])
+            .unwrap_err()
+            .contains("takes no options"));
         assert!(parse_words(&["rename-field", "jobs", "a"]).unwrap_err().contains("FROM TO"));
 
         let report = json!({"checked": 3, "problems": [

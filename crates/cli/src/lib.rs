@@ -14,6 +14,7 @@ mod queue;
 mod records;
 mod render;
 mod scheduler;
+mod schedules;
 mod when;
 mod workspaces;
 
