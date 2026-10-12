@@ -8,12 +8,15 @@ mod args;
 mod autostart;
 mod client;
 mod csv;
+mod editor;
 mod flags;
+mod follow;
 pub mod packs;
 mod queue;
 mod records;
 mod render;
 mod scheduler;
+mod schedules;
 mod when;
 mod workspaces;
 
