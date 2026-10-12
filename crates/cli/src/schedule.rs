@@ -60,22 +60,25 @@ pub struct When {
     pub words: String,
 }
 
-/// Words that start the command. An alias of the active pack starts one too.
-pub const COMMAND_WORDS: &[&str] = &[
-    "records",
-    "workspaces",
-    "queue",
-    "scheduler",
-    "packs",
-    "ping",
-    "manifest",
-    "shutdown",
-    "call",
-    "daemon",
-    "mockd",
-    "schedule",
-    "help",
-];
+/// The words that start a command: the entries of `shimmer --help`'s "commands:" section, read
+/// from the help text itself so a new command is known here with no second list to keep (#185's
+/// review). An alias of the active pack starts one too, rewritten before this is asked.
+fn is_command_word(word: &str) -> bool {
+    let commands = crate::args::USAGE.split("commands:\n").nth(1).unwrap_or_default();
+    word == "help"
+        || commands
+            .split("\n\n")
+            .next()
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.starts_with("  ") && !l.starts_with("   "))
+            .filter_map(|l| l.split_whitespace().next())
+            .any(|w| w == word)
+}
+
+/// `shimmer`'s own options that go before the command (`--pack`, `--canonical`, `--no-color`):
+/// put after `schedule`, they're not the schedule's.
+const FRONT_FLAGS: &[&str] = &["--pack", "--canonical", "--no-color"];
 
 const EXAMPLES: &str = "e.g. 'weekdays 09:00', 'daily 18:00', 'every 2h' or 'once 2026-10-20 18:00'";
 
@@ -104,6 +107,11 @@ pub fn parse(words: Vec<String>) -> std::result::Result<ScheduleCmd, String> {
         match flag {
             "--catch-up" => catch_up = Some(catch_up_word(&value()?)?),
             "--lane" => lane = Some(value()?),
+            other if FRONT_FLAGS.contains(&other) => {
+                return Err(format!(
+                    "'{other}' is one of shimmer's own options: put it before 'schedule', e.g. shimmer {other} … schedule …"
+                ))
+            }
             other => {
                 return Err(format!("unknown option '{other}' before the command; options for the command go after it"))
             }
@@ -115,12 +123,19 @@ pub fn parse(words: Vec<String>) -> std::result::Result<ScheduleCmd, String> {
         None => {
             Err(format!("nothing to schedule after '{}': add the command, e.g. workspaces activate site", when.words))
         }
-        Some(w) if !COMMAND_WORDS.contains(&w.as_str()) => Err(format!(
+        Some(w) if !is_command_word(w) => Err(format!(
             "'{w}' isn't a command: after when ({}) comes the command, e.g. workspaces activate site",
             when.words
         )),
         Some(_) => Ok(ScheduleCmd::Add(Planned { when, catch_up, lane, command })),
     }
+}
+
+/// `op` for workspace `id`, once the daemon has it: a typo is caught when it's scheduled, not each
+/// time it fires (#185's review). `workspaces.status` is the read-only lookup `status` makes.
+async fn known_workspace(client: &mut Client, op: &'static str, id: &str) -> Result<(&'static str, Value)> {
+    client.call("workspaces.status", json!({"id": id})).await?;
+    Ok((op, json!({"id": id})))
 }
 
 /// `skip`, `run-once` or `backfill` → the protocol's spelling.
@@ -284,6 +299,13 @@ async fn request(client: &mut Client, command: &[String]) -> Result<(&'static st
                 Some(id) => records::schema(client, id).await?,
                 None => Value::Null,
             };
+            // A typo is caught now, not every day after (#185's review): the same lookup running
+            // the command does.
+            if let (Some(id), true) = (cmd.collection(), schema.is_null()) {
+                return Err(Error::not_found(format!(
+                    "no collection '{id}' to schedule for (see 'shimmer records collections')"
+                )));
+            }
             records::request(&cmd, &schema)
         }
         "workspaces" => match workspaces::parse(rest.to_vec()).map_err(Error::invalid_params)? {
@@ -292,9 +314,9 @@ async fn request(client: &mut Client, command: &[String]) -> Result<(&'static st
             | WorkspacesCmd::Cleanup { wait: true, .. } => {
                 Err(not("--wait follows a launch as it happens, and a scheduled one runs with no one waiting"))
             }
-            WorkspacesCmd::Activate { id, .. } => Ok(("workspaces.activate", json!({"id": id}))),
-            WorkspacesCmd::Stop { id, .. } => Ok(("workspaces.stop", json!({"id": id}))),
-            WorkspacesCmd::Cleanup { id, .. } => Ok(("workspaces.cleanup", json!({"id": id}))),
+            WorkspacesCmd::Activate { id, .. } => known_workspace(client, "workspaces.activate", &id).await,
+            WorkspacesCmd::Stop { id, .. } => known_workspace(client, "workspaces.stop", &id).await,
+            WorkspacesCmd::Cleanup { id, .. } => known_workspace(client, "workspaces.cleanup", &id).await,
             _ => Err(not("only workspaces activate, stop and cleanup can")),
         },
         other => Err(Error::invalid_params(format!(
@@ -382,6 +404,22 @@ mod tests {
         assert_eq!(p.lane.as_deref(), Some("workspaces"));
         assert_eq!(p.command, w(&["records", "add", "fairs", "--at", "Hall B"]));
         assert_eq!(p.catch_up, None, "asked later");
+    }
+
+    #[test]
+    fn command_words_come_from_the_help() {
+        // Every entry in `shimmer --help`'s commands, with no second list to keep (#185's review).
+        for word in ["records", "workspaces", "queue", "scheduler", "schedule", "packs", "ping", "call", "shutdown"] {
+            assert!(is_command_word(word), "{word}");
+        }
+        assert!(is_command_word("help"));
+        assert!(!is_command_word("activate") && !is_command_word("--socket"));
+    }
+
+    #[test]
+    fn shimmers_own_options_are_sent_before_schedule() {
+        let e = parse(w(&["weekdays", "09:00", "--catch-up", "skip", "--pack", "short", "wgo", "site"])).unwrap_err();
+        assert!(e.contains("'--pack' is one of shimmer's own options: put it before 'schedule'"), "{e}");
     }
 
     #[test]
