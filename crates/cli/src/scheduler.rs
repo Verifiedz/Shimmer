@@ -35,7 +35,7 @@ default, because guessing wrong sends duplicates:
 e.g. shimmer scheduler add records.list '{\"collection\":\"leetcode\"}' --every 1d --catch-up skip
 
 A trigger enqueues a task when it fires; 'shimmer queue' shows it running. TRIGGER is the id as
-'scheduler list' shows it: its ending is enough. Add --json to any command for raw output.";
+'scheduler list' shows it: its ending is enough (at least 4 characters). Add --json to any command for raw output.";
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SchedulerCmd {
@@ -157,18 +157,20 @@ pub async fn run(client: &mut Client, cmd: &SchedulerCmd, json: bool) -> Result<
         SchedulerCmd::Resume { id } => one(id, "scheduler.resume"),
         SchedulerCmd::Remove { id } => one(id, "scheduler.remove"),
     };
-    let data = client.call(op, params).await?;
+    // Find the trigger first, then act on its full id, and say which one it was and what it runs:
+    // never just echo what was typed (#183's review). A removed trigger can't be looked up after.
+    let trigger = client.call("scheduler.get", params).await?;
+    let full = trigger["id"].as_str().unwrap_or("?").to_string();
+    let data = client.call(op, json!({ "trigger_id": full })).await?;
     if json {
         return Ok(render::json(&data));
     }
-    let id = match cmd {
-        SchedulerCmd::Pause { id } | SchedulerCmd::Resume { id } | SchedulerCmd::Remove { id } => id,
-        _ => unreachable!("only these reach here"),
-    };
+    let shown = render::short_id(&full);
+    let what = format!("{shown} ({}, {})", render::cell(&trigger["op"]), schedule(&trigger["schedule"]));
     Ok(match op {
-        "scheduler.pause" => format!("✓ paused {id}: it won't fire until 'shimmer scheduler resume {id}'"),
-        "scheduler.resume" => format!("✓ resumed {id}: it fires again from now on"),
-        _ => format!("✓ removed {id}"),
+        "scheduler.pause" => format!("✓ paused {what}: it won't fire until 'shimmer scheduler resume {shown}'"),
+        "scheduler.resume" => format!("✓ resumed {what}: it fires again from now on"),
+        _ => format!("✓ removed {what}"),
     })
 }
 

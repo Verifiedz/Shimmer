@@ -333,9 +333,6 @@ impl Scheduler {
         json!({ "triggers": triggers })
     }
 
-    /// One trigger, in exactly the shape a `scheduler.list` entry has (#76) — `queue show`
-    /// uses `queue.task` and `workspaces status` uses `workspaces.status`; this was the odd
-    /// one out, picking its one trigger out of the full list instead.
     /// A trigger id as a client wrote it: the full id, or a unique ending of one, case insensitive
     /// (ADR 0031 §4). Several matches are `conflict`, none `not_found`.
     fn resolve(&self, written: &str) -> Result<String> {
@@ -346,6 +343,9 @@ impl Scheduler {
         crate::short_id::resolve(written, &ids, "trigger")
     }
 
+    /// One trigger, in exactly the shape a `scheduler.list` entry has (#76) — `queue show`
+    /// uses `queue.task` and `workspaces status` uses `workspaces.status`; this was the odd
+    /// one out, picking its one trigger out of the full list instead.
     fn get(&self, id: &str) -> Result<Value> {
         let st = self.lock();
         let e = st.get(id).ok_or_else(|| Error::not_found(format!("no trigger '{id}'")))?;
@@ -399,14 +399,14 @@ impl Scheduler {
         }
         self.delete(id, ("scheduler.trigger.removed", json!({"trigger_id": id, "reason": "removed by user"})))?;
         st.remove(id);
-        Ok(json!({"removed": true}))
+        Ok(json!({"removed": true, "trigger_id": id}))
     }
 
     fn set_paused(&self, id: &str, paused: bool) -> Result<Value> {
         let mut st = self.lock();
         let e = st.get_mut(id).ok_or_else(|| Error::not_found(format!("no trigger '{id}'")))?;
         if e.stored.paused == paused {
-            return Ok(json!({ "paused": paused }));
+            return Ok(json!({ "paused": paused, "trigger_id": id }));
         }
         let mut next = e.stored.clone();
         next.paused = paused;
@@ -417,7 +417,7 @@ impl Scheduler {
         let topic = if paused { "scheduler.trigger.paused" } else { "scheduler.trigger.resumed" };
         self.write(&next, Some((topic, json!({"trigger_id": id}))))?;
         e.stored = next;
-        Ok(json!({ "paused": paused }))
+        Ok(json!({ "paused": paused, "trigger_id": id }))
     }
 }
 

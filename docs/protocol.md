@@ -328,16 +328,19 @@ Always present, independent of which modules are registered.
 |---|---|---|---|
 | `queue.list` | inline | `{"lane"?}` | Lanes, each with `running` and `queued` task arrays and `queue_version`. |
 | `queue.task` | inline | `{"task_id"}` | One task with status, progress, attempts, origin. |
-| `queue.reorder` | inline | `{"lane","task_id","before":TaskId\|null,"queue_version"}` | New `queue_version`. |
-| `queue.cancel` | inline | `{"task_id"}` | `{"cancelled":true}` or `not_cancellable`. |
+| `queue.reorder` | inline | `{"lane","task_id","before":TaskId\|null,"queue_version"}` | `{"queue_version","task_id"}`: the new `queue_version`, and the moved task's full id. |
+| `queue.cancel` | inline | `{"task_id"}` | `{"cancelled":true,"was":"queued"\|"running","task_id"}`, or `not_cancellable`. |
 
 Reordering is within a lane only. The running task cannot be reordered or displaced; it can
 be cancelled. A stale `queue_version` returns `conflict`.
 
 **Short ids (ADR 0031 §4).** Every `task_id` the queue ops take (and `before`) may be the full
 id or a unique ending of one, case insensitive: a ULID's start is its creation time, its end is
-random. Several matches return `conflict` naming them; none returns `not_found`. The same holds
-for every `trigger_id` the scheduler ops take.
+random. A whole id matches at any length; an ending needs at least 4 characters (shorter is
+`invalid_params`), so a stray keystroke can't remove or cancel something. Several matches return
+`conflict` naming them; none returns `not_found`. The same holds for every `trigger_id` the
+scheduler ops take. Replies that act on one carry its full id (`task_id` / `trigger_id`), so a
+client can say which one it hit.
 
 ## Scheduler ops
 
@@ -346,9 +349,9 @@ for every `trigger_id` the scheduler ops take.
 | `scheduler.list` | inline | `{}` | Triggers with `next_due`, `last_run`, `catch_up`, `paused`. |
 | `scheduler.get` | inline | `{"trigger_id"}` | One trigger, same shape as a `scheduler.list` entry, or `not_found`. |
 | `scheduler.add` | inline | `{"schedule","op","params","catch_up","lane"?,"fallback"?}` | `{"trigger_id"}` |
-| `scheduler.remove` | inline | `{"trigger_id"}` | `{"removed":true}` |
-| `scheduler.pause` | inline | `{"trigger_id"}` | `{"paused":true}` |
-| `scheduler.resume` | inline | `{"trigger_id"}` | `{"paused":false}` |
+| `scheduler.remove` | inline | `{"trigger_id"}` | `{"removed":true,"trigger_id"}` (the full id) |
+| `scheduler.pause` | inline | `{"trigger_id"}` | `{"paused":true,"trigger_id"}` |
+| `scheduler.resume` | inline | `{"trigger_id"}` | `{"paused":false,"trigger_id"}` |
 
 `trigger_id` may be a unique ending of the id (see "Short ids" above).
 
