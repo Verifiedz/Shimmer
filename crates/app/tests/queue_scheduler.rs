@@ -38,6 +38,11 @@ fn task_id(activate_output: &str) -> String {
     activate_output[start..].split(')').next().unwrap().to_string()
 }
 
+/// How a list shows a long id: its last six characters (ADR 0031 §4; unique among the few here).
+fn shown(id: &str) -> &str {
+    &id[id.len() - 6..]
+}
+
 #[test]
 fn bare_words_show_help() {
     let home = Home::with_leetcode();
@@ -71,8 +76,9 @@ fn real_launches_wait_in_the_queue_and_can_be_moved_and_cancelled() {
     let list = ok(&home, &["queue", "list"]);
     let order: Vec<&str> = list.lines().filter(|l| l.starts_with("workspaces")).collect();
     assert_eq!(order.len(), 3, "{list}");
-    assert!(order[0].contains(a.as_str()) && order[0].contains("running") && order[0].contains(" you "), "{list}");
-    assert!(order[1].contains(b.as_str()) && order[2].contains(c.as_str()), "{list}");
+    // Lists show each id's unique ending (ADR 0031 §4).
+    assert!(order[0].contains(shown(a)) && order[0].contains("running") && order[0].contains(" you "), "{list}");
+    assert!(order[1].contains(shown(b)) && order[2].contains(shown(c)), "{list}");
     assert!(list.contains("3 tasks;"), "{list}");
 
     let show = ok(&home, &["queue", "show", b]);
@@ -85,7 +91,7 @@ fn real_launches_wait_in_the_queue_and_can_be_moved_and_cancelled() {
     );
     let list = ok(&home, &["queue", "list", "--lane", "workspaces"]);
     let order: Vec<&str> = list.lines().filter(|l| l.starts_with("workspaces")).collect();
-    assert!(order[1].contains(c.as_str()) && order[2].contains(b.as_str()), "{list}");
+    assert!(order[1].contains(shown(c)) && order[2].contains(shown(b)), "{list}");
 
     // A queued task is simply gone; a running one is asked to stop.
     assert!(ok(&home, &["queue", "cancel", b]).contains("it was still queued, so it never ran"));
@@ -112,7 +118,7 @@ fn a_trigger_fires_and_can_be_paused_resumed_and_removed() {
     let id = out["✓ added trigger ".len()..].split(':').next().unwrap().to_string();
 
     let list = ok(&home, &["scheduler", "list"]);
-    let row = list.lines().find(|l| l.starts_with(&id)).unwrap_or_else(|| panic!("{list}"));
+    let row = list.lines().find(|l| l.starts_with(shown(&id))).unwrap_or_else(|| panic!("{list}"));
     assert!(
         row.contains("records.list")
             && row.contains("every 1s")
@@ -161,4 +167,22 @@ fn a_pack_can_alias_the_new_commands() {
     )
     .unwrap();
     assert!(ok(&home, &["--pack", "mine", "jobs"]).starts_with("nothing queued or running"));
+}
+
+#[test]
+fn a_trigger_or_task_is_reached_by_the_ending_its_list_shows() {
+    // ADR 0031 §4: lists show a long id's unique ending, and that ending is accepted back.
+    let home = Home::with_leetcode();
+    let out = ok(
+        &home,
+        &["scheduler", "add", "records.list", r#"{"collection":"leetcode"}"#, "--every", "1d", "--catch-up", "skip"],
+    );
+    let id = out["✓ added trigger ".len()..].split(':').next().unwrap().to_string();
+    let end = shown(&id);
+    assert!(ok(&home, &["scheduler", "list"]).lines().any(|l| l.starts_with(end)), "the list shows {end}");
+    ok(&home, &["scheduler", "pause", end]);
+    assert!(ok(&home, &["scheduler", "show", &end.to_uppercase()]).contains("(paused)"), "any case");
+    ok(&home, &["scheduler", "remove", end]);
+    let o = home.shimmer(&["scheduler", "show", end]);
+    assert!(stderr(&o).contains("not_found"), "{}", stderr(&o));
 }

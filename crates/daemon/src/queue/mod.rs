@@ -404,6 +404,19 @@ impl QueueInner {
         Ok(json!({"queue_version": new_version}))
     }
 
+    /// A task id as a client wrote it: the full id, or a unique ending of one, case insensitive
+    /// (ADR 0031 §4). A ULID starts with its creation time, so ids made close together share
+    /// their start; the end is random. Several matches are `conflict`, none `not_found`.
+    pub fn resolve(&self, written: &str) -> Result<TaskId> {
+        if let Ok(id) = written.parse::<TaskId>() {
+            return Ok(id);
+        }
+        let st = self.lock();
+        let ids: Vec<String> = st.records.keys().map(ToString::to_string).collect();
+        drop(st);
+        crate::short_id::resolve(written, &ids, "task")?.parse()
+    }
+
     pub fn task_view(&self, id: TaskId) -> Result<Value> {
         let st = self.lock();
         let r = st.records.get(&id).ok_or_else(|| Error::not_found(format!("no task {id}")))?;

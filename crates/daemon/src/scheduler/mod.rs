@@ -319,11 +319,11 @@ impl Scheduler {
     pub fn handle(&self, op: &str, params: Value) -> Result<Value> {
         match op {
             "scheduler.list" => Ok(self.list()),
-            "scheduler.get" => self.get(&trigger_id(params)?),
+            "scheduler.get" => self.get(&self.resolve(&trigger_id(params)?)?),
             "scheduler.add" => self.add(params),
-            "scheduler.remove" => self.remove(&trigger_id(params)?),
-            "scheduler.pause" => self.set_paused(&trigger_id(params)?, true),
-            "scheduler.resume" => self.set_paused(&trigger_id(params)?, false),
+            "scheduler.remove" => self.remove(&self.resolve(&trigger_id(params)?)?),
+            "scheduler.pause" => self.set_paused(&self.resolve(&trigger_id(params)?)?, true),
+            "scheduler.resume" => self.set_paused(&self.resolve(&trigger_id(params)?)?, false),
             _ => Err(Error::unknown_op(format!("no such scheduler op '{op}'"))),
         }
     }
@@ -336,6 +336,16 @@ impl Scheduler {
     /// One trigger, in exactly the shape a `scheduler.list` entry has (#76) — `queue show`
     /// uses `queue.task` and `workspaces status` uses `workspaces.status`; this was the odd
     /// one out, picking its one trigger out of the full list instead.
+    /// A trigger id as a client wrote it: the full id, or a unique ending of one, case insensitive
+    /// (ADR 0031 §4). Several matches are `conflict`, none `not_found`.
+    fn resolve(&self, written: &str) -> Result<String> {
+        let ids: Vec<String> = self.lock().keys().cloned().collect();
+        if ids.iter().any(|id| id == written) {
+            return Ok(written.to_owned());
+        }
+        crate::short_id::resolve(written, &ids, "trigger")
+    }
+
     fn get(&self, id: &str) -> Result<Value> {
         let st = self.lock();
         let e = st.get(id).ok_or_else(|| Error::not_found(format!("no trigger '{id}'")))?;

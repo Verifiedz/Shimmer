@@ -34,8 +34,8 @@ default, because guessing wrong sends duplicates:
 
 e.g. shimmer scheduler add records.list '{\"collection\":\"leetcode\"}' --every 1d --catch-up skip
 
-A trigger enqueues a task when it fires; 'shimmer queue' shows it running. Add --json to any
-command for raw output.";
+A trigger enqueues a task when it fires; 'shimmer queue' shows it running. TRIGGER is the id as
+'scheduler list' shows it: its ending is enough. Add --json to any command for raw output.";
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SchedulerCmd {
@@ -191,11 +191,13 @@ fn list(data: &Value, now: DateTime<Utc>) -> String {
     if triggers.is_empty() {
         return "no triggers yet; add one with: shimmer scheduler add OP WHEN --catch-up WHAT".into();
     }
+    let ids: Vec<String> = triggers.iter().map(|t| render::cell(&t["id"])).collect();
     let rows: Vec<Vec<String>> = triggers
         .iter()
-        .map(|t| {
+        .zip(render::short_ids(&ids))
+        .map(|(t, id)| {
             vec![
-                render::cell(&t["id"]),
+                id,
                 render::cell(&t["op"]),
                 schedule(&t["schedule"]),
                 catch_up(&t["catch_up"]),

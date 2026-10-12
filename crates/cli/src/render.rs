@@ -149,6 +149,26 @@ pub fn wrap(text: &str, width: usize, indent: &str) -> String {
     lines.join(&format!("\n{indent}"))
 }
 
+/// Ids as a list shows them (ADR 0031 §4): a long id (a ULID, or `usr-` plus one) as its last six
+/// characters, or more where that's needed to tell it from another id in the same list, which is
+/// what the daemon accepts back. Short ids (`digest`, a test's `usr-1`) are shown whole.
+pub fn short_ids(ids: &[String]) -> Vec<String> {
+    let lower: Vec<String> = ids.iter().map(|id| id.to_lowercase()).collect();
+    ids.iter()
+        .zip(&lower)
+        .map(|(id, me)| {
+            if id.chars().count() <= 12 {
+                return id.clone();
+            }
+            let mut n = 6;
+            while n < me.len() && lower.iter().any(|other| other != me && other.ends_with(&me[me.len() - n..])) {
+                n += 1;
+            }
+            id[id.len() - n..].to_owned()
+        })
+        .collect()
+}
+
 /// The templates a `*.templates` op sent (`records`, `workspaces`), grouped under their
 /// categories' headings in the daemon's order. With `which`: only that category's, or that one
 /// template as `in_full` shows it. `kind` names the commands in the footer and in mistakes;
@@ -233,6 +253,22 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn long_ids_show_their_unique_ending() {
+        let ids: Vec<String> =
+            ["01M4PPHE00ABCDEF0123XK7P2X", "01M4PPK8K0QRSTUV4567HK7P2X", "usr-01m4ppm0003fq9tm", "digest"]
+                .map(String::from)
+                .to_vec();
+        // "k7p2x" ends both of the first two, so they need seven characters; the others don't.
+        assert_eq!(short_ids(&ids), ["XK7P2X", "HK7P2X", "3fq9tm", "digest"]);
+        let close: Vec<String> =
+            ["01M4PPHE00ABCDEF0123AK7P2X", "01M4PPK8K0QRSTUV4567BK7P2X"].map(String::from).to_vec();
+        assert_eq!(short_ids(&close), ["AK7P2X", "BK7P2X"]);
+        let same6: Vec<String> =
+            ["01M4PPHE00ABCDEF012AXK7P2X", "01M4PPK8K0QRSTUV456BXK7P2X"].map(String::from).to_vec();
+        assert_eq!(short_ids(&same6), ["AXK7P2X", "BXK7P2X"], "lengthened until unique");
+    }
 
     #[test]
     fn ping_shows_uptime() {

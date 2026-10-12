@@ -21,7 +21,8 @@ commands:
 
 Every unit of work runs through the queue: workspace launches, scheduled tasks, anything a module
 starts. Each lane runs a set number of tasks at a time; reordering is within a lane only, and a
-running task can be cancelled but not moved. Add --json to any command for raw output.";
+running task can be cancelled but not moved. TASK is the id as 'shimmer queue' shows it: its
+ending is enough. Add --json to any command for raw output.";
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum QueueCmd {
@@ -117,6 +118,12 @@ pub async fn run(client: &mut Client, cmd: &QueueCmd, json: bool) -> Result<Stri
 fn list(data: &Value, now: DateTime<Utc>) -> String {
     let lanes = data["lanes"].as_array().cloned().unwrap_or_default();
     let mut rows = Vec::new();
+    let all: Vec<String> = lanes
+        .iter()
+        .flat_map(|l| l["running"].as_array().into_iter().flatten().chain(l["queued"].as_array().into_iter().flatten()))
+        .map(|t| render::cell(&t["task_id"]))
+        .collect();
+    let mut short = render::short_ids(&all).into_iter();
     for lane in &lanes {
         let id = lane["id"].as_str().unwrap_or("?");
         for t in lane["running"].as_array().into_iter().flatten().chain(lane["queued"].as_array().into_iter().flatten())
@@ -124,7 +131,7 @@ fn list(data: &Value, now: DateTime<Utc>) -> String {
             let since = when::timestamp(&t["started_at"]).or_else(|| when::timestamp(&t["enqueued_at"]));
             rows.push(vec![
                 id.to_string(),
-                render::cell(&t["task_id"]),
+                short.next().unwrap_or_default(),
                 render::cell(&t["status"]),
                 render::cell(&t["op"]),
                 origin(&t["origin"]),

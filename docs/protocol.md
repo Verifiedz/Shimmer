@@ -334,6 +334,11 @@ Always present, independent of which modules are registered.
 Reordering is within a lane only. The running task cannot be reordered or displaced; it can
 be cancelled. A stale `queue_version` returns `conflict`.
 
+**Short ids (ADR 0031 §4).** Every `task_id` the queue ops take (and `before`) may be the full
+id or a unique ending of one, case insensitive: a ULID's start is its creation time, its end is
+random. Several matches return `conflict` naming them; none returns `not_found`. The same holds
+for every `trigger_id` the scheduler ops take.
+
 ## Scheduler ops
 
 | Op | Execution | Params | Returns |
@@ -344,6 +349,8 @@ be cancelled. A stale `queue_version` returns `conflict`.
 | `scheduler.remove` | inline | `{"trigger_id"}` | `{"removed":true}` |
 | `scheduler.pause` | inline | `{"trigger_id"}` | `{"paused":true}` |
 | `scheduler.resume` | inline | `{"trigger_id"}` | `{"paused":false}` |
+
+`trigger_id` may be a unique ending of the id (see "Short ids" above).
 
 Schedules are `{"cron": "0 9 * * 1"}` (5 fields, Sunday = 0 or 7, Monday = 1, UTC),
 `{"every": 172800}` (seconds) or `{"once": "2026-10-04T09:00:00Z"}`. A fired task's params
