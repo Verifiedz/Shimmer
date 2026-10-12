@@ -6,7 +6,7 @@ whole command:
 ```
 $ shimmer packs use anime-tropes
 ✓ active pack: anime-tropes (Anime Tropes)
-  linked 16 commands into /home/me/.local/bin
+  linked 53 commands into /home/me/.local/bin
 try it: ohayo
 
 $ ikuzo deep-work            # = shimmer workspaces activate deep-work
@@ -65,6 +65,31 @@ belongs to this machine, so copying your Shimmer folder elsewhere doesn't bring 
 | scheduler pause | `chotto-matte` | `code-freeze` | `hold-position` | `spause` |
 | scheduler resume | `hajime` | `thaw` | `full-ahead` | `sresume` |
 | scheduler remove | `mou-ii` | `deprecate` | `scrub-mission` | `sdel` |
+| records templates | `sugoi` | `boilerplate` | `starcharts` | `rtpl` |
+| records new | `yosh` | `greenfield` | `commission` | `rnew` |
+| records trash | `gomen` | `graveyard` | `debris-field` | `rtrash` |
+| records purge | `itai` | `rm-rf` | `self-destruct` | `rpurge` |
+| records import | `irasshaimase` | `migrate` | `tractor-beam` | `rimport` |
+| records export | `ganbatte` | `dump` | `transmit` | `rexport` |
+| records check | `uso` | `lint` | `sensor-sweep` | `rcheck` |
+| records rename-field | `henshin` | `refactor` | `recalibrate` | `rmvfield` |
+| records rename-collection | `kakkoii` | `pivot` | `rename-fleet` | `rmvcol` |
+| records remove-collection | `oyasumi` | `archive` | `mothball` | `rrmcol` |
+| records restore-collection | `okaerinasai` | `unarchive` | `recommission` | `rundocol` |
+| workspaces stop | `otsukare` | `eod` | `dock` | `wstop` |
+| workspaces remove | `mata-ne` | `decommission` | `stand-down` | `wrm` |
+| workspaces restore | `hisashiburi` | `cherry-pick` | `homecoming` | `wundo` |
+| workspaces rename | `dare-da` | `rename-env` | `callsign` | `wmv` |
+| workspaces copy | `bunshin` | `fork` | `sister-ship` | `wcp` |
+| workspaces reconfigure | `chotto` | `hotfix` | `refit` | `wset` |
+| workspaces edit | `mendokusai` | `monkey-patch` | `engineering` | `wedit` |
+| workspaces templates | `kawaii` | `starter-kits` | `shipyard` | `wtpl` |
+| workspaces peek | `hontou` | `code-review` | `long-range-scan` | `wpeek` |
+| workspaces new | `yoroshiku` | `scaffold` | `maiden-voyage` | `wnew` |
+| scheduler show | `itsu` | `eta` | `countdown` | `sget` |
+| records peek | `hora` | `preview` | `probe` | `rpeek` |
+| records copy-collection | `futago` | `copy-pasta` | `twin-fleet` | `rcpcol` |
+| records edit | `kaizou` | `tweak-schema` | `drydock` | `redit` |
 
 ## Writing your own
 
@@ -92,13 +117,17 @@ On the right of each alias goes the command it runs, by its op name:
 | Op | Runs |
 |---|---|
 | `core.ping`, `core.shutdown`, `core.manifest` | `shimmer ping`, `shutdown`, `manifest` |
-| `records.collections`, `.add`, `.list`, `.get`, `.update`, `.complete`, `.remove` | `shimmer records <verb>` |
-| `workspaces.list`, `.status`, `.activate`, `.cleanup`, `.force_relaunch`, `.reset` | `shimmer workspaces <verb>` |
+| `records.collections`, `.add`, `.list`, `.get`, `.update`, `.complete`, `.reopen`, `.rename`, `.remove`, `.restore`, `.trash`, `.purge`, `.import`, `.export`, `.check`, `.templates` | `shimmer records <verb>` |
+| `records.create_collection` | `shimmer records new` |
+| `records.rename_field`, `.rename_collection`, `.remove_collection`, `.restore_collection` | `shimmer records rename-field`, `rename-collection`, `remove-collection`, `restore-collection` |
+| `records.peek`, `.copy_collection`, `.edit` | `shimmer records peek`, `copy-collection`, `edit` |
+| `workspaces.list`, `.status`, `.activate`, `.cleanup`, `.reset`, `.stop`, `.remove`, `.restore`, `.rename`, `.copy`, `.reconfigure`, `.edit`, `.templates`, `.peek` | `shimmer workspaces <verb>` |
+| `workspaces.force_relaunch`, `workspaces.create` | `shimmer workspaces force-relaunch`, `new` |
 | `queue.list`, `.task`, `.cancel`, `.reorder` | `shimmer queue list`, `show`, `cancel`, `move` |
-| `scheduler.list`, `.add`, `.pause`, `.resume`, `.remove` | `shimmer scheduler <verb>` |
+| `scheduler.list`, `.get`, `.add`, `.pause`, `.resume`, `.remove` | `shimmer scheduler list`, `show`, `add`, `pause`, `resume`, `remove` |
 
-The queue and scheduler commands are optional for your own packs: name them if you like. The
-built-in packs name all 28.
+`shimmer packs --help` prints the same list. Your own pack names as many or as few as you like;
+the built-in packs name every one.
 
 Then check it, and turn it on:
 

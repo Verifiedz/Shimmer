@@ -128,8 +128,18 @@ template is the way back to its notes and examples.
 - `records.templates` with `{}` returns the same templates as before in a different order, with
   more keys; a client that sorted by id itself is unaffected.
 
+## Pack aliases
+
+`records peek`, `copy-collection` and `edit` join the commands a pack can name (ADR 0029), as
+`records.peek`, `records.copy_collection` and `records.edit`; `peek` and `edit` have no op of
+their own, so they're named like `workspaces.edit`. The built-in packs name them:
+
+| Command | `anime-tropes` | `ship-it` | `starship` | `short` |
+|---|---|---|---|---|
+| records peek | `hora` | `preview` | `probe` | `rpeek` |
+| records copy-collection | `futago` | `copy-pasta` | `twin-fleet` | `rcpcol` |
+| records edit | `kaizou` | `tweak-schema` | `drydock` | `redit` |
+
 ## Not done here
 
-- Pack aliases for `records peek`, `copy-collection` and `edit`: after the every-command packs
-  PR (ADR 0029) merges.
 - User-defined template folders: built-ins only, as in ADR 0022.

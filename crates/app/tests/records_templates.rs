@@ -465,3 +465,29 @@ fn collections_show_the_template_they_came_from() {
     // Peek of that template is the way back to its notes and examples.
     assert!(ok(&home, &["records", "peek", "job-applications"]).contains("How it works"));
 }
+
+// ---------------------------------------------------------------- ADR 0030: pack aliases
+
+#[test]
+fn every_built_in_pack_names_the_new_records_commands() {
+    let home = Home::new();
+    ok(&home, &["records", "new", "jobs", "--from", "job-applications"]);
+    let peek = ok(&home, &["records", "peek", "leetcode"]);
+    let path = ok(&home, &["records", "edit", "jobs", "--path"]);
+    for (pack, [peek_alias, copy_alias, edit_alias]) in [
+        ("short", ["rpeek", "rcpcol", "redit"]),
+        ("anime-tropes", ["hora", "futago", "kaizou"]),
+        ("ship-it", ["preview", "copy-pasta", "tweak-schema"]),
+        ("starship", ["probe", "twin-fleet", "drydock"]),
+    ] {
+        assert_eq!(ok(&home, &["--pack", pack, peek_alias, "leetcode"]), peek, "{pack}");
+        assert_eq!(ok(&home, &["--pack", pack, edit_alias, "jobs", "--path"]), path, "{pack}");
+        let copy = format!("jobs-{pack}");
+        let out = ok(&home, &["--pack", pack, copy_alias, "jobs", &copy]);
+        assert!(out.starts_with(&format!("✓ copied jobs to {copy}")), "{pack}: {out}");
+        let shown = ok(&home, &["packs", "show", pack]);
+        for op in ["shimmer records peek", "shimmer records copy-collection", "shimmer records edit"] {
+            assert!(shown.contains(op), "{pack} doesn't show {op}:\n{shown}");
+        }
+    }
+}
