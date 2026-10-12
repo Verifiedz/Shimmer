@@ -139,10 +139,23 @@ impl Scheduler {
                     // is still caught up. Another zone: the same wall-clock time there.
                     if parsed.is_local() {
                         let was = stored.zone.as_deref().and_then(|z| LocalTimezone::parse(z).ok());
+                        let unrecorded = was.is_none();
                         stored.zone = Some(self.local_tz.name().to_owned());
-                        if let Some(was) = was.filter(|was| *was != self.local_tz) {
-                            stored.next_due = stored.next_due.and_then(|due| parsed.rezoned(due, was, stored.last_run));
-                            self.write(&stored, None)?;
+                        let moved = match was.filter(|was| *was != self.local_tz) {
+                            Some(was) => {
+                                stored.next_due =
+                                    stored.next_due.and_then(|due| parsed.rezoned(due, was, stored.last_run));
+                                true
+                            }
+                            None => false,
+                        };
+                        // Saved so a later zone change can move it. A failed write is only logged,
+                        // like an unreadable file: the move is kept in memory and simply redone on
+                        // the next start, and one bad file never stops the daemon (#184's review).
+                        if moved || unrecorded {
+                            if let Err(e) = self.write(&stored, None) {
+                                tracing::warn!(file, error = %e, "couldn't save a local trigger's zone; redone next start");
+                            }
                         }
                     }
                     st.insert(stored.spec.id.to_string(), Entry { stored, parsed, pending: Vec::new() });
