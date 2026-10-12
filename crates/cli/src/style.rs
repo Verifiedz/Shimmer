@@ -97,18 +97,22 @@ static OUT: OnceLock<Option<Palette>> = OnceLock::new();
 static ERR: OnceLock<Option<Palette>> = OnceLock::new();
 
 /// Should a stream be coloured? `tty`: is it a terminal; `no_color_env`: `NO_COLOR`'s value
-/// (any non-empty value turns colour off); `flag`: `--no-color`; `json`: `--json`.
-pub fn should_color(tty: bool, no_color_env: Option<&str>, flag: bool, json: bool) -> bool {
-    tty && !flag && !json && no_color_env.is_none_or(str::is_empty)
+/// (any non-empty value turns colour off); `term`: `TERM`, where `dumb` means no escape codes
+/// (Emacs' shell, some CI consoles); `flag`: `--no-color`; `json`: `--json`.
+pub fn should_color(tty: bool, no_color_env: Option<&str>, term: Option<&str>, flag: bool, json: bool) -> bool {
+    tty && !flag && !json && no_color_env.is_none_or(str::is_empty) && term != Some("dumb")
 }
 
 /// Decide colour for this run, once. `overrides` are the active pack's `[colors]`.
 pub fn init(no_color_flag: bool, json: bool, overrides: &BTreeMap<String, (u8, u8, u8)>) {
     use std::io::IsTerminal;
     let env = std::env::var("NO_COLOR").ok();
+    let term = std::env::var("TERM").ok();
     let truecolor = std::env::var("COLORTERM").is_ok_and(|v| v == "truecolor" || v == "24bit");
-    let palette =
-        |tty: bool| should_color(tty, env.as_deref(), no_color_flag, json).then(|| Palette::new(truecolor, overrides));
+    let palette = |tty: bool| {
+        should_color(tty, env.as_deref(), term.as_deref(), no_color_flag, json)
+            .then(|| Palette::new(truecolor, overrides))
+    };
     let _ = OUT.set(palette(std::io::stdout().is_terminal()));
     let _ = ERR.set(palette(std::io::stderr().is_terminal()));
 }
@@ -299,12 +303,14 @@ mod tests {
 
     #[test]
     fn colour_only_on_a_terminal_and_never_when_asked_not_to() {
-        assert!(should_color(true, None, false, false));
-        assert!(!should_color(false, None, false, false), "a pipe or a file");
-        assert!(!should_color(true, None, false, true), "--json");
-        assert!(!should_color(true, None, true, false), "--no-color");
-        assert!(!should_color(true, Some("1"), false, false), "NO_COLOR");
-        assert!(should_color(true, Some(""), false, false), "an empty NO_COLOR doesn't count");
+        assert!(should_color(true, None, None, false, false));
+        assert!(!should_color(false, None, None, false, false), "a pipe or a file");
+        assert!(!should_color(true, None, None, false, true), "--json");
+        assert!(!should_color(true, None, None, true, false), "--no-color");
+        assert!(!should_color(true, Some("1"), None, false, false), "NO_COLOR");
+        assert!(should_color(true, Some(""), None, false, false), "an empty NO_COLOR doesn't count");
+        assert!(!should_color(true, None, Some("dumb"), false, false), "TERM=dumb");
+        assert!(should_color(true, None, Some("xterm-256color"), false, false));
     }
 
     #[test]
