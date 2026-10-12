@@ -24,6 +24,8 @@ commands:
   packs …               command packs: themed aliases for these commands (shimmer packs --help)
   call OP [PARAMS]      send any op; PARAMS is a JSON object (default {})
   shutdown              stop the daemon
+  completions SHELL     print Tab completion for bash, zsh or fish, to load in your shell:
+                        source <(shimmer completions zsh), e.g. in ~/.zshrc
   daemon                run the daemon in the foreground (Ctrl-C to stop)
   mockd                 run the mock daemon for building clients (shimmer mockd --help)
 

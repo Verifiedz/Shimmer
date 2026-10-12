@@ -177,6 +177,22 @@ shimmer --help                # every command
 Add `--json` to any command to see the daemon's raw reply, and `--socket PATH` to talk to a
 daemon on a socket other than the default.
 
+### Tab completion
+
+Load it once in your shell's startup file, and Tab completes commands, options and your own
+workspaces, collections, records and templates (and the active pack's aliases):
+
+```sh
+source <(shimmer completions bash)          # in ~/.bashrc
+source <(shimmer completions zsh)           # in ~/.zshrc, after compinit
+shimmer completions fish | source           # in ~/.config/fish/config.fish
+```
+
+In zsh, suggestions come in titled groups in the Shimmer colours, and the command line is
+coloured as you type: commands you can run in the name colour, a misspelt one in the error
+colour, options grey. fish colours the line with your fish theme; bash has no colours.
+Completion never starts the daemon: without one, you still get the commands and options.
+
 ### Contributing
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the checks to run before pushing, and the

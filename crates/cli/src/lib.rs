@@ -7,6 +7,7 @@
 mod args;
 mod autostart;
 mod client;
+mod complete;
 mod csv;
 mod editor;
 mod flags;
@@ -57,6 +58,11 @@ pub async fn run_as_alias(alias: String, args: Vec<String>) -> ExitCode {
 }
 
 async fn run_line(alias: Option<String>, args: Vec<String>) -> ExitCode {
+    // Tab, from a completion script (#188): answered before anything else, and never by starting
+    // a daemon.
+    if alias.is_none() && args.first().is_some_and(|a| a == "__complete") {
+        return complete_line(&args[1..]).await;
+    }
     // Command packs (ADR 0013): find the active pack, then turn an alias into the command it
     // stands for before anything else sees the line. A pack problem is only ever a warning.
     let front = match packs::active::take_front_flags(args) {
@@ -78,6 +84,25 @@ async fn run_line(alias: Option<String>, args: Vec<String>) -> ExitCode {
         for warning in &active.warnings {
             eprintln!("{} {warning}", style::paint_err(style::Role::Warning, "shimmer:"));
         }
+    }
+    if front.args.first().is_some_and(|a| a == "completions") {
+        let colors = active.pack.as_ref().map(|p| p.colors.clone()).unwrap_or_default();
+        let script = match front.args.get(1..) {
+            Some([shell]) => daemon_exe()
+                .map_err(|e| e.message)
+                .and_then(|exe| complete::script(shell, &exe, active.pack.as_ref(), &style::for_script(&colors))),
+            _ => Err("usage: shimmer completions bash|zsh|fish".to_owned()),
+        };
+        return match script {
+            Ok(text) => {
+                print!("{text}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{} {e}", style::paint_err(style::Role::Error, "shimmer:"));
+                ExitCode::from(2)
+            }
+        };
     }
     let help = match (&active.pack, front.canonical) {
         (Some(pack), false) => format!("{USAGE}\n\n{}", packs::active::help_section(pack)),
@@ -119,6 +144,21 @@ async fn run_line(alias: Option<String>, args: Vec<String>) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `shimmer __complete WORDS…`: the suggestions for the last word (#188). `--pack` and
+/// `--socket` on the line count, as they would when it runs.
+async fn complete_line(words: &[String]) -> ExitCode {
+    let after = |flag: &str| words.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone());
+    let active = packs::active::load(after("--pack").as_deref());
+    let socket = after("--socket").map(PathBuf::from).unwrap_or_else(shimmer_proto::paths::socket_path);
+    let cx = complete::Context {
+        pack: active.pack.as_ref(),
+        pack_folders: complete::pack_folders(&shimmer_proto::paths::shimmer_home()),
+    };
+    let groups = complete::complete(words, &cx, &mut complete::Daemon::new(socket)).await;
+    print!("{}", complete::print(&groups));
+    ExitCode::SUCCESS
 }
 
 /// The help to show after a usage error: chosen by the command word the user typed, not by
