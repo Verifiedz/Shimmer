@@ -38,6 +38,8 @@ commands:
                                            dates may be today, today+7, today-30
        [--search TEXT]                     text in the id or any text field
        [--sort FIELD]… [--sort -FIELD]     order, e.g. --sort oa_deadline --sort -applied_on
+                                       a field named like one of these options (limit, sort…):
+                                       filter it with --filter FIELD=VALUE
   get COLLECTION/ID                    show one record
   update COLLECTION/ID [--FIELD VALUE]… [--unset FIELD]…
        [--add FIELD VALUE]… [--remove FIELD VALUE]…  change items of a list field
@@ -786,6 +788,32 @@ fn condition(schema: &Value, raw: &str) -> Result<(String, &'static str, Value)>
 }
 
 /// `--last-solved` finds a field named `last_solved`; an exact match wins.
+/// `records list`/`export` options that were given and share a name with a field of the collection
+/// (#178): the option keeps its meaning (command options never take a name away from fields, ADR
+/// 0031), so say how to filter the field instead.
+fn shadowed_fields(cmd: &RecordsCmd, schema: &Value) -> Vec<String> {
+    let (limit, offset, refine) = match cmd {
+        RecordsCmd::List { limit, offset, refine, .. } => (limit.is_some(), offset.is_some(), refine),
+        RecordsCmd::Export { refine, .. } => (false, false, refine),
+        _ => return Vec::new(),
+    };
+    let given = [
+        ("limit", limit, "the row limit"),
+        ("offset", offset, "how many rows to skip"),
+        ("sort", !refine.sort.is_empty(), "the sort order"),
+        ("search", refine.search.is_some(), "a text search"),
+        ("filter", !refine.conditions.is_empty(), "a condition"),
+        ("or", !refine.or.is_empty(), "an alternative condition"),
+        ("has", !refine.has.is_empty(), "'has a value'"),
+        ("missing", !refine.missing.is_empty(), "'has no value'"),
+    ];
+    given
+        .into_iter()
+        .filter(|(name, used, _)| *used && field(schema, name).is_some())
+        .map(|(name, _, what)| format!("(--{name} is {what}; to filter the field '{name}', use --filter {name}=VALUE)"))
+        .collect()
+}
+
 fn field_name(schema: &Value, flag: &str) -> String {
     let known = |n: &str| field(schema, n).is_some();
     if known(flag) {
@@ -842,6 +870,10 @@ pub async fn run(client: &mut Client, cmd: &RecordsCmd, json: bool, prompt: &mut
         Some(id) => schema(client, id).await?,
         None => Value::Null,
     };
+    // On stderr, so the list itself (and --json) is unchanged.
+    for hint in shadowed_fields(cmd, &schema) {
+        eprintln!("{hint}");
+    }
     match cmd {
         RecordsCmd::Import { collection, file, dry_run, skip_invalid, yes } => {
             let text =
@@ -2165,6 +2197,29 @@ mod tests {
             "nothing in jobs's trash\nskipped: record file 'y.toml': bad"
         );
         assert_eq!(show(&trash, &json!({"items": []}), &Value::Null), "nothing in jobs's trash");
+    }
+
+    #[test]
+    fn a_list_option_named_like_a_field_says_how_to_filter_the_field() {
+        // #178: the option wins, so `--limit 5` on a collection with a field `limit` is the row
+        // limit; the hint says how to filter the field.
+        let schema = json!({"fields": [{"name": "limit"}, {"name": "sort"}, {"name": "title"}]});
+        let p = |w: &[&str]| parse_words(w).unwrap();
+        assert_eq!(
+            shadowed_fields(&p(&["list", "t", "--limit", "5", "--sort", "title"]), &schema),
+            [
+                "(--limit is the row limit; to filter the field 'limit', use --filter limit=VALUE)",
+                "(--sort is the sort order; to filter the field 'sort', use --filter sort=VALUE)",
+            ]
+        );
+        // Only options that were given, and only when the collection has such a field.
+        assert!(shadowed_fields(&p(&["list", "t", "--title", "x"]), &schema).is_empty());
+        assert!(shadowed_fields(&p(&["list", "t", "--search", "x"]), &schema).is_empty());
+        assert!(shadowed_fields(&p(&["list", "t", "--limit", "5"]), &json!({"fields": []})).is_empty());
+        // export has no --limit, but the rest apply.
+        assert_eq!(shadowed_fields(&p(&["export", "t", "--sort", "title"]), &schema).len(), 1);
+        // Other commands never get it.
+        assert!(shadowed_fields(&p(&["add", "t", "--limit", "5"]), &schema).is_empty());
     }
 
     #[test]
