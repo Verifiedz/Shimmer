@@ -51,6 +51,9 @@ impl Module for Workspaces {
                 "workspaces.session.stopped",
                 "workspaces.workspace.removed",
                 "workspaces.workspace.restored",
+                "workspaces.workspace.copied",
+                "workspaces.workspace.renamed",
+                "workspaces.workspace.reconfigured",
             ]
             .map(String::from)
             .to_vec(),
