@@ -10,7 +10,7 @@ mod common;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use common::{fails, ok, wait_gone, Home};
+use common::{fails, ok, stderr, stdout, wait_gone, Home};
 use serde_json::Value;
 
 fn json(home: &Home, args: &[&str]) -> Value {
@@ -23,11 +23,33 @@ fn state(home: &Home, id: &str) -> String {
     json(home, &["workspaces", "status", id])["state"].as_str().unwrap_or_default().to_owned()
 }
 
-/// Poll `cond` for up to 20 s; the scheduler ticks once a second.
-fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(20);
+/// Poll `cond` for up to 60 s (the scheduler ticks once a second, but a cold first run can be
+/// slow). On a timeout, show what the daemon was doing, so a CI failure explains itself.
+fn wait_until(home: &Home, what: &str, mut cond: impl FnMut() -> bool) {
+    let started = Instant::now();
     while !cond() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        if started.elapsed() > Duration::from_secs(60) {
+            let show = |args: &[&str]| {
+                let o = home.shimmer(args);
+                format!("$ shimmer {}\n{}{}", args.join(" "), stdout(&o), stderr(&o))
+            };
+            let logs = home.dir.path().join("home/logs");
+            let daemon_log = std::fs::read_dir(&logs)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("daemon.log"))
+                .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+                .collect::<String>();
+            let tail: Vec<&str> = daemon_log.lines().rev().take(40).collect();
+            panic!(
+                "timed out after 60 s waiting for {what}\n{}\n{}\n{}\n--- end of the daemon log ---\n{}",
+                show(&["--json", "scheduler", "list"]),
+                show(&["--json", "queue", "list"]),
+                show(&["workspaces", "list"]),
+                tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+            );
+        }
         std::thread::sleep(Duration::from_millis(250));
     }
 }
@@ -149,11 +171,11 @@ fn a_schedule_launches_a_workspace_and_a_dirty_one_never_blocks_the_lane() {
         added_trigger(&out)
     };
     add("smoke");
-    wait_until("the scheduled launch of smoke", || state(&home, "smoke") == "active");
+    wait_until(&home, "the scheduled launch of smoke", || state(&home, "smoke") == "active");
 
     // A scheduled launch that fails leaves that workspace dirty...
     add("broken");
-    wait_until("the scheduled launch of broken to fail", || state(&home, "broken") == "dirty");
+    wait_until(&home, "the scheduled launch of broken to fail", || state(&home, "broken") == "dirty");
     let status = ok(&home, &["workspaces", "status", "broken"]);
     assert!(status.contains("step 1/3 check"), "{status}");
 
