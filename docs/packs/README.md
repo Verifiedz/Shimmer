@@ -6,7 +6,7 @@ whole command:
 ```
 $ shimmer packs use anime-tropes
 ✓ active pack: anime-tropes (Anime Tropes)
-  linked 50 commands into /home/me/.local/bin
+  linked 53 commands into /home/me/.local/bin
 try it: ohayo
 
 $ ikuzo deep-work            # = shimmer workspaces activate deep-work
@@ -87,6 +87,9 @@ belongs to this machine, so copying your Shimmer folder elsewhere doesn't bring 
 | workspaces peek | `hontou` | `code-review` | `long-range-scan` | `wpeek` |
 | workspaces new | `yoroshiku` | `scaffold` | `maiden-voyage` | `wnew` |
 | scheduler show | `itsu` | `eta` | `countdown` | `sget` |
+| records peek | `hora` | `preview` | `probe` | `rpeek` |
+| records copy-collection | `futago` | `copy-pasta` | `twin-fleet` | `rcpcol` |
+| records edit | `kaizou` | `tweak-schema` | `drydock` | `redit` |
 
 ## Writing your own
 
@@ -117,6 +120,7 @@ On the right of each alias goes the command it runs, by its op name:
 | `records.collections`, `.add`, `.list`, `.get`, `.update`, `.complete`, `.reopen`, `.rename`, `.remove`, `.restore`, `.trash`, `.purge`, `.import`, `.export`, `.check`, `.templates` | `shimmer records <verb>` |
 | `records.create_collection` | `shimmer records new` |
 | `records.rename_field`, `.rename_collection`, `.remove_collection`, `.restore_collection` | `shimmer records rename-field`, `rename-collection`, `remove-collection`, `restore-collection` |
+| `records.peek`, `.copy_collection`, `.edit` | `shimmer records peek`, `copy-collection`, `edit` |
 | `workspaces.list`, `.status`, `.activate`, `.cleanup`, `.reset`, `.stop`, `.remove`, `.restore`, `.rename`, `.copy`, `.reconfigure`, `.edit`, `.templates`, `.peek` | `shimmer workspaces <verb>` |
 | `workspaces.force_relaunch`, `workspaces.create` | `shimmer workspaces force-relaunch`, `new` |
 | `queue.list`, `.task`, `.cancel`, `.reorder` | `shimmer queue list`, `show`, `cancel`, `move` |

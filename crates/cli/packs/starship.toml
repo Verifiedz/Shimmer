@@ -60,3 +60,7 @@ label = "Starship"
 "long-range-scan"   = "workspaces.peek"
 "maiden-voyage"     = "workspaces.create"
 "countdown"         = "scheduler.get"
+# records peek, copy-collection and edit (ADR 0030)
+"probe"             = "records.peek"
+"twin-fleet"        = "records.copy_collection"
+"drydock"           = "records.edit"

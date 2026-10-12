@@ -61,3 +61,7 @@ label = "Anime Tropes"
 "hontou"         = "workspaces.peek"
 "yoroshiku"      = "workspaces.create"
 "itsu"           = "scheduler.get"
+# records peek, copy-collection and edit (ADR 0030)
+"hora"           = "records.peek"
+"futago"         = "records.copy_collection"
+"kaizou"         = "records.edit"

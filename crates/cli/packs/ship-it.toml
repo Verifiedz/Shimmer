@@ -60,3 +60,7 @@ label = "Ship It"
 "code-review"    = "workspaces.peek"
 "scaffold"       = "workspaces.create"
 "eta"            = "scheduler.get"
+# records peek, copy-collection and edit (ADR 0030)
+"preview"        = "records.peek"
+"copy-pasta"     = "records.copy_collection"
+"tweak-schema"   = "records.edit"

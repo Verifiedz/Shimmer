@@ -62,6 +62,20 @@ pub fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
+/// `shimmer args…`'s output; fails the test, with what it printed, if the command failed.
+pub fn ok(home: &Home, args: &[&str]) -> String {
+    let o = home.shimmer(args);
+    assert!(o.status.success(), "shimmer {args:?} failed: {}{}", stdout(&o), stderr(&o));
+    stdout(&o)
+}
+
+/// `shimmer args…`'s error output; fails the test if the command succeeded.
+pub fn fails(home: &Home, args: &[&str]) -> String {
+    let o = home.shimmer(args);
+    assert!(!o.status.success(), "shimmer {args:?} should have failed: {}", stdout(&o));
+    stderr(&o)
+}
+
 pub fn wait_gone(path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while path.exists() && Instant::now() < deadline {

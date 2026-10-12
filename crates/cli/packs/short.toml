@@ -61,3 +61,7 @@ label = "Short"
 "wpeek"      = "workspaces.peek"
 "wnew"       = "workspaces.create"
 "sget"       = "scheduler.get"
+# records peek, copy-collection and edit (ADR 0030)
+"rpeek"      = "records.peek"
+"rcpcol"     = "records.copy_collection"
+"redit"      = "records.edit"
