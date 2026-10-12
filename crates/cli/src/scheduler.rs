@@ -142,9 +142,16 @@ pub async fn run(client: &mut Client, cmd: &SchedulerCmd, json: bool) -> Result<
             }
             let id = data["trigger_id"].as_str().unwrap_or("?").to_string();
             // Just the new trigger, as `show` gets it (#104). It's already added, so if this
-            // fails, say so plainly rather than failing the command.
-            let new = client.call("scheduler.get", json!({"trigger_id": id})).await.ok();
-            return Ok(added(&id, new.as_ref(), now));
+            // fails the command still succeeds (a script must not add it again), and says why
+            // the details are missing.
+            return Ok(match client.call("scheduler.get", json!({"trigger_id": id})).await {
+                Ok(t) => added(&id, Some(&t), now),
+                Err(e) => format!(
+                    "{}\n  (couldn't fetch its details: {}; see 'shimmer scheduler show {id}')",
+                    added(&id, None, now),
+                    e.code
+                ),
+            });
         }
         SchedulerCmd::Pause { id } => one(id, "scheduler.pause"),
         SchedulerCmd::Resume { id } => one(id, "scheduler.resume"),
@@ -384,5 +391,47 @@ mod tests {
             "{msg}"
         );
         assert_eq!(added("usr-9", None, now), "✓ added trigger usr-9", "still says it was added");
+    }
+
+    /// A daemon that accepts `scheduler.add` and fails every other request, as one would if
+    /// `scheduler.get` broke right after the trigger was created.
+    async fn add_only_daemon(sock: &std::path::Path) {
+        use shimmer_proto::{decode_client, encode, ClientFrame, ServerFrame};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::UnixListener::bind(sock).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (rd, mut wr) = stream.into_split();
+            let mut lines = BufReader::new(rd).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let frame = match decode_client(&line).unwrap() {
+                    ClientFrame::Hello { .. } => ServerFrame::welcome("test", "s1"),
+                    ClientFrame::Request { id, op, .. } if op == "scheduler.add" => {
+                        ServerFrame::ok(id, json!({"trigger_id": "usr-new"}))
+                    }
+                    ClientFrame::Request { id, op, .. } => {
+                        ServerFrame::err(id, shimmer_core::Error::unavailable(format!("{op} broke")))
+                    }
+                    _ => continue,
+                };
+                wr.write_all(encode(&frame).unwrap().as_bytes()).await.unwrap();
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn add_still_succeeds_and_says_why_when_its_details_cant_be_fetched() {
+        // Wasay's review of #169: the trigger exists either way, so the command succeeds (a
+        // script must not retry and add it twice), and says why it shows only the id.
+        let dir = tempfile::TempDir::new().unwrap();
+        let sock = dir.path().join("s.sock");
+        add_only_daemon(&sock).await;
+        let mut client = Client::connect(&sock).await.unwrap();
+        let cmd = p(&["add", "records.list", "--every", "1d", "--catch-up", "skip"]).unwrap();
+        let out = run(&mut client, &cmd, false).await.unwrap();
+        assert_eq!(
+            out,
+            "✓ added trigger usr-new\n  (couldn't fetch its details: unavailable; see 'shimmer scheduler show usr-new')"
+        );
     }
 }

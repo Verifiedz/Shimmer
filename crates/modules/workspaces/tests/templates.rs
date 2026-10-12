@@ -180,6 +180,66 @@ fn every_script_is_valid_sh() {
     assert!(checked >= 15, "found {checked} scripts");
 }
 
+/// Load the shared helper as a step does, with `TMPDIR` and `SHIMMER_HOME` set: the folder it
+/// keeps run-time files in, or the error it stopped with.
+#[cfg(unix)]
+fn state_dir(tmp: &std::path::Path, home: &str) -> std::result::Result<String, String> {
+    let helper = concat!(env!("CARGO_MANIFEST_DIR"), "/templates/lib/shimmer-open.sh");
+    let out = Command::new("sh")
+        .args(["-c", ". \"$1\" && printf %s \"$SHIMMER_STATE_DIR\"", "sh", helper])
+        .env("TMPDIR", tmp)
+        .env("SHIMMER_HOME", home)
+        .env("SHIMMER_WORKSPACE_ID", "site")
+        .output()
+        .unwrap();
+    match out.status.success() {
+        true => Ok(String::from_utf8(out.stdout).unwrap()),
+        false => Err(String::from_utf8_lossy(&out.stderr).into_owned()),
+    }
+}
+
+/// #165: templates keep pid files in this folder; one shared by every Shimmer folder and user
+/// let a workspace stop another's processes, or let someone plant a pid for it to signal.
+#[cfg(unix)]
+#[test]
+fn run_time_files_live_in_a_private_folder_per_user_shimmer_folder_and_workspace() {
+    use std::os::unix::fs::PermissionsExt;
+    /// Removes the test's folder even when an assert fails.
+    struct Gone(std::path::PathBuf);
+    impl Drop for Gone {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let tmp = std::env::temp_dir().join(format!("shimmer-state-test-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let _gone = Gone(tmp.clone());
+    let uid = String::from_utf8(Command::new("id").arg("-u").output().unwrap().stdout).unwrap();
+
+    let a = state_dir(&tmp, "/home/a/.local/share/shimmer").unwrap();
+    let b = state_dir(&tmp, "/home/b/.local/share/shimmer").unwrap();
+    assert_ne!(a, b, "two Shimmer folders with a workspace named 'site' must not share one");
+    assert!(a.ends_with("-site"), "{a}");
+    let name = std::path::Path::new(&a).file_name().unwrap().to_string_lossy().into_owned();
+    assert!(name.starts_with(&format!("shimmer-{}-", uid.trim())), "named after the user: {name}");
+    assert_eq!(state_dir(&tmp, "/home/a/.local/share/shimmer").unwrap(), a, "the same each time");
+    let mode = std::fs::metadata(&a).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "private: {mode:o}");
+    // Our own folder left with loose permissions is made private again.
+    std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o777)).unwrap();
+    state_dir(&tmp, "/home/a/.local/share/shimmer").unwrap();
+    assert_eq!(std::fs::metadata(&a).unwrap().permissions().mode() & 0o777, 0o700, "tightened again");
+
+    // Something already at that path that isn't our own folder is refused.
+    std::fs::remove_dir(&b).unwrap();
+    std::os::unix::fs::symlink(&tmp, &b).unwrap();
+    let e = state_dir(&tmp, "/home/b/.local/share/shimmer").unwrap_err();
+    assert!(e.contains("not a folder of your own") && e.contains("a reboot clears it"), "{e}");
+    std::fs::remove_file(&b).unwrap();
+    std::fs::write(&b, "1234").unwrap();
+    assert!(state_dir(&tmp, "/home/b/.local/share/shimmer").is_err(), "a planted file too");
+}
+
 #[tokio::test]
 async fn the_vm_template_never_takes_a_password_only_a_keychain_entry_name() {
     // ADR 0025 §6: an answer is written to workspace.toml in plain text, so the vm template
