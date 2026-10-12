@@ -200,16 +200,16 @@ fn clock(text: &str) -> std::result::Result<(u32, u32), String> {
     Ok((h, m))
 }
 
-/// Where the command starts in `words` (what follows `shimmer schedule`), when an alias may
-/// stand in for it: for rewriting that alias, as the CLI does for the first word of a line.
-fn command_start(words: &[String], is_alias: &dyn Fn(&str) -> bool) -> Option<usize> {
+/// Where the command starts in `words` (what follows `shimmer schedule`), by position (ADR 0031
+/// §1): after `WHEN`, which has a fixed shape, and the schedule's `--option value` pairs. So an
+/// option's value is never taken for the command (`--lane workspaces workspaces activate site`),
+/// and no word needs reserving: `daily` may be a pack's alias too. For rewriting an alias there,
+/// as the CLI does for the first word of a line.
+fn command_start(words: &[String]) -> Option<usize> {
     let (_, mut i) = parse_when(words).ok()?;
     while let Some(word) = words.get(i) {
-        if COMMAND_WORDS.contains(&word.as_str()) || is_alias(word) {
-            return Some(i);
-        }
         if !word.starts_with("--") {
-            return None;
+            return Some(i);
         }
         // `--catch-up X` / `--lane X` take the next word; `--flag=X` doesn't.
         i += if word.contains('=') { 1 } else { 2 };
@@ -226,7 +226,7 @@ pub fn rewrite_inner(mut args: Vec<String>, pack: Option<&Pack>) -> Vec<String> 
         return args;
     }
     let rest = &args[i + 1..];
-    if let Some(start) = command_start(rest, &|w| pack.aliases.contains_key(w)) {
+    if let Some(start) = command_start(rest) {
         if let Some(target) = pack.aliases.get(&rest[start]) {
             let at = i + 1 + start;
             args.splice(at..=at, target.words.iter().map(|w| w.to_string()));
@@ -417,31 +417,39 @@ mod tests {
         );
     }
 
-    /// The words `WHEN` is made of. No pack may use them as an alias, so where the command starts
-    /// is never ambiguous (ADR 0031 §1).
-    const WHEN_WORDS: &[&str] = &[
-        "daily",
-        "weekdays",
-        "weekends",
-        "every",
-        "once",
-        "cron",
-        "cron-local",
-        "mon",
-        "tue",
-        "wed",
-        "thu",
-        "fri",
-        "sat",
-        "sun",
-    ];
+    fn pack(aliases: &str) -> Pack {
+        crate::packs::pack::parse("p", &format!("[pack]\nid = \"p\"\nlabel = \"P\"\n[alias]\n{aliases}"))
+            .unwrap_or_else(|problems| panic!("{problems:?}"))
+    }
 
     #[test]
-    fn no_pack_can_alias_a_when_word_or_schedule() {
-        // Otherwise "where the scheduled command starts" would be ambiguous.
-        for word in WHEN_WORDS.iter().chain(&["schedule"]) {
-            assert!(crate::packs::pack::RESERVED.contains(word), "'{word}' must be reserved for packs");
-        }
+    fn the_command_starts_by_position_so_a_pack_may_alias_when_words() {
+        // ADR 0031 §1 (#175's review): nothing is reserved but `schedule` itself.
+        let pack = pack("\"daily\" = \"records.list\"\n\"mon\" = \"workspaces.activate\"\n");
+        // `daily` as WHEN, then `daily` the alias as the command: only the second is rewritten.
+        let line = w(&["schedule", "daily", "09:00", "--catch-up", "skip", "daily", "lc"]);
+        assert_eq!(
+            rewrite_inner(line, Some(&pack)),
+            w(&["schedule", "daily", "09:00", "--catch-up", "skip", "records", "list", "lc"])
+        );
+        // An option's value is never the command, even when it's an alias's or a command's name.
+        let line = w(&["schedule", "mon", "09:00", "--lane", "mon", "mon", "site"]);
+        assert_eq!(
+            rewrite_inner(line, Some(&pack)),
+            w(&["schedule", "mon", "09:00", "--lane", "mon", "workspaces", "activate", "site"])
+        );
+        let p = plan(&["weekdays", "09:00", "--lane", "workspaces", "workspaces", "activate", "site"]);
+        assert_eq!((p.lane.as_deref(), p.command), (Some("workspaces"), w(&["workspaces", "activate", "site"])));
+    }
+
+    #[test]
+    fn schedule_itself_is_the_one_word_no_pack_may_use() {
+        let problems = crate::packs::pack::parse(
+            "p",
+            "[pack]\nid = \"p\"\nlabel = \"P\"\n[alias]\n\"schedule\" = \"core.ping\"\n",
+        )
+        .unwrap_err();
+        assert!(problems.iter().any(|p| p.contains("schedule")), "{problems:?}");
     }
 
     struct Answer(Option<&'static str>, bool);

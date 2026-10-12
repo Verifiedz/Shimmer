@@ -557,3 +557,55 @@ async fn a_local_time_trigger_follows_the_timezone_after_a_restart() {
     assert_eq!((hours(&la) - hours(&ny)).num_hours(), 3, "9am Los Angeles is 3 hours after 9am New York: {ny} → {la}");
     stop(d).await;
 }
+
+/// Wait until `topic` has been logged `n` times.
+async fn until_logged(env: &Env, topic: &str, n: usize) {
+    for _ in 0..300 {
+        if logged(env, topic).len() >= n {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("{topic} logged {} times, not {n}", logged(env, topic).len());
+}
+
+#[tokio::test]
+async fn a_local_time_trigger_missed_while_down_still_catches_up_after_a_restart() {
+    // ADR 0031 §2 (#175's review): catch-up decides from the stored next run, so a restart must
+    // never move it past runs the daemon missed, or run-once and backfill would act like skip.
+    let env = Env::fake_clock();
+    let config = env.home.path().join("config.toml");
+    std::fs::write(&config, "[general]\nlocal_timezone = \"America/New_York\"\n").unwrap();
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    let id = add(&mut c, json!({"cron_local": "0 9 * * *"}), "demo.echo", "run_once").await;
+    drop(c);
+    stop(d).await;
+
+    // Off for three days, same zone: one run on waking, for the runs it missed.
+    advance(&env, 3 * DAY);
+    let d = env.start().await;
+    until_logged(&env, "scheduler.trigger.fired", 1).await;
+    let mut c = Client::connect(&env.sock).await;
+    settle(&mut c).await;
+    assert_eq!(logged(&env, "scheduler.trigger.fired").len(), 1, "same zone: caught up once");
+    assert_eq!(logged(&env, "scheduler.trigger.missed").len(), 1);
+    let ran = trigger(&mut c, &id).await.unwrap()["last_run"].clone();
+    drop(c);
+    stop(d).await;
+
+    // Off for three more days, and now in Los Angeles: still caught up, never before last_run.
+    advance(&env, 3 * DAY);
+    std::fs::write(&config, "[general]\nlocal_timezone = \"America/Los_Angeles\"\n").unwrap();
+    let d = env.start().await;
+    until_logged(&env, "scheduler.trigger.fired", 2).await;
+    let mut c = Client::connect(&env.sock).await;
+    settle(&mut c).await;
+    assert_eq!(logged(&env, "scheduler.trigger.fired").len(), 2, "zone changed: caught up once more");
+    let t = trigger(&mut c, &id).await.unwrap();
+    assert!(t["last_run"].as_str() > ran.as_str(), "{t}");
+    let file = env.home.path().join(format!("data/scheduler/triggers/{id}.json"));
+    let on_disk: Value = serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+    assert_eq!(on_disk["zone"], "America/Los_Angeles", "the zone its next run is in");
+    stop(d).await;
+}
