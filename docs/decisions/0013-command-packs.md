@@ -319,7 +319,8 @@ animations.
 
 ## Not done here
 
-- Playing animations and `--no-anim` (§12). That PR closes #35.
-- `shimmer queue …` and `shimmer scheduler …` commands, so packs can alias them (§6).
+- Playing animations and `--no-anim` (§12). That PR closes #35. **Still not built:** #35 was
+  closed with the packs PRs, and nothing plays an `[anim]` file yet.
+- `shimmer queue …` and `shimmer scheduler …` commands, so packs can alias them (§6). **Done since:** ADR 0015.
 - Bare commands on Windows (`.cmd` shims instead of symlinks), and `cli.toml`'s Windows location.
 - A community collection for franchise packs, and where it lives.
