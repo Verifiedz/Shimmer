@@ -25,7 +25,8 @@ it. The CLI's `--socket PATH` overrides both, and a command given `--socket` nev
 daemon.
 
 If the socket file exists but connecting returns `ECONNREFUSED`, the daemon died without
-cleaning up. Clients should unlink it and start a daemon.
+cleaning up. Start a daemon: it clears the stale file when it binds, so a client need not
+(ADR 0007).
 
 ## Framing
 
