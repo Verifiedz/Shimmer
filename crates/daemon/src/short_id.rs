@@ -4,12 +4,25 @@
 
 use shimmer_core::{Error, Result};
 
-/// The one id in `ids` that `written` is the ending of, ignoring case. `kind` names them in
+/// The shortest ending accepted, as for git's abbreviated hashes: a stray keystroke or half a
+/// paste must never remove or cancel something (#183's review). The lists show 6 or more.
+pub const MIN_ENDING: usize = 4;
+
+/// The one id in `ids` that `written` is, or is the ending of, ignoring case. A whole id
+/// matches at any length; an ending needs [`MIN_ENDING`] characters. `kind` names them in
 /// errors ("task", "trigger").
 pub fn resolve(written: &str, ids: &[String], kind: &str) -> Result<String> {
     let want = written.to_lowercase();
     if want.is_empty() {
         return Err(Error::invalid_params(format!("a {kind} id can't be empty")));
+    }
+    if let Some(whole) = ids.iter().find(|id| id.to_lowercase() == want) {
+        return Ok(whole.clone());
+    }
+    if want.chars().count() < MIN_ENDING {
+        return Err(Error::invalid_params(format!(
+            "'{written}' is too short to pick a {kind}: give at least {MIN_ENDING} characters of its end"
+        )));
     }
     let matches: Vec<&String> = ids.iter().filter(|id| id.to_lowercase().ends_with(&want)).collect();
     match matches.as_slice() {
@@ -51,7 +64,19 @@ mod tests {
         let e = resolve("k7p2x", &ids(), "task").unwrap_err();
         assert_eq!(e.code, ErrorCode::Conflict);
         assert!(e.message.contains("ends 2 task ids") && e.message.contains("give more of it"), "{}", e.message);
-        assert_eq!(resolve("zzz", &ids(), "task").unwrap_err().code, ErrorCode::NotFound);
+        assert_eq!(resolve("zzzz", &ids(), "task").unwrap_err().code, ErrorCode::NotFound);
         assert_eq!(resolve("", &ids(), "task").unwrap_err().code, ErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn an_ending_needs_four_characters_but_a_whole_id_any() {
+        // One character ends exactly one id here, and is still refused (#183's review).
+        let e = resolve("m", &ids(), "trigger").unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidParams);
+        assert!(e.message.contains("at least 4"), "{}", e.message);
+        assert_eq!(resolve("q9tm", &ids(), "trigger").unwrap(), "usr-01m4ppm0003fq9tm");
+        // A module's own trigger may have a short id: written whole, it's found.
+        let short = vec!["ab".to_owned()];
+        assert_eq!(resolve("AB", &short, "trigger").unwrap(), "ab");
     }
 }
