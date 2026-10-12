@@ -10,6 +10,7 @@ mod client;
 mod csv;
 mod editor;
 mod flags;
+mod follow;
 pub mod packs;
 mod queue;
 mod records;

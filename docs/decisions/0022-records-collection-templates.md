@@ -1,7 +1,8 @@
 # 0022. Collection templates: ready-made trackers created with one command
 
-Status: proposed · Raised by Dev B (records roadmap, item 1; issue #78) · Needs sign-off: Dev A
-(two new ops in `records`, docs/protocol.md) · Dev C notified · No `core` or `proto` change
+Status: accepted (records roadmap, #101) · Raised by Dev B (records roadmap, item 1; issue #78) ·
+Signed off: Dev A (two new ops in `records`, docs/protocol.md) · Dev C notified · No `core` or
+`proto` change
 
 ## Context
 

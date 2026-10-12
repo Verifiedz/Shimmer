@@ -1,8 +1,8 @@
 # 0019. Asking records real questions: comparisons, search and sorting
 
-Status: proposed · Raised by Dev B (records roadmap, item 4) · Needs sign-off: Dev A
-(`records.list` params, docs/protocol.md) · Dev C notified (the TUI's tables use `records.list`)
-· No `core` or `proto` change
+Status: accepted (records roadmap, #101) · Raised by Dev B (records roadmap, item 4) · Signed off:
+Dev A (`records.list` params, docs/protocol.md) · Dev C notified (the TUI's tables use
+`records.list`) · No `core` or `proto` change
 
 ## Context
 

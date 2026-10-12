@@ -1206,12 +1206,23 @@ pub fn show(cmd: &RecordsCmd, data: &Value, schema: &Value) -> String {
             data["templates"][0]["file"].as_str().unwrap_or_default().trim_end().to_owned()
         }
         RecordsCmd::New { id, template, .. } => created(id, template, data),
-        RecordsCmd::RenameField { collection, from, to } => format!(
-            "✓ {collection}: field '{}' is now '{}' ({} record(s) updated)",
-            field_name(schema, from),
-            to.replace('-', "_"),
-            cell(&data["updated"])
-        ),
+        RecordsCmd::RenameField { collection, from, to } => {
+            let from = field_name(schema, from);
+            let mut out = format!(
+                "✓ {collection}: field '{from}' is now '{}' ({} record(s) updated)",
+                to.replace('-', "_"),
+                cell(&data["updated"])
+            );
+            // Files it couldn't read keep the old name until they're fixed (#99).
+            for skipped in data["skipped"].as_array().into_iter().flatten() {
+                // In full, never cut: the message is how the person finds the file.
+                let _ = write!(out, "\nskipped, still has '{from}': {}", skipped.as_str().unwrap_or_default());
+            }
+            if data["skipped"].is_array() {
+                let _ = write!(out, "\n  fix those files, then: shimmer records check {collection}");
+            }
+            out
+        }
         RecordsCmd::RenameCollection { id, new_id, .. } => format!("✓ {id} is now {new_id}"),
         RecordsCmd::Edit { collection, .. } => {
             format!("✓ {collection} saved; {}", check_report(collection, data))
@@ -1223,7 +1234,13 @@ pub fn show(cmd: &RecordsCmd, data: &Value, schema: &Value) -> String {
         ),
         RecordsCmd::RestoreCollection { id } => format!("✓ {id} restored"),
         RecordsCmd::Trash { collection } => match data["items"].as_array().is_none_or(Vec::is_empty) {
-            true => format!("nothing in {collection}'s trash"),
+            true => {
+                let mut out = format!("nothing in {collection}'s trash");
+                for skipped in data["skipped"].as_array().into_iter().flatten() {
+                    let _ = write!(out, "\nskipped: {}", skipped.as_str().unwrap_or_default());
+                }
+                out
+            }
             false => list(data, schema),
         },
         RecordsCmd::Complete { collection, id, .. } => {
@@ -1552,7 +1569,7 @@ fn list(data: &Value, schema: &Value) -> String {
         t
     };
     for skipped in data["skipped"].as_array().into_iter().flatten() {
-        let _ = write!(out, "\nskipped: {}", cell(skipped));
+        let _ = write!(out, "\nskipped: {}", skipped.as_str().unwrap_or_default());
     }
     out
 }
@@ -2127,6 +2144,27 @@ mod tests {
         let table = collections(&mixed);
         assert!(table.starts_with("ID    LABEL  TEMPLATE"), "{table}");
         assert!(table.contains("\njobs  Jobs   job-applications") && table.contains("\nlc    LC     -"), "{table}");
+    }
+
+    #[test]
+    fn unreadable_files_are_named_after_rename_field_and_in_the_trash() {
+        // #99: what couldn't be read is shown, never silently dropped.
+        let rename =
+            RecordsCmd::RenameField { collection: "jobs".into(), from: "stage".into(), to: "status-now".into() };
+        let data = json!({"updated": 2, "skipped": ["record file 'x.toml' can't be read: not UTF-8"]});
+        assert_eq!(
+            show(&rename, &data, &Value::Null),
+            "✓ jobs: field 'stage' is now 'status_now' (2 record(s) updated)\n\
+             skipped, still has 'stage': record file 'x.toml' can't be read: not UTF-8\n  \
+             fix those files, then: shimmer records check jobs"
+        );
+        assert!(!show(&rename, &json!({"updated": 2}), &Value::Null).contains("skipped"));
+        let trash = RecordsCmd::Trash { collection: "jobs".into() };
+        assert_eq!(
+            show(&trash, &json!({"items": [], "skipped": ["record file 'y.toml': bad"]}), &Value::Null),
+            "nothing in jobs's trash\nskipped: record file 'y.toml': bad"
+        );
+        assert_eq!(show(&trash, &json!({"items": []}), &Value::Null), "nothing in jobs's trash");
     }
 
     #[test]

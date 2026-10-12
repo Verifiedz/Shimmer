@@ -1,6 +1,7 @@
 # 0029. Command packs can alias every command
 
-Status: accepted (2026-10-07). Amends ADR 0013 §6, ADR 0021 §6, ADR 0022 §4, ADR 0025 §8.
+Status: accepted (#125) · Raised by Dev B · Signed off: Dev A (#125's review) · Amends ADR 0013 §6,
+ADR 0021 §6, ADR 0022 §4, ADR 0025 §8 · No `core` or `proto` change
 
 ## Context
 
