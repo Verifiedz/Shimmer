@@ -119,6 +119,115 @@ pub(crate) fn table(header: &[String], rows: &[Vec<String>]) -> String {
     out
 }
 
+/// The longest description shown in the list; `peek` shows it whole.
+const LISTED_DESCRIPTION: usize = 72;
+
+/// A description cut at [`LISTED_DESCRIPTION`] characters, at a word, for a list of templates.
+fn shorten(text: &str) -> String {
+    if text.chars().count() <= LISTED_DESCRIPTION {
+        return text.to_owned();
+    }
+    let cut: String = text.chars().take(LISTED_DESCRIPTION).collect();
+    let cut = cut.rsplit_once(' ').map_or(cut.as_str(), |(head, _)| head);
+    format!("{}…", cut.trim_end_matches([',', ':', ';', ' ']))
+}
+
+/// Words wrapped to `width`, each line after the first indented by `indent`.
+pub fn wrap(text: &str, width: usize, indent: &str) -> String {
+    let mut lines: Vec<String> = vec![String::new()];
+    for word in text.split_whitespace() {
+        let line = lines.last_mut().expect("never empty");
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+            lines.push(word.to_owned());
+        } else {
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+    }
+    lines.join(&format!("\n{indent}"))
+}
+
+/// The templates a `*.templates` op sent (`records`, `workspaces`), grouped under their
+/// categories' headings in the daemon's order. With `which`: only that category's, or that one
+/// template as `in_full` shows it. `kind` names the commands in the footer and in mistakes;
+/// `make` is the footer's line for making one, e.g. ("make a workspace from it:", "shimmer
+/// workspaces new NAME --from TEMPLATE").
+pub fn templates_by_category(
+    data: &Value,
+    which: Option<&str>,
+    kind: &str,
+    make: (&str, &str),
+    in_full: fn(&Value, &[Value]) -> String,
+) -> Result<String, Error> {
+    let all = data["templates"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let categories = data["categories"].as_array().map(Vec::as_slice).unwrap_or_default();
+    if let Some(which) = which {
+        if all.iter().any(|t| t["id"] == which) {
+            return template_named(data, which, kind).map(|t| in_full(t, categories));
+        }
+        if !categories.iter().any(|c| c["id"] == which) {
+            let names: Vec<String> = categories.iter().map(|c| cell(&c["id"])).collect();
+            return Err(Error::not_found(format!(
+                "no template or category '{which}' (categories: {}; templates: shimmer {kind} templates)",
+                names.join(", ")
+            )));
+        }
+    }
+    if all.is_empty() {
+        return Ok("no templates".into());
+    }
+    let id_width = all.iter().map(|t| cell(&t["id"]).chars().count()).max().unwrap_or(0);
+    let mut groups: Vec<(String, Vec<&Value>)> = Vec::new();
+    for t in all.iter().filter(|t| which.is_none_or(|w| t["category"] == w)) {
+        // "Job hunt (job-hunt)": the short name is what `templates CATEGORY` takes.
+        let heading = categories
+            .iter()
+            .find(|c| c["id"] == t["category"])
+            .map_or_else(|| "Other".to_owned(), |c| format!("{} ({})", cell(&c["label"]), cell(&c["id"])));
+        match groups.iter_mut().find(|(h, _)| *h == heading) {
+            Some((_, ts)) => ts.push(t),
+            None => groups.push((heading, vec![t])),
+        }
+    }
+    let mut out = String::new();
+    for (heading, ts) in &groups {
+        let _ = writeln!(out, "{heading}");
+        for t in ts {
+            let id = t["id"].as_str().unwrap_or_default();
+            let _ = writeln!(out, "  {id:<id_width$}  {}", shorten(t["description"].as_str().unwrap_or_default()));
+        }
+        out.push('\n');
+    }
+    let peek = ("everything about one:", format!("shimmer {kind} peek TEMPLATE"));
+    let width = peek.0.len().max(make.0.len());
+    let _ = write!(out, "{:<width$} {}\n{:<width$} {}", peek.0, peek.1, make.0, make.1);
+    Ok(out)
+}
+
+/// Template `id` from a `*.templates` reply. A category's name gets a pointer to
+/// `templates CATEGORY`; anything else is `not_found` naming the templates there are.
+pub fn template_named<'a>(data: &'a Value, id: &str, kind: &str) -> Result<&'a Value, Error> {
+    let all = data["templates"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let categories = data["categories"].as_array().map(Vec::as_slice).unwrap_or_default();
+    match all.iter().find(|t| t["id"] == id) {
+        Some(t) => Ok(t),
+        None if categories.iter().any(|c| c["id"] == id) => Err(Error::not_found(format!(
+            "'{id}' is a category, not a template: see its templates with shimmer {kind} templates {id}"
+        ))),
+        None => {
+            let names: Vec<String> = all.iter().map(|t| cell(&t["id"])).collect();
+            Err(Error::not_found(format!("no template '{id}' (there are: {})", names.join(", "))))
+        }
+    }
+}
+
+/// The categories' headings a `*.templates` reply carries.
+pub fn categories(data: &Value) -> &[Value] {
+    data["categories"].as_array().map(Vec::as_slice).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -172,5 +281,14 @@ modules
         assert_eq!(error(&Error::not_found("no collection 'x'")), "not_found: no collection 'x'");
         let e = Error::conflict("stale").with_detail(json!({"queue_version": 41}));
         assert_eq!(error(&e), "conflict: stale\n{\n  \"queue_version\": 41\n}");
+    }
+
+    #[test]
+    fn long_descriptions_are_cut_at_a_word() {
+        assert_eq!(shorten("short"), "short");
+        assert_eq!(
+            shorten("Free space safely: build folders of projects you haven't touched in a while, and tool caches"),
+            "Free space safely: build folders of projects you haven't touched in a…"
+        );
     }
 }

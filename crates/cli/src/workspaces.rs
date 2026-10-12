@@ -18,7 +18,10 @@ use serde_json::{json, Value};
 use shimmer_core::{Error, ErrorCode, Result};
 
 use crate::client::Client;
-use crate::render::{self, cell, table};
+use crate::editor;
+use crate::follow::{follow, Followed};
+use crate::render::{self, cell, table, wrap};
+use crate::schedules;
 
 pub const USAGE: &str = "usage: shimmer workspaces <command>
 
@@ -59,6 +62,8 @@ commands:
 --wait  follow the launch until it ends and show how it went. Without it the command
         returns once the launch is queued; check on it with 'shimmer workspaces status NAME'.
         Don't use --wait from a workspace's own step scripts: launches run one at a time.
+        With --json: the op's result, or {\"result_missed\": true, \"task\": {…}} when it
+        succeeded but its result was lost to dropped events (then fields like log are absent).
 --yes   skip the question. Needed when no one is at the keyboard (scripts).
 
 A workspace is a folder under data/workspaces/ in your Shimmer folder, holding a
@@ -437,21 +442,7 @@ pub async fn run(client: &mut Client, cmd: &WorkspacesCmd, json: bool, prompt: &
                     path.display()
                 )));
             }
-            let editor =
-                editor_command(std::env::var("VISUAL").ok().as_deref(), std::env::var("EDITOR").ok().as_deref(), |p| {
-                    which(p)
-                })
-                .ok_or_else(|| Error::invalid_params("no editor found: set $EDITOR (e.g. export EDITOR=nano)"))?;
-            let status = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!("{editor} \"$1\""))
-                .arg("sh")
-                .arg(&path)
-                .status()
-                .map_err(|e| Error::unavailable(format!("couldn't start {editor}: {e}")))?;
-            if !status.success() {
-                return Err(Error::unavailable(format!("{editor} exited with {status}; nothing checked")));
-            }
+            editor::open(&path)?;
             // The daemon reads the file fresh on every request, so this checks what was saved.
             let data = client.call("workspaces.status", id_params(id)).await?;
             Ok(out(&data, edited(id, &data)))
@@ -531,43 +522,15 @@ pub async fn run(client: &mut Client, cmd: &WorkspacesCmd, json: bool, prompt: &
             }
             // Schedules that activate (or stop…) it by its old name would now fail: say so, and
             // move them only when the person says yes.
-            let all = client.call("scheduler.list", json!({})).await.unwrap_or(Value::Null);
-            let old = schedules_for(&all, id);
-            if old.is_empty() {
-                return Ok(out(&data, text));
-            }
-            let verb = if old.len() == 1 { "uses" } else { "use" };
-            let mut listing = format!("\n  {} still {verb} the old name {id}:", plural(old.len(), "schedule"));
-            for t in &old {
-                let _ = write!(listing, "\n    {}", schedule_line(t));
-            }
-            let asked = !*move_schedules && prompt.interactive();
-            let go = *move_schedules || {
-                if asked {
-                    eprintln!("{}", listing.trim_start_matches('\n'));
-                    prompt.confirm(&format!("Move {} to {to}?", if old.len() == 1 { "it" } else { "them" }))
-                } else {
-                    false
-                }
+            let old = schedules::find(client, "workspaces.", &schedules::names(&[("id", id)])).await;
+            let rename = schedules::Rename {
+                from: id,
+                to,
+                changes: schedules::names(&[("id", to)]),
+                undo: format!("shimmer workspaces rename {to} {id}"),
+                yes: *move_schedules,
             };
-            if !asked {
-                text.push_str(&listing);
-            }
-            if !go {
-                let _ = write!(
-                    text,
-                    "\n  they'll fail until moved: run 'shimmer workspaces rename {to} {id}' to undo, or \
-                     remove each (shimmer scheduler remove ID) and add it again for {to}"
-                );
-                return Ok(out(&data, text));
-            }
-            for t in &old {
-                let line = match move_schedule(client, t, to).await {
-                    Ok(new) => format!("moved {} → {new}", cell(&t["id"])),
-                    Err(e) => format!("couldn't move {}: {} (it still uses {id})", cell(&t["id"]), e.message),
-                };
-                let _ = write!(text, "\n  {line}");
-            }
+            text.push_str(&schedules::follow_rename(client, prompt, &old, &rename).await);
             Ok(out(&data, text))
         }
         WorkspacesCmd::Reconfigure { id, set } => {
@@ -672,8 +635,18 @@ async fn queued(client: &mut Client, kind: Queued, id: &str, wait: bool, json: b
     if !wait {
         return Ok(if json { render::json(&handle) } else { queued_message(kind, id, task) });
     }
-    match follow(client, task, json).await {
-        Ok(result) => Ok(if json { render::json(&result) } else { with_log(kind.done(id), &result) }),
+    let look = format!("shimmer workspaces status {id}");
+    match follow(client, task, !json, &look).await {
+        Ok(Followed::Finished(result)) => {
+            Ok(if json { render::json(&result) } else { with_log(kind.done(id), &result) })
+        }
+        // It worked; only its log lines were missed (#142). With --json, `result_missed` says so,
+        // so a script reading the usual result's fields can tell why they're absent.
+        Ok(Followed::ResultMissed(task)) => Ok(if json {
+            render::json(&json!({"result_missed": true, "task": task}))
+        } else {
+            format!("{}\n  (its output was missed: some events were dropped; see '{look}')", kind.done(id))
+        }),
         Err(e) if json => Err(e),
         Err(e) => Err(explain(e, id)),
     }
@@ -712,72 +685,15 @@ fn queued_message(kind: Queued, id: &str, task: &str) -> String {
     format!("queued the {} of {id} (task {task})\ncheck on it with: shimmer workspaces status {id}", kind.what())
 }
 
-/// Follow task `task` over the subscription stream until it ends: its result, or the error it
-/// failed with (e.g. `workspace_dirty`, with its detail). Progress notes go to stderr.
-async fn follow(client: &mut Client, task: &str, json: bool) -> Result<Value> {
-    let mut last_note = String::new();
-    loop {
-        let ev = client.next_event().await?;
-        if ev.topic == "core.stream.lagged" {
-            // Events were dropped, maybe the one we wait for: ask directly instead.
-            if let Some(outcome) = finished_task(client, task).await? {
-                return outcome;
-            }
-            continue;
-        }
-        if ev.payload["task_id"] != task {
-            continue;
-        }
-        match ev.topic.as_str() {
-            "queue.task.progress" => {
-                let note = ev.payload["note"].as_str().unwrap_or_default();
-                if !json && !note.is_empty() && note != last_note {
-                    eprintln!("  {note} …");
-                    last_note = note.to_owned();
-                }
-            }
-            "queue.task.finished" => return Ok(ev.payload["result"].clone()),
-            "queue.task.failed" => return Err(task_error(&ev.payload)),
-            "queue.task.cancelled" => return Err(cancelled()),
-            _ => {}
-        }
-    }
-}
-
-/// After `core.stream.lagged`: has the task ended? `None` while it is still queued or running.
-async fn finished_task(client: &mut Client, task: &str) -> Result<Option<Result<Value>>> {
-    let t = client.call("queue.task", json!({"task_id": task})).await?;
-    Ok(match t["status"].as_str() {
-        Some("succeeded") => Some(Ok(t["result"].clone())),
-        Some("failed") => {
-            Some(Err(Error::new(ErrorCode::ModuleError, t["error"].as_str().unwrap_or("the task failed").to_owned())))
-        }
-        Some("cancelled") => Some(Err(cancelled())),
-        _ => None,
-    })
-}
-
-/// The error a `queue.task.failed` event carries, rebuilt as the daemon sent it.
-fn task_error(payload: &Value) -> Error {
-    let code: ErrorCode = serde_json::from_value(payload["code"].clone()).unwrap_or(ErrorCode::ModuleError);
-    let mut e = Error::new(code, payload["error"].as_str().unwrap_or("the task failed").to_owned());
-    if let Some(detail) = payload.get("detail").filter(|d| !d.is_null()) {
-        e = e.with_detail(detail.clone());
-    }
-    e
-}
-
-fn cancelled() -> Error {
-    Error::new(ErrorCode::ModuleError, "the task was cancelled")
-}
-
 /// For people: a dirty workspace's error says where to look and what to do (§10.3), instead
 /// of raw JSON detail. Other errors are shown as they are.
 fn explain(e: Error, id: &str) -> Error {
     if e.code != ErrorCode::WorkspaceDirty {
         return e;
     }
-    let detail = e.detail.clone().unwrap_or(Value::Null);
+    // After a lagged stream the error has its code but no detail (#157): which ways out apply
+    // (is there a cleanup script?) is unknown, and its message already names where to look.
+    let Some(detail) = e.detail.clone() else { return e };
     let mut message = e.message.clone();
     if let Some(log) = detail["log"].as_str().filter(|l| !l.is_empty()) {
         // Why it failed is the end of the step's log (a template's check step says it in one line).
@@ -807,22 +723,6 @@ fn edit_path(home: &std::path::Path, id: &str, file: Option<&str>) -> Result<std
         )));
     }
     Ok(home.join("data/workspaces").join(id).join(file))
-}
-
-/// `$VISUAL`, then `$EDITOR`, then the first of `nano`, `vi` that exists. A GUI editor needs its
-/// wait flag (`EDITOR="code --wait"`), or the check runs before you've saved.
-fn editor_command(visual: Option<&str>, editor: Option<&str>, has: impl Fn(&str) -> bool) -> Option<String> {
-    [visual, editor]
-        .into_iter()
-        .flatten()
-        .map(str::trim)
-        .find(|e| !e.is_empty())
-        .map(str::to_owned)
-        .or_else(|| ["nano", "vi"].into_iter().find(|e| has(e)).map(str::to_owned))
-}
-
-fn which(program: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
 }
 
 /// After editing: fine, or exactly what's wrong now.
@@ -945,100 +845,6 @@ fn how_to_answer(e: Error, prompt: &dyn Prompt) -> Error {
     e
 }
 
-/// The longest description shown in the list; `templates TEMPLATE` shows it whole.
-const LISTED_DESCRIPTION: usize = 72;
-
-/// `workspaces.templates`, grouped under the categories' headings in the daemon's order. With
-/// `which`: only that category's templates, or that one template in full.
-fn templates(data: &Value, which: Option<&str>) -> Result<String> {
-    let all = data["templates"].as_array().map(Vec::as_slice).unwrap_or_default();
-    let categories = data["categories"].as_array().map(Vec::as_slice).unwrap_or_default();
-    if let Some(which) = which {
-        if all.iter().any(|t| t["id"] == which) {
-            return peek(data, which);
-        }
-        if !categories.iter().any(|c| c["id"] == which) {
-            let names: Vec<String> = categories.iter().map(|c| cell(&c["id"])).collect();
-            return Err(Error::not_found(format!(
-                "no template or category '{which}' (categories: {}; templates: shimmer workspaces templates)",
-                names.join(", ")
-            )));
-        }
-    }
-    let id_width = all.iter().map(|t| cell(&t["id"]).chars().count()).max().unwrap_or(0);
-    let mut groups: Vec<(String, Vec<&Value>)> = Vec::new();
-    for t in all {
-        // "Machine upkeep (upkeep)": the short name is what `templates CATEGORY` takes.
-        let heading = categories
-            .iter()
-            .find(|c| c["id"] == t["category"])
-            .map_or_else(|| "Other".to_owned(), |c| format!("{} ({})", cell(&c["label"]), cell(&c["id"])));
-        if which.is_some_and(|w| t["category"] != w) {
-            continue;
-        }
-        match groups.iter_mut().find(|(h, _)| *h == heading) {
-            Some((_, ts)) => ts.push(t),
-            None => groups.push((heading, vec![t])),
-        }
-    }
-    let mut out = String::new();
-    for (heading, ts) in &groups {
-        let _ = writeln!(out, "{heading}");
-        for t in ts {
-            let id = t["id"].as_str().unwrap_or_default();
-            let _ = writeln!(out, "  {id:<id_width$}  {}", shorten(t["description"].as_str().unwrap_or_default()));
-        }
-        out.push('\n');
-    }
-    out.push_str("everything about one:     shimmer workspaces peek TEMPLATE\n");
-    out.push_str("make a workspace from it: shimmer workspaces new NAME --from TEMPLATE");
-    Ok(out)
-}
-
-/// A description cut at [`LISTED_DESCRIPTION`] characters, at a word.
-fn shorten(text: &str) -> String {
-    if text.chars().count() <= LISTED_DESCRIPTION {
-        return text.to_owned();
-    }
-    let cut: String = text.chars().take(LISTED_DESCRIPTION).collect();
-    let cut = cut.rsplit_once(' ').map_or(cut.as_str(), |(head, _)| head);
-    format!("{}…", cut.trim_end_matches([',', ':', ';', ' ']))
-}
-
-/// Words wrapped to `width`, each line after the first indented by `indent`.
-fn wrap(text: &str, width: usize, indent: &str) -> String {
-    let mut lines: Vec<String> = vec![String::new()];
-    for word in text.split_whitespace() {
-        let line = lines.last_mut().expect("never empty");
-        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
-            lines.push(word.to_owned());
-        } else {
-            if !line.is_empty() {
-                line.push(' ');
-            }
-            line.push_str(word);
-        }
-    }
-    lines.join(&format!("\n{indent}"))
-}
-
-/// `peek TEMPLATE`: everything about one template before making a workspace from it. A
-/// category's name gets a pointer to `templates CATEGORY`; anything else is `not_found`.
-fn peek(data: &Value, id: &str) -> Result<String> {
-    let all = data["templates"].as_array().map(Vec::as_slice).unwrap_or_default();
-    let categories = data["categories"].as_array().map(Vec::as_slice).unwrap_or_default();
-    match all.iter().find(|t| t["id"] == id) {
-        Some(t) => Ok(template_in_full(t, categories)),
-        None if categories.iter().any(|c| c["id"] == id) => Err(Error::not_found(format!(
-            "'{id}' is a category, not a template: see its templates with shimmer workspaces templates {id}"
-        ))),
-        None => {
-            let names: Vec<String> = all.iter().map(|t| cell(&t["id"])).collect();
-            Err(Error::not_found(format!("no template '{id}' (there are: {})", names.join(", "))))
-        }
-    }
-}
-
 /// The scripts that run, in order: each step's, then cleanup's, then the other files by name.
 /// `t` is a template with its `files` (`workspaces.templates` with `files: true`).
 fn scripts_of(t: &Value) -> String {
@@ -1104,6 +910,22 @@ fn how_it_runs(step: &Value) -> String {
         (Some("supervised"), None) => "waits".to_owned(),
         _ => "starts, keeps running".to_owned(),
     }
+}
+
+/// `workspaces.templates`, grouped by category; with `which`, one category or one template in full.
+fn templates(data: &Value, which: Option<&str>) -> Result<String> {
+    render::templates_by_category(
+        data,
+        which,
+        "workspaces",
+        ("make a workspace from it:", "shimmer workspaces new NAME --from TEMPLATE"),
+        template_in_full,
+    )
+}
+
+/// `peek TEMPLATE`: everything about one template before making one from it.
+fn peek(data: &Value, id: &str) -> Result<String> {
+    Ok(template_in_full(render::template_named(data, id, "workspaces")?, render::categories(data)))
 }
 
 /// One template: what it does, what to know, what it needs, its steps in order, what stop does,
@@ -1177,66 +999,6 @@ fn template_in_full(t: &Value, categories: &[Value]) -> String {
     }
     let _ = write!(out, "\nmake one: shimmer workspaces new NAME --from {id}");
     out
-}
-
-/// The schedules you added that run a `workspaces.*` op on workspace ID and haven't finished.
-fn schedules_for(all: &Value, id: &str) -> Vec<Value> {
-    all["triggers"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|t| {
-            t["source"]["type"] == "user"
-                && t["done"] != true
-                && t["op"].as_str().is_some_and(|op| op.starts_with("workspaces."))
-                && t["params"]["id"] == id
-        })
-        .cloned()
-        .collect()
-}
-
-/// "usr-01… workspaces.activate, cron 0 9 * * 1-5".
-fn schedule_line(t: &Value) -> String {
-    let s = &t["schedule"];
-    let when = if let Some(c) = s["cron"].as_str() {
-        format!("cron {c}")
-    } else if let Some(n) = s["every"].as_u64() {
-        format!("every {n}s")
-    } else if let Some(at) = s["once"].as_str() {
-        format!("once at {at}")
-    } else {
-        s.to_string()
-    };
-    let paused = if t["paused"] == true { " (paused)" } else { "" };
-    format!("{} {}, {when}{paused}", cell(&t["id"]), cell(&t["op"]))
-}
-
-/// Move one schedule to workspace TO: the same trigger added again with the new id (paused if
-/// it was), then the old one removed. The old one stays if adding fails. Its new id.
-async fn move_schedule(client: &mut Client, t: &Value, to: &str) -> Result<String> {
-    let mut params = t["params"].clone();
-    params["id"] = json!(to);
-    let mut add = json!({"schedule": t["schedule"], "op": t["op"], "params": params, "catch_up": t["catch_up"]});
-    for key in ["lane", "fallback"] {
-        if !t[key].is_null() {
-            add[key] = t[key].clone();
-        }
-    }
-    let new = client.call("scheduler.add", add).await?;
-    let new_id = new["trigger_id"].as_str().unwrap_or_default().to_owned();
-    if t["paused"] == true {
-        client.call("scheduler.pause", json!({"trigger_id": new_id})).await?;
-    }
-    client.call("scheduler.remove", json!({"trigger_id": t["id"]})).await?;
-    Ok(new_id)
-}
-
-fn plural(n: usize, word: &str) -> String {
-    if n == 1 {
-        format!("1 {word}")
-    } else {
-        format!("{n} {word}s")
-    }
 }
 
 /// The template's questions with each current answer as its default, so Enter keeps it.
@@ -1431,6 +1193,7 @@ fn first_line(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::follow::task_error;
 
     fn parse_words(words: &[&str]) -> std::result::Result<WorkspacesCmd, String> {
         parse(words.iter().map(|w| w.to_string()).collect())
@@ -1496,21 +1259,6 @@ mod tests {
             "queued the forced relaunch of deep-work (task 01TASK)\ncheck on it with: shimmer workspaces status deep-work"
         );
         assert!(!m.contains("--wait"), "{m}");
-    }
-
-    #[test]
-    fn a_failed_task_keeps_its_code_and_detail() {
-        let payload = json!({"task_id": "01", "error": "workspace 'deep-work' failed at step 1/3 setup (exit code 1)",
-                             "code": "workspace_dirty",
-                             "detail": {"workspace": "deep-work", "log": "logs/x.log", "has_cleanup_script": true}});
-        let e = task_error(&payload);
-        assert_eq!(e.code, ErrorCode::WorkspaceDirty);
-        assert_eq!(e.detail.as_ref().unwrap()["log"], "logs/x.log");
-
-        let other =
-            task_error(&json!({"task_id": "01", "error": "no launch backend registered", "code": "unavailable"}));
-        assert_eq!((other.code, other.detail), (ErrorCode::Unavailable, None));
-        assert_eq!(task_error(&json!({"task_id": "01"})).code, ErrorCode::ModuleError, "unknown code still fails");
     }
 
     #[test]
@@ -1693,15 +1441,6 @@ mod tests {
         for bad in ["../records/x.toml", "/etc/passwd", "steps/../../x", ""] {
             assert!(edit_path(home, "site", Some(bad)).is_err(), "{bad}");
         }
-    }
-
-    #[test]
-    fn the_editor_is_visual_then_editor_then_nano_or_vi() {
-        let has = |p: &str| p == "vi";
-        assert_eq!(editor_command(Some("code --wait"), Some("nano"), has).as_deref(), Some("code --wait"));
-        assert_eq!(editor_command(Some(" "), Some("nano"), has).as_deref(), Some("nano"));
-        assert_eq!(editor_command(None, None, has).as_deref(), Some("vi"));
-        assert_eq!(editor_command(None, None, |_| false), None);
     }
 
     #[test]
@@ -1957,11 +1696,6 @@ mod tests {
         assert!(full.ends_with("make one: shimmer workspaces new NAME --from web-project"), "{full}");
         let e = templates(&data, Some("games")).unwrap_err();
         assert!(e.message.contains("no template or category 'games' (categories: code, testing"), "{}", e.message);
-        assert_eq!(shorten("short"), "short");
-        assert_eq!(
-            shorten("Free space safely: build folders of projects you haven't touched in a while, and tool caches"),
-            "Free space safely: build folders of projects you haven't touched in a…"
-        );
         assert!(created("site", "web-project")
             .starts_with("✓ created workspace site from web-project\n  start it: shimmer workspaces activate site"));
     }
@@ -1972,6 +1706,22 @@ mod tests {
         let without = ways_out("deep-work", false);
         assert!(!without.contains("cleanup deep-work"), "{without}");
         assert!(without.contains("force-relaunch deep-work") && without.contains("reset deep-work"), "{without}");
+    }
+
+    #[test]
+    fn a_dirty_error_without_detail_points_at_status_instead_of_guessing() {
+        // After a lagged stream (#157) the code survives but the detail doesn't: whether there is
+        // a cleanup script is unknown, so no ways out are offered; the message names `status`.
+        let lagged = Error::new(
+            ErrorCode::WorkspaceDirty,
+            "step 1 failed (some events were dropped, so details may be missing: see 'shimmer workspaces status s')",
+        );
+        let e = explain(lagged.clone(), "s");
+        assert_eq!((e.code, &e.message), (ErrorCode::WorkspaceDirty, &lagged.message));
+        assert!(!e.message.contains("fix it with one of"), "{}", e.message);
+        // With detail, as before: the ways out, cleanup included when there's a script.
+        let full = lagged.with_detail(json!({"has_cleanup_script": true}));
+        assert!(explain(full, "s").message.contains("shimmer workspaces cleanup s"));
     }
 
     #[test]
@@ -2012,30 +1762,6 @@ mod tests {
             "✓ reconfigured site\n  CODE_EDITOR: vscode → cursor\n  LINKS: https://a.dev → (none)\n  it takes effect the next time you activate it"
         );
         assert_eq!(reconfigured("site", &json!({"changed": []})), "nothing changed in site");
-    }
-
-    #[test]
-    fn rename_finds_the_schedules_that_name_the_workspace() {
-        let all = json!({"triggers": [
-            {"id": "usr-1", "source": {"type": "user"}, "op": "workspaces.activate", "params": {"id": "site"},
-             "schedule": {"cron": "0 9 * * 1-5"}, "paused": false, "done": false},
-            {"id": "usr-2", "source": {"type": "user"}, "op": "workspaces.stop", "params": {"id": "site"},
-             "schedule": {"every": 3600}, "paused": true, "done": false},
-            {"id": "usr-3", "source": {"type": "user"}, "op": "workspaces.activate", "params": {"id": "other"},
-             "schedule": {"every": 60}, "done": false},
-            {"id": "usr-4", "source": {"type": "user"}, "op": "workspaces.activate", "params": {"id": "site"},
-             "schedule": {"once": "2026-10-01T09:00:00Z"}, "done": true},
-            {"id": "records-x", "source": {"type": "module", "id": "records"}, "op": "workspaces.activate",
-             "params": {"id": "site"}, "schedule": {"every": 60}, "done": false},
-            {"id": "usr-5", "source": {"type": "user"}, "op": "records.list", "params": {"id": "site"},
-             "schedule": {"every": 60}, "done": false}]});
-        let found: Vec<String> = schedules_for(&all, "site").iter().map(|t| cell(&t["id"])).collect();
-        assert_eq!(found, ["usr-1", "usr-2"], "yours, unfinished, a workspaces op, this workspace");
-        let lines: Vec<String> = schedules_for(&all, "site").iter().map(schedule_line).collect();
-        assert_eq!(
-            lines,
-            ["usr-1 workspaces.activate, cron 0 9 * * 1-5", "usr-2 workspaces.stop, every 3600s (paused)"]
-        );
     }
 
     #[test]
