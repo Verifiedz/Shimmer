@@ -6,11 +6,6 @@
 #
 # This is your copy: Shimmer never changes it after the workspace is created.
 
-# Where this workspace keeps its dev server's log and process id: the system temp folder, never
-# inside the Shimmer folder (only the daemon writes there). A reboot clears it, and a reboot
-# also ends the server.
-SHIMMER_STATE_DIR="${TMPDIR:-/tmp}/shimmer-$SHIMMER_WORKSPACE_ID"
-
 shimmer_has() {
     command -v "$1" >/dev/null 2>&1
 }
@@ -25,6 +20,32 @@ shimmer_fail() {
     echo "$*" >&2
     exit 1
 }
+
+# Where this workspace keeps its dev server's log and process ids: the system temp folder, never
+# inside the Shimmer folder (only the daemon writes there). A reboot clears it, and a reboot
+# also ends the server. Named after this user and this Shimmer folder as well as the workspace,
+# so two Shimmer folders or two users with a same-named workspace never share it (#165).
+shimmer_home_tag() {
+    LC_ALL=C awk 'BEGIN {
+        for (i = 1; i < 256; i++) code[sprintf("%c", i)] = i
+        s = ARGV[1]; h = 0
+        for (i = 1; i <= length(s); i++) h = (h * 31 + code[substr(s, i, 1)]) % 2147483647
+        printf "%08x", h
+    }' "$SHIMMER_HOME"
+}
+SHIMMER_STATE_DIR="${TMPDIR:-/tmp}/shimmer-$(id -u)-$(shimmer_home_tag)-$SHIMMER_WORKSPACE_ID"
+# Private, and ours: one that already exists as anything else (another user's folder, a link)
+# could make stop signal a process this workspace never started, so it's refused. Written so a
+# shell that can't run a test refuses rather than accepts.
+mkdir -m 700 "$SHIMMER_STATE_DIR" 2>/dev/null
+if ! { [ ! -L "$SHIMMER_STATE_DIR" ] && [ -d "$SHIMMER_STATE_DIR" ] && [ -O "$SHIMMER_STATE_DIR" ]; }; then
+    if [ ! -d "${TMPDIR:-/tmp}" ]; then
+        shimmer_fail "can't keep this workspace's run-time files: ${TMPDIR:-/tmp} doesn't exist (check TMPDIR)"
+    fi
+    owner=$(ls -ld "$SHIMMER_STATE_DIR" 2>/dev/null | awk '{print $3}')
+    shimmer_fail "can't use $SHIMMER_STATE_DIR for this workspace's run-time files: something else is there (owned by ${owner:-someone else}), not a folder of your own. Remove it if you can; a reboot clears it."
+fi
+chmod 700 "$SHIMMER_STATE_DIR"
 
 # ---------------------------------------------------------------- where windows open
 
