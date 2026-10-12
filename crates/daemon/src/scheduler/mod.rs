@@ -139,10 +139,23 @@ impl Scheduler {
                     // is still caught up. Another zone: the same wall-clock time there.
                     if parsed.is_local() {
                         let was = stored.zone.as_deref().and_then(|z| LocalTimezone::parse(z).ok());
+                        let unrecorded = was.is_none();
                         stored.zone = Some(self.local_tz.name().to_owned());
-                        if let Some(was) = was.filter(|was| *was != self.local_tz) {
-                            stored.next_due = stored.next_due.and_then(|due| parsed.rezoned(due, was, stored.last_run));
-                            self.write(&stored, None)?;
+                        let moved = match was.filter(|was| *was != self.local_tz) {
+                            Some(was) => {
+                                stored.next_due =
+                                    stored.next_due.and_then(|due| parsed.rezoned(due, was, stored.last_run));
+                                true
+                            }
+                            None => false,
+                        };
+                        // Saved so a later zone change can move it. A failed write is only logged,
+                        // like an unreadable file: the move is kept in memory and simply redone on
+                        // the next start, and one bad file never stops the daemon (#184's review).
+                        if moved || unrecorded {
+                            if let Err(e) = self.write(&stored, None) {
+                                tracing::warn!(file, error = %e, "couldn't save a local trigger's zone; redone next start");
+                            }
                         }
                     }
                     st.insert(stored.spec.id.to_string(), Entry { stored, parsed, pending: Vec::new() });
@@ -353,9 +366,6 @@ impl Scheduler {
         json!({ "triggers": triggers })
     }
 
-    /// One trigger, in exactly the shape a `scheduler.list` entry has (#76) — `queue show`
-    /// uses `queue.task` and `workspaces status` uses `workspaces.status`; this was the odd
-    /// one out, picking its one trigger out of the full list instead.
     /// A trigger id as a client wrote it: the full id, or a unique ending of one, case insensitive
     /// (ADR 0031 §4). Several matches are `conflict`, none `not_found`.
     fn resolve(&self, written: &str) -> Result<String> {
@@ -366,6 +376,9 @@ impl Scheduler {
         crate::short_id::resolve(written, &ids, "trigger")
     }
 
+    /// One trigger, in exactly the shape a `scheduler.list` entry has (#76) — `queue show`
+    /// uses `queue.task` and `workspaces status` uses `workspaces.status`; this was the odd
+    /// one out, picking its one trigger out of the full list instead.
     fn get(&self, id: &str) -> Result<Value> {
         let st = self.lock();
         let e = st.get(id).ok_or_else(|| Error::not_found(format!("no trigger '{id}'")))?;
@@ -420,14 +433,14 @@ impl Scheduler {
         }
         self.delete(id, ("scheduler.trigger.removed", json!({"trigger_id": id, "reason": "removed by user"})))?;
         st.remove(id);
-        Ok(json!({"removed": true}))
+        Ok(json!({"removed": true, "trigger_id": id}))
     }
 
     fn set_paused(&self, id: &str, paused: bool) -> Result<Value> {
         let mut st = self.lock();
         let e = st.get_mut(id).ok_or_else(|| Error::not_found(format!("no trigger '{id}'")))?;
         if e.stored.paused == paused {
-            return Ok(json!({ "paused": paused }));
+            return Ok(json!({ "paused": paused, "trigger_id": id }));
         }
         let mut next = e.stored.clone();
         next.paused = paused;
@@ -438,7 +451,7 @@ impl Scheduler {
         let topic = if paused { "scheduler.trigger.paused" } else { "scheduler.trigger.resumed" };
         self.write(&next, Some((topic, json!({"trigger_id": id}))))?;
         e.stored = next;
-        Ok(json!({ "paused": paused }))
+        Ok(json!({ "paused": paused, "trigger_id": id }))
     }
 }
 

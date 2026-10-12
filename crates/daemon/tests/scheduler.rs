@@ -609,3 +609,43 @@ async fn a_local_time_trigger_missed_while_down_still_catches_up_after_a_restart
     assert_eq!(on_disk["zone"], "America/Los_Angeles", "the zone its next run is in");
     stop(d).await;
 }
+
+#[tokio::test]
+async fn a_local_trigger_gets_its_zone_saved_and_a_failed_save_never_stops_the_daemon() {
+    // #184's review: a trigger with no stored zone (hand-edited) gets one written, so a later zone
+    // change can move it; and a file that can't be rewritten is logged, not fatal.
+    let env = Env::fake_clock();
+    let config = env.home.path().join("config.toml");
+    std::fs::write(&config, "[general]\nlocal_timezone = \"America/New_York\"\n").unwrap();
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    let id = add(&mut c, json!({"cron_local": "0 9 * * *"}), "demo.echo", "skip").await;
+    drop(c);
+    stop(d).await;
+
+    let file = env.home.path().join(format!("data/scheduler/triggers/{id}.json"));
+    let read = || serde_json::from_str::<Value>(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let mut edited = read();
+    edited.as_object_mut().unwrap().remove("zone");
+    std::fs::write(&file, serde_json::to_string_pretty(&edited).unwrap()).unwrap();
+    let d = env.start().await;
+    stop(d).await;
+    assert_eq!(read()["zone"], "America/New_York", "saved again on start");
+
+    // Now the zone changes, but the folder can't be written: the daemon still starts, with the
+    // trigger moved to 9am Los Angeles in memory.
+    std::fs::write(&config, "[general]\nlocal_timezone = \"America/Los_Angeles\"\n").unwrap();
+    let dir = file.parent().unwrap().to_path_buf();
+    let before = read()["next_due"].clone();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    let moved = trigger(&mut c, &id).await.unwrap()["next_due"].clone();
+    drop(c);
+    stop(d).await;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let hours = |v: &Value| chrono::DateTime::parse_from_rfc3339(v.as_str().unwrap()).unwrap();
+    assert_eq!((hours(&moved) - hours(&before)).num_hours(), 3, "moved in memory: {before} → {moved}");
+    assert_eq!(read()["zone"], "America/New_York", "the file couldn't be written, so it's unchanged");
+}
