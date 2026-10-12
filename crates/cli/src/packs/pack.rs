@@ -68,12 +68,39 @@ pub const TARGETS: &[Target] = &[
     Target { op: "records.rename", words: &["records", "rename"] },
     Target { op: "records.remove", words: &["records", "remove"] },
     Target { op: "records.restore", words: &["records", "restore"] },
+    // ADR 0029: every command, the rare and destructive ones too (they still ask first).
+    Target { op: "records.templates", words: &["records", "templates"] },
+    Target { op: "records.create_collection", words: &["records", "new"] },
+    Target { op: "records.trash", words: &["records", "trash"] },
+    Target { op: "records.purge", words: &["records", "purge"] },
+    Target { op: "records.import", words: &["records", "import"] },
+    Target { op: "records.export", words: &["records", "export"] },
+    Target { op: "records.check", words: &["records", "check"] },
+    Target { op: "records.rename_field", words: &["records", "rename-field"] },
+    Target { op: "records.rename_collection", words: &["records", "rename-collection"] },
+    Target { op: "records.remove_collection", words: &["records", "remove-collection"] },
+    Target { op: "records.restore_collection", words: &["records", "restore-collection"] },
+    // ADR 0030: `peek` and `edit` have no op of their own, so they're named like
+    // `workspaces.edit`.
+    Target { op: "records.peek", words: &["records", "peek"] },
+    Target { op: "records.copy_collection", words: &["records", "copy-collection"] },
+    Target { op: "records.edit", words: &["records", "edit"] },
     Target { op: "workspaces.list", words: &["workspaces", "list"] },
     Target { op: "workspaces.status", words: &["workspaces", "status"] },
     Target { op: "workspaces.activate", words: &["workspaces", "activate"] },
     Target { op: "workspaces.cleanup", words: &["workspaces", "cleanup"] },
     Target { op: "workspaces.force_relaunch", words: &["workspaces", "force-relaunch"] },
     Target { op: "workspaces.reset", words: &["workspaces", "reset"] },
+    Target { op: "workspaces.stop", words: &["workspaces", "stop"] },
+    Target { op: "workspaces.remove", words: &["workspaces", "remove"] },
+    Target { op: "workspaces.restore", words: &["workspaces", "restore"] },
+    Target { op: "workspaces.rename", words: &["workspaces", "rename"] },
+    Target { op: "workspaces.copy", words: &["workspaces", "copy"] },
+    Target { op: "workspaces.reconfigure", words: &["workspaces", "reconfigure"] },
+    Target { op: "workspaces.edit", words: &["workspaces", "edit"] },
+    Target { op: "workspaces.templates", words: &["workspaces", "templates"] },
+    Target { op: "workspaces.peek", words: &["workspaces", "peek"] },
+    Target { op: "workspaces.create", words: &["workspaces", "new"] },
     // ADR 0015 §5: the queue and scheduler commands. A user's pack may leave these out; the
     // built-in packs name all of them.
     Target { op: "queue.list", words: &["queue", "list"] },
@@ -81,6 +108,7 @@ pub const TARGETS: &[Target] = &[
     Target { op: "queue.cancel", words: &["queue", "cancel"] },
     Target { op: "queue.reorder", words: &["queue", "move"] },
     Target { op: "scheduler.list", words: &["scheduler", "list"] },
+    Target { op: "scheduler.get", words: &["scheduler", "show"] },
     Target { op: "scheduler.add", words: &["scheduler", "add"] },
     Target { op: "scheduler.pause", words: &["scheduler", "pause"] },
     Target { op: "scheduler.resume", words: &["scheduler", "resume"] },
@@ -354,9 +382,15 @@ label = "My Pack"
 
     #[test]
     fn every_target_is_an_op_with_its_command_words() {
-        assert_eq!(TARGETS.len(), 28);
+        assert_eq!(TARGETS.len(), 53);
         // Where the CLI's word differs from the op's verb (ADR 0015 §1).
-        let renamed = [("queue.task", "show"), ("queue.reorder", "move")];
+        let renamed = [
+            ("queue.task", "show"),
+            ("queue.reorder", "move"),
+            ("records.create_collection", "new"),
+            ("workspaces.create", "new"),
+            ("scheduler.get", "show"),
+        ];
         for t in TARGETS {
             let (module, verb) = t.op.split_once('.').unwrap();
             let verb = renamed.iter().find(|(op, _)| *op == t.op).map_or(verb, |(_, word)| word);

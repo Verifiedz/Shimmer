@@ -18,8 +18,10 @@ use serde_json::{json, Value};
 use shimmer_core::{Error, ErrorCode, Result};
 
 use crate::client::Client;
+use crate::editor;
 use crate::follow::{follow, Followed};
-use crate::render::{self, cell, table};
+use crate::render::{self, cell, table, wrap};
+use crate::schedules;
 
 pub const USAGE: &str = "usage: shimmer workspaces <command>
 
@@ -440,21 +442,7 @@ pub async fn run(client: &mut Client, cmd: &WorkspacesCmd, json: bool, prompt: &
                     path.display()
                 )));
             }
-            let editor =
-                editor_command(std::env::var("VISUAL").ok().as_deref(), std::env::var("EDITOR").ok().as_deref(), |p| {
-                    which(p)
-                })
-                .ok_or_else(|| Error::invalid_params("no editor found: set $EDITOR (e.g. export EDITOR=nano)"))?;
-            let status = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!("{editor} \"$1\""))
-                .arg("sh")
-                .arg(&path)
-                .status()
-                .map_err(|e| Error::unavailable(format!("couldn't start {editor}: {e}")))?;
-            if !status.success() {
-                return Err(Error::unavailable(format!("{editor} exited with {status}; nothing checked")));
-            }
+            editor::open(&path)?;
             // The daemon reads the file fresh on every request, so this checks what was saved.
             let data = client.call("workspaces.status", id_params(id)).await?;
             Ok(out(&data, edited(id, &data)))
@@ -534,43 +522,15 @@ pub async fn run(client: &mut Client, cmd: &WorkspacesCmd, json: bool, prompt: &
             }
             // Schedules that activate (or stop…) it by its old name would now fail: say so, and
             // move them only when the person says yes.
-            let all = client.call("scheduler.list", json!({})).await.unwrap_or(Value::Null);
-            let old = schedules_for(&all, id);
-            if old.is_empty() {
-                return Ok(out(&data, text));
-            }
-            let verb = if old.len() == 1 { "uses" } else { "use" };
-            let mut listing = format!("\n  {} still {verb} the old name {id}:", plural(old.len(), "schedule"));
-            for t in &old {
-                let _ = write!(listing, "\n    {}", schedule_line(t));
-            }
-            let asked = !*move_schedules && prompt.interactive();
-            let go = *move_schedules || {
-                if asked {
-                    eprintln!("{}", listing.trim_start_matches('\n'));
-                    prompt.confirm(&format!("Move {} to {to}?", if old.len() == 1 { "it" } else { "them" }))
-                } else {
-                    false
-                }
+            let old = schedules::find(client, "workspaces.", &schedules::names(&[("id", id)])).await;
+            let rename = schedules::Rename {
+                from: id,
+                to,
+                changes: schedules::names(&[("id", to)]),
+                undo: format!("shimmer workspaces rename {to} {id}"),
+                yes: *move_schedules,
             };
-            if !asked {
-                text.push_str(&listing);
-            }
-            if !go {
-                let _ = write!(
-                    text,
-                    "\n  they'll fail until moved: run 'shimmer workspaces rename {to} {id}' to undo, or \
-                     remove each (shimmer scheduler remove ID) and add it again for {to}"
-                );
-                return Ok(out(&data, text));
-            }
-            for t in &old {
-                let line = match move_schedule(client, t, to).await {
-                    Ok(new) => format!("moved {} → {new}", cell(&t["id"])),
-                    Err(e) => format!("couldn't move {}: {} (it still uses {id})", cell(&t["id"]), e.message),
-                };
-                let _ = write!(text, "\n  {line}");
-            }
+            text.push_str(&schedules::follow_rename(client, prompt, &old, &rename).await);
             Ok(out(&data, text))
         }
         WorkspacesCmd::Reconfigure { id, set } => {
@@ -765,22 +725,6 @@ fn edit_path(home: &std::path::Path, id: &str, file: Option<&str>) -> Result<std
     Ok(home.join("data/workspaces").join(id).join(file))
 }
 
-/// `$VISUAL`, then `$EDITOR`, then the first of `nano`, `vi` that exists. A GUI editor needs its
-/// wait flag (`EDITOR="code --wait"`), or the check runs before you've saved.
-fn editor_command(visual: Option<&str>, editor: Option<&str>, has: impl Fn(&str) -> bool) -> Option<String> {
-    [visual, editor]
-        .into_iter()
-        .flatten()
-        .map(str::trim)
-        .find(|e| !e.is_empty())
-        .map(str::to_owned)
-        .or_else(|| ["nano", "vi"].into_iter().find(|e| has(e)).map(str::to_owned))
-}
-
-fn which(program: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
-}
-
 /// After editing: fine, or exactly what's wrong now.
 fn edited(id: &str, data: &Value) -> String {
     match data["state"].as_str() {
@@ -901,100 +845,6 @@ fn how_to_answer(e: Error, prompt: &dyn Prompt) -> Error {
     e
 }
 
-/// The longest description shown in the list; `templates TEMPLATE` shows it whole.
-const LISTED_DESCRIPTION: usize = 72;
-
-/// `workspaces.templates`, grouped under the categories' headings in the daemon's order. With
-/// `which`: only that category's templates, or that one template in full.
-fn templates(data: &Value, which: Option<&str>) -> Result<String> {
-    let all = data["templates"].as_array().map(Vec::as_slice).unwrap_or_default();
-    let categories = data["categories"].as_array().map(Vec::as_slice).unwrap_or_default();
-    if let Some(which) = which {
-        if all.iter().any(|t| t["id"] == which) {
-            return peek(data, which);
-        }
-        if !categories.iter().any(|c| c["id"] == which) {
-            let names: Vec<String> = categories.iter().map(|c| cell(&c["id"])).collect();
-            return Err(Error::not_found(format!(
-                "no template or category '{which}' (categories: {}; templates: shimmer workspaces templates)",
-                names.join(", ")
-            )));
-        }
-    }
-    let id_width = all.iter().map(|t| cell(&t["id"]).chars().count()).max().unwrap_or(0);
-    let mut groups: Vec<(String, Vec<&Value>)> = Vec::new();
-    for t in all {
-        // "Machine upkeep (upkeep)": the short name is what `templates CATEGORY` takes.
-        let heading = categories
-            .iter()
-            .find(|c| c["id"] == t["category"])
-            .map_or_else(|| "Other".to_owned(), |c| format!("{} ({})", cell(&c["label"]), cell(&c["id"])));
-        if which.is_some_and(|w| t["category"] != w) {
-            continue;
-        }
-        match groups.iter_mut().find(|(h, _)| *h == heading) {
-            Some((_, ts)) => ts.push(t),
-            None => groups.push((heading, vec![t])),
-        }
-    }
-    let mut out = String::new();
-    for (heading, ts) in &groups {
-        let _ = writeln!(out, "{heading}");
-        for t in ts {
-            let id = t["id"].as_str().unwrap_or_default();
-            let _ = writeln!(out, "  {id:<id_width$}  {}", shorten(t["description"].as_str().unwrap_or_default()));
-        }
-        out.push('\n');
-    }
-    out.push_str("everything about one:     shimmer workspaces peek TEMPLATE\n");
-    out.push_str("make a workspace from it: shimmer workspaces new NAME --from TEMPLATE");
-    Ok(out)
-}
-
-/// A description cut at [`LISTED_DESCRIPTION`] characters, at a word.
-fn shorten(text: &str) -> String {
-    if text.chars().count() <= LISTED_DESCRIPTION {
-        return text.to_owned();
-    }
-    let cut: String = text.chars().take(LISTED_DESCRIPTION).collect();
-    let cut = cut.rsplit_once(' ').map_or(cut.as_str(), |(head, _)| head);
-    format!("{}…", cut.trim_end_matches([',', ':', ';', ' ']))
-}
-
-/// Words wrapped to `width`, each line after the first indented by `indent`.
-fn wrap(text: &str, width: usize, indent: &str) -> String {
-    let mut lines: Vec<String> = vec![String::new()];
-    for word in text.split_whitespace() {
-        let line = lines.last_mut().expect("never empty");
-        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
-            lines.push(word.to_owned());
-        } else {
-            if !line.is_empty() {
-                line.push(' ');
-            }
-            line.push_str(word);
-        }
-    }
-    lines.join(&format!("\n{indent}"))
-}
-
-/// `peek TEMPLATE`: everything about one template before making a workspace from it. A
-/// category's name gets a pointer to `templates CATEGORY`; anything else is `not_found`.
-fn peek(data: &Value, id: &str) -> Result<String> {
-    let all = data["templates"].as_array().map(Vec::as_slice).unwrap_or_default();
-    let categories = data["categories"].as_array().map(Vec::as_slice).unwrap_or_default();
-    match all.iter().find(|t| t["id"] == id) {
-        Some(t) => Ok(template_in_full(t, categories)),
-        None if categories.iter().any(|c| c["id"] == id) => Err(Error::not_found(format!(
-            "'{id}' is a category, not a template: see its templates with shimmer workspaces templates {id}"
-        ))),
-        None => {
-            let names: Vec<String> = all.iter().map(|t| cell(&t["id"])).collect();
-            Err(Error::not_found(format!("no template '{id}' (there are: {})", names.join(", "))))
-        }
-    }
-}
-
 /// The scripts that run, in order: each step's, then cleanup's, then the other files by name.
 /// `t` is a template with its `files` (`workspaces.templates` with `files: true`).
 fn scripts_of(t: &Value) -> String {
@@ -1060,6 +910,22 @@ fn how_it_runs(step: &Value) -> String {
         (Some("supervised"), None) => "waits".to_owned(),
         _ => "starts, keeps running".to_owned(),
     }
+}
+
+/// `workspaces.templates`, grouped by category; with `which`, one category or one template in full.
+fn templates(data: &Value, which: Option<&str>) -> Result<String> {
+    render::templates_by_category(
+        data,
+        which,
+        "workspaces",
+        ("make a workspace from it:", "shimmer workspaces new NAME --from TEMPLATE"),
+        template_in_full,
+    )
+}
+
+/// `peek TEMPLATE`: everything about one template before making one from it.
+fn peek(data: &Value, id: &str) -> Result<String> {
+    Ok(template_in_full(render::template_named(data, id, "workspaces")?, render::categories(data)))
 }
 
 /// One template: what it does, what to know, what it needs, its steps in order, what stop does,
@@ -1133,66 +999,6 @@ fn template_in_full(t: &Value, categories: &[Value]) -> String {
     }
     let _ = write!(out, "\nmake one: shimmer workspaces new NAME --from {id}");
     out
-}
-
-/// The schedules you added that run a `workspaces.*` op on workspace ID and haven't finished.
-fn schedules_for(all: &Value, id: &str) -> Vec<Value> {
-    all["triggers"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|t| {
-            t["source"]["type"] == "user"
-                && t["done"] != true
-                && t["op"].as_str().is_some_and(|op| op.starts_with("workspaces."))
-                && t["params"]["id"] == id
-        })
-        .cloned()
-        .collect()
-}
-
-/// "usr-01… workspaces.activate, cron 0 9 * * 1-5".
-fn schedule_line(t: &Value) -> String {
-    let s = &t["schedule"];
-    let when = if let Some(c) = s["cron"].as_str() {
-        format!("cron {c}")
-    } else if let Some(n) = s["every"].as_u64() {
-        format!("every {n}s")
-    } else if let Some(at) = s["once"].as_str() {
-        format!("once at {at}")
-    } else {
-        s.to_string()
-    };
-    let paused = if t["paused"] == true { " (paused)" } else { "" };
-    format!("{} {}, {when}{paused}", cell(&t["id"]), cell(&t["op"]))
-}
-
-/// Move one schedule to workspace TO: the same trigger added again with the new id (paused if
-/// it was), then the old one removed. The old one stays if adding fails. Its new id.
-async fn move_schedule(client: &mut Client, t: &Value, to: &str) -> Result<String> {
-    let mut params = t["params"].clone();
-    params["id"] = json!(to);
-    let mut add = json!({"schedule": t["schedule"], "op": t["op"], "params": params, "catch_up": t["catch_up"]});
-    for key in ["lane", "fallback"] {
-        if !t[key].is_null() {
-            add[key] = t[key].clone();
-        }
-    }
-    let new = client.call("scheduler.add", add).await?;
-    let new_id = new["trigger_id"].as_str().unwrap_or_default().to_owned();
-    if t["paused"] == true {
-        client.call("scheduler.pause", json!({"trigger_id": new_id})).await?;
-    }
-    client.call("scheduler.remove", json!({"trigger_id": t["id"]})).await?;
-    Ok(new_id)
-}
-
-fn plural(n: usize, word: &str) -> String {
-    if n == 1 {
-        format!("1 {word}")
-    } else {
-        format!("{n} {word}s")
-    }
 }
 
 /// The template's questions with each current answer as its default, so Enter keeps it.
@@ -1638,15 +1444,6 @@ mod tests {
     }
 
     #[test]
-    fn the_editor_is_visual_then_editor_then_nano_or_vi() {
-        let has = |p: &str| p == "vi";
-        assert_eq!(editor_command(Some("code --wait"), Some("nano"), has).as_deref(), Some("code --wait"));
-        assert_eq!(editor_command(Some(" "), Some("nano"), has).as_deref(), Some("nano"));
-        assert_eq!(editor_command(None, None, has).as_deref(), Some("vi"));
-        assert_eq!(editor_command(None, None, |_| false), None);
-    }
-
-    #[test]
     fn after_editing_it_says_whether_the_file_still_works() {
         let ok = json!({"id": "site", "state": "ready"});
         assert!(edited("site", &ok).starts_with("✓ site saved"));
@@ -1899,11 +1696,6 @@ mod tests {
         assert!(full.ends_with("make one: shimmer workspaces new NAME --from web-project"), "{full}");
         let e = templates(&data, Some("games")).unwrap_err();
         assert!(e.message.contains("no template or category 'games' (categories: code, testing"), "{}", e.message);
-        assert_eq!(shorten("short"), "short");
-        assert_eq!(
-            shorten("Free space safely: build folders of projects you haven't touched in a while, and tool caches"),
-            "Free space safely: build folders of projects you haven't touched in a…"
-        );
         assert!(created("site", "web-project")
             .starts_with("✓ created workspace site from web-project\n  start it: shimmer workspaces activate site"));
     }
@@ -1970,30 +1762,6 @@ mod tests {
             "✓ reconfigured site\n  CODE_EDITOR: vscode → cursor\n  LINKS: https://a.dev → (none)\n  it takes effect the next time you activate it"
         );
         assert_eq!(reconfigured("site", &json!({"changed": []})), "nothing changed in site");
-    }
-
-    #[test]
-    fn rename_finds_the_schedules_that_name_the_workspace() {
-        let all = json!({"triggers": [
-            {"id": "usr-1", "source": {"type": "user"}, "op": "workspaces.activate", "params": {"id": "site"},
-             "schedule": {"cron": "0 9 * * 1-5"}, "paused": false, "done": false},
-            {"id": "usr-2", "source": {"type": "user"}, "op": "workspaces.stop", "params": {"id": "site"},
-             "schedule": {"every": 3600}, "paused": true, "done": false},
-            {"id": "usr-3", "source": {"type": "user"}, "op": "workspaces.activate", "params": {"id": "other"},
-             "schedule": {"every": 60}, "done": false},
-            {"id": "usr-4", "source": {"type": "user"}, "op": "workspaces.activate", "params": {"id": "site"},
-             "schedule": {"once": "2026-10-01T09:00:00Z"}, "done": true},
-            {"id": "records-x", "source": {"type": "module", "id": "records"}, "op": "workspaces.activate",
-             "params": {"id": "site"}, "schedule": {"every": 60}, "done": false},
-            {"id": "usr-5", "source": {"type": "user"}, "op": "records.list", "params": {"id": "site"},
-             "schedule": {"every": 60}, "done": false}]});
-        let found: Vec<String> = schedules_for(&all, "site").iter().map(|t| cell(&t["id"])).collect();
-        assert_eq!(found, ["usr-1", "usr-2"], "yours, unfinished, a workspaces op, this workspace");
-        let lines: Vec<String> = schedules_for(&all, "site").iter().map(schedule_line).collect();
-        assert_eq!(
-            lines,
-            ["usr-1 workspaces.activate, cron 0 9 * * 1-5", "usr-2 workspaces.stop, every 3600s (paused)"]
-        );
     }
 
     #[test]
