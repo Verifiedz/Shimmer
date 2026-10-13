@@ -66,6 +66,12 @@ a list of modules to ask.
 - Daemon-level checks (index needs a rebuild, leftover `.staging/` transactions, the queue) are
   Dev A's: a `core.health` op in the same shape would be shown by doctor with no CLI change.
   Not part of this ADR.
+- `records.health` reads every record file, as `records.list` does for one collection: fine at
+  hundreds of records, slow at the tens of thousands CLAUDE.md §1.4 warns about. The fix is an
+  index of records that modules can query, with M4 (#214); until then, nothing is built for it.
+- A health op is found by its name, `<module>.health`, not by a field in the manifest. A field
+  (`kind: "health"` on a `CommandSpec`) would be explicit but is a `core` change. The name fits
+  how every op is already named; if it ever isn't enough, only doctor changes.
 - Not closed: #194 (same version, different build) needs a build id in `welcome`, which is a
   `proto` change.
 - Later, from notify (ADR 0032) and calendar: their own `.health` ops (e.g. desktop notifications
