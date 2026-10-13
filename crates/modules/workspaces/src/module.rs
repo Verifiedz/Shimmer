@@ -142,6 +142,12 @@ impl Module for Workspaces {
                     "id": {"type": "string"}, "values": {"type": "object"}}}),
                 Execution::Inline,
             ),
+            (
+                "workspaces.health",
+                "Check every workspace for problems; changes nothing (ADR 0033)",
+                json!({"type": "object"}),
+                Execution::Inline,
+            ),
         ]
         .into_iter()
         .map(|(op, summary, params_schema, execution)| CommandSpec {
@@ -170,6 +176,7 @@ impl Module for Workspaces {
             "workspaces.create" => self.create(ctx, decode(params)?),
             "workspaces.answers" => self.answers(ctx, &decode::<Target>(params)?.id),
             "workspaces.reconfigure" => self.reconfigure(ctx, decode(params)?),
+            "workspaces.health" => self.health(ctx),
             _ => Err(Error::unknown_op(format!("workspaces has no op '{op}'"))),
         }
     }
@@ -282,6 +289,48 @@ impl Workspaces {
             out.push(Value::Object(entry));
         }
         Ok(json!({"workspaces": out}))
+    }
+
+    /// What `shimmer doctor` shows for workspaces (ADR 0033): ones that can't be read, dirty ones,
+    /// and ones whose detached steps nothing can stop. Writes nothing.
+    fn health(&self, ctx: &Ctx) -> Result<Value> {
+        let all = folders(ctx)?;
+        let mut checks = Vec::new();
+        for (id, folder) in &all {
+            let (workspace, saved, errors) = folder.read(ctx, id);
+            if !errors.is_empty() {
+                // Each error already starts "<id>: " when it's about the files; say the id once.
+                let prefix = format!("{id}: ");
+                let errors: Vec<&str> = errors.iter().map(|e| e.strip_prefix(&prefix).unwrap_or(e)).collect();
+                checks.push(json!({"status": "fail", "subject": id,
+                    "message": format!("{id} can't be used: {}", errors.join("; ")),
+                    "fix": {"summary": "fix its workspace.toml or the step files it lists"}}));
+                continue;
+            }
+            if let Some(WorkspaceState::Dirty { reason, failed_step, log, .. }) = saved.as_ref().map(|s| &s.state) {
+                let fix = if folder.has_cleanup_script() {
+                    json!({"summary": "run its cleanup script", "op": "workspaces.cleanup", "params": {"id": id}})
+                } else {
+                    json!({"summary": "it has no cleanup script: undo what the step left behind, then reset it",
+                           "op": "workspaces.reset", "params": {"id": id}})
+                };
+                checks.push(json!({"status": "fail", "subject": id,
+                    "message": format!("{id} is dirty: step {failed_step} failed ({reason}); log: {log}"), "fix": fix}));
+            }
+            let detached = workspace.iter().flat_map(|w| &w.steps).filter(|s| s.mode == SpawnMode::Detached).count();
+            if detached > 0 && !folder.has_cleanup_script() {
+                let steps = if detached == 1 { "a detached step" } else { "detached steps" };
+                checks.push(json!({"status": "warn", "subject": id,
+                    "message": format!("{id} starts {steps} but has no cleanup script, so stopping it can't close them"),
+                    "fix": {"summary": "add cleanup.sh and a [cleanup] section to workspace.toml"}}));
+            }
+        }
+        if checks.is_empty() {
+            let n = all.len();
+            checks.push(json!({"status": "ok",
+                "message": format!("{n} {}, all fine", if n == 1 { "workspace" } else { "workspaces" })}));
+        }
+        Ok(json!({"checks": checks}))
     }
 
     /// One workspace in full: its definition, state, and why it is dirty or invalid.

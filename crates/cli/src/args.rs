@@ -22,6 +22,7 @@ commands:
   queue …               what's running and waiting, and cancel or reorder it (shimmer queue --help)
   scheduler …           run things on a schedule (shimmer scheduler --help)
   packs …               command packs: themed aliases for these commands (shimmer packs --help)
+  doctor                check everything and say how to fix what's wrong
   call OP [PARAMS]      send any op; PARAMS is a JSON object (default {})
   shutdown              stop the daemon
   daemon                run the daemon in the foreground (Ctrl-C to stop)
@@ -43,6 +44,8 @@ pub enum Command {
     Manifest,
     Shutdown,
     Call { op: String, params: Value },
+    Doctor,
+    DoctorHelp,
     Records(RecordsCmd),
     Workspaces(WorkspacesCmd),
     Queue(QueueCmd),
@@ -90,6 +93,7 @@ impl Args {
             (true, Some("queue")) => Command::Queue(QueueCmd::Help),
             (true, Some("scheduler")) => Command::Scheduler(SchedulerCmd::Help),
             (true, Some("packs")) => Command::Packs(PacksCmd::Help),
+            (true, Some("doctor")) => Command::DoctorHelp,
             (true, _) => Command::Help,
             (false, _) => command(words)?,
         };
@@ -115,6 +119,9 @@ fn command(words: Vec<String>) -> Result<Command, String> {
     }
     if word == "packs" {
         return packs::parse(rest).map(Command::Packs);
+    }
+    if word == "doctor" {
+        return crate::doctor::parse(rest).map(|()| Command::Doctor);
     }
     if let Some(opt) = rest.iter().find(|w| w.starts_with('-') && w.len() > 1) {
         return Err(format!("unknown option '{}'", opt.split('=').next().unwrap_or(opt)));

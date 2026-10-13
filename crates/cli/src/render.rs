@@ -65,7 +65,7 @@ fn execution(e: &Execution) -> String {
     }
 }
 
-fn uptime(secs: u64) -> String {
+pub(crate) fn uptime(secs: u64) -> String {
     let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
     match (h, m) {
         (0, 0) => format!("{s}s"),
