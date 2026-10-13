@@ -20,7 +20,8 @@ destructive command already asks before it acts (`purge`, `remove-collection`, `
 2. An alias's value stays a canonical op. A command with no daemon op of its own (`records
    export`, `workspaces edit`, `workspaces peek`) uses its canonical command name in the same
    form (`records.export`, `workspaces.edit`, `workspaces.peek`); two commands never share one.
-3. The four built-in packs name all 50, once each (the existing test checks this). The new names
+3. The four built-in packs name all 50, once each (the existing test checks this). (Since then,
+   ADR 0030 added `records peek`, `copy-collection` and `edit`: 53.) The new names
    follow each pack's style and the faith rule (e.g. starship avoids `rechristen`).
 
 ## Consequences
