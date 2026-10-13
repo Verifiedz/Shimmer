@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use shimmer_core::{Error, Event, Result};
-use shimmer_proto::{decode_server, encode, ClientFrame, ServerFrame, PROTOCOL_VERSION};
+use shimmer_proto::{decode_server, encode, ClientFrame, QueueControl, ServerFrame, PROTOCOL_VERSION};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
@@ -61,9 +61,14 @@ impl Client {
     /// Send one request and wait for its response. Events arriving meanwhile are kept for
     /// [`next_event`](Self::next_event) once subscribed, and skipped before that.
     pub async fn call(&mut self, op: &str, params: Value) -> Result<Value> {
+        self.call_queued(op, params, None).await
+    }
+
+    /// [`call`](Self::call) with the request frame's `queue` block (docs/protocol.md, "Queue
+    /// control on the request frame"): only `--first` sends one (#222).
+    pub async fn call_queued(&mut self, op: &str, params: Value, queue: Option<QueueControl>) -> Result<Value> {
         let id = self.fresh_id();
-        let request =
-            ClientFrame::Request { v: PROTOCOL_VERSION, id: id.clone(), op: op.to_owned(), params, queue: None };
+        let request = ClientFrame::Request { v: PROTOCOL_VERSION, id: id.clone(), op: op.to_owned(), params, queue };
         self.send(&request).await?;
         tokio::time::timeout(REQUEST_TIMEOUT, self.response(&id))
             .await

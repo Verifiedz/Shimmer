@@ -28,11 +28,12 @@ pub const USAGE: &str = "usage: shimmer workspaces <command>
 commands:
   list                                  list workspaces and their state
   status NAME                           show one workspace in full: steps, last session, why it is dirty
-  activate NAME [--wait]                launch its steps in order
-  cleanup NAME [--wait]                 run a dirty workspace's cleanup script
+  activate NAME [--wait] [--first]      launch its steps in order
+  cleanup NAME [--wait] [--first]       run a dirty workspace's cleanup script
   force-relaunch NAME [--yes] [--wait]  launch a dirty workspace anyway (asks first)
+       [--first]
   reset NAME [--yes]                    clear dirty without running cleanup (asks first)
-  stop NAME [--wait]                    stop what an active workspace started (its dev server,
+  stop NAME [--wait] [--first]          stop what an active workspace started (its dev server,
                                         services, the windows it can close) and say what it left
   remove NAME                           remove a workspace that isn't running
   edit NAME [FILE] [--path]             open its workspace.toml (or FILE in its folder, e.g.
@@ -64,10 +65,16 @@ commands:
         Don't use --wait from a workspace's own step scripts: launches run one at a time.
         With --json: the op's result, or {\"result_missed\": true, \"task\": {…}} when it
         succeeded but its result was lost to dropped events (then fields like log are absent).
+--first run it ahead of everything waiting in the workspaces lane. Shows what it would run
+        ahead of and asks first (--yes to skip that); never stops what's already running.
 --yes   skip the question. Needed when no one is at the keyboard (scripts).
 
 A workspace is a folder under data/workspaces/ in your Shimmer folder, holding a
 workspace.toml and its steps/ scripts (ADR 0012). Add --json to any command for raw output.";
+
+/// `--first` on a command that queues work (#222): `Some(yes)` runs it ahead of its lane, asking
+/// first unless `yes`; `None` queues it in turn, as usual.
+pub type First = Option<bool>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum WorkspacesCmd {
@@ -79,15 +86,18 @@ pub enum WorkspacesCmd {
     Activate {
         id: String,
         wait: bool,
+        first: First,
     },
     Cleanup {
         id: String,
         wait: bool,
+        first: First,
     },
     ForceRelaunch {
         id: String,
         yes: bool,
         wait: bool,
+        first: First,
     },
     Reset {
         id: String,
@@ -96,6 +106,7 @@ pub enum WorkspacesCmd {
     Stop {
         id: String,
         wait: bool,
+        first: First,
     },
     /// `file`: inside the workspace folder; `None` is `workspace.toml`.
     Edit {
@@ -197,11 +208,12 @@ pub fn parse(words: Vec<String>) -> std::result::Result<WorkspacesCmd, String> {
         return Ok(WorkspacesCmd::Rename { id, to, move_schedules });
     }
     let mut positional = Vec::new();
-    let (mut yes, mut wait, mut path_only) = (false, false, false);
+    let (mut yes, mut wait, mut path_only, mut first) = (false, false, false, false);
     for word in words {
         match word.as_str() {
             "--yes" | "-y" => yes = true,
             "--wait" => wait = true,
+            "--first" => first = true,
             "--path" if sub == "edit" => path_only = true,
             w if w.starts_with('-') && w.len() > 1 => {
                 return Err(format!("unknown option '{}'", w.split('=').next().unwrap_or(w)));
@@ -210,17 +222,24 @@ pub fn parse(words: Vec<String>) -> std::result::Result<WorkspacesCmd, String> {
         }
     }
     // Which command takes which flag; anything else is a mistake worth naming.
-    let (takes_yes, takes_wait) = match sub.as_str() {
-        "force-relaunch" => (true, true),
-        "activate" | "cleanup" | "stop" => (false, true),
-        "reset" => (true, false),
-        _ => (false, false),
+    let (takes_yes, takes_wait, takes_first) = match sub.as_str() {
+        "force-relaunch" => (true, true, true),
+        // `--yes` there only answers --first's question.
+        "activate" | "cleanup" | "stop" => (first, true, true),
+        "reset" => (true, false, false),
+        _ => (false, false, false),
     };
-    for (given, allowed, flag) in [(yes, takes_yes, "--yes"), (wait, takes_wait, "--wait")] {
+    for (given, allowed, flag) in
+        [(yes, takes_yes, "--yes"), (wait, takes_wait, "--wait"), (first, takes_first, "--first")]
+    {
         if given && !allowed {
-            return Err(format!("'workspaces {sub}' takes no {flag}"));
+            return Err(match flag == "--yes" && takes_first {
+                true => format!("'workspaces {sub}' takes --yes only with --first"),
+                false => format!("'workspaces {sub}' takes no {flag}"),
+            });
         }
     }
+    let first = first.then_some(yes);
     let name = |positional: Vec<String>| -> std::result::Result<String, String> {
         match <[String; 1]>::try_from(positional) {
             Ok([id]) => Ok(id),
@@ -234,11 +253,11 @@ pub fn parse(words: Vec<String>) -> std::result::Result<WorkspacesCmd, String> {
             false => Err("'workspaces list' takes no arguments".into()),
         },
         "status" => Ok(WorkspacesCmd::Status { id: name(positional)? }),
-        "activate" => Ok(WorkspacesCmd::Activate { id: name(positional)?, wait }),
-        "cleanup" => Ok(WorkspacesCmd::Cleanup { id: name(positional)?, wait }),
-        "force-relaunch" => Ok(WorkspacesCmd::ForceRelaunch { id: name(positional)?, yes, wait }),
+        "activate" => Ok(WorkspacesCmd::Activate { id: name(positional)?, wait, first }),
+        "cleanup" => Ok(WorkspacesCmd::Cleanup { id: name(positional)?, wait, first }),
+        "force-relaunch" => Ok(WorkspacesCmd::ForceRelaunch { id: name(positional)?, yes, wait, first }),
         "reset" => Ok(WorkspacesCmd::Reset { id: name(positional)?, yes }),
-        "stop" => Ok(WorkspacesCmd::Stop { id: name(positional)?, wait }),
+        "stop" => Ok(WorkspacesCmd::Stop { id: name(positional)?, wait, first }),
         "remove" => Ok(WorkspacesCmd::Remove { id: name(positional)? }),
         "edit" => {
             let mut words = positional.into_iter();
@@ -426,9 +445,15 @@ pub async fn run(client: &mut Client, cmd: &WorkspacesCmd, json: bool, prompt: &
             let data = client.call("workspaces.status", id_params(id)).await?;
             Ok(out(&data, status(&data)))
         }
-        WorkspacesCmd::Activate { id, wait } => queued(client, Queued::Activate, id, *wait, json).await,
-        WorkspacesCmd::Cleanup { id, wait } => queued(client, Queued::Cleanup, id, *wait, json).await,
-        WorkspacesCmd::Stop { id, wait } => queued(client, Queued::Stop, id, *wait, json).await,
+        WorkspacesCmd::Activate { id, wait, first } => {
+            queued(client, prompt, Queued::Activate, id, (*wait, *first), json).await
+        }
+        WorkspacesCmd::Cleanup { id, wait, first } => {
+            queued(client, prompt, Queued::Cleanup, id, (*wait, *first), json).await
+        }
+        WorkspacesCmd::Stop { id, wait, first } => {
+            queued(client, prompt, Queued::Stop, id, (*wait, *first), json).await
+        }
         WorkspacesCmd::Edit { id, file, path_only } => {
             // Through the daemon first: an unknown workspace is its `not_found`, not a new file.
             client.call("workspaces.status", id_params(id)).await?;
@@ -455,7 +480,7 @@ pub async fn run(client: &mut Client, cmd: &WorkspacesCmd, json: bool, prompt: &
             let data = client.call("workspaces.restore", id_params(id)).await?;
             Ok(out(&data, format!("✓ {id} restored")))
         }
-        WorkspacesCmd::ForceRelaunch { id, yes, wait } => {
+        WorkspacesCmd::ForceRelaunch { id, yes, wait, first } => {
             if !*yes {
                 let current = client.call("workspaces.status", id_params(id)).await?;
                 let question = "Launch it anyway, without cleaning up?";
@@ -463,7 +488,7 @@ pub async fn run(client: &mut Client, cmd: &WorkspacesCmd, json: bool, prompt: &
                     return Ok(format!("{id} was not relaunched"));
                 }
             }
-            queued(client, Queued::ForceRelaunch, id, *wait, json).await
+            queued(client, prompt, Queued::ForceRelaunch, id, (*wait, *first), json).await
         }
         WorkspacesCmd::Templates { which } => {
             let data = client.call("workspaces.templates", json!({})).await?;
@@ -624,16 +649,34 @@ impl Queued {
     }
 }
 
-/// Send a queued op; with `wait`, follow its task to the end.
-async fn queued(client: &mut Client, kind: Queued, id: &str, wait: bool, json: bool) -> Result<String> {
+/// Send a queued op; with `wait`, follow its task to the end; with `first`, ahead of its lane
+/// once the person agrees to what it runs ahead of (#222).
+async fn queued(
+    client: &mut Client,
+    prompt: &mut dyn Prompt,
+    kind: Queued,
+    id: &str,
+    (wait, first): (bool, First),
+    json: bool,
+) -> Result<String> {
     if wait {
         // Before the request, so not even the first event can be missed.
         client.subscribe(&["queue.task.*"]).await?;
     }
-    let handle = client.call(kind.op(), json!({"id": id})).await?;
+    let handle = match first {
+        None => client.call(kind.op(), json!({"id": id})).await?,
+        Some(yes) => match crate::first::send(client, kind.op(), json!({"id": id}), yes, prompt).await? {
+            Some(handle) => handle,
+            None => return Ok(format!("{id}: nothing queued")),
+        },
+    };
     let task = handle["task_id"].as_str().ok_or_else(|| Error::internal("no task_id in the queued response"))?;
     if !wait {
-        return Ok(if json { render::json(&handle) } else { queued_message(kind, id, task) });
+        return Ok(match (json, first) {
+            (true, _) => render::json(&handle),
+            (false, None) => queued_message(kind, id, task),
+            (false, Some(_)) => queued_message(kind, id, task).replacen(" (task", " first in its lane (task", 1),
+        });
     }
     let look = format!("shimmer workspaces status {id}");
     match follow(client, task, !json, &look).await {
@@ -1214,7 +1257,7 @@ mod tests {
         }
         assert_eq!(
             parse_words(&["stop", "site", "--wait"]).unwrap(),
-            WorkspacesCmd::Stop { id: "site".into(), wait: true }
+            WorkspacesCmd::Stop { id: "site".into(), wait: true, first: None }
         );
         assert_eq!(parse_words(&["remove", "site"]).unwrap(), WorkspacesCmd::Remove { id: "site".into() });
         assert_eq!(parse_words(&["restore", "site"]).unwrap(), WorkspacesCmd::Restore { id: "site".into() });
@@ -1225,22 +1268,37 @@ mod tests {
     fn queued_commands_take_wait_and_force_relaunch_takes_yes() {
         assert_eq!(
             parse_words(&["activate", "deep-work"]).unwrap(),
-            WorkspacesCmd::Activate { id: "deep-work".into(), wait: false }
+            WorkspacesCmd::Activate { id: "deep-work".into(), wait: false, first: None }
         );
         assert_eq!(
             parse_words(&["activate", "--wait", "deep-work"]).unwrap(),
-            WorkspacesCmd::Activate { id: "deep-work".into(), wait: true }
+            WorkspacesCmd::Activate { id: "deep-work".into(), wait: true, first: None }
         );
         assert_eq!(
             parse_words(&["cleanup", "deep-work", "--wait"]).unwrap(),
-            WorkspacesCmd::Cleanup { id: "deep-work".into(), wait: true }
+            WorkspacesCmd::Cleanup { id: "deep-work".into(), wait: true, first: None }
         );
         assert_eq!(
             parse_words(&["force-relaunch", "deep-work", "--yes", "--wait"]).unwrap(),
-            WorkspacesCmd::ForceRelaunch { id: "deep-work".into(), yes: true, wait: true }
+            WorkspacesCmd::ForceRelaunch { id: "deep-work".into(), yes: true, wait: true, first: None }
+        );
+        // #222: --first on every queued command; --yes then answers its question.
+        assert_eq!(
+            parse_words(&["activate", "x", "--first"]).unwrap(),
+            WorkspacesCmd::Activate { id: "x".into(), wait: false, first: Some(false) }
+        );
+        assert_eq!(
+            parse_words(&["stop", "x", "--first", "--yes", "--wait"]).unwrap(),
+            WorkspacesCmd::Stop { id: "x".into(), wait: true, first: Some(true) }
+        );
+        assert_eq!(
+            parse_words(&["force-relaunch", "x", "--first", "--yes"]).unwrap(),
+            WorkspacesCmd::ForceRelaunch { id: "x".into(), yes: true, wait: false, first: Some(true) }
         );
         for (words, expected) in [
-            (&["activate", "x", "--yes"][..], "'workspaces activate' takes no --yes"),
+            (&["activate", "x", "--yes"][..], "'workspaces activate' takes --yes only with --first"),
+            (&["reset", "x", "--first"], "'workspaces reset' takes no --first"),
+            (&["status", "x", "--first"], "'workspaces status' takes no --first"),
             (&["reset", "x", "--wait"], "'workspaces reset' takes no --wait"),
             (&["status", "x", "--wait"], "'workspaces status' takes no --wait"),
             (&["force_relaunch", "x"], "unknown workspaces command 'force_relaunch'"),
