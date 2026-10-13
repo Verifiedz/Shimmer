@@ -1102,6 +1102,66 @@ async fn remove_collection_asks_first_then_restore_brings_it_all_back() {
     assert_eq!(e.code, ErrorCode::NotFound);
 }
 
+#[tokio::test]
+async fn removed_collections_are_listed_and_purge_collection_deletes_one_for_good() {
+    // #199: a removed collection can be found, then deleted for good after confirming the count.
+    let (r, env) = setup().await;
+    add_two_sum(&r, &env).await;
+    call(&r, &env, "records.add", json!({"collection": "leetcode", "id": "gone", "fields": {"title": "Gone"}}))
+        .await
+        .unwrap();
+    call(&r, &env, "records.remove", json!({"collection": "leetcode", "id": "gone"})).await.unwrap();
+    call(&r, &env, "records.remove_collection", json!({"id": "leetcode", "confirm": {"records": 1}})).await.unwrap();
+
+    let removed = call(&r, &env, "records.collections", json!({"removed": true})).await.unwrap();
+    assert_eq!(removed, json!({"collections": [{"id": "leetcode", "label": "LeetCode", "records": 1, "trash": 1}]}));
+    let live = call(&r, &env, "records.collections", json!({})).await.unwrap();
+    assert_eq!(live["collections"], json!([]), "a removed collection isn't listed as a live one");
+
+    // Asks first, with the records and the trashed ones counted together.
+    let before = topics(&env).len();
+    let e = call(&r, &env, "records.purge_collection", json!({"id": "leetcode"})).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::ConfirmationRequired);
+    assert_eq!(e.detail, Some(json!({"records": 2})));
+    assert!(e.message.contains("(1 + 1 in its trash)"), "{}", e.message);
+    let stale = call(&r, &env, "records.purge_collection", json!({"id": "leetcode", "confirm": {"records": 1}}))
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code, ErrorCode::ConfirmationRequired, "a count that doesn't match asks again");
+    assert_eq!(topics(&env).len(), before, "nothing deleted without the right confirmation");
+
+    let out =
+        call(&r, &env, "records.purge_collection", json!({"id": "leetcode", "confirm": {"records": 2}})).await.unwrap();
+    assert_eq!(out, json!({"purged": true, "records": 2}));
+    assert!(env.backend.list("records", "removed-collections").unwrap().is_empty(), "every file is gone");
+    let ev = env.backend.events().pop().unwrap();
+    assert_eq!(
+        (ev.topic.as_str(), ev.payload),
+        ("records.collection.purged", json!({"collection": "leetcode", "records": 2}))
+    );
+
+    let e = call(&r, &env, "records.restore_collection", json!({"id": "leetcode"})).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::NotFound, "nothing left to restore");
+    for id in ["leetcode", "../items", ""] {
+        let e = call(&r, &env, "records.purge_collection", json!({"id": id})).await.unwrap_err();
+        assert_eq!(e.code, ErrorCode::NotFound, "{id}");
+    }
+}
+
+#[tokio::test]
+async fn purge_collection_never_touches_a_live_collection_of_the_same_name() {
+    let (r, env) = setup().await;
+    add_two_sum(&r, &env).await;
+    call(&r, &env, "records.remove_collection", json!({"id": "leetcode", "confirm": {"records": 1}})).await.unwrap();
+    // A new collection under the same id, made after the old one was removed.
+    env.ctx.store.write("collections/leetcode.toml", LEETCODE).unwrap();
+    add_two_sum(&r, &env).await;
+
+    call(&r, &env, "records.purge_collection", json!({"id": "leetcode", "confirm": {"records": 1}})).await.unwrap();
+    let item = call(&r, &env, "records.get", json!({"collection": "leetcode", "id": "two-sum"})).await.unwrap();
+    assert_eq!(item["title"], "Two Sum", "the live collection and its record are untouched");
+}
+
 // ---------------------------------------------------------------- ADR 0022: templates
 
 #[tokio::test]

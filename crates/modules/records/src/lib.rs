@@ -57,6 +57,7 @@ impl Module for Records {
                 "records.collection.created",
                 "records.collection.copied",
                 "records.trash.purged",
+                "records.collection.purged",
             ]
             .map(String::from)
             .to_vec(),
@@ -79,7 +80,11 @@ impl Module for Records {
         };
         let fields = json!({"fields": {"type": "object"}});
         [
-            ("records.collections", "List collection definitions", json!({"type": "object"})),
+            (
+                "records.collections",
+                "List collection definitions (with removed, the removed collections instead)",
+                json!({"type": "object", "properties": {"removed": {"type": "boolean"}}}),
+            ),
             (
                 "records.add",
                 "Add a record to a collection; without an id, one is made from its title",
@@ -184,6 +189,12 @@ impl Module for Records {
                 "Bring a removed collection back with its records",
                 json!({"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}}),
             ),
+            (
+                "records.purge_collection",
+                "Permanently delete a removed collection and its records; needs confirmation",
+                json!({"type": "object", "required": ["id"], "properties": {
+                    "id": {"type": "string"}, "confirm": {"type": "object"}}}),
+            ),
         ]
         .into_iter()
         .map(|(op, summary, params_schema)| CommandSpec {
@@ -197,7 +208,10 @@ impl Module for Records {
 
     async fn handle(&self, op: &str, params: Value, ctx: &Ctx) -> Result<Value> {
         match op {
-            "records.collections" => self.collections(ctx),
+            "records.collections" => match decode::<WhichCollections>(params)?.removed {
+                true => removed_collections(ctx),
+                false => self.collections(ctx),
+            },
             "records.add" => self.add(ctx, decode(params)?),
             "records.get" => {
                 let t: Target = decode(params)?;
@@ -220,6 +234,7 @@ impl Module for Records {
             "records.copy_collection" => self.copy_collection(ctx, decode(params)?),
             "records.remove_collection" => self.remove_collection(ctx, decode(params)?),
             "records.restore_collection" => self.restore_collection(ctx, decode(params)?),
+            "records.purge_collection" => self.purge_collection(ctx, decode(params)?),
             "records.import" => self.import(ctx, decode(params)?),
             "records.purge" => self.purge(ctx, decode(params)?),
             _ => Err(Error::unknown_op(format!("records has no op '{op}'"))),
@@ -381,6 +396,13 @@ struct CopyCollection {
     label: Option<String>,
     #[serde(default)]
     with_records: bool,
+}
+
+/// `records.collections`: with `removed`, the removed collections instead (#199).
+#[derive(Deserialize, Default)]
+struct WhichCollections {
+    #[serde(default)]
+    removed: bool,
 }
 
 #[derive(Deserialize)]
@@ -889,6 +911,43 @@ impl Records {
         Ok(serde_json::to_value(c).unwrap_or_default())
     }
 
+    /// Delete a removed collection for good: its file, records and trash, after the caller confirms
+    /// the record count it was shown (#199, as `purge` does for the record trash).
+    fn purge_collection(&self, ctx: &Ctx, p: RemoveCollection) -> Result<Value> {
+        let missing = || Error::not_found(format!("no removed collection '{}'", p.id));
+        if !is_valid_name(&p.id) {
+            return Err(missing());
+        }
+        let _g = self.write.lock();
+        let dir = format!("removed-collections/{}", p.id);
+        let paths = ctx.store.list(&dir)?;
+        if paths.is_empty() {
+            return Err(missing());
+        }
+        let (records, trash) = counts(&paths, &dir);
+        let expected = json!({"records": records + trash});
+        if p.confirm.as_ref() != Some(&expected) {
+            let in_trash = if trash > 0 { format!(" ({records} + {trash} in its trash)") } else { String::new() };
+            return Err(Error::new(
+                ErrorCode::ConfirmationRequired,
+                format!(
+                    "purging permanently deletes the removed collection '{}' and its {} record(s){in_trash}; \
+                     confirm with {expected}",
+                    p.id,
+                    records + trash
+                ),
+            )
+            .with_detail(expected));
+        }
+        ctx.store.transaction(|tx| {
+            for path in &paths {
+                tx.delete(path)?;
+            }
+            tx.emit("records.collection.purged", json!({"collection": p.id, "records": records + trash}))
+        })?;
+        Ok(json!({"purged": true, "records": records + trash}))
+    }
+
     /// Add many records at once (ADR 0024 §4): each row checked as `records.add` checks one, and
     /// against the other rows; rows already there skipped; everything written in one transaction,
     /// or nothing when a row is invalid (unless `skip_invalid`) or on a dry run.
@@ -1259,6 +1318,36 @@ fn referrers(ctx: &Ctx, target: &str, id: &str) -> Result<Vec<(Collection, Item)
 }
 
 /// Every collection that parses.
+/// `records.collections` with `removed` (#199): each removed collection with its label and how
+/// many records and trashed records it holds, by id. One whose file won't parse is still listed,
+/// with no label, so it can be purged.
+fn removed_collections(ctx: &Ctx) -> Result<Value> {
+    let mut ids = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for path in ctx.store.list("removed-collections")? {
+        if let Some((id, _)) = path.strip_prefix("removed-collections/").and_then(|p| p.split_once('/')) {
+            ids.entry(id.to_owned()).or_default().push(path.clone());
+        }
+    }
+    let mut out = Vec::new();
+    for (id, paths) in ids {
+        let dir = format!("removed-collections/{id}");
+        let (records, trash) = counts(&paths, &dir);
+        let text = ctx.store.read_string(&format!("{dir}/collection.toml"))?.unwrap_or_default();
+        let mut entry = json!({"id": id, "records": records, "trash": trash});
+        if let Ok(c) = Collection::parse(&id, &text) {
+            entry["label"] = json!(c.label);
+        }
+        out.push(entry);
+    }
+    Ok(json!({"collections": out}))
+}
+
+/// Records and trashed records among a removed collection's `paths`, under `dir`.
+fn counts(paths: &[String], dir: &str) -> (usize, usize) {
+    let under = |sub: &str| paths.iter().filter(|p| p.starts_with(&format!("{dir}/{sub}/"))).count();
+    (under("items"), under("trash"))
+}
+
 fn all_collections(ctx: &Ctx) -> Result<Vec<Collection>> {
     let mut out = Vec::new();
     for path in ctx.store.list("collections")? {
