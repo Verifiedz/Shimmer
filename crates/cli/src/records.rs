@@ -43,8 +43,9 @@ commands:
   get COLLECTION/ID                    show one record
   update COLLECTION/ID [--FIELD VALUE]… [--unset FIELD]…
        [--add FIELD VALUE]… [--remove FIELD VALUE]…  change items of a list field
+       [--set FIELD=VALUE]…            any field, even one named like an option (add, unset…)
   complete COLLECTION/ID [--FIELD VALUE]… [--unset FIELD]…
-                                       mark done and stamp the collection's date field;
+       [--set FIELD=VALUE]…            mark done and stamp the collection's date field;
                                        a value for the date field back-dates it
   reopen COLLECTION/ID [--clear-stamp] mark a done record todo again
   rename COLLECTION/ID NEW_ID          give a record a new id; offers to move schedules that
@@ -77,7 +78,9 @@ changing a collection:
   restore-collection ID                bring a removed collection back
 
 A record can be written COLLECTION/ID or COLLECTION ID. Field names come from the
-collection: see 'shimmer records collections'. Add --json to any command for raw output.";
+collection: see 'shimmer records collections'. A field named like an option (add, unset, set…)
+is set with --set FIELD=VALUE on add, update and complete. Add --json to any command for raw
+output.";
 
 /// `--name value` pairs, in the order given.
 pub type Flags = Vec<(String, String)>;
@@ -298,7 +301,7 @@ pub fn parse(words: Vec<String>) -> std::result::Result<RecordsCmd, String> {
                 [one] if !one.contains('/') => (one.clone(), None),
                 _ => target(&sub, positional).map(|(c, id)| (c, Some(id)))?,
             };
-            Ok(RecordsCmd::Add { collection, id, set: flags })
+            Ok(RecordsCmd::Add { collection, id, set: with_set(flags)? })
         }
         "rename" => {
             no_flags()?;
@@ -366,6 +369,7 @@ pub fn parse(words: Vec<String>) -> std::result::Result<RecordsCmd, String> {
             let (collection, id) = target(&sub, positional)?;
             let (unset, set) = flags.into_iter().partition::<Vec<_>, _>(|(name, _)| name == "unset");
             let unset: Vec<String> = unset.into_iter().map(|(_, field)| field).collect();
+            let set = with_set(set)?;
             if sub == "complete" {
                 return Ok(RecordsCmd::Complete { collection, id, set, unset, items });
             }
@@ -787,14 +791,51 @@ fn condition(schema: &Value, raw: &str) -> Result<(String, &'static str, Value)>
     Ok((name, op, value))
 }
 
+/// `--set FIELD=VALUE` as the field it sets (#205): every other `--name value` is kept as it is. It
+/// reaches any field, even one named like an option of the command (`add`, `unset`, `set`…).
+fn with_set(flags: Flags) -> std::result::Result<Flags, String> {
+    flags
+        .into_iter()
+        .map(|(name, value)| match name.as_str() {
+            "set" => match value.split_once('=') {
+                Some((field, v)) if !field.is_empty() => Ok((field.to_owned(), v.to_owned())),
+                _ => Err(format!(
+                    "--set takes FIELD=VALUE, e.g. --set unset=yes (to set a field named 'set': --set set={value})"
+                )),
+            },
+            _ => Ok((name, value)),
+        })
+        .collect()
+}
+
 /// `--last-solved` finds a field named `last_solved`; an exact match wins.
 /// `records list`/`export` options that were given and share a name with a field of the collection
 /// (#178): the option keeps its meaning (command options never take a name away from fields, ADR
 /// 0031), so say how to filter the field instead.
 fn shadowed_fields(cmd: &RecordsCmd, schema: &Value) -> Vec<String> {
+    // `update`/`complete`'s own options (#205): set the field with `--set` instead.
+    let set_hint = |given: [(&str, bool, &str); 3]| -> Vec<String> {
+        given
+            .into_iter()
+            .filter(|(name, used, _)| *used && field(schema, name).is_some())
+            .map(|(name, _, what)| format!("(--{name} {what}; to set the field '{name}', use --set {name}=VALUE)"))
+            .collect()
+    };
     let (limit, offset, refine) = match cmd {
         RecordsCmd::List { limit, offset, refine, .. } => (limit.is_some(), offset.is_some(), refine),
         RecordsCmd::Export { refine, .. } => (false, false, refine),
+        RecordsCmd::Update { unset, items, .. } | RecordsCmd::Complete { unset, items, .. } => {
+            return set_hint([
+                ("unset", !unset.is_empty(), "clears a field"),
+                ("add", items.iter().any(|i| i.add), "adds to a list field"),
+                ("remove", items.iter().any(|i| !i.add), "removes from a list field"),
+            ]);
+        }
+        RecordsCmd::Reopen { clear_stamp: true, .. } if field(schema, "clear_stamp").is_some() => {
+            return vec!["(--clear-stamp clears the date completing set; to change the field 'clear_stamp', \
+                         use records update … --set clear_stamp=VALUE)"
+                .to_owned()];
+        }
         _ => return Vec::new(),
     };
     let given = [
@@ -2220,6 +2261,43 @@ mod tests {
         assert_eq!(shadowed_fields(&p(&["export", "t", "--sort", "title"]), &schema).len(), 1);
         // Other commands never get it.
         assert!(shadowed_fields(&p(&["add", "t", "--limit", "5"]), &schema).is_empty());
+    }
+
+    #[test]
+    fn set_reaches_any_field_even_one_named_like_an_option() {
+        // #205: `--add`, `--remove`, `--unset` and `--clear-stamp` keep their meaning; `--set
+        // FIELD=VALUE` reaches the field whatever it's called.
+        let schema = json!({"fields": [
+            {"name": "add", "type": "string"}, {"name": "unset", "type": "int"},
+            {"name": "set", "type": "string"}, {"name": "tags", "type": "list"}]});
+        let p = |w: &[&str]| parse_words(w).unwrap();
+        let fields = |w: &[&str]| request(&p(w), &schema).unwrap().1["fields"].clone();
+        assert_eq!(fields(&["update", "t/x", "--set", "add=yes"]), json!({"add": "yes"}));
+        assert_eq!(fields(&["update", "t/x", "--set", "unset=3", "--unset", "add"]), json!({"unset": 3, "add": null}));
+        assert_eq!(fields(&["complete", "t/x", "--set", "set=a=b"]), json!({"set": "a=b"}), "the first '=' splits");
+        assert_eq!(
+            fields(&["add", "t", "x", "--set", "add=1", "--set", "tags=a, b"]),
+            json!({"add": "1", "tags": ["a", "b"]})
+        );
+        let e = parse_words(&["update", "t/x", "--set", "nope"]).unwrap_err();
+        assert!(e.contains("--set takes FIELD=VALUE") && e.contains("--set set=nope"), "{e}");
+    }
+
+    #[test]
+    fn an_update_option_named_like_a_field_says_how_to_set_the_field() {
+        let schema = json!({"fields": [{"name": "add"}, {"name": "unset"}, {"name": "clear_stamp"}, {"name": "tags"}]});
+        let p = |w: &[&str]| parse_words(w).unwrap();
+        assert_eq!(
+            shadowed_fields(&p(&["update", "t/x", "--unset", "tags", "--add", "tags", "a"]), &schema),
+            [
+                "(--unset clears a field; to set the field 'unset', use --set unset=VALUE)",
+                "(--add adds to a list field; to set the field 'add', use --set add=VALUE)",
+            ]
+        );
+        assert!(shadowed_fields(&p(&["complete", "t/x", "--set", "add=1"]), &schema).is_empty(), "--set used: no hint");
+        let reopen = shadowed_fields(&p(&["reopen", "t/x", "--clear-stamp"]), &schema);
+        assert!(reopen[0].contains("use records update … --set clear_stamp=VALUE"), "{reopen:?}");
+        assert!(shadowed_fields(&p(&["reopen", "t/x", "--clear-stamp"]), &json!({"fields": []})).is_empty());
     }
 
     #[test]
