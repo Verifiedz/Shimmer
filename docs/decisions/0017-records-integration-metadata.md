@@ -175,7 +175,7 @@ jobs   Jobs   company*, url (url, unique), stage (oa|interview), apply_by (date,
 
 - **Titles in `records.list` / `records.get` responses.** Items are flat and a field may be named
   `title` (§2); a response-level `titles` map can come with filters and sorting (roadmap item 4)
-  if clients need it.
+  if clients need it. **Done since:** `records.list` returns `titles` (ADR 0024 §5).
 - **More roles** (`email`, `phone`, `started`, …): each by ADR when a feature needs it.
 - **`unique` across several fields together** (company + job id): not needed yet.
 - **Reminder timing** (how long before a deadline): the calendar's decision, possibly through

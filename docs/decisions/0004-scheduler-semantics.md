@@ -1,6 +1,6 @@
 # 0004. Scheduler semantics
 
-Status: accepted (M2 partial) · Needs sign-off: Dev A
+Status: accepted (M2) · Needs sign-off: Dev A
 
 CLAUDE.md §6.3 fixes the shape (`TriggerSpec`, `CatchUp`, never overlap, persisted state,
 injected clock). These are the points it left open.

@@ -17,6 +17,7 @@ mod records;
 mod render;
 mod scheduler;
 mod schedules;
+mod style;
 mod when;
 mod workspaces;
 
@@ -61,16 +62,21 @@ async fn run_line(alias: Option<String>, args: Vec<String>) -> ExitCode {
     let front = match packs::active::take_front_flags(args) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("shimmer: {e}\n\n{USAGE}");
+            style::init(false, false, &Default::default());
+            eprintln!("{} {e}\n\n{}", style::paint_err(style::Role::Error, "shimmer:"), style::decorate_err(USAGE));
             return ExitCode::from(2);
         }
     };
     let active = packs::active::load(front.pack.as_deref());
+    // Colour is decided once, as soon as the pack is known (#189): its warnings and a usage
+    // error are coloured too.
+    let colors = active.pack.as_ref().map(|p| p.colors.clone()).unwrap_or_default();
+    style::init(front.no_color, front.args.iter().any(|a| a == "--json"), &colors);
     // `shimmer packs …` reports pack problems itself, and needs no aliases: no warning there.
     let packs_command = packs::active::command_word(&front.args).is_some_and(|i| front.args[i] == "packs");
     if !packs_command {
         for warning in &active.warnings {
-            eprintln!("shimmer: {warning}");
+            eprintln!("{} {warning}", style::paint_err(style::Role::Warning, "shimmer:"));
         }
     }
     let help = match (&active.pack, front.canonical) {
@@ -98,18 +104,22 @@ async fn run_line(alias: Option<String>, args: Vec<String>) -> ExitCode {
     let args = match Args::parse(args) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("shimmer: {e}\n\n{usage}");
+            eprintln!("{} {e}\n\n{}", style::paint_err(style::Role::Error, "shimmer:"), style::decorate_err(usage));
             return ExitCode::from(2);
         }
     };
     match execute(&args, help).await {
         Ok(Some(text)) => {
+            // Output showing people's own data is printed as drawn: its tables are coloured as
+            // they're built, and the finishing pass must never read a record's title as Shimmer's
+            // own text (#192's review).
+            let text = if prints_data(&args.command) { text } else { style::decorate(&text) };
             println!("{text}");
             ExitCode::SUCCESS
         }
         Ok(None) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("shimmer: {}", render::error(&e));
+            eprintln!("{} {}", style::paint_err(style::Role::Error, "shimmer:"), render::error(&e));
             ExitCode::FAILURE
         }
     }
@@ -136,6 +146,28 @@ fn usage_for(args: &[String]) -> &'static str {
         }
     }
     USAGE
+}
+
+/// Commands whose output shows what people typed into Shimmer (record fields, collection labels,
+/// workspace labels, a trigger's params, raw JSON). The finishing pass skips them, so a title like
+/// "Run shimmer records list (see notes)" or a CSV value stays exactly as typed (#192's review).
+fn prints_data(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Call { .. }
+            | Command::Records(
+                RecordsCmd::List { .. }
+                    | RecordsCmd::Get { .. }
+                    | RecordsCmd::Export { .. }
+                    | RecordsCmd::Trash { .. }
+                    | RecordsCmd::Collections
+                    | RecordsCmd::Check { .. }
+                    | RecordsCmd::Peek { file: true, .. }
+            )
+            | Command::Workspaces(WorkspacesCmd::List | WorkspacesCmd::Status { .. })
+            | Command::Queue(QueueCmd::List { .. } | QueueCmd::Show { .. })
+            | Command::Scheduler(SchedulerCmd::List | SchedulerCmd::Show { .. })
+    )
 }
 
 /// `help` is the top-level help: [`USAGE`], plus the active pack's aliases unless `--canonical`.
@@ -233,6 +265,27 @@ mod tests {
 
     fn usage(args: &[&str]) -> &'static str {
         usage_for(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn output_with_peoples_data_isnt_read_as_shimmers_own_text() {
+        let cmd = |words: &[&str]| Args::parse(words.iter().map(|w| w.to_string())).unwrap().command;
+        for words in [
+            &["records", "list", "lc"][..],
+            &["records", "get", "lc/x"],
+            &["records", "export", "lc"],
+            &["records", "collections"],
+            &["workspaces", "status", "site"],
+            &["scheduler", "list"],
+            &["call", "core.ping"],
+        ] {
+            assert!(prints_data(&cmd(words)), "{words:?}");
+        }
+        for words in
+            [&["records", "complete", "lc/x"][..], &["workspaces", "templates"], &["records", "peek", "leetcode"]]
+        {
+            assert!(!prints_data(&cmd(words)), "{words:?}: Shimmer's own messages and pages");
+        }
     }
 
     #[test]
