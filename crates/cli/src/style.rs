@@ -98,25 +98,6 @@ impl Palette {
         let bold = if role == Role::Heading { "1;" } else { "" };
         format!("{bold}38;2;{r};{g};{b}")
     }
-
-    /// `role` as zsh writes a highlight: `fg=#a294ff`, `bold,fg=#725eff`, or a basic colour's
-    /// name in 16 colours. zsh's `region_highlight` takes these (#188).
-    pub fn zsh(&self, role: Role) -> String {
-        let bold = if role == Role::Heading { "bold," } else { "" };
-        if !self.truecolor {
-            let name = match role {
-                Role::Success => "green",
-                Role::Error => "magenta",
-                Role::Heading => "blue",
-                Role::Name => "cyan",
-                Role::Warning => "yellow",
-                Role::Hint => "8",
-            };
-            return format!("{bold}fg={name}");
-        }
-        let (r, g, b) = self.rgb(role);
-        format!("{bold}fg=#{r:02x}{g:02x}{b:02x}")
-    }
 }
 
 const RESET: &str = "\x1b[0m";
@@ -402,9 +383,6 @@ mod tests {
     fn a_role_as_a_shell_script_writes_it() {
         assert_eq!(palette(true).code(Role::Heading), "1;38;2;114;94;255");
         assert_eq!(palette(false).code(Role::Name), "36");
-        assert_eq!(palette(true).zsh(Role::Name), "fg=#a294ff");
-        assert_eq!(palette(true).zsh(Role::Heading), "bold,fg=#725eff");
-        assert_eq!(palette(false).zsh(Role::Hint), "fg=8");
     }
 
     #[test]

@@ -775,7 +775,7 @@ const ZSH: &str = include_str!("complete/shimmer.zsh");
 const FISH: &str = include_str!("complete/shimmer.fish");
 
 /// The script for `shell`, calling `exe` back on Tab. Aliases of the active pack complete too;
-/// in zsh, the command line and the suggestions are coloured with `palette` (#189).
+/// in zsh, the suggestions are coloured with `palette` (#189).
 pub fn script(shell: &str, exe: &Path, pack: Option<&Pack>, palette: &Palette) -> Result<String, String> {
     let exe = quote(&exe.display().to_string());
     let aliases: Vec<&str> = pack.map(|p| p.aliases.keys().map(String::as_str).collect()).unwrap_or_default();
@@ -783,24 +783,11 @@ pub fn script(shell: &str, exe: &Path, pack: Option<&Pack>, palette: &Palette) -
     let text = match shell {
         "bash" => BASH.to_owned(),
         "fish" => FISH.to_owned(),
-        "zsh" => {
-            let mut subs = String::new();
-            for (module, usage) in modules() {
-                let words: Vec<String> = commands(usage).into_iter().map(|c| c.word).collect();
-                subs.push_str(&format!("  {module} '{}'\n", words.join(" ")));
-            }
-            let top: Vec<String> = commands(crate::args::USAGE).into_iter().map(|c| c.word).collect();
-            ZSH.replace("@TOP@", &top.join(" "))
-                .replace("@SUBS@", subs.trim_end())
-                .replace("@PATTERN@", &format!("({})", names.replace(' ', "|")))
-                .replace("@HEADING@", &palette.zsh(Role::Heading))
-                .replace("@NAME@", &palette.zsh(Role::Name))
-                .replace("@ERROR@", &palette.zsh(Role::Error))
-                .replace("@HINT@", &palette.zsh(Role::Hint))
-                .replace("@NAME_CODE@", &palette.code(Role::Name))
-                .replace("@HINT_CODE@", &palette.code(Role::Hint))
-                .replace("@HEADING_CODE@", &palette.code(Role::Heading))
-        }
+        "zsh" => ZSH
+            .replace("@PATTERN@", &format!("({})", names.replace(' ', "|")))
+            .replace("@NAME_CODE@", &palette.code(Role::Name))
+            .replace("@HINT_CODE@", &palette.code(Role::Hint))
+            .replace("@HEADING_CODE@", &palette.code(Role::Heading)),
         other => return Err(format!("'{other}' isn't a shell completion is made for: use bash, zsh or fish")),
     };
     Ok(text.replace("@EXE@", &exe).replace("@NAMES@", &names))
@@ -1034,8 +1021,8 @@ mod tests {
             assert_eq!(unfilled, None, "{shell}: every placeholder filled");
         }
         let zsh = script("zsh", Path::new("shimmer"), None, &palette).unwrap();
-        assert!(zsh.contains("fg=#a294ff") && zsh.contains("38;2;162;148;255"), "zsh: the palette");
-        assert!(zsh.contains("records 'collections templates peek new add list"), "zsh: subcommands to highlight");
+        assert!(zsh.contains("38;2;162;148;255"), "zsh: the palette");
+        assert!(!zsh.contains("region_highlight"), "zsh: the line isn't coloured as you type");
         assert!(script("tcsh", Path::new("shimmer"), None, &palette).unwrap_err().contains("bash, zsh or fish"));
     }
 }

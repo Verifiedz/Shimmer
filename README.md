@@ -272,11 +272,9 @@ What each shell shows:
 | The suggestions | ✓ | ✓ | ✓ |
 | What each one is, next to it | – | ✓ | ✓ |
 | Grouped and coloured | – | ✓ (Shimmer's colours) | your fish theme |
-| The line coloured as you type | – | ✓ (Shimmer's colours) | your fish theme |
 
-In zsh, the line you type is coloured as you go: `shimmer` in violet, each command you can run
-in lavender, a misspelt one in pink, options grey. A pack's `[colors]` changes these, and
-`NO_COLOR=1` turns them off. bash can't colour what you type or show descriptions.
+In zsh, the suggestions are grouped and coloured in Shimmer's palette; a `[colors]` section changes
+them, and `NO_COLOR=1` turns them off. bash can't show descriptions.
 
 ### Contributing
 
