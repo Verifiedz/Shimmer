@@ -165,6 +165,7 @@ removed applications (42 records)
   shows what wouldn't fit; converting is a later op if needed.
 - **Removing a field's values** from every record (the stranded keys `records.check` reports).
   Leaving them is harmless; an op can come later.
-- **Emptying the trash** (ADR 0020). Removed collections can now be purged one at a time (§5a);
-  emptying everything at once is still not done.
+- **Emptying the trash**, including removed collections (ADR 0020). **Done since:** for records,
+  `records.purge` (ADR 0024 §5); for removed collections, `records.purge_collection`, one at a time
+  (§5a). Emptying everything at once is still not done.
 - **Following a rename in other collections' `related`** or in workspace scripts.

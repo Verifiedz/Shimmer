@@ -26,9 +26,10 @@ code today:
 | **event bus** | How the pieces react to each other. Every change is published as an event (`records.item.completed`, …) and appended to a log. Modules never call each other directly. |
 
 `records` and `workspaces` are modules. The queue, scheduler and event bus are core services
-inside the daemon.
-The full design, including the mechanisms that aren't built yet, is in
-[`CLAUDE.md`](CLAUDE.md) §1.1.
+inside the daemon. On top of them, the CLI has **command packs**: optional themed names for its
+commands (`ikuzo deep-work` for `shimmer workspaces activate deep-work`).
+The full design, including the mechanisms that aren't built yet (fetchers, notifications and a
+calendar), is in [`CLAUDE.md`](CLAUDE.md) §1.1.
 
 ## How it works
 
@@ -54,14 +55,18 @@ shimmer (CLI) ──→ Unix socket ──→ daemon ──→ files in $SHIMMER
 
 ```
 $SHIMMER_HOME/
-  config.toml                                Settings
+  config.toml                                Settings (see below)
   data/records/collections/<collection>.toml One file per collection definition
   data/records/items/<collection>/<id>.toml  One file per record
+  data/records/trash/<collection>/<id>.toml  Removed records, until restored or purged
+  data/workspaces/<name>/                    A workspace: workspace.toml, steps/, its state
+  data/scheduler/triggers/<id>.json          One file per scheduled trigger
+  packs/<name>/                              Your own command packs
   events/YYYY-MM-DD.jsonl                    Append-only log of every event
   index.sqlite                               Derived from the files; safe to delete
-  logs/daemon.log.<date>                     Daemon logs, rotated daily at UTC midnight; oldest
-                                              deleted past 8 files. A leftover undated
-                                              logs/daemon.log predates this and is safe to delete.
+  logs/                                      Daemon logs (daemon.log.<date>, rotated daily at
+                                              UTC midnight, oldest deleted past 8 files) and
+                                              workspace step logs
 ```
 
 `$SHIMMER_HOME` defaults to `~/.local/share/shimmer` on Linux and `~/Library/Application Support/shimmer` on
@@ -70,6 +75,22 @@ only to make queries fast: delete it and the daemon rebuilds it from the event l
 start. Writes are atomic, so a crash leaves either the old file or the new one, never half of
 one. The folder ships with a `.gitignore` for the derived and machine-local parts, so you can
 commit it as-is.
+
+**Settings** live in `config.toml`, read when the daemon starts (`shimmer shutdown`, then any
+command, to apply a change). Every section is optional:
+
+```toml
+[general]
+local_timezone = "America/New_York"   # for "today": completion dates, today+7 in filters.
+                                      # Detected and written here on first start.
+[lanes]
+workspaces = 1                        # how many tasks a lane runs at once
+
+[modules.records]                     # a module's own settings, handed only to that module
+```
+
+`[http]` sets the network gateway's rate limits and cache, for modules that reach the network
+(none on master yet); [ADR 0027](docs/decisions/0027-real-http-gateway.md) lists its keys.
 
 ## Running it
 
@@ -90,6 +111,9 @@ cargo run -q -- ping          # starts the daemon if needed, then: "pong (daemon
 `shimmer` from any folder, run `.dev/install-dev-launcher.sh` once (see
 [CONTRIBUTING.md](CONTRIBUTING.md#the-dev-launcher)). The examples below assume you have.
 
+The daemon keeps running the code it started with. After pulling or changing the code, run
+`shimmer shutdown`; the next command starts a daemon with the new code.
+
 ### Track records
 
 ```sh
@@ -104,9 +128,19 @@ shimmer records update leetcode/two-sum --url https://leetcode.com/problems/two-
 shimmer records remove leetcode/two-sum
 ```
 
-`list` also takes `--limit N` and `--offset N`, and `update` takes `--unset FIELD`. You can
-write a record as `leetcode/two-sum` or `leetcode two-sum`. Run `shimmer records --help` for the
-details.
+You can write a record as `leetcode/two-sum` or `leetcode two-sum`. There is more:
+
+- **Finding records:** `list` filters (`--filter "difficulty=hard"`, `--or`, `--has`,
+  `--missing`, dates like `today+7`), searches (`--search`), sorts (`--sort -last_solved`) and
+  pages (`--limit`, `--offset`).
+- **Undo:** `remove` moves a record to the trash; `restore` brings it back, `trash` lists it, and
+  `purge` deletes it for good (it asks first). `reopen` makes a done record todo again.
+- **Moving data:** `import` from CSV or JSON, `export` to either.
+- **Changing a collection:** `edit` opens its file; `check`, `rename-field`, `rename-collection`,
+  `copy-collection`, `remove-collection` and `restore-collection`.
+- **Templates:** `templates` lists them by category, `peek` shows everything about one.
+
+`shimmer records --help` has every command and option.
 
 ### Add your own tracker
 
@@ -163,6 +197,20 @@ A workspace is a folder in `$SHIMMER_HOME/data/workspaces/<name>/` holding a `wo
 and a `steps/` folder of scripts. [`CLAUDE.md`](CLAUDE.md) §10 shows an example and ADR 0012
 has every rule. `shimmer workspaces --help`, `shimmer queue --help` and
 `shimmer scheduler --help` cover the rest.
+
+### Command packs
+
+A command pack gives the commands themed names, each standing for `shimmer` and a whole command:
+
+```sh
+shimmer packs list                  # the built-in packs (anime-tropes, ship-it, starship, short) and yours
+shimmer packs show short            # a pack's names and what each one runs
+shimmer packs use short             # turn it on: then `wgo site` = shimmer workspaces activate site
+shimmer packs use none              # turn packs off
+```
+
+The real names always work. [`docs/packs/README.md`](docs/packs/README.md) shows every built-in
+pack and how to make your own.
 
 ### Other commands
 

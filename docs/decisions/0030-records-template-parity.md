@@ -1,6 +1,6 @@
 # 0030. Records catch up with workspaces: categories, peek, schedules, copy, edit, origin
 
-Status: proposed · Raised by Dev B · Needs sign-off: Dev A (ops in `records`, docs/protocol.md;
+Status: proposed; implemented and merged (#149–#153, then #177 into master, reviewed by Wasay), Dev A's sign-off still to record · Raised by Dev B · Needs sign-off: Dev A (ops in `records`, docs/protocol.md;
 the CLI reads `scheduler.list` and calls `scheduler.add`/`remove`) · Dev C notified · No `core`
 or `proto` change
 

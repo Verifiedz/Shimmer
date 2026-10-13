@@ -6,6 +6,10 @@ Dev B (issue #35) · Signed off: Dev A (changes CLAUDE.md
 `crates/app`, §10 below) · No `core` or `proto` change · Dev C: FYI (§3, a client setting the TUI
 may also want to read)
 
+> **Extended since:** a pack may also have a `[colors]` section that sets the output's colours by
+> role (`success`, `error`, `heading`, `name`, `warning`, `hint`, each `#rrggbb`), checked at load
+> like the rest of the pack (#189; the user side is in `docs/packs/README.md`).
+
 ## Context
 
 CLAUDE.md §15.1 describes command packs: themed aliases such as `bankai` for
@@ -319,7 +323,8 @@ animations.
 
 ## Not done here
 
-- Playing animations and `--no-anim` (§12). That PR closes #35.
-- `shimmer queue …` and `shimmer scheduler …` commands, so packs can alias them (§6).
+- Playing animations and `--no-anim` (§12). That PR closes #35. **Still not built:** #35 was
+  closed with the packs PRs, and nothing plays an `[anim]` file yet.
+- `shimmer queue …` and `shimmer scheduler …` commands, so packs can alias them (§6). **Done since:** ADR 0015.
 - Bare commands on Windows (`.cmd` shims instead of symlinks), and `cli.toml`'s Windows location.
 - A community collection for franchise packs, and where it lives.

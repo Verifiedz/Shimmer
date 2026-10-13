@@ -32,6 +32,8 @@ options:
   --json                print the daemon's raw JSON instead of formatted output
   --pack NAME           use this command pack for one command ('none' for plain names);
                         goes before the command
+  --no-color            no colour (also when NO_COLOR is set, or output isn't a terminal);
+                        goes before the command
   -h, --help            show this help; with --canonical, without the active pack's aliases
 
 The daemon is started automatically when it is not running.";
