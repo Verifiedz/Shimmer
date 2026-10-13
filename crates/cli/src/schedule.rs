@@ -131,11 +131,24 @@ pub fn parse(words: Vec<String>) -> std::result::Result<ScheduleCmd, String> {
     }
 }
 
+/// The one op + params a schedulable workspaces command sends: activate, stop or cleanup, without
+/// `--wait`. Shared with `scheduler list`, which reads a schedule back through it (ADR 0031 §3).
+pub fn workspaces_op(cmd: &WorkspacesCmd) -> Option<(&'static str, Value)> {
+    match cmd {
+        WorkspacesCmd::Activate { id, wait: false } => Some(("workspaces.activate", json!({"id": id}))),
+        WorkspacesCmd::Stop { id, wait: false } => Some(("workspaces.stop", json!({"id": id}))),
+        WorkspacesCmd::Cleanup { id, wait: false } => Some(("workspaces.cleanup", json!({"id": id}))),
+        _ => None,
+    }
+}
+
 /// `op` for workspace `id`, once the daemon has it: a typo is caught when it's scheduled, not each
 /// time it fires (#185's review). `workspaces.status` is the read-only lookup `status` makes.
-async fn known_workspace(client: &mut Client, op: &'static str, id: &str) -> Result<(&'static str, Value)> {
-    client.call("workspaces.status", json!({"id": id})).await?;
-    Ok((op, json!({"id": id})))
+async fn known_workspace(client: &mut Client, op: &'static str, id: &str) -> Result<()> {
+    client.call("workspaces.status", json!({"id": id})).await.map(|_| ()).map_err(|e| match e.code {
+        shimmer_core::ErrorCode::NotFound => Error::not_found(format!("no workspace '{id}' to schedule for ({op})")),
+        _ => e,
+    })
 }
 
 /// `skip`, `run-once` or `backfill` → the protocol's spelling.
@@ -314,10 +327,13 @@ async fn request(client: &mut Client, command: &[String]) -> Result<(&'static st
             | WorkspacesCmd::Cleanup { wait: true, .. } => {
                 Err(not("--wait follows a launch as it happens, and a scheduled one runs with no one waiting"))
             }
-            WorkspacesCmd::Activate { id, .. } => known_workspace(client, "workspaces.activate", &id).await,
-            WorkspacesCmd::Stop { id, .. } => known_workspace(client, "workspaces.stop", &id).await,
-            WorkspacesCmd::Cleanup { id, .. } => known_workspace(client, "workspaces.cleanup", &id).await,
-            _ => Err(not("only workspaces activate, stop and cleanup can")),
+            cmd => match workspaces_op(&cmd) {
+                Some((op, params)) => {
+                    known_workspace(client, op, params["id"].as_str().unwrap_or_default()).await?;
+                    Ok((op, params))
+                }
+                None => Err(not("only workspaces activate, stop and cleanup can")),
+            },
         },
         other => Err(Error::invalid_params(format!(
             "'{other}' can't be scheduled: only records and workspaces commands that make one change can"

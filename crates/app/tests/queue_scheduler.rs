@@ -124,7 +124,9 @@ fn a_trigger_fires_and_can_be_paused_resumed_and_removed() {
     let list = ok(&home, &["scheduler", "list"]);
     let row = list.lines().find(|l| l.starts_with(shown(&id))).unwrap_or_else(|| panic!("{list}"));
     assert!(
-        row.contains("records.list")
+        // Added raw, it isn't exactly what typing `records list leetcode` sends (no `filter`), so it
+        // shows as op + params: never a command that would do something else (#186's review).
+        row.contains(r#"records.list {"collection":"leetcode"}"#)
             && row.contains("every 1s")
             && row.contains("skip")
             && row.contains("active")
@@ -222,6 +224,12 @@ fn schedule_runs_a_normal_command_in_plain_words() {
     assert_eq!(
         (t["op"].as_str(), &t["schedule"]),
         (Some("records.reopen"), &serde_json::json!({"cron_local": "0 9 * * 1-5"}))
+    );
+    // And the list reads it back as exactly what was typed (ADR 0031 §3).
+    let list = ok(&home, &["scheduler", "list"]);
+    assert!(
+        list.lines().any(|l| l.contains("records reopen leetcode/two-sum") && l.contains("weekdays 09:00 (local)")),
+        "{list}"
     );
 
     // Never a guessed catch-up, and only commands that make one change.
