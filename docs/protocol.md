@@ -356,7 +356,10 @@ client can say which one it hit.
 `trigger_id` may be a unique ending of the id (see "Short ids" above).
 
 Schedules are `{"cron": "0 9 * * 1"}` (5 fields, Sunday = 0 or 7, Monday = 1, UTC),
-`{"every": 172800}` (seconds) or `{"once": "2026-10-04T09:00:00Z"}`. A fired task's params
+`{"cron_local": "0 9 * * 1"}` (the same, read in config.toml's `[general] local_timezone`, so 9am
+stays 9am across a clock change; ADR 0031 §2), `{"every": 172800}` (seconds) or
+`{"once": "2026-10-04T09:00:00Z"}`. A client should show a schedule shape it doesn't know rather
+than fail on it: more may be added without a version bump. A fired task's params
 gain a `scheduled_for` timestamp when they are an object. See
 `docs/decisions/0004-scheduler-semantics.md`.
 

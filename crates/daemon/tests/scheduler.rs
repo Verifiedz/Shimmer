@@ -532,3 +532,120 @@ async fn module_triggers_with_an_invalid_fallback_are_not_registered() {
     assert_eq!(ids, ["good"], "a bad declaration degrades like any other, and never stops the daemon");
     stop(d).await;
 }
+
+#[tokio::test]
+async fn a_local_time_trigger_follows_the_timezone_after_a_restart() {
+    // ADR 0031 §2: a `cron_local` schedule is read in `[general] local_timezone`; that is read at
+    // start, so after a change of zone the next run moves to the same local time in the new zone.
+    let env = Env::fake_clock();
+    let config = env.home.path().join("config.toml");
+    std::fs::write(&config, "[general]\nlocal_timezone = \"America/New_York\"\n").unwrap();
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    let id = add(&mut c, json!({"cron_local": "0 9 * * *"}), "demo.echo", "skip").await;
+    let ny = trigger(&mut c, &id).await.unwrap()["next_due"].as_str().unwrap().to_owned();
+    assert!(ny.ends_with("13:00:00Z") || ny.ends_with("14:00:00Z"), "9am in New York is 13:00 or 14:00 UTC: {ny}");
+    assert_eq!(trigger(&mut c, &id).await.unwrap()["schedule"], json!({"cron_local": "0 9 * * *"}));
+    drop(c);
+    stop(d).await;
+
+    std::fs::write(&config, "[general]\nlocal_timezone = \"America/Los_Angeles\"\n").unwrap();
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    let la = trigger(&mut c, &id).await.unwrap()["next_due"].as_str().unwrap().to_owned();
+    let hours = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap();
+    assert_eq!((hours(&la) - hours(&ny)).num_hours(), 3, "9am Los Angeles is 3 hours after 9am New York: {ny} → {la}");
+    stop(d).await;
+}
+
+/// Wait until `topic` has been logged `n` times.
+async fn until_logged(env: &Env, topic: &str, n: usize) {
+    for _ in 0..300 {
+        if logged(env, topic).len() >= n {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("{topic} logged {} times, not {n}", logged(env, topic).len());
+}
+
+#[tokio::test]
+async fn a_local_time_trigger_missed_while_down_still_catches_up_after_a_restart() {
+    // ADR 0031 §2 (#175's review): catch-up decides from the stored next run, so a restart must
+    // never move it past runs the daemon missed, or run-once and backfill would act like skip.
+    let env = Env::fake_clock();
+    let config = env.home.path().join("config.toml");
+    std::fs::write(&config, "[general]\nlocal_timezone = \"America/New_York\"\n").unwrap();
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    let id = add(&mut c, json!({"cron_local": "0 9 * * *"}), "demo.echo", "run_once").await;
+    drop(c);
+    stop(d).await;
+
+    // Off for three days, same zone: one run on waking, for the runs it missed.
+    advance(&env, 3 * DAY);
+    let d = env.start().await;
+    until_logged(&env, "scheduler.trigger.fired", 1).await;
+    let mut c = Client::connect(&env.sock).await;
+    settle(&mut c).await;
+    assert_eq!(logged(&env, "scheduler.trigger.fired").len(), 1, "same zone: caught up once");
+    assert_eq!(logged(&env, "scheduler.trigger.missed").len(), 1);
+    let ran = trigger(&mut c, &id).await.unwrap()["last_run"].clone();
+    drop(c);
+    stop(d).await;
+
+    // Off for three more days, and now in Los Angeles: still caught up, never before last_run.
+    advance(&env, 3 * DAY);
+    std::fs::write(&config, "[general]\nlocal_timezone = \"America/Los_Angeles\"\n").unwrap();
+    let d = env.start().await;
+    until_logged(&env, "scheduler.trigger.fired", 2).await;
+    let mut c = Client::connect(&env.sock).await;
+    settle(&mut c).await;
+    assert_eq!(logged(&env, "scheduler.trigger.fired").len(), 2, "zone changed: caught up once more");
+    let t = trigger(&mut c, &id).await.unwrap();
+    assert!(t["last_run"].as_str() > ran.as_str(), "{t}");
+    let file = env.home.path().join(format!("data/scheduler/triggers/{id}.json"));
+    let on_disk: Value = serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+    assert_eq!(on_disk["zone"], "America/Los_Angeles", "the zone its next run is in");
+    stop(d).await;
+}
+
+#[tokio::test]
+async fn a_local_trigger_gets_its_zone_saved_and_a_failed_save_never_stops_the_daemon() {
+    // #184's review: a trigger with no stored zone (hand-edited) gets one written, so a later zone
+    // change can move it; and a file that can't be rewritten is logged, not fatal.
+    let env = Env::fake_clock();
+    let config = env.home.path().join("config.toml");
+    std::fs::write(&config, "[general]\nlocal_timezone = \"America/New_York\"\n").unwrap();
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    let id = add(&mut c, json!({"cron_local": "0 9 * * *"}), "demo.echo", "skip").await;
+    drop(c);
+    stop(d).await;
+
+    let file = env.home.path().join(format!("data/scheduler/triggers/{id}.json"));
+    let read = || serde_json::from_str::<Value>(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let mut edited = read();
+    edited.as_object_mut().unwrap().remove("zone");
+    std::fs::write(&file, serde_json::to_string_pretty(&edited).unwrap()).unwrap();
+    let d = env.start().await;
+    stop(d).await;
+    assert_eq!(read()["zone"], "America/New_York", "saved again on start");
+
+    // Now the zone changes, but the folder can't be written: the daemon still starts, with the
+    // trigger moved to 9am Los Angeles in memory.
+    std::fs::write(&config, "[general]\nlocal_timezone = \"America/Los_Angeles\"\n").unwrap();
+    let dir = file.parent().unwrap().to_path_buf();
+    let before = read()["next_due"].clone();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    let moved = trigger(&mut c, &id).await.unwrap()["next_due"].clone();
+    drop(c);
+    stop(d).await;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let hours = |v: &Value| chrono::DateTime::parse_from_rfc3339(v.as_str().unwrap()).unwrap();
+    assert_eq!((hours(&moved) - hours(&before)).num_hours(), 3, "moved in memory: {before} → {moved}");
+    assert_eq!(read()["zone"], "America/New_York", "the file couldn't be written, so it's unchanged");
+}

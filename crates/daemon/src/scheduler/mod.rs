@@ -20,8 +20,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use shimmer_core::{
-    CatchUp, Clock, Emitter, EnqueueRequest, Error, Fallback, LaneId, ModuleId, NamespacedStore, Origin, Priority,
-    Result, Schedule, TaskId, TriggerId, TriggerSpec,
+    CatchUp, Clock, Emitter, EnqueueRequest, Error, Fallback, LaneId, LocalTimezone, ModuleId, NamespacedStore, Origin,
+    Priority, Result, Schedule, TaskId, TriggerId, TriggerSpec,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -49,6 +49,10 @@ struct Stored {
     next_due: Option<DateTime<Utc>>,
     /// A finished `Once`. Kept, so a module re-declaring it does not fire it again.
     done: bool,
+    /// The zone a `CronLocal` trigger's `next_due` was computed in (ADR 0031 §2), so a restart
+    /// in another zone can move it. Absent for every other schedule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    zone: Option<String>,
 }
 
 struct Entry {
@@ -66,6 +70,8 @@ pub struct Scheduler {
     queue: Arc<QueueInner>,
     known_ops: HashSet<String>,
     lanes: HashSet<LaneId>,
+    /// `[general] local_timezone`, for `CronLocal` schedules (ADR 0031 §2).
+    local_tz: LocalTimezone,
 }
 
 fn valid_trigger_id(id: &str) -> bool {
@@ -87,8 +93,9 @@ impl Scheduler {
         queue: Arc<QueueInner>,
         known_ops: HashSet<String>,
         lanes: HashSet<LaneId>,
+        local_tz: LocalTimezone,
     ) -> Self {
-        Self { state: Mutex::default(), store, emitter, clock, queue, known_ops, lanes }
+        Self { state: Mutex::default(), store, emitter, clock, queue, known_ops, lanes, local_tz }
     }
 
     fn lock(&self) -> MutexGuard<'_, BTreeMap<String, Entry>> {
@@ -124,9 +131,33 @@ impl Scheduler {
             let parsed = serde_json::from_str::<Stored>(&text)
                 .map_err(|e| Error::invalid_params(e.to_string()))
                 .and_then(|s| fallback::validate(&s.spec.op, s.spec.fallback.as_ref()).map(|()| s))
-                .and_then(|s| Parsed::parse(&s.spec.schedule).map(|p| (s, p)));
+                .and_then(|s| Parsed::parse(&s.spec.schedule, self.local_tz).map(|p| (s, p)));
             match parsed {
-                Ok((stored, parsed)) => {
+                Ok((mut stored, parsed)) => {
+                    // The zone is read at start and may have changed (ADR 0031 §2). Same zone: the
+                    // stored next run is kept exactly, so a run missed while the daemon was down
+                    // is still caught up. Another zone: the same wall-clock time there.
+                    if parsed.is_local() {
+                        let was = stored.zone.as_deref().and_then(|z| LocalTimezone::parse(z).ok());
+                        let unrecorded = was.is_none();
+                        stored.zone = Some(self.local_tz.name().to_owned());
+                        let moved = match was.filter(|was| *was != self.local_tz) {
+                            Some(was) => {
+                                stored.next_due =
+                                    stored.next_due.and_then(|due| parsed.rezoned(due, was, stored.last_run));
+                                true
+                            }
+                            None => false,
+                        };
+                        // Saved so a later zone change can move it. A failed write is only logged,
+                        // like an unreadable file: the move is kept in memory and simply redone on
+                        // the next start, and one bad file never stops the daemon (#184's review).
+                        if moved || unrecorded {
+                            if let Err(e) = self.write(&stored, None) {
+                                tracing::warn!(file, error = %e, "couldn't save a local trigger's zone; redone next start");
+                            }
+                        }
+                    }
                     st.insert(stored.spec.id.to_string(), Entry { stored, parsed, pending: Vec::new() });
                 }
                 Err(e) => tracing::error!(file, error = %e, "ignoring unreadable trigger file"),
@@ -154,7 +185,7 @@ impl Scheduler {
                 tracing::warn!(module = %module, trigger = %id, error = %e, "skipping trigger");
                 continue;
             }
-            let parsed = match Parsed::parse(&spec.schedule) {
+            let parsed = match Parsed::parse(&spec.schedule, self.local_tz) {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!(module = %module, trigger = %id, error = %e, "skipping trigger");
@@ -174,6 +205,7 @@ impl Scheduler {
                     if e.stored.spec.schedule != spec.schedule {
                         next.next_due = parsed.first_due(now);
                         next.done = false;
+                        next.zone = parsed.is_local().then(|| self.local_tz.name().to_owned());
                     }
                     next.spec = spec;
                     self.write(&next, None)?;
@@ -188,6 +220,7 @@ impl Scheduler {
                         paused: false,
                         last_run: None,
                         done: false,
+                        zone: parsed.is_local().then(|| self.local_tz.name().to_owned()),
                     };
                     self.write(&stored, Some(("scheduler.trigger.added", added_payload(&stored))))?;
                     st.insert(id, Entry { stored, parsed, pending: Vec::new() });
@@ -376,7 +409,7 @@ impl Scheduler {
             fallback: a.fallback,
         };
         self.check_target(&spec)?;
-        let parsed = Parsed::parse(&spec.schedule)?;
+        let parsed = Parsed::parse(&spec.schedule, self.local_tz)?;
         let stored = Stored {
             next_due: parsed.first_due(self.clock.now()),
             spec,
@@ -384,6 +417,7 @@ impl Scheduler {
             paused: false,
             last_run: None,
             done: false,
+            zone: parsed.is_local().then(|| self.local_tz.name().to_owned()),
         };
         self.write(&stored, Some(("scheduler.trigger.added", added_payload(&stored))))?;
         let id = stored.spec.id.clone();

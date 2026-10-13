@@ -20,7 +20,10 @@ commands:
   records …             add, list and complete records (shimmer records --help)
   workspaces …          list, inspect and reset workspaces (shimmer workspaces --help)
   queue …               what's running and waiting, and cancel or reorder it (shimmer queue --help)
-  scheduler …           run things on a schedule (shimmer scheduler --help)
+  schedule WHEN … COMMAND
+                        run a command on a schedule, e.g. shimmer schedule weekdays 09:00
+                        workspaces activate site (shimmer schedule --help)
+  scheduler …           list, pause, resume and remove schedules (shimmer scheduler --help)
   packs …               command packs: themed aliases for these commands (shimmer packs --help)
   call OP [PARAMS]      send any op; PARAMS is a JSON object (default {})
   shutdown              stop the daemon
@@ -47,6 +50,7 @@ pub enum Command {
     Workspaces(WorkspacesCmd),
     Queue(QueueCmd),
     Scheduler(SchedulerCmd),
+    Schedule(crate::schedule::ScheduleCmd),
     Packs(PacksCmd),
 }
 
@@ -89,6 +93,7 @@ impl Args {
             (true, Some("workspaces")) => Command::Workspaces(WorkspacesCmd::Help),
             (true, Some("queue")) => Command::Queue(QueueCmd::Help),
             (true, Some("scheduler")) => Command::Scheduler(SchedulerCmd::Help),
+            (true, Some("schedule")) => Command::Schedule(crate::schedule::ScheduleCmd::Help),
             (true, Some("packs")) => Command::Packs(PacksCmd::Help),
             (true, _) => Command::Help,
             (false, _) => command(words)?,
@@ -112,6 +117,9 @@ fn command(words: Vec<String>) -> Result<Command, String> {
     }
     if word == "scheduler" {
         return scheduler::parse(rest).map(Command::Scheduler);
+    }
+    if word == "schedule" {
+        return crate::schedule::parse(rest).map(Command::Schedule);
     }
     if word == "packs" {
         return packs::parse(rest).map(Command::Packs);

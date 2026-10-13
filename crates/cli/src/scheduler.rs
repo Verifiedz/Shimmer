@@ -24,6 +24,8 @@ commands:
 WHEN is exactly one of:
   --every DURATION   e.g. 30s, 15m, 2h, 3d, 1w, 1h30m
   --cron \"EXPR\"      five fields, minute hour day month weekday; times are UTC
+  --cron-local \"EXPR\" the same, in your local timezone (config.toml's local_timezone):
+                     9am stays 9am when the clocks change
   --once TIME        2026-10-10 09:00 (your local time) or 2026-10-10T09:00:00Z
 
 --catch-up says what happens to runs missed while the machine was off or asleep. It has no
@@ -67,7 +69,8 @@ const CATCH_UP_HELP: &str = "skip (drop missed runs), run-once (one run on wakin
 pub fn parse(words: Vec<String>) -> std::result::Result<SchedulerCmd, String> {
     let mut words = words.into_iter();
     let Some(sub) = words.next() else { return Ok(SchedulerCmd::Help) };
-    let options: &[&str] = if sub == "add" { &["--every", "--cron", "--once", "--catch-up", "--lane"] } else { &[] };
+    let options: &[&str] =
+        if sub == "add" { &["--every", "--cron", "--cron-local", "--once", "--catch-up", "--lane"] } else { &[] };
     let flags = Flags::split(words.collect(), options, &[]).map_err(|e| format!("scheduler {sub}: {e}"))?;
     let id = || match flags.positional.as_slice() {
         [id] => Ok(id.clone()),
@@ -102,11 +105,19 @@ fn add(flags: &Flags) -> std::result::Result<NewTrigger, String> {
             )
         }
     };
-    let schedule = match (flags.value("--every"), flags.value("--cron"), flags.value("--once")) {
-        (Some(d), None, None) => json!({ "every": when::parse_duration(d)? }),
-        (None, Some(expr), None) => json!({ "cron": expr }),
-        (None, None, Some(t)) => json!({ "once": when::parse_once(t)?.to_rfc3339() }),
-        _ => return Err("'scheduler add' needs exactly one of --every DURATION, --cron \"EXPR\" or --once TIME".into()),
+    let given = [flags.value("--every"), flags.value("--cron"), flags.value("--cron-local"), flags.value("--once")];
+    let schedule = match given {
+        [Some(d), None, None, None] => json!({ "every": when::parse_duration(d)? }),
+        [None, Some(expr), None, None] => json!({ "cron": expr }),
+        [None, None, Some(expr), None] => json!({ "cron_local": expr }),
+        [None, None, None, Some(t)] => json!({ "once": when::parse_once(t)?.to_rfc3339() }),
+        _ => {
+            return Err(
+                "'scheduler add' needs exactly one of --every DURATION, --cron \"EXPR\", --cron-local \"EXPR\" \
+                        or --once TIME"
+                    .into(),
+            )
+        }
     };
     let catch_up = match flags.value("--catch-up") {
         Some("skip") => "skip",
@@ -125,11 +136,20 @@ pub async fn run(client: &mut Client, cmd: &SchedulerCmd, json: bool) -> Result<
         SchedulerCmd::Help => return Ok(USAGE.into()),
         SchedulerCmd::List => {
             let data = client.call("scheduler.list", json!({})).await?;
-            return Ok(if json { render::json(&data) } else { list(&data, now) });
+            if json {
+                return Ok(render::json(&data));
+            }
+            let all = data["triggers"].as_array().cloned().unwrap_or_default();
+            let schemas = schemas_for(client, &all).await;
+            return Ok(list(&data, now, &schemas));
         }
         SchedulerCmd::Show { id } => {
             let data = client.call("scheduler.get", json!({"trigger_id": id})).await?;
-            return Ok(if json { render::json(&data) } else { trigger(&data, now) });
+            if json {
+                return Ok(render::json(&data));
+            }
+            let schemas = schemas_for(client, std::slice::from_ref(&data)).await;
+            return Ok(trigger(&data, now, &schemas));
         }
         SchedulerCmd::Add(t) => {
             let mut params = json!({"schedule": t.schedule, "op": t.op, "params": t.params, "catch_up": t.catch_up});
@@ -188,7 +208,7 @@ fn added(id: &str, t: Option<&Value>, now: DateTime<Utc>) -> String {
 }
 
 /// Every trigger in one table, or a line saying there are none.
-fn list(data: &Value, now: DateTime<Utc>) -> String {
+fn list(data: &Value, now: DateTime<Utc>, schemas: &Schemas) -> String {
     let triggers = data["triggers"].as_array().cloned().unwrap_or_default();
     if triggers.is_empty() {
         return "no triggers yet; add one with: shimmer scheduler add OP WHEN --catch-up WHAT".into();
@@ -200,7 +220,7 @@ fn list(data: &Value, now: DateTime<Utc>) -> String {
         .map(|(t, id)| {
             vec![
                 id,
-                render::cell(&t["op"]),
+                command_of(&t["op"], &t["params"], schemas),
                 schedule(&t["schedule"]),
                 catch_up(&t["catch_up"]),
                 when::timestamp(&t["next_due"]).map_or("-".into(), |at| when::relative(at, now)),
@@ -210,17 +230,18 @@ fn list(data: &Value, now: DateTime<Utc>) -> String {
             ]
         })
         .collect();
-    let header = ["ID", "OP", "SCHEDULE", "CATCH-UP", "NEXT", "LAST", "STATE", "FROM"].map(String::from);
+    let header = ["ID", "COMMAND", "SCHEDULE", "CATCH-UP", "NEXT", "LAST", "STATE", "FROM"].map(String::from);
     table(&header, &rows)
 }
 
 /// One trigger as label / value lines.
-fn trigger(t: &Value, now: DateTime<Utc>) -> String {
+fn trigger(t: &Value, now: DateTime<Utc>, schemas: &Schemas) -> String {
     let time = |v: &Value, none: &str| {
         when::timestamp(v).map_or(none.to_string(), |at| format!("{} ({})", when::local(at), when::relative(at, now)))
     };
     let mut out = format!("{}  ({})\n", render::cell(&t["id"]), state(t));
     let mut line = |label: &str, value: String| out.push_str(&format!("  {label:<10}{value}\n"));
+    line("command", command_of(&t["op"], &t["params"], schemas));
     line("op", render::cell(&t["op"]));
     line("params", serde_json::to_string(&t["params"]).unwrap_or_default());
     line("schedule", schedule(&t["schedule"]));
@@ -232,17 +253,236 @@ fn trigger(t: &Value, now: DateTime<Utc>) -> String {
     out.trim_end().to_string()
 }
 
-/// `every 2d`, `cron 0 9 * * 1 (UTC)` or `once 2026-10-10 09:00:00`.
+/// The collections' definitions, by id, for reading records schedules back (their fields' types).
+pub type Schemas = std::collections::BTreeMap<String, Value>;
+
+/// What a trigger runs, as the command you'd type (ADR 0031 §3): `workspaces activate site`,
+/// `records complete habits/stretch`. **Exactly, or not at all** (#186's review): a candidate is
+/// rebuilt from op + params, then parsed back with the same parsers running a command uses, and is
+/// shown only if that gives back exactly this op + params. Anything else shows as op + params.
+/// Presentation only: the daemon stores, and `--json` shows, op + params.
+fn command_of(op: &Value, params: &Value, schemas: &Schemas) -> String {
+    let op = render::cell(op);
+    let mut params = params.clone();
+    // Stamped by the scheduler on each firing (ADR 0004), never typed.
+    if let Some(p) = params.as_object_mut() {
+        p.remove("scheduled_for");
+    }
+    for words in candidates(&op, &params) {
+        if parses_back_to(&words, &op, &params, schemas) {
+            return words.iter().map(|w| shell_word(w)).collect::<Vec<_>>().join(" ");
+        }
+    }
+    format!("{op} {}", serde_json::to_string(&params).unwrap_or_default())
+}
+
+/// Commands that might send `op` + `params`, most natural first: for a `records.list` filter,
+/// `--FIELD VALUE` first, then the same as `--filter "FIELD=VALUE"` (a field named like an
+/// option, #178). Unchecked: [`parses_back_to`] decides.
+fn candidates(op: &str, params: &Value) -> Vec<Vec<String>> {
+    let Some(target) = crate::packs::pack::TARGETS.iter().find(|t| t.op == op) else { return Vec::new() };
+    let Some(p) = params.as_object() else { return Vec::new() };
+    let base: Vec<String> = target.words.iter().map(|w| w.to_string()).collect();
+    if op.starts_with("workspaces.") {
+        let mut words = base;
+        words.extend(p.get("id").and_then(Value::as_str).map(String::from));
+        return vec![words];
+    }
+    if !op.starts_with("records.") {
+        return Vec::new();
+    }
+    [false, true]
+        .into_iter()
+        .filter_map(|as_filter| {
+            let mut words = base.clone();
+            match (p.get("collection").and_then(Value::as_str), p.get("id").and_then(Value::as_str)) {
+                (Some(c), Some(id)) => words.push(format!("{c}/{id}")),
+                (Some(c), None) => words.push(c.into()),
+                _ => return None,
+            }
+            for (key, value) in p {
+                match key.as_str() {
+                    "collection" | "id" => {}
+                    "fields" => {
+                        for (name, v) in value.as_object()? {
+                            field_words(&mut words, name, v)?;
+                        }
+                    }
+                    "filter" => {
+                        for (name, v) in value.as_object()? {
+                            filter_words(&mut words, name, v, as_filter)?;
+                        }
+                    }
+                    // A true switch is the bare flag; false is never sent.
+                    "clear_stamp" | "force" if value == &Value::Bool(true) => words.push(flag(key)),
+                    "search" => words.extend([flag(key), value.as_str()?.to_owned()]),
+                    "limit" | "offset" => words.extend([flag(key), value.as_u64()?.to_string()]),
+                    "sort" => {
+                        for k in value.as_array()? {
+                            words.extend(["--sort".to_owned(), k.as_str()?.to_owned()]);
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            Some(words)
+        })
+        .collect()
+}
+
+fn flag(name: &str) -> String {
+    format!("--{}", name.replace('_', "-"))
+}
+
+/// A field's change as the flags that make it: a value is `--F V` (a list as its items joined by
+/// `, `), `null` is `--unset F`, a list patch is `--add F ITEM` / `--remove F ITEM` per item.
+fn field_words(words: &mut Vec<String>, name: &str, v: &Value) -> Option<()> {
+    match v {
+        Value::Null => words.extend(["--unset".to_owned(), name.to_owned()]),
+        Value::Object(patch) => {
+            for (key, items) in patch {
+                let which = match key.as_str() {
+                    "add" => "--add",
+                    "remove" => "--remove",
+                    _ => return None,
+                };
+                for item in items.as_array()? {
+                    words.extend([which.to_owned(), name.to_owned(), item.as_str()?.to_owned()]);
+                }
+            }
+        }
+        other => words.extend([flag(name), plain(other)?]),
+    }
+    Some(())
+}
+
+/// One `records.list` filter entry as flags: a plain value is `--F V` (or `--filter "F=V"`), an
+/// operator a `--filter` condition, `set` is `--has F` / `--missing F`, `or` one `--or` each.
+fn filter_words(words: &mut Vec<String>, name: &str, v: &Value, as_filter: bool) -> Option<()> {
+    const OPS: [(&str, &str); 7] =
+        [("eq", "="), ("ne", "!="), ("lt", "<"), ("lte", "<="), ("gt", ">"), ("gte", ">="), ("contains", "~")];
+    let condition = |name: &str, op: &str, v: &Value| -> Option<String> {
+        if op == "in" {
+            let items: Option<Vec<String>> = v.as_array()?.iter().map(plain).collect();
+            return Some(format!("{name}={}", items?.join("|")));
+        }
+        if op == "has" {
+            return Some(format!("{name} has {}", plain(v)?));
+        }
+        let (_, sym) = OPS.iter().find(|(o, _)| *o == op)?;
+        Some(format!("{name}{sym}{}", plain(v)?))
+    };
+    match (name, v) {
+        ("or", Value::Array(alternatives)) => {
+            for alt in alternatives {
+                let (field, ops) = alt.as_object()?.iter().next()?;
+                let (op, value) = ops.as_object()?.iter().next()?;
+                words.extend(["--or".to_owned(), condition(field, op, value)?]);
+            }
+        }
+        (_, Value::Object(ops)) => {
+            for (op, value) in ops {
+                match (op.as_str(), value) {
+                    ("set", Value::Bool(true)) => words.extend(["--has".to_owned(), name.to_owned()]),
+                    ("set", Value::Bool(false)) => words.extend(["--missing".to_owned(), name.to_owned()]),
+                    _ => words.extend(["--filter".to_owned(), condition(name, op, value)?]),
+                }
+            }
+        }
+        _ if as_filter => words.extend(["--filter".to_owned(), condition(name, "eq", v)?]),
+        _ => words.extend([flag(name), plain(v)?]),
+    }
+    Some(())
+}
+
+/// A scalar or a list of strings as typed text; anything else can't be.
+fn plain(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Array(items) => {
+            let items: Option<Vec<&str>> = items.iter().map(Value::as_str).collect();
+            Some(items?.join(", "))
+        }
+        _ => None,
+    }
+}
+
+/// Does typing `words` send exactly `op` + `params`? Parsed and turned into a request by the very
+/// functions running the command uses (`records::request`, `schedule::workspaces_op`).
+fn parses_back_to(words: &[String], op: &str, params: &Value, schemas: &Schemas) -> bool {
+    let Some((first, rest)) = words.split_first() else { return false };
+    let got = match first.as_str() {
+        "records" => crate::records::parse(rest.to_vec()).ok().and_then(|cmd| {
+            let schema = cmd.collection().and_then(|c| schemas.get(c)).cloned().unwrap_or(Value::Null);
+            crate::records::request(&cmd, &schema).ok()
+        }),
+        "workspaces" => {
+            crate::workspaces::parse(rest.to_vec()).ok().and_then(|cmd| crate::schedule::workspaces_op(&cmd))
+        }
+        _ => None,
+    };
+    got.is_some_and(|(got_op, got_params)| got_op == op && &got_params == params)
+}
+
+/// `text` as one word a shell reads back as it is: bare when it's safe, else in single quotes.
+fn shell_word(text: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c);
+    if !text.is_empty() && text.chars().all(safe) {
+        text.to_owned()
+    } else {
+        format!("'{}'", text.replace('\'', r"'\''"))
+    }
+}
+
+/// The definitions of the collections `triggers` touch, fetched once, for [`command_of`]. Empty
+/// (each records command then shows as op + params) when there are none or the call fails.
+pub async fn schemas_for(client: &mut Client, triggers: &[Value]) -> Schemas {
+    if !triggers.iter().any(|t| t["op"].as_str().is_some_and(|op| op.starts_with("records."))) {
+        return Schemas::new();
+    }
+    let Ok(all) = client.call("records.collections", json!({})).await else { return Schemas::new() };
+    all["collections"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| Some((c["id"].as_str()?.to_owned(), c.clone())))
+        .collect()
+}
+
+/// `every 2d`, `weekdays 09:00 (local)`, `cron 0 9 * * 1 (UTC)` or `once 2026-10-10 09:00:00`.
 fn schedule(v: &Value) -> String {
     if let Some(secs) = v["every"].as_u64() {
         format!("every {}", when::format_duration(secs))
     } else if let Some(expr) = v["cron"].as_str() {
         format!("cron {expr} (UTC)")
+    } else if let Some(expr) = v["cron_local"].as_str() {
+        local_words(expr).unwrap_or_else(|| format!("cron {expr} (local)"))
     } else if let Some(at) = when::timestamp(&v["once"]) {
         format!("once {}", when::local(at))
     } else {
         render::cell(v)
     }
+}
+
+/// A local cron as `shimmer schedule` writes it, when it is one of its forms: `0 9 * * 1-5` →
+/// `weekdays 09:00 (local)`.
+fn local_words(expr: &str) -> Option<String> {
+    const NAMES: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+    let [minute, hour, "*", "*", days] = expr.split_whitespace().collect::<Vec<_>>()[..] else { return None };
+    let (minute, hour): (u32, u32) = (minute.parse().ok()?, hour.parse().ok()?);
+    let days = match days {
+        "*" => "daily".to_owned(),
+        "1-5" => "weekdays".to_owned(),
+        "0,6" => "weekends".to_owned(),
+        list => list
+            .split(',')
+            .map(|d| d.parse::<usize>().ok().and_then(|i| NAMES.get(i)).copied())
+            .collect::<Option<Vec<_>>>()?
+            .join(","),
+    };
+    (hour < 24 && minute < 60).then(|| format!("{days} {hour:02}:{minute:02} (local)"))
 }
 
 /// The protocol's `run_once` as the CLI spells it.
@@ -274,6 +514,18 @@ mod tests {
     use chrono::Duration;
 
     use super::*;
+
+    #[test]
+    fn cron_local_is_added_and_shown_as_local_time() {
+        let SchedulerCmd::Add(t) = p(&["add", "x.y", "--cron-local", "0 9 * * 1-5", "--catch-up", "skip"]).unwrap()
+        else {
+            panic!("not an add")
+        };
+        assert_eq!(t.schedule, json!({"cron_local": "0 9 * * 1-5"}));
+        assert_eq!(schedule(&t.schedule), "weekdays 09:00 (local)");
+        let both = p(&["add", "x.y", "--cron", "0 9 * * *", "--cron-local", "0 9 * * *", "--catch-up", "skip"]);
+        assert!(both.unwrap_err().contains("exactly one of"));
+    }
 
     fn p(s: &[&str]) -> std::result::Result<SchedulerCmd, String> {
         parse(s.iter().map(|w| w.to_string()).collect())
@@ -351,7 +603,7 @@ mod tests {
     fn sample(now: DateTime<Utc>) -> Value {
         json!({"triggers": [
             {"id": "usr-1", "source": {"type": "user"}, "schedule": {"every": 172_800}, "op": "records.list",
-             "params": {"collection": "leetcode"}, "catch_up": "run_once", "lane": null, "fallback": null,
+             "params": {"collection": "leetcode", "filter": {}}, "catch_up": "run_once", "lane": null, "fallback": null,
              "next_due": (now + Duration::seconds(7_201)).to_rfc3339(), "last_run": null, "paused": false, "done": false},
             {"id": "digest", "source": {"type": "module", "id": "notify"}, "schedule": {"cron": "0 9 * * 1"},
              "op": "notify.digest", "params": {}, "catch_up": "skip", "lane": "notify", "fallback": null,
@@ -362,19 +614,158 @@ mod tests {
     #[test]
     fn list_shows_each_trigger_readably() {
         let now = Utc::now();
-        let out = list(&sample(now), now);
+        let out = list(&sample(now), now, &Schemas::new());
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(
             lines[0].split_whitespace().collect::<Vec<_>>(),
-            ["ID", "OP", "SCHEDULE", "CATCH-UP", "NEXT", "LAST", "STATE", "FROM"]
+            ["ID", "COMMAND", "SCHEDULE", "CATCH-UP", "NEXT", "LAST", "STATE", "FROM"]
         );
         let row = |i: usize| lines[i].split("  ").map(str::trim).filter(|c| !c.is_empty()).collect::<Vec<_>>();
-        assert_eq!(row(1), ["usr-1", "records.list", "every 2d", "run-once", "in 2h", "never", "active", "you"]);
+        assert_eq!(
+            row(1),
+            ["usr-1", "records list leetcode", "every 2d", "run-once", "in 2h", "never", "active", "you"]
+        );
         assert_eq!(
             row(2),
-            ["digest", "notify.digest", "cron 0 9 * * 1 (UTC)", "skip", "-", "3m ago", "paused", "module notify"]
+            ["digest", "notify.digest {}", "cron 0 9 * * 1 (UTC)", "skip", "-", "3m ago", "paused", "module notify"]
         );
-        assert!(list(&json!({"triggers": []}), now).starts_with("no triggers yet"));
+        assert!(list(&json!({"triggers": []}), now, &Schemas::new()).starts_with("no triggers yet"));
+    }
+
+    fn schemas() -> Schemas {
+        let field = |name: &str, kind: &str| json!({"name": name, "type": kind});
+        let lc = json!({"id": "lc", "fields": [
+            field("title", "string"), field("number", "int"), field("url", "string"),
+            {"name": "difficulty", "type": "enum", "values": ["easy", "medium", "hard"]},
+            field("topic", "list"), field("last_solved", "date"), field("solved_without_help", "bool")]});
+        // `limit` is also a `list` option (#178): it can only be reached with --filter.
+        let jobs = json!({"id": "jobs", "fields": [
+            field("position", "string"), field("apply_by", "date"), field("limit", "int"),
+            {"name": "stage", "type": "enum", "values": ["saved", "applied", "offer"]}]});
+        Schemas::from([("lc".to_owned(), lc), ("jobs".to_owned(), jobs)])
+    }
+
+    /// Words as a shell splits them: spaces separate, single quotes keep (`'\''` is a quote).
+    fn shell_split(text: &str) -> Vec<String> {
+        let (mut out, mut word, mut quoted, mut any) = (Vec::new(), String::new(), false, false);
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' if !quoted => word.extend(chars.next()),
+                '\'' => {
+                    quoted = !quoted;
+                    any = true;
+                }
+                ' ' if !quoted => {
+                    if any || !word.is_empty() {
+                        out.push(std::mem::take(&mut word));
+                    }
+                    any = false;
+                }
+                c => word.push(c),
+            }
+        }
+        if any || !word.is_empty() {
+            out.push(word);
+        }
+        out
+    }
+
+    /// What typing `line` sends: op + params, by the parsers running the command uses.
+    fn sent(line: &str) -> (&'static str, Value) {
+        let words = shell_split(line);
+        let (op, params) = match words[0].as_str() {
+            "records" => {
+                let cmd = crate::records::parse(words[1..].to_vec()).unwrap();
+                let schema = cmd.collection().and_then(|c| schemas().get(c).cloned()).unwrap_or(Value::Null);
+                crate::records::request(&cmd, &schema).unwrap()
+            }
+            _ => crate::schedule::workspaces_op(&crate::workspaces::parse(words[1..].to_vec()).unwrap()).unwrap(),
+        };
+        (op, params)
+    }
+
+    #[test]
+    fn every_schedulable_command_reads_back_as_itself() {
+        // #186's review: parse what's typed, rebuild it from the op + params it sends, and typing the
+        // rebuilt text must send exactly the same. Commands added later belong in this list.
+        for line in [
+            "records add lc --title 'Two Sum' --number 1 --difficulty easy --topic 'array, hash'",
+            "records add lc two-sum --title Hi",
+            "records update lc/two-sum --unset url",
+            "records update lc/two-sum --add topic array --remove topic graph",
+            "records update lc/two-sum --url 'https://x.y/z?a=1&b=2' --solved-without-help true",
+            "records update lc/two-sum --title 'It'\\''s fine'",
+            "records complete lc/two-sum --last-solved 2026-10-01",
+            "records complete lc/two-sum",
+            "records reopen lc/two-sum --clear-stamp",
+            "records reopen lc/two-sum",
+            "records remove lc/two-sum --force",
+            "records restore lc/two-sum",
+            "workspaces activate site",
+            "workspaces stop site",
+            "workspaces cleanup site",
+            // Through `scheduler add`: list filters, options, and a field named like an option.
+            "records list jobs --stage offer",
+            "records list jobs --filter limit=5",
+            "records list lc --filter 'number>=3' --sort -number --limit 5 --search sum --has url --missing topic",
+            "records list jobs --or stage=offer --or 'apply_by<=2026-11-01'",
+        ] {
+            let (op, params) = sent(line);
+            let shown = command_of(&json!(op), &params, &schemas());
+            assert!(!shown.starts_with(op), "{line}\n  fell back to op + params: {shown}");
+            assert_eq!(sent(&shown), (op, params.clone()), "{line}\n  shown as: {shown}");
+        }
+    }
+
+    #[test]
+    fn a_trigger_reads_as_the_command_it_runs() {
+        let c = |op: &str, params: Value| command_of(&json!(op), &params, &schemas());
+        assert_eq!(c("workspaces.activate", json!({"id": "site"})), "workspaces activate site");
+        assert_eq!(
+            c("records.complete", json!({"collection": "lc", "id": "two-sum", "scheduled_for": "x"})),
+            "records complete lc/two-sum",
+            "scheduled_for is the scheduler's stamp, never typed"
+        );
+        // The cases from #186's review.
+        let update =
+            |fields: Value| c("records.update", json!({"collection": "lc", "id": "two-sum", "fields": fields}));
+        assert_eq!(update(json!({"url": null})), "records update lc/two-sum --unset url");
+        assert_eq!(update(json!({"topic": {"add": ["array"]}})), "records update lc/two-sum --add topic array");
+        assert_eq!(
+            c("records.reopen", json!({"collection": "lc", "id": "two-sum", "clear_stamp": true})),
+            "records reopen lc/two-sum --clear-stamp"
+        );
+        assert_eq!(
+            c("records.remove", json!({"collection": "lc", "id": "two-sum", "force": true})),
+            "records remove lc/two-sum --force"
+        );
+        assert_eq!(
+            c("records.add", json!({"collection": "lc", "fields": {"title": "Two Sum"}})),
+            "records add lc --title 'Two Sum'",
+            "quoted for a shell"
+        );
+    }
+
+    #[test]
+    fn what_cant_be_typed_exactly_shows_as_op_and_params() {
+        let c = |op: &str, params: Value| command_of(&json!(op), &params, &schemas());
+        assert_eq!(c("demo.echo", json!({"x": 1})), "demo.echo {\"x\":1}", "no command");
+        // An operator `list` has no flag for, and a field the collection doesn't have.
+        let odd = json!({"collection": "lc", "filter": {"number": {"between": [1, 2]}}});
+        assert!(c("records.list", odd).starts_with("records.list {"), "unknown operator");
+        let unknown = json!({"collection": "nosuch", "id": "x", "fields": {"n": 1}});
+        assert!(c("records.update", unknown).starts_with("records.update {"), "no schema: can't be sure of types");
+    }
+
+    #[test]
+    fn local_schedules_read_as_they_were_written() {
+        let s = |expr: &str| schedule(&json!({"cron_local": expr}));
+        assert_eq!(s("0 9 * * 1-5"), "weekdays 09:00 (local)");
+        assert_eq!(s("30 18 * * *"), "daily 18:30 (local)");
+        assert_eq!(s("5 8 * * 0,6"), "weekends 08:05 (local)");
+        assert_eq!(s("0 7 * * 1,3,5"), "mon,wed,fri 07:00 (local)");
+        assert_eq!(s("*/15 9 * * 1"), "cron */15 9 * * 1 (local)", "anything else as cron");
     }
 
     #[test]
@@ -383,8 +774,8 @@ mod tests {
         let data = sample(now);
         let usr1 = &data["triggers"][0];
         assert_eq!(usr1["id"], "usr-1");
-        let out = trigger(usr1, now);
-        assert!(out.starts_with("usr-1  (active)\n  op        records.list\n  params    {\"collection\":\"leetcode\"}\n  schedule  every 2d"), "{out}");
+        let out = trigger(usr1, now, &schemas());
+        assert!(out.starts_with("usr-1  (active)\n  command   records list leetcode\n  op        records.list\n  params    {\"collection\":\"leetcode\",\"filter\":{}}\n  schedule  every 2d"), "{out}");
         assert!(
             out.contains("  lane      the op's own") && out.contains("(in 2h)") && out.contains("  last run  never"),
             "{out}"

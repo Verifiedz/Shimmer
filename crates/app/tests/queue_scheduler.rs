@@ -124,7 +124,9 @@ fn a_trigger_fires_and_can_be_paused_resumed_and_removed() {
     let list = ok(&home, &["scheduler", "list"]);
     let row = list.lines().find(|l| l.starts_with(shown(&id))).unwrap_or_else(|| panic!("{list}"));
     assert!(
-        row.contains("records.list")
+        // Added raw, it isn't exactly what typing `records list leetcode` sends (no `filter`), so it
+        // shows as op + params: never a command that would do something else (#186's review).
+        row.contains(r#"records.list {"collection":"leetcode"}"#)
             && row.contains("every 1s")
             && row.contains("skip")
             && row.contains("active")
@@ -196,4 +198,50 @@ fn a_trigger_or_task_is_reached_by_the_ending_its_list_shows() {
     ok(&home, &["scheduler", "remove", end]);
     let o = home.shimmer(&["scheduler", "show", end]);
     assert!(stderr(&o).contains("not_found"), "{}", stderr(&o));
+}
+
+#[test]
+fn schedule_runs_a_normal_command_in_plain_words() {
+    // ADR 0031 §1: the schedule in words, then the command as you'd type it; it is stored as the
+    // op + params running it sends, an alias as its canonical command, and it fires for real.
+    let home = Home::with_leetcode();
+    ok(&home, &["records", "add", "leetcode", "two-sum", "--title", "Two Sum"]);
+    let out = ok(&home, &["schedule", "every", "1s", "--catch-up", "skip", "records", "complete", "leetcode/two-sum"]);
+    assert!(out.starts_with("✓ scheduled records complete leetcode/two-sum · every 1s"), "{out}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !ok(&home, &["records", "get", "leetcode/two-sum"]).contains("(done)") {
+        assert!(std::time::Instant::now() < deadline, "the scheduled complete never ran");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    let local = ok(
+        &home,
+        &["--json", "schedule", "weekdays", "09:00", "--catch-up", "skip", "records", "reopen", "leetcode/two-sum"],
+    );
+    let id: serde_json::Value = serde_json::from_str(&local).unwrap();
+    let t = ok(&home, &["--json", "scheduler", "show", id["trigger_id"].as_str().unwrap()]);
+    let t: serde_json::Value = serde_json::from_str(&t).unwrap();
+    assert_eq!(
+        (t["op"].as_str(), &t["schedule"]),
+        (Some("records.reopen"), &serde_json::json!({"cron_local": "0 9 * * 1-5"}))
+    );
+    // And the list reads it back as exactly what was typed (ADR 0031 §3).
+    let list = ok(&home, &["scheduler", "list"]);
+    assert!(
+        list.lines().any(|l| l.contains("records reopen leetcode/two-sum") && l.contains("weekdays 09:00 (local)")),
+        "{list}"
+    );
+
+    // Never a guessed catch-up, and only commands that make one change.
+    let o = home.shimmer(&["schedule", "daily", "09:00", "records", "add", "leetcode", "x"]);
+    assert!(!o.status.success() && stderr(&o).contains("--catch-up skip, run-once or backfill"), "{}", stderr(&o));
+    let o = home.shimmer(&["schedule", "daily", "09:00", "--catch-up", "skip", "records", "list", "leetcode"]);
+    assert!(stderr(&o).contains("can't be scheduled"), "{}", stderr(&o));
+
+    // A typo is refused when it's scheduled, not every day after (#185's review).
+    let o = home.shimmer(&["schedule", "daily", "09:00", "--catch-up", "skip", "records", "complete", "nosuch/x"]);
+    assert!(stderr(&o).contains("no collection 'nosuch'"), "{}", stderr(&o));
+    let o = home.shimmer(&["schedule", "daily", "09:00", "--catch-up", "skip", "workspaces", "activate", "nope"]);
+    assert!(stderr(&o).contains("not_found"), "{}", stderr(&o));
+    assert!(!ok(&home, &["scheduler", "list"]).contains("nope"), "nothing stored for either");
 }
