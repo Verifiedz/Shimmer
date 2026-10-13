@@ -2,7 +2,8 @@
 
 Status: proposed · Raised by Dev B · Needs sign-off: Dev A (§1 adds a `Ctx` capability and moves a
 helper into `crates/core`; §2 is daemon code; §1 and §7 change CLAUDE.md and `docs/protocol.md`,
-CLAUDE.md §4) · Dev C notified (new ops and topics, §5–§6)
+CLAUDE.md §4) · Dev C notified (new ops and topics, §5–§6) · Amends ADR 0005 (where an
+exhausted delivery goes)
 
 ## Context
 
@@ -82,8 +83,14 @@ helper is the case ADR 0014 put helpers in `core` for.
   1 of argv)' -e 'end run' <title> <body>`. The text is passed as arguments, never put into the
   script, so nothing in a message can run as AppleScript.
 - `std::process::Command` with arguments, no shell; a 5-second timeout.
-- A missing tool, or no desktop session (Shimmer started over SSH), is `unavailable`, with a message
-  that says which.
+- A missing tool, or no desktop session, is `unavailable`, with a message that says which. On Linux,
+  `notify-send` needs `DBUS_SESSION_BUS_ADDRESS` in the daemon's environment: a daemon the CLI
+  started from a terminal on the desktop has it, one started over SSH doesn't, and that's the "no
+  desktop session" case.
+- **A delivery that succeeds means "handed to the OS", not "the user saw it".** On macOS,
+  `osascript … display notification` exits 0 even when notifications are turned off for it, and
+  macOS lists the popups under Script Editor, not Shimmer. So an inbox item's `ok = true` is never
+  proof the message was seen; `shimmer notify test` is how a person checks that popups reach them.
 - **`config.toml` `[desktop] show = false`** logs each note to the daemon log instead of showing it:
   for machines with no screen, and for the end-to-end tests, which must never pop anything up on a
   developer's screen.
@@ -117,8 +124,13 @@ ok = true
   could deliver stays, with state `failed`: nothing is ever dropped (§11.3).
 - This replaces §7's `notifications/failed.jsonl`: a failed message is an inbox file like any other,
   inside notify's own namespace. CLAUDE.md §7 and §11.3 are amended to say so.
-- The inbox keeps the newest 1000 messages; older **read** ones are removed in the same transaction
-  that adds a new one. Unread messages are never removed.
+- **The inbox is capped**, so it can't fill the disk even if nobody ever reads it (most people will
+  read it in the TUI, which comes later). In the same transaction that adds a message: read
+  messages past the newest 1000 are removed, and if there are still more than 5000 in all, the
+  oldest unread ones go too. `notify.message.received` then says how many unread were removed
+  (`"removed_unread": N`), and `shimmer notify list` shows one line saying so. No message is lost
+  from the history: `notify.message.received` carries its title, body and priority, and the event
+  log keeps it.
 
 **Sinks** (§8): one trait, one small `impl` per way of reaching you.
 
@@ -151,7 +163,10 @@ meant to be committable to git (§1.4). The VM template's `SSH_PASSWORD_ITEM` wo
 1. Build the message: `title` and `body` as given; or, with `rule`, that rule's templates rendered
    with `fields`. A call from ADR 0005's fallback carries `failure_code`, `failure_reason` and
    `failure_detail`; with no `title`, notify writes one from them ("Scheduled task failed: …"). The
-   `priority` key the queue stamps is the message's priority.
+   `priority` key the queue stamps is the message's priority. A `message` key, the name ADR 0005's
+   examples and tests use (`queue/fallback.rs`), is read as `body` when there's no `body`, so a
+   fallback set up before notify existed still says what it was meant to. Any other unknown key is
+   ignored, never an error: a fallback that fails to send would be the silence it exists to prevent.
 2. Write it to the inbox (`notify.message.received`).
 3. **Quiet hours:** if it's `low` or `normal` and now is inside them, mark it `held`
    (`notify.message.held`) and stop. `high` always goes through.
@@ -169,7 +184,9 @@ meant to be committable to git (§1.4). The VM template's `SSH_PASSWORD_ITEM` wo
   hour (`Schedule::Every`, `CatchUp::Skip`), on daemon start, and on the first event notify sees
   after quiet hours end. A trigger can't be set for the configured end time itself:
   `Module::triggers()` runs before `init`, with no config. So the summary is at most an hour late,
-  and the event log gets four entries an hour, not hundreds. When calendar brings a way for a module
+  and the event log gets four entries an hour, not hundreds. That's accepted, even with quiet hours
+  unset: `triggers()` can't read config, so the trigger can't be left out, and `notify.flush` with
+  nothing held returns at once without writing anything. When calendar brings a way for a module
   to set its own one-time triggers, this becomes one trigger at the end of quiet hours, only on
   nights with held messages.
 
@@ -178,16 +195,42 @@ meant to be committable to git (§1.4). The VM template's `SSH_PASSWORD_ITEM` wo
 
 | Alert | When | Priority |
 |---|---|---|
-| `workspace_dirty` | `workspaces.session.dirty` | high: "site couldn't launch: step 2/5 failed (see log)" |
-| `scheduled_task_failed` | `queue.task.failed` with origin `scheduler`, no fallback, and code not `workspace_dirty` (that one has its own alert) | high |
+| `workspace_dirty` | `queue.task.failed` with code `workspace_dirty` and `"fallback": false`; and `workspaces.session.dirty` with `"recovered": true` | high: "site couldn't launch: step 2/5 failed (see log)" |
+| `scheduled_task_failed` | `queue.task.failed` with origin `scheduler`, `"fallback": false`, and code not `workspace_dirty` (that one has its own alert) | high |
 
-- **`queue.task.failed` gains `"fallback": true|false`** (additive, daemon side), so the second alert
-  can skip a task whose fallback already sends its own message. Without it, a failed scheduled launch
-  with a fallback would notify twice.
+- **`queue.task.failed` gains `"fallback": true|false`** (additive, daemon side): `true` only when a
+  fallback is being enqueued **for this failure**, which is `fallback::request(..).is_some()`, not
+  "the task has a fallback". The queue only sends a fallback for a structural failure
+  (`workspace_dirty`, `unavailable`, ADR 0005), so a scheduled task with a fallback that fails any
+  other way (`module_error`, `invalid_params`…) reports `false` and still gets the
+  `scheduled_task_failed` alert. `queue.fallback.enqueued` / `.failed` can't be used instead: they
+  are emitted after `queue.task.failed`, so notify would have to wait for an event that may never
+  come.
+- **One message per failure, never two.** A launch that fails `dirty` is reported by its task's
+  `queue.task.failed` (code `workspace_dirty`, its `detail` naming the step and the log), not by
+  `workspaces.session.dirty`. That one event says whether a fallback was sent: if it was, the
+  fallback's message is the only one; if not, the `workspace_dirty` alert is. The same covers a
+  scheduled activate of a workspace that was already dirty, which fails `workspace_dirty` with no
+  `session.dirty` at all. The one dirty with no failing task, a launch the daemon never finished
+  (`init` marks it dirty after a restart), is the `workspaces.session.dirty` event, which gains
+  `"recovered": true` in that case (additive, workspaces module).
 - From `on_event`, notify **enqueues** `notify.send` (`ctx.queue`); it never delivers inline. A slow
   popup never holds up the event bus, and every send shows in `shimmer queue`.
-- **Notify never reacts to its own events (`notify.*`), or to the failure of a `notify.*` task**, so
-  a failing delivery can never set off a message about itself.
+- **Notify never reacts to its own work**, in the alerts and in rules (§5) alike, so nothing it does
+  can set off another message. Every `notify.send` is a queued task, so its own work isn't only the
+  `notify.*` topics. Notify ignores an event when:
+  - its topic is `notify.*`;
+  - its payload's `op` starts with `notify.`: `queue.task.enqueued`, `.started`, `.finished`,
+    `.failed`, `.cancelled`, `.promoted` and `.reordered` of a notify task, `queue.fallback.*` (a
+    fallback is always a `notify.*` op) and `scheduler.trigger.fired` for a trigger that runs one;
+  - its payload's `trigger_id` starts with `notify.`: `scheduler.trigger.missed` and `.skipped` for
+    notify's own `notify.flush` trigger carry no `op`;
+  - its topic is `queue.task.progress`: it carries no `op`, and is never worth a message.
+
+  Without this, a rule on `queue.task.finished`, `queue.*` or `*` would match the finish of its own
+  `notify.send`, which would send again, forever: a popup and an inbox file each time. And a rule on
+  `scheduler.*` would send every hour, when `notify.flush` fires. `notify.create_rule` also refuses
+  `on = "*"`: a message for every event is never what anyone wants.
 
 ### 5. Rules and templates
 
@@ -215,13 +258,16 @@ body = "[{difficulty}, ]{collection}/{id}"
   the record's own fields from `item` are available directly too (`{difficulty}`); where a name is
   in both, the payload's wins, so `{title}` is the record's readable title (ADR 0017).
 - Rules load at `init` and reload when one is created or removed. They're matched in `on_event`, as
-  the alerts are, under the same never-react-to-notify rule.
+  the alerts are, and ignore the same events (§4: notify never reacts to its own work).
 
 A **template** makes a rule, in the format records' and workspaces' templates use: one TOML file in
 `crates/modules/notify/templates/`, a header comment with notes and "How it works" examples, a
 category, and `[[question]]` blocks as in workspace templates (ADR 0025 §3). The answers replace
 `${NAME}` in the rule when it's created, so the stored rule is plain and hand-editable (e.g. `when =
-{ collection = "${COLLECTION}" }`). Built in, kept few (the template debloat comes right after the
+{ collection = "${COLLECTION}" }`). `${NAME}` may only appear inside a quoted string in a template,
+and each answer is escaped as TOML string content (`"`, `\` and newlines), by the `toml` crate as
+workspace templates' `[env]` answers are. So an answer can never end the string early, break the file, or add a
+key such as `priority`; the created rule is parsed and checked like any rule before it's written. Built in, kept few (the template debloat comes right after the
 MVP):
 
 | Template | Makes a rule for |
@@ -273,8 +319,11 @@ shimmer notify rules · remove-rule ID
 - Every command gets a pack target and an alias in each built-in pack (ADR 0029).
 - `notify send` is one op, so `shimmer schedule` can schedule it once ADR 0031 lands:
   `shimmer schedule weekdays 09:00 --catch-up skip notify send "Standup in 15 minutes"`.
-- Docs: `docs/protocol.md` (§6's ops and topics, `queue.task.failed`'s `fallback`), mockd's fixture
-  manifest, CLAUDE.md §5 (`Ctx.desktop`), §7 (`data/notify/`), §11.3, the README.
+- Docs: `docs/protocol.md` (§6's ops and topics, `queue.task.failed`'s `fallback`,
+  `workspaces.session.dirty`'s `recovered`), mockd's fixture manifest, CLAUDE.md §5 (`Ctx.desktop`),
+  §7 (`data/notify/`), §11.3, the README, and **ADR 0005**, which still says a delivery that exhausts
+  every sink appends to `notifications/failed.jsonl` and emits `notify.exhausted`: amended to the
+  inbox and `notify.message.exhausted`.
 
 ## Consequences
 
@@ -284,7 +333,10 @@ shimmer notify rules · remove-rule ID
 - New ways to reach you are one sink each; new things to be told about are one rule or template,
   with no code.
 - `core` gains one capability and one shared helper; the daemon gains one backend and one field on
-  an event. Records' titles move onto the shared helper, unchanged.
+  an event (`queue.task.failed`'s `fallback`); workspaces gains one field on an event
+  (`workspaces.session.dirty`'s `recovered`). Records' titles move onto the shared helper, unchanged.
+- Every failure the user is told about produces one message: the fallback's, or an alert, never
+  both.
 - Built in this order, stacked in an `integration/notify` umbrella: this ADR → `core` (§1) → the
   daemon backend and `fallback` flag (§2) → the module: inbox, send, desktop, quiet hours, alerts,
   and the CLI for them (§3–§4) → rules and templates (§5) → docs (§7).
