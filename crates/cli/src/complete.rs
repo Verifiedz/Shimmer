@@ -852,6 +852,33 @@ mod tests {
     }
 
     #[test]
+    fn every_command_group_in_the_help_has_its_subcommands_read() {
+        // A group is written `NAME …` in `shimmer --help` (records, workspaces, queue…). Its
+        // subcommands only complete if `modules()` reads its help page, so a new group (fetchers,
+        // notify, calendar) has to be added there: this says so instead of it being forgotten.
+        let groups: Vec<&str> = crate::args::USAGE
+            .lines()
+            .filter(|l| l.starts_with("  ") && !l.starts_with("   "))
+            .filter_map(|l| {
+                let mut words = l.split_whitespace();
+                match (words.next(), words.next()) {
+                    (Some(name), Some("…")) => Some(name),
+                    _ => None,
+                }
+            })
+            .collect();
+        assert!(groups.contains(&"records"), "no groups found in the help: {groups:?}");
+        let read: Vec<&str> = modules().iter().map(|(m, _)| *m).collect();
+        for group in groups {
+            assert!(
+                read.contains(&group),
+                "`shimmer {group} …` is in the help, but complete.rs's modules() doesn't read its help \
+                 page, so its subcommands won't complete. Add (\"{group}\", crate::{group}::USAGE)."
+            );
+        }
+    }
+
+    #[test]
     fn every_command_in_the_help_pages_is_read() {
         let top: Vec<String> = commands(crate::args::USAGE).into_iter().map(|c| c.word).collect();
         for word in ["ping", "records", "workspaces", "queue", "scheduler", "packs", "call", "shutdown"] {
