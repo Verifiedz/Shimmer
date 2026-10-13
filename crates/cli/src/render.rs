@@ -166,6 +166,22 @@ pub fn wrap(text: &str, width: usize, indent: &str) -> String {
     lines.join(&format!("\n{indent}"))
 }
 
+/// The part of a `*.templates` reply that `templates [CATEGORY | TEMPLATE]` shows, for `--json`:
+/// the same shape, `{"templates": [...], "categories": [...]}`, with only that category's
+/// templates, or only that template (#179). `which` must already be known to be one of them
+/// (`templates_by_category` checks it); anything else gives everything.
+pub fn templates_selected(data: &Value, which: Option<&str>) -> Value {
+    let Some(which) = which else { return data.clone() };
+    let all = data["templates"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let chosen: Vec<&Value> = match all.iter().find(|t| t["id"] == which) {
+        Some(t) => vec![t],
+        None => all.iter().filter(|t| t["category"] == which).collect(),
+    };
+    let mut out = data.clone();
+    out["templates"] = serde_json::json!(chosen);
+    out
+}
+
 /// The templates a `*.templates` op sent (`records`, `workspaces`), grouped under their
 /// categories' headings in the daemon's order. With `which`: only that category's, or that one
 /// template as `in_full` shows it. `kind` names the commands in the footer and in mistakes;
@@ -252,6 +268,21 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn json_for_templates_shows_what_the_text_shows() {
+        // #179: `templates CATEGORY --json` returned every template.
+        let data = serde_json::json!({
+            "templates": [{"id": "leetcode", "category": "practice"}, {"id": "jobs", "category": "job-hunt"},
+                          {"id": "offers", "category": "job-hunt"}],
+            "categories": [{"id": "job-hunt"}, {"id": "practice"}]
+        });
+        let ids = |v: Value| v["templates"].as_array().unwrap().iter().map(|t| cell(&t["id"])).collect::<Vec<_>>();
+        assert_eq!(ids(templates_selected(&data, Some("job-hunt"))), ["jobs", "offers"]);
+        assert_eq!(ids(templates_selected(&data, Some("leetcode"))), ["leetcode"]);
+        assert_eq!(templates_selected(&data, None), data);
+        assert_eq!(templates_selected(&data, Some("practice"))["categories"], data["categories"], "headings kept");
+    }
 
     #[test]
     fn ping_shows_uptime() {

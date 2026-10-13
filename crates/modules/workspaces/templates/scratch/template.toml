@@ -9,6 +9,7 @@ good_to_know = [
     "Each activate makes a NEW folder (2026-10-07-python, -2, -3…) unless NEW_FOLDER = once-a-day",
     "Never deletes anything. With KEEP_DAYS, old scratch folders it made go to the trash (you can get them back), and only ones untouched that long",
     "Any language works: about 30 have a starter file; for others give a file name like main.odin and a RUN_COMMAND",
+    "On macOS, the first time it opens a Terminal or iTerm window, macOS asks whether the program that started Shimmer (Terminal, iTerm, or sshd-keygen-wrapper over SSH) may control it: allow it, or no window can open. You can change it later in System Settings › Privacy & Security › Automation",
 ]
 on_stop = "Closes the terminal it opened where it can. The folder is always kept, and your editor stays open."
 
