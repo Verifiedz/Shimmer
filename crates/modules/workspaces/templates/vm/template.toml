@@ -11,6 +11,7 @@ good_to_know = [
     "Never stores a password. Best: an SSH key (ssh-copy-id once). Otherwise ssh asks you itself, or SSH_PASSWORD_ITEM names a macOS Keychain or Linux keyring entry that ssh reads when it connects",
     "Starts the VM only if it isn't running, then waits (up to 5 minutes) until it answers on its SSH port",
     "Run Shimmer on the computer that hosts the VM",
+    "On macOS, the first time it opens a Terminal or iTerm window, macOS asks whether the program that started Shimmer (Terminal, iTerm, or sshd-keygen-wrapper over SSH) may control it: allow it, or no window can open. You can change it later in System Settings › Privacy & Security › Automation",
 ]
 on_stop = "Suspends it, shuts it down or leaves it running, as you chose (ON_STOP), but only if this workspace started it: a VM you started yourself is left running. Closes the SSH terminal (and virt-viewer) where it can. Your editor stays open."
 
