@@ -183,7 +183,7 @@ fn show(name: &str, env: &Env) -> Result<String> {
         .collect();
     Ok(format!(
         "{}  ({}, {from})\n\n{}\n\nTurn it on with: shimmer packs use {}",
-        pack.id,
+        crate::style::paint(crate::style::Role::Name, &pack.id),
         pack.label,
         table(&["ALIAS".into(), "RUNS".into()], &rows),
         pack.id

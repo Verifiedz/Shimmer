@@ -8,6 +8,7 @@ use shimmer_core::{Error, Result};
 use crate::client::Client;
 use crate::flags::Flags;
 use crate::render::{self, table};
+use crate::style::{paint, Role};
 use crate::when;
 
 pub const USAGE: &str = "usage: shimmer queue <command>
@@ -150,8 +151,9 @@ fn task(t: &Value, now: DateTime<Utc>) -> String {
     let time = |v: &Value| {
         when::timestamp(v).map_or("-".into(), |at| format!("{} ({})", when::local(at), when::relative(at, now)))
     };
-    let mut out = format!("{}  ({})\n", render::cell(&t["task_id"]), render::cell(&t["status"]));
-    let mut line = |label: &str, value: String| out.push_str(&format!("  {label:<10}{value}\n"));
+    let id = paint(Role::Name, &render::cell(&t["task_id"]));
+    let mut out = format!("{id}  ({})\n", crate::style::state(&render::cell(&t["status"])));
+    let mut line = |label: &str, value: String| out.push_str(&format!("  {}{value}\n", crate::style::label(label, 10)));
     line("op", render::cell(&t["op"]));
     line("lane", render::cell(&t["lane"]));
     line("from", origin(&t["origin"]));

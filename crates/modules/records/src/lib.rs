@@ -634,6 +634,8 @@ impl Records {
         Ok(wire)
     }
 
+    /// A new collection from a template: its text copied with only the id (and label) changed,
+    /// checked, and written with its event in one transaction. Never overwrites (ADR 0022 §2).
     fn create_collection(&self, ctx: &Ctx, p: CreateCollection) -> Result<Value> {
         new_collection_id(&p.id)?;
         let Some(text) = templates::find(&p.template) else {
