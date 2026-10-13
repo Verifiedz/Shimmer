@@ -68,6 +68,12 @@ a clone you moved), re-run with `--force` to replace it.
 
 One thing to know: the daemon keeps running the binary it was started from. After changing daemon
 or module code, run `shimmer shutdown` and the next command starts a daemon with your new code.
+The same goes for an installed copy: a daemon started by another `shimmer` (say, one from
+`cargo install`) keeps serving your new client with its old code, and nothing warns you. If
+output looks out of date, `shimmer shutdown` first.
+
+The launcher and `cargo install --path crates/app` both write `~/.cargo/bin/shimmer`, so use one
+or the other. Each refuses to replace the other's file unless given `--force`.
 
 ## Before every push
 
@@ -86,6 +92,30 @@ cargo test --workspace
 `check-deps.py` enforces who may depend on whom. In short: modules never depend on each other
 or on `store`/`daemon`, and clients (`cli`, `tui`, `mockd`) depend only on `core` and `proto`.
 If it fails, the fix is almost always to emit an event instead of making a direct call.
+
+## Tests
+
+`cargo test --workspace` runs everything. Most tests are unit tests next to the code; module
+tests use the in-memory `Ctx` (below), never a real filesystem.
+
+The end-to-end tests in `crates/app/tests/` run the real `shimmer` binary and a real daemon, each
+in its own throwaway Shimmer folder, so they never touch your data:
+
+| File | Covers |
+|---|---|
+| `m0.rs`, `m1.rs` | The M0 and M1 definitions of done (CLAUDE.md §14) |
+| `system.rs` | What the MVP promises a user, from an empty Shimmer folder |
+| `records_templates.rs` | Every records template, its "How it works" examples run as written |
+| `workspaces.rs`, `templates_e2e.rs` | Workspaces with real scripts; every workspace template from create to remove |
+| `queue_scheduler.rs` | The queue and scheduler commands, with real launches and a real trigger firing |
+| `packs.rs` | Command packs: aliases after `shimmer` and on their own |
+| `index_recovery.rs` | A corrupt `index.sqlite` never stops the daemon starting |
+
+Run one file with `cargo test -p shimmer --test system`, or one test by adding part of its name.
+
+Some things only a real machine can show (windows opening, a VM starting). For workspaces,
+`.dev/test-workspaces-34.sh` runs the M3 checks on your machine, in a throwaway folder, and writes
+a pass/fail log (issue #34).
 
 ## Who owns what
 
@@ -227,8 +257,8 @@ test never touches the real filesystem, network or system time.
 
 `shimmer mockd` serves the real protocol from canned responses and a scripted event timeline, so you
 can build or test a client without a real daemon. It's the main tool for front-end work: the TUI
-(`crates/tui`, Dev C) is built against `mockd` and `docs/protocol.md` alone, so it never waits on
-daemon changes. `mockd` is a server built like a client: it depends only on `core` and `proto`.
+(`crates/tui`, Dev C's, not started yet) is to be built against `mockd` and `docs/protocol.md`
+alone, so it never waits on daemon changes. `mockd` is a server built like a client: it depends only on `core` and `proto`.
 Start it with:
 
 ```sh
