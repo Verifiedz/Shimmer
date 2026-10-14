@@ -225,6 +225,57 @@ shimmer --help                # every command
 Add `--json` to any command to see the daemon's raw reply, and `--socket PATH` to talk to a
 daemon on a socket other than the default.
 
+### Tab completion
+
+Tab can complete commands, options, and your own workspaces, collections, records and
+templates (and the active pack's aliases), the way it does for `git` or `cargo`:
+
+```sh
+shimmer wor<Tab>                          # shimmer workspaces
+shimmer workspaces activate <Tab>         # your workspaces
+shimmer records complete <Tab>            # lc/   then <Tab> again: lc/two-sum
+shimmer records list lc --difficulty <Tab>   # easy  medium  hard
+```
+
+Set it up once, by adding one line to your shell's startup file:
+
+| Shell | Add this line | To |
+|---|---|---|
+| bash | `source <(shimmer completions bash)` | `~/.bashrc` |
+| zsh | `source <(shimmer completions zsh)` | `~/.zshrc`, after `compinit` |
+| fish | `shimmer completions fish \| source` | `~/.config/fish/config.fish` |
+
+Then open a new terminal and try `shimmer wor<Tab>`. In bash, press Tab twice to see the list
+when more than one thing matches.
+
+- **zsh needs `compinit`.** Most setups (oh-my-zsh, prezto, many distributions' `~/.zshrc`)
+  already run it. If yours doesn't, put `autoload -Uz compinit && compinit` above the line;
+  without it, loading says `shimmer: load completion after compinit`.
+- **bash** needs nothing else (not even the `bash-completion` package; macOS's bash 3.2 works).
+- **With the dev launcher,** that line would run `cargo` each time a terminal opens, rebuilding
+  first if the code changed. Save the script once instead, and load the file:
+  ```sh
+  shimmer completions bash > ~/.shimmer-completion.bash     # or zsh / fish
+  echo 'source ~/.shimmer-completion.bash' >> ~/.bashrc
+  ```
+  It calls the built binary directly, so Tab stays instant. Save it again after switching
+  pack (it lists the pack's aliases) and, in zsh, after commands are added (its colours list
+  them).
+- **After `shimmer packs use NAME`,** open a new terminal so the pack's aliases complete.
+- **Without a daemon running,** completion doesn't start one: you still get commands and
+  options, and your own names once the daemon is up (any `shimmer` command starts it).
+
+What each shell shows:
+
+| | bash | zsh | fish |
+|---|---|---|---|
+| The suggestions | ✓ | ✓ | ✓ |
+| What each one is, next to it | – | ✓ | ✓ |
+| Grouped and coloured | – | ✓ (Shimmer's colours) | your fish theme |
+
+In zsh, the suggestions are grouped and coloured in Shimmer's palette; a `[colors]` section changes
+them, and `NO_COLOR=1` turns them off. bash can't show descriptions.
+
 ### Contributing
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the checks to run before pushing, and the

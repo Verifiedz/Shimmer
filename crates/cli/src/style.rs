@@ -81,12 +81,22 @@ impl Palette {
     }
 
     fn start(&self, role: Role) -> String {
+        format!("\x1b[{}m", self.code(role))
+    }
+
+    fn rgb(&self, role: Role) -> (u8, u8, u8) {
+        self.rgb[Role::ALL.iter().position(|x| *x == role).expect("every role is in ALL")]
+    }
+
+    /// `role`'s SGR code, without the escape around it: `1;38;2;114;94;255`, or `1;34` in 16
+    /// colours. zsh's `list-colors` takes these (#188).
+    pub fn code(&self, role: Role) -> String {
         if !self.truecolor {
-            return format!("\x1b[{}m", role.basic());
+            return role.basic().to_owned();
         }
-        let (r, g, b) = self.rgb[Role::ALL.iter().position(|x| *x == role).expect("every role is in ALL")];
+        let (r, g, b) = self.rgb(role);
         let bold = if role == Role::Heading { "1;" } else { "" };
-        format!("\x1b[{bold}38;2;{r};{g};{b}m")
+        format!("{bold}38;2;{r};{g};{b}")
     }
 }
 
@@ -115,6 +125,13 @@ pub fn init(no_color_flag: bool, json: bool, overrides: &BTreeMap<String, (u8, u
     };
     let _ = OUT.set(palette(std::io::stdout().is_terminal()));
     let _ = ERR.set(palette(std::io::stderr().is_terminal()));
+}
+
+/// The palette for a shell script that colours later, at the terminal (#188): never off, since
+/// the script itself checks `NO_COLOR` when it runs. True colour as `COLORTERM` says now.
+pub fn for_script(overrides: &BTreeMap<String, (u8, u8, u8)>) -> Palette {
+    let truecolor = std::env::var("COLORTERM").is_ok_and(|v| v == "truecolor" || v == "24bit");
+    Palette::new(truecolor, overrides)
 }
 
 fn out() -> Option<&'static Palette> {
@@ -360,6 +377,12 @@ mod tests {
         assert_eq!(state_role("todo"), None, "nothing to say about it: plain");
         assert_eq!(state_role("ready"), None);
         assert_eq!(state("dirty"), "dirty", "never initialised here: plain");
+    }
+
+    #[test]
+    fn a_role_as_a_shell_script_writes_it() {
+        assert_eq!(palette(true).code(Role::Heading), "1;38;2;114;94;255");
+        assert_eq!(palette(false).code(Role::Name), "36");
     }
 
     #[test]
