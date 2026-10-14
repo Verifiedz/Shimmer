@@ -9,6 +9,7 @@ mod autostart;
 mod client;
 mod complete;
 mod csv;
+mod doctor;
 mod editor;
 mod first;
 mod flags;
@@ -80,7 +81,9 @@ async fn run_line(alias: Option<String>, args: Vec<String>) -> ExitCode {
     let colors = active.pack.as_ref().map(|p| p.colors.clone()).unwrap_or_default();
     style::init(front.no_color, front.args.iter().any(|a| a == "--json"), &colors);
     // `shimmer packs …` reports pack problems itself, and needs no aliases: no warning there.
-    let packs_command = packs::active::command_word(&front.args).is_some_and(|i| front.args[i] == "packs");
+    // `shimmer doctor` lists them in its report instead.
+    let packs_command =
+        packs::active::command_word(&front.args).is_some_and(|i| front.args[i] == "packs" || front.args[i] == "doctor");
     if !packs_command {
         for warning in &active.warnings {
             eprintln!("{} {warning}", style::paint_err(style::Role::Warning, "shimmer:"));
@@ -134,6 +137,10 @@ async fn run_line(alias: Option<String>, args: Vec<String>) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Doctor reports even when the daemon can't be reached, and sets its own exit code.
+    if args.command == Command::Doctor {
+        return doctor::run(&args, &active.warnings).await;
+    }
     match execute(&args, help).await {
         Ok(Some(text)) => {
             // Output showing people's own data is printed as drawn: its tables are coloured as
@@ -193,6 +200,7 @@ fn usage_for(args: &[String]) -> &'static str {
             "queue" => return queue::USAGE,
             "scheduler" => return scheduler::USAGE,
             "packs" => return packs::cmd::USAGE,
+            "doctor" => return doctor::USAGE,
             _ => return USAGE,
         }
     }
@@ -229,6 +237,7 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
         Command::Workspaces(WorkspacesCmd::Help) => return Ok(Some(workspaces::USAGE.into())),
         Command::Queue(QueueCmd::Help) => return Ok(Some(queue::USAGE.into())),
         Command::Scheduler(SchedulerCmd::Help) => return Ok(Some(scheduler::USAGE.into())),
+        Command::DoctorHelp => return Ok(Some(doctor::USAGE.into())),
         // Packs live entirely in the client: no daemon needed.
         Command::Packs(cmd) => return packs::cmd::run(cmd, &packs::cmd::Env::from_process()).map(Some),
         _ => {}
@@ -256,6 +265,8 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
         Command::Shutdown => (ops::CORE_SHUTDOWN, json!({})),
         Command::Call { op, params, .. } => (op.as_str(), params.clone()),
         Command::Help
+        | Command::Doctor
+        | Command::DoctorHelp
         | Command::Records(_)
         | Command::Workspaces(_)
         | Command::Queue(_)
@@ -322,6 +333,8 @@ fn output(args: &Args, data: &Value) -> String {
         Command::Shutdown => render::shutdown(),
         Command::Call { .. }
         | Command::Help
+        | Command::Doctor
+        | Command::DoctorHelp
         | Command::Records(_)
         | Command::Workspaces(_)
         | Command::Queue(_)
@@ -333,7 +346,7 @@ fn output(args: &Args, data: &Value) -> String {
 /// The daemon is this same binary, run as `shimmer daemon`. Symlinks are resolved: started as
 /// `ikuzo` through a pack link, the binary must not start the daemon as `ikuzo daemon`, which
 /// would run the alias (ADR 0013 §10).
-fn daemon_exe() -> Result<PathBuf> {
+pub(crate) fn daemon_exe() -> Result<PathBuf> {
     std::env::current_exe()
         .and_then(|p| p.canonicalize())
         .map_err(|e| Error::unavailable(format!("cannot find the shimmer binary to start the daemon: {e}")))

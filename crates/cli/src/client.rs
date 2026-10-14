@@ -28,6 +28,8 @@ pub struct Client {
     subscribed: bool,
     /// Events that arrived while waiting for a response, oldest first.
     events: VecDeque<Event>,
+    /// What the daemon's `welcome` said it is.
+    daemon_version: String,
 }
 
 impl Client {
@@ -36,7 +38,14 @@ impl Client {
     pub async fn connect(socket: &Path) -> std::result::Result<Self, ConnectError> {
         let stream = UnixStream::connect(socket).await.map_err(ConnectError::Io)?;
         let (rd, wr) = stream.into_split();
-        let mut client = Self { rd: BufReader::new(rd), wr, next_id: 0, subscribed: false, events: VecDeque::new() };
+        let mut client = Self {
+            rd: BufReader::new(rd),
+            wr,
+            next_id: 0,
+            subscribed: false,
+            events: VecDeque::new(),
+            daemon_version: String::new(),
+        };
         client.handshake().await.map_err(ConnectError::Protocol)?;
         Ok(client)
     }
@@ -52,10 +61,18 @@ impl Client {
             .await
             .map_err(|_| Error::unavailable("daemon did not answer the handshake"))??;
         match frame {
-            ServerFrame::Welcome { .. } => Ok(()),
+            ServerFrame::Welcome { daemon_version, .. } => {
+                self.daemon_version = daemon_version;
+                Ok(())
+            }
             ServerFrame::Error { error, .. } => Err(error),
             other => Err(Error::bad_request(format!("expected welcome, got {}", kind(&other)))),
         }
+    }
+
+    /// The version the daemon gave in its `welcome`.
+    pub fn daemon_version(&self) -> &str {
+        &self.daemon_version
     }
 
     /// Send one request and wait for its response. Events arriving meanwhile are kept for

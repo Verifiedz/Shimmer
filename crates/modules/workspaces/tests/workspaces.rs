@@ -94,8 +94,74 @@ fn it_declares_its_lane_the_process_capability_and_the_protocol_ops() {
             ("workspaces.create".to_owned(), Execution::Inline),
             ("workspaces.answers".to_owned(), Execution::Inline),
             ("workspaces.reconfigure".to_owned(), Execution::Inline),
+            ("workspaces.health".to_owned(), Execution::Inline),
         ]
     );
+}
+
+// ---------------------------------------------------------------- health
+
+#[tokio::test]
+async fn health_is_one_ok_line_when_nothing_is_wrong() {
+    let (w, env) = setup().await;
+    let before = topics(&env).len();
+    let data = call(&w, &env, "workspaces.health", json!({})).await.unwrap();
+    assert_eq!(data, json!({"checks": [{"status": "ok", "message": "1 workspace, all fine"}]}));
+    assert_eq!(topics(&env).len(), before, "nothing written");
+}
+
+#[tokio::test]
+async fn health_reports_dirty_broken_and_unstoppable_workspaces_with_a_fix() {
+    let (w, env) = setup().await;
+    put(&env, "deep-work/state.toml", DIRTY_STATE);
+    // No workspace.toml at all.
+    put(&env, "broken/steps/01-a.sh", "true\n");
+    // A detached step and no cleanup script.
+    put(
+        &env,
+        "loose/workspace.toml",
+        "[workspace]\nlabel = \"Loose\"\n\n[[step]]\nname = \"editor\"\nmode = \"detached\"\n",
+    );
+    put(&env, "loose/steps/01-editor.sh", "code .\n");
+
+    let data = call(&w, &env, "workspaces.health", json!({})).await.unwrap();
+    let checks = data["checks"].as_array().unwrap();
+    let by = |id: &str| checks.iter().filter(|c| c["subject"] == id).collect::<Vec<_>>();
+
+    let broken = by("broken");
+    assert_eq!((broken.len(), &broken[0]["status"]), (1, &json!("fail")), "{data}");
+    assert!(
+        broken[0]["message"].as_str().unwrap().contains("broken can't be used: there is no workspace.toml"),
+        "{data}"
+    );
+
+    let dirty = by("deep-work");
+    assert_eq!(dirty[0]["status"], "fail");
+    let message = dirty[0]["message"].as_str().unwrap();
+    assert!(
+        message.contains("1/2 setup")
+            && message.contains("exit code 1")
+            && message.contains("logs/deep-work-01JD2T.log")
+    );
+    // It has a cleanup script, so that's the fix.
+    assert_eq!(dirty[0]["fix"]["op"], "workspaces.cleanup");
+    assert_eq!(dirty[0]["fix"]["params"], json!({"id": "deep-work"}));
+
+    let loose = by("loose");
+    assert_eq!(loose[0]["status"], "warn", "{data}");
+    assert!(loose[0]["message"].as_str().unwrap().contains("no cleanup script"));
+    assert_eq!(checks.len(), 3, "no ok line when something is wrong: {data}");
+}
+
+#[tokio::test]
+async fn health_suggests_reset_for_a_dirty_workspace_with_no_cleanup_script() {
+    let (w, env) = setup().await;
+    env.ctx.store.delete("deep-work/cleanup.sh").unwrap();
+    put(&env, "deep-work/workspace.toml", &DEEP_WORK.replace("[cleanup]\ntimeout_s = 30\n", ""));
+    put(&env, "deep-work/state.toml", DIRTY_STATE);
+    let data = call(&w, &env, "workspaces.health", json!({})).await.unwrap();
+    let fixes: Vec<&Value> = data["checks"].as_array().unwrap().iter().map(|c| &c["fix"]).collect();
+    assert_eq!(fixes[0]["op"], "workspaces.reset", "{data}");
 }
 
 // ---------------------------------------------------------------- list
