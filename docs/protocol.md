@@ -287,11 +287,11 @@ Clients should offer: run cleanup, force relaunch, or open the log. Never auto-f
   ]}}
 ```
 
-Illustrative excerpt — `records` actually registers twenty-two ops (`records.collections`,
+Illustrative excerpt — `records` actually registers twenty-three ops (`records.collections`,
 `.templates`, `.create_collection`,
 `.add`, `.get`, `.list`, `.update`, `.complete`, `.reopen`, `.rename`, `.remove`, `.restore`,
 `.trash`, `.purge`, `.check`, `.rename_field`, `.rename_collection`, `.copy_collection`,
-`.remove_collection`, `.restore_collection`, `.purge_collection`, `.import`) and fifteen topics; see "Records
+`.remove_collection`, `.restore_collection`, `.purge_collection`, `.import`, `.health`) and fifteen topics; see "Records
 ops" below and `docs/decisions/0008-records-collections-and-storage.md` for the full list.
 This example only shows two commands to keep the shape readable.
 
@@ -373,6 +373,7 @@ emails.
 | `workspaces.answers` | inline | `{"id"}` | `{"id","template","questions":[…as workspaces.templates],"answers":{NAME: value or null}}`: the template the workspace was made from (its `.template` file, or the "Created from Shimmer's X template" line in `workspace.toml`) and its current answers. `invalid_params` for a workspace made by hand. ADR 0025 §9. |
 | `workspaces.reconfigure` | inline | `{"id","values":{NAME: answer}}` | `{"id","template","changed":[{"name","from","to"}]}`. Only while `ready` (`conflict` when active, launching or dirty: cleanup reads the answers). Only `[env]` in `workspace.toml` is rewritten; changed answers are checked as `create` checks them; an empty one clears an optional question. Nothing changed: nothing written. ADR 0025 §9. |
 | `workspaces.create` | inline | `{"id","template","values"?,"label"?}` | The new workspace, as `workspaces.status` shows it (state `ready`). `values` maps question names to strings; left out means the default, or empty. Every answer is written to the workspace's `[env]`. A missing required answer, an unknown question, or an answer that doesn't fit its kind (`folder`/`file` must be absolute, `url`s must start with `http://` or `https://`) is `invalid_params` naming the question; an unknown template is `not_found` naming the ones there are; anything already at `data/workspaces/<id>/` is `conflict`, never overwritten. One transaction writes the folder and emits `workspaces.workspace.created`. ADR 0025. |
+| `workspaces.health` | inline | `{}` | `{"checks":[…]}` in the shape ADR 0033 sets: a `fail` for each workspace that can't be read and each dirty one (fix: `workspaces.cleanup`, or `workspaces.reset` with no cleanup script), a `warn` for each with a detached step and no cleanup script, or one `ok` line. Writes nothing. |
 
 `state` is one of `ready`, `launching`, `active`, `dirty`, or `invalid` when the workspace's
 `workspace.toml` or `state.toml` can't be read; `error` then says why, one problem per line
@@ -426,6 +427,7 @@ after a step has run leaves it `dirty`.
 | `records.remove_collection` | inline | `{"id","confirm"?}` | `{"removed":true,"records":N}`. Without a matching `confirm`, `confirmation_required` with `detail: {"records":N}`; re-send with `"confirm": {"records":N}`. Moves everything to `data/records/removed-collections/<id>/`; emits `records.collection.removed`. |
 | `records.restore_collection` | inline | `{"id"}` | The collection, back with its records and trash; emits `records.collection.restored`. |
 | `records.purge_collection` | inline | `{"id","confirm"?}` | `{"purged":true,"records":N}`. Permanently deletes a removed collection: its file, its records and its trash, `N` counting both. Without a matching `confirm`, `confirmation_required` with `detail: {"records":N}`; re-send with `"confirm": {"records":N}`. `not_found` when there's no removed collection by that id; a live collection with the same id is never touched. Emits `records.collection.purged`. ADR 0021 §5a. |
+| `records.health` | inline | `{}` | `{"checks":[…]}` in the shape ADR 0033 sets: a `fail` for each collection file that won't load, a `warn` for each collection with records `records.check` finds problems in (fix: `records.check` on it), or one `ok` line. Writes nothing. |
 
 All inline — nothing here is slow enough to queue. Items on the wire are flat:
 `{"id","status",<every schema field>}`, with unset fields as `null`. `filter` on

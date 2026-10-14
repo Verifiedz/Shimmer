@@ -195,6 +195,11 @@ impl Module for Records {
                 json!({"type": "object", "required": ["id"], "properties": {
                     "id": {"type": "string"}, "confirm": {"type": "object"}}}),
             ),
+            (
+                "records.health",
+                "Check every collection and its records for problems; changes nothing (ADR 0033)",
+                json!({"type": "object"}),
+            ),
         ]
         .into_iter()
         .map(|(op, summary, params_schema)| CommandSpec {
@@ -237,6 +242,7 @@ impl Module for Records {
             "records.purge_collection" => self.purge_collection(ctx, decode(params)?),
             "records.import" => self.import(ctx, decode(params)?),
             "records.purge" => self.purge(ctx, decode(params)?),
+            "records.health" => self.health(ctx),
             _ => Err(Error::unknown_op(format!("records has no op '{op}'"))),
         }
     }
@@ -705,6 +711,42 @@ impl Records {
             }
         }
         Ok(json!({"checked": checked, "problems": out}))
+    }
+
+    /// What `shimmer doctor` shows for records (ADR 0033): a collection file that won't load, and
+    /// each collection whose records `records.check` finds problems in. Writes nothing.
+    fn health(&self, ctx: &Ctx) -> Result<Value> {
+        let listed = self.collections(ctx)?;
+        let mut checks = Vec::new();
+        for problem in listed["skipped"].as_array().into_iter().flatten() {
+            let message = problem.as_str().unwrap_or_default();
+            checks.push(json!({"status": "fail", "message": message,
+                "fix": {"summary": "fix or remove the collection file; its records can't be used until then"}}));
+        }
+        let (mut collections, mut records) = (0, 0);
+        for c in listed["collections"].as_array().into_iter().flatten() {
+            let id = c["id"].as_str().unwrap_or_default();
+            let report = self.check(ctx, CollectionOnly { collection: id.to_owned() })?;
+            collections += 1;
+            records += report["checked"].as_u64().unwrap_or(0);
+            let bad = report["problems"].as_array().map_or(0, Vec::len);
+            if bad > 0 {
+                let what = if bad == 1 { "1 record doesn't".to_owned() } else { format!("{bad} records don't") };
+                checks.push(json!({"status": "warn", "subject": id,
+                    "message": format!("{id}: {what} fit the collection"),
+                    "fix": {"summary": "see which, and why", "op": "records.check", "params": {"collection": id}}}));
+            }
+        }
+        if checks.is_empty() {
+            let s = |n: u64, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+            let message = format!(
+                "{} and {}, all fine",
+                s(collections, "collection", "collections"),
+                s(records, "record", "records")
+            );
+            checks.push(json!({"status": "ok", "message": message}));
+        }
+        Ok(json!({"checks": checks}))
     }
 
     /// Rename a field in the collection file (comments kept) and in every record that has it,

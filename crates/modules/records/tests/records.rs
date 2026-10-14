@@ -925,6 +925,34 @@ async fn check_reports_what_does_not_fit_and_changes_nothing() {
 }
 
 #[tokio::test]
+async fn health_is_one_ok_line_when_every_collection_is_fine() {
+    let (r, env) = setup().await;
+    add_two_sum(&r, &env).await;
+    let data = call(&r, &env, "records.health", json!({})).await.unwrap();
+    assert_eq!(data, json!({"checks": [{"status": "ok", "message": "1 collection and 1 record, all fine"}]}));
+}
+
+#[tokio::test]
+async fn health_reports_unloadable_collections_and_records_that_dont_fit() {
+    let (r, env) = setup().await;
+    add_two_sum(&r, &env).await;
+    env.ctx.store.write("items/leetcode/bad.toml", "difficulty = \"trivial\"\n").unwrap();
+    env.ctx.store.write("collections/broken.toml", "[collection\n").unwrap();
+    let before = topics(&env).len();
+
+    let data = call(&r, &env, "records.health", json!({})).await.unwrap();
+    let checks = data["checks"].as_array().unwrap();
+    assert_eq!(checks.len(), 2, "{data}");
+    assert_eq!(checks[0]["status"], "fail");
+    assert!(checks[0]["message"].as_str().unwrap().contains("broken"), "{data}");
+    assert_eq!(checks[1]["status"], "warn");
+    assert_eq!(checks[1]["message"], "leetcode: 1 record doesn't fit the collection");
+    assert_eq!(checks[1]["fix"]["op"], "records.check");
+    assert_eq!(checks[1]["fix"]["params"], json!({"collection": "leetcode"}));
+    assert_eq!(topics(&env).len(), before, "nothing written");
+}
+
+#[tokio::test]
 async fn rename_field_moves_values_everywhere_in_one_step() {
     let (r, env) = setup().await;
     add_two_sum(&r, &env).await;

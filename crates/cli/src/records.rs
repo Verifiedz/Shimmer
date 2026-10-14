@@ -822,8 +822,9 @@ fn with_set(flags: Flags) -> std::result::Result<Flags, String> {
         .into_iter()
         .map(|(name, value)| match name.as_str() {
             "set" => match value.split_once('=') {
-                Some((field, v)) if !field.is_empty() => Ok((field.to_owned(), v.to_owned())),
-                _ => Err(format!(
+                Some(("", _)) => Err("--set needs a field name before the '=', e.g. --set unset=yes".to_owned()),
+                Some((field, v)) => Ok((field.to_owned(), v.to_owned())),
+                None => Err(format!(
                     "--set takes FIELD=VALUE, e.g. --set unset=yes (to set a field named 'set': --set set={value})"
                 )),
             },
@@ -855,10 +856,11 @@ fn shadowed_fields(cmd: &RecordsCmd, schema: &Value) -> Vec<String> {
                 ("remove", items.iter().any(|i| !i.add), "removes from a list field"),
             ]);
         }
-        RecordsCmd::Reopen { clear_stamp: true, .. } if field(schema, "clear_stamp").is_some() => {
-            return vec!["(--clear-stamp clears the date completing set; to change the field 'clear_stamp', \
-                         use records update … --set clear_stamp=VALUE)"
-                .to_owned()];
+        RecordsCmd::Reopen { collection, id, clear_stamp: true } if field(schema, "clear_stamp").is_some() => {
+            return vec![format!(
+                "(--clear-stamp clears the date completing set; to change the field 'clear_stamp', \
+                 use shimmer records update {collection}/{id} --set clear_stamp=VALUE)"
+            )];
         }
         _ => return Vec::new(),
     };
@@ -900,7 +902,8 @@ fn field<'a>(schema: &'a Value, name: &str) -> Option<&'a Value> {
 fn typed(schema: &Value, flag: &str, raw: &str) -> Result<(String, Value)> {
     let name = field_name(schema, flag);
     let kind = field(schema, &name).and_then(|f| f["type"].as_str()).unwrap_or("string");
-    let bad = |want: &str| Error::invalid_params(format!("--{flag} expects {want}, got '{raw}'"));
+    // Names the field, not the option: with `--set unset=x` there is no `--unset` (#217).
+    let bad = |want: &str| Error::invalid_params(format!("field '{name}' expects {want}, got '{raw}'"));
     let value = match kind {
         "int" => Value::from(raw.parse::<i64>().map_err(|_| bad("a whole number"))?),
         "bool" => Value::Bool(match raw {
@@ -2343,6 +2346,12 @@ mod tests {
         );
         let e = parse_words(&["update", "t/x", "--set", "nope"]).unwrap_err();
         assert!(e.contains("--set takes FIELD=VALUE") && e.contains("--set set=nope"), "{e}");
+        // #217: an empty field name says so, rather than suggesting `--set set==v`.
+        let e = parse_words(&["update", "t/x", "--set", "=v"]).unwrap_err();
+        assert_eq!(e, "--set needs a field name before the '=', e.g. --set unset=yes");
+        // #217: a type error names the field, since the option `--unset` was never typed.
+        let e = request(&p(&["update", "t/x", "--set", "unset=many"]), &schema).unwrap_err();
+        assert_eq!(e.message, "field 'unset' expects a whole number, got 'many'");
     }
 
     #[test]
@@ -2358,7 +2367,7 @@ mod tests {
         );
         assert!(shadowed_fields(&p(&["complete", "t/x", "--set", "add=1"]), &schema).is_empty(), "--set used: no hint");
         let reopen = shadowed_fields(&p(&["reopen", "t/x", "--clear-stamp"]), &schema);
-        assert!(reopen[0].contains("use records update … --set clear_stamp=VALUE"), "{reopen:?}");
+        assert!(reopen[0].contains("use shimmer records update t/x --set clear_stamp=VALUE"), "{reopen:?}");
         assert!(shadowed_fields(&p(&["reopen", "t/x", "--clear-stamp"]), &json!({"fields": []})).is_empty());
     }
 
@@ -2396,7 +2405,7 @@ mod tests {
 
         let bad = parse_words(&["add", "leetcode/x", "--attempts", "three"]).unwrap();
         let e = request(&bad, &leetcode()).unwrap_err();
-        assert_eq!(e.message, "--attempts expects a whole number, got 'three'");
+        assert_eq!(e.message, "field 'attempts' expects a whole number, got 'three'");
 
         // Without a schema everything goes as a string and the daemon judges it.
         let (_, params) = request(&bad, &Value::Null).unwrap();
