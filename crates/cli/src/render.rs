@@ -149,6 +149,39 @@ pub fn wrap(text: &str, width: usize, indent: &str) -> String {
     lines.join(&format!("\n{indent}"))
 }
 
+/// Ids as a list shows them (ADR 0031 §4): a long id (a ULID, or `usr-` plus one) as its last six
+/// characters, or more where that's needed to tell it from another id in the same list, which is
+/// what the daemon accepts back. Short ids (`digest`, a test's `usr-1`) are shown whole.
+pub fn short_ids(ids: &[String]) -> Vec<String> {
+    let lower: Vec<String> = ids.iter().map(|id| id.to_lowercase()).collect();
+    ids.iter()
+        .zip(&lower)
+        .map(|(id, me)| {
+            // Only a random id shortens well: a module's own trigger id (`fetchers.poll-hackernews`)
+            // is shown whole, since its end means nothing on its own.
+            if !is_random_id(id) {
+                return id.clone();
+            }
+            let mut n = 6;
+            while n < me.len() && lower.iter().any(|other| other != me && other.ends_with(&me[me.len() - n..])) {
+                n += 1;
+            }
+            id[id.len() - n..].to_owned()
+        })
+        .collect()
+}
+
+/// A ULID, or `usr-` plus one: the ids whose end is random, so a short ending tells them apart.
+fn is_random_id(id: &str) -> bool {
+    let ulid = id.strip_prefix("usr-").unwrap_or(id);
+    ulid.len() == 26 && ulid.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// The ending of one id that lists show (see [`short_ids`]), for saying which one a command hit.
+pub fn short_id(id: &str) -> String {
+    short_ids(&[id.to_owned()]).remove(0)
+}
+
 /// The templates a `*.templates` op sent (`records`, `workspaces`), grouped under their
 /// categories' headings in the daemon's order. With `which`: only that category's, or that one
 /// template as `in_full` shows it. `kind` names the commands in the footer and in mistakes;
@@ -233,6 +266,26 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn long_ids_show_their_unique_ending() {
+        let ids: Vec<String> =
+            ["01M4PPHE00ABCDEF0123XK7P2X", "01M4PPK8K0QRSTUV4567HK7P2X", "usr-01m4ppm000nntaem1rv43fq9tm", "digest"]
+                .map(String::from)
+                .to_vec();
+        // "k7p2x" ends both of the first two, so they need seven characters; the others don't.
+        assert_eq!(short_ids(&ids), ["XK7P2X", "HK7P2X", "3fq9tm", "digest"]);
+        // A module's own trigger id isn't random: shown whole, however long (#183's review).
+        let named = ["fetchers.poll-hackernews".to_owned()];
+        assert_eq!(short_ids(&named), ["fetchers.poll-hackernews"]);
+        assert_eq!(short_id("usr-01m4ppm000nntaem1rv43fq9tm"), "3fq9tm");
+        let close: Vec<String> =
+            ["01M4PPHE00ABCDEF0123AK7P2X", "01M4PPK8K0QRSTUV4567BK7P2X"].map(String::from).to_vec();
+        assert_eq!(short_ids(&close), ["AK7P2X", "BK7P2X"]);
+        let same6: Vec<String> =
+            ["01M4PPHE00ABCDEF012AXK7P2X", "01M4PPK8K0QRSTUV456BXK7P2X"].map(String::from).to_vec();
+        assert_eq!(short_ids(&same6), ["AXK7P2X", "BXK7P2X"], "lengthened until unique");
+    }
 
     #[test]
     fn ping_shows_uptime() {
