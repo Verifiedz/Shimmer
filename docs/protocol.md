@@ -25,7 +25,8 @@ it. The CLI's `--socket PATH` overrides both, and a command given `--socket` nev
 daemon.
 
 If the socket file exists but connecting returns `ECONNREFUSED`, the daemon died without
-cleaning up. Clients should unlink it and start a daemon.
+cleaning up. Start a daemon: it clears the stale file when it binds, so a client need not
+(ADR 0007).
 
 ## Framing
 
@@ -286,11 +287,11 @@ Clients should offer: run cleanup, force relaunch, or open the log. Never auto-f
   ]}}
 ```
 
-Illustrative excerpt — `records` actually registers twenty ops (`records.collections`,
+Illustrative excerpt — `records` actually registers twenty-one ops (`records.collections`,
 `.templates`, `.create_collection`,
 `.add`, `.get`, `.list`, `.update`, `.complete`, `.reopen`, `.rename`, `.remove`, `.restore`,
-`.trash`, `.purge`, `.check`, `.rename_field`, `.rename_collection`, `.remove_collection`,
-`.restore_collection`, `.import`) and thirteen topics; see "Records
+`.trash`, `.purge`, `.check`, `.rename_field`, `.rename_collection`, `.copy_collection`,
+`.remove_collection`, `.restore_collection`, `.import`) and fourteen topics; see "Records
 ops" below and `docs/decisions/0008-records-collections-and-storage.md` for the full list.
 This example only shows two commands to keep the shape readable.
 
@@ -298,14 +299,13 @@ This example only shows two commands to keep the shape readable.
 architecture registered at once — not any one build.** `lanes` is not a fixed list: `default`
 (`max_concurrent: 4`) is the only lane always present; every other lane (`workspaces`,
 `fetchers`, `notify`, `index`, or one a plugin declares) appears **only when some registered
-module's `Module::lanes()` declares it** (`crates/daemon/src/registry.rs`). A daemon that has
-only registered `records` — true of `crates/app` as of M1 — returns `lanes: [{"id":"default",
-"max_concurrent":4}]` and one module in `modules`, not the five-lane, three-module picture
-above. Clients must read `core.manifest` at runtime rather than assume this example's shape,
+module's `Module::lanes()` declares it** (`crates/daemon/src/registry.rs`). Today `crates/app`
+registers `records` and `workspaces`, so a real daemon returns two lanes, `default` (4) and
+`workspaces` (1), and those two modules, not the five-lane picture above. Clients must read `core.manifest` at runtime rather than assume this example's shape,
 same as the "Discovery" heading already says for module knowledge generally.
 
-`params_schema` is JSON Schema. Advisory before M3 — the TUI may render forms from it
-later but must not depend on it being complete yet.
+`params_schema` is JSON Schema. Advisory: the daemon doesn't check params against it (each op
+checks its own), so the TUI may render forms from it but must not depend on it being complete.
 
 This op is what makes the platform extensible: a module written after the TUI shipped still
 appears in it, in the right lane, with the right execution semantics.
@@ -329,7 +329,7 @@ Always present, independent of which modules are registered.
 | `queue.list` | inline | `{"lane"?}` | Lanes, each with `running` and `queued` task arrays and `queue_version`. |
 | `queue.task` | inline | `{"task_id"}` | One task with status, progress, attempts, origin. |
 | `queue.reorder` | inline | `{"lane","task_id","before":TaskId\|null,"queue_version"}` | New `queue_version`. |
-| `queue.cancel` | inline | `{"task_id"}` | `{"cancelled":true}` or `not_cancellable`. |
+| `queue.cancel` | inline | `{"task_id"}` | `{"cancelled":true,"was":"queued"\|"running"}`, or `not_cancellable`. A queued task is gone; a running one has been asked to stop and ends at its next cancellation check. |
 
 Reordering is within a lane only. The running task cannot be reordered or displaced; it can
 be cancelled. A stale `queue_version` returns `conflict`.
@@ -338,7 +338,7 @@ be cancelled. A stale `queue_version` returns `conflict`.
 
 | Op | Execution | Params | Returns |
 |---|---|---|---|
-| `scheduler.list` | inline | `{}` | Triggers with `next_due`, `last_run`, `catch_up`, `paused`. |
+| `scheduler.list` | inline | `{}` | `{"triggers":[…]}`, each `{"id","op","params","schedule","catch_up","lane","fallback","next_due","last_run","paused","done","source"}`. `done` is a `once` trigger that has fired; `source` is `{"type":"user"}` or `{"type":"module","id"}`. |
 | `scheduler.get` | inline | `{"trigger_id"}` | One trigger, same shape as a `scheduler.list` entry, or `not_found`. |
 | `scheduler.add` | inline | `{"schedule","op","params","catch_up","lane"?,"fallback"?}` | `{"trigger_id"}` |
 | `scheduler.remove` | inline | `{"trigger_id"}` | `{"removed":true}` |
@@ -465,7 +465,7 @@ record only (`conflict` on `records.add`, `records.update`, or `records.complete
 Module ops are namespaced `<module>.<verb>`. The daemon routes on the prefix; a collision
 between two modules is a startup failure, not a runtime surprise.
 
-**Aliases never appear on the wire.** `bankai`, `arise` and every other command-pack name
+**Aliases never appear on the wire.** `ikuzo`, `engage` and every other command-pack name
 are resolved to canonical ops by the client before a frame is sent. The daemon rejects an
 alias as `unknown_op`. Swapping or installing a pack therefore never requires a protocol
 change or a daemon restart. See `CLAUDE.md` §15.1.
@@ -488,6 +488,8 @@ tolerate unknown topics.
 | `queue.task.cancelled` | Task cancelled before or during execution. |
 | `queue.task.promoted` | A task jumped the lane. Payload lists displaced task ids. |
 | `queue.task.reordered` | A waiting task moved within its lane. Payload `{task_id, lane, before, queue_version}`. |
+| `queue.fallback.enqueued` | A failed task's fallback was enqueued (ADR 0005). Payload `{task_id, fallback_task_id, op, lane}`. |
+| `queue.fallback.failed` | A failed task's fallback couldn't be enqueued, e.g. no `notify` module. Payload `{task_id, op, error, code}`. Never stalls the lane; nothing retries. |
 | `scheduler.trigger.fired` | Trigger fired and enqueued a task. |
 | `scheduler.trigger.skipped` | Trigger fired while its previous task was still pending (`reason: "overlap"`), or its task could not be enqueued (`reason: "enqueue_failed"`). |
 | `scheduler.trigger.missed` | A `catch_up` policy dropped due occurrences. Payload `{trigger_id, count, catch_up}`. |
@@ -506,15 +508,16 @@ tolerate unknown topics.
 | `workspaces.workspace.reconfigured` | `workspaces.reconfigure` changed a workspace's answers. Payload `{workspace, changed: [name…]}`: the names, never the values. ADR 0025 §9. |
 | `records.item.created` / `.updated` / `.completed` / `.reopened` / `.renamed` / `.removed` / `.restored` | Record mutations. All carry `{collection, id, title, deadlines, item}` (for `.removed`, `item` is the record as it was): `item` is the full wire item, `title` the record's readable name (the collection's `title` template, or the id), `deadlines` `{field: date}` for every set field with `role = "deadline"` (ADR 0017). `.updated` also carries `changed`: the fields whose value actually changed, sorted (`[]` when nothing did). `.renamed` also carries `new_id` (`id` is the old one; `item` is under the new one) and `references` (how many `ref` values were rewritten to point at the new id). |
 | `records.collection.created` | `records.create_collection` made a collection from a template. Payload `{collection, template}`. Nothing is created on first start (ADR 0023). |
+| `records.collection.copied` | `records.copy_collection` made a collection from another. Payload `{collection, from, records}`. ADR 0030 §3. |
 | `records.field.renamed` | `{collection, from, to}`. |
 | `records.collection.renamed` / `.removed` / `.restored` | `{collection, new_id}` / `{collection, records}` / `{collection}`. |
 | `records.trash.purged` | `records.purge` deleted trashed records for good. `{collection, records}`, plus `id` when one record was purged. ADR 0024 §5. |
-| `fetchers.item.found` | A source returned a new, deduplicated item. |
-| `fetchers.fetch.finished` / `.failed` | A fetch run ended. |
-| `calendar.date.registered` | A dated entry was stored. |
-| `notify.sent` | Delivery succeeded, naming the sink used. |
-| `notify.fallback_used` | Primary sink failed; the fallback delivered. |
-| `notify.exhausted` | Every sink failed. Written to `notifications/failed.jsonl`. |
+| `fetchers.item.found` | A source returned a new, deduplicated item. Planned (M6): not emitted by any module yet. |
+| `fetchers.fetch.finished` / `.failed` | A fetch run ended. Planned (M6): not emitted by any module yet. |
+| `calendar.date.registered` | A dated entry was stored. Planned (M6): not emitted by any module yet. |
+| `notify.sent` | Delivery succeeded, naming the sink used. Planned (M6): not emitted by any module yet. |
+| `notify.fallback_used` | Primary sink failed; the fallback delivered. Planned (M6): not emitted by any module yet. |
+| `notify.exhausted` | Every sink failed. Written to `notifications/failed.jsonl`. Planned (M6): not emitted by any module yet. |
 
 `queue.task.failed` is the topic a dashboard most needs: it is how failures become visible
 without polling, and it is how the elevated-priority dirty-workspace warning reaches the

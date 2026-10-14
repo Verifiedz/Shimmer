@@ -15,6 +15,7 @@ use crate::csv;
 use crate::editor;
 use crate::render::{self, cell, table, wrap};
 use crate::schedules;
+use crate::style::{paint, Role};
 use crate::workspaces::Prompt;
 
 pub const USAGE: &str = "usage: shimmer records <command>
@@ -43,8 +44,9 @@ commands:
   get COLLECTION/ID                    show one record
   update COLLECTION/ID [--FIELD VALUE]… [--unset FIELD]…
        [--add FIELD VALUE]… [--remove FIELD VALUE]…  change items of a list field
+       [--set FIELD=VALUE]…            any field, even one named like an option (add, unset…)
   complete COLLECTION/ID [--FIELD VALUE]… [--unset FIELD]…
-                                       mark done and stamp the collection's date field;
+       [--set FIELD=VALUE]…            mark done and stamp the collection's date field;
                                        a value for the date field back-dates it
   reopen COLLECTION/ID [--clear-stamp] mark a done record todo again
   rename COLLECTION/ID NEW_ID          give a record a new id; offers to move schedules that
@@ -77,7 +79,9 @@ changing a collection:
   restore-collection ID                bring a removed collection back
 
 A record can be written COLLECTION/ID or COLLECTION ID. Field names come from the
-collection: see 'shimmer records collections'. Add --json to any command for raw output.";
+collection: see 'shimmer records collections'. A field named like an option (add, unset, set…)
+is set with --set FIELD=VALUE on add, update and complete. Add --json to any command for raw
+output.";
 
 /// `--name value` pairs, in the order given.
 pub type Flags = Vec<(String, String)>;
@@ -298,7 +302,7 @@ pub fn parse(words: Vec<String>) -> std::result::Result<RecordsCmd, String> {
                 [one] if !one.contains('/') => (one.clone(), None),
                 _ => target(&sub, positional).map(|(c, id)| (c, Some(id)))?,
             };
-            Ok(RecordsCmd::Add { collection, id, set: flags })
+            Ok(RecordsCmd::Add { collection, id, set: with_set(flags)? })
         }
         "rename" => {
             no_flags()?;
@@ -366,6 +370,7 @@ pub fn parse(words: Vec<String>) -> std::result::Result<RecordsCmd, String> {
             let (collection, id) = target(&sub, positional)?;
             let (unset, set) = flags.into_iter().partition::<Vec<_>, _>(|(name, _)| name == "unset");
             let unset: Vec<String> = unset.into_iter().map(|(_, field)| field).collect();
+            let set = with_set(set)?;
             if sub == "complete" {
                 return Ok(RecordsCmd::Complete { collection, id, set, unset, items });
             }
@@ -787,14 +792,53 @@ fn condition(schema: &Value, raw: &str) -> Result<(String, &'static str, Value)>
     Ok((name, op, value))
 }
 
+/// `--set FIELD=VALUE` as the field it sets (#205): every other `--name value` is kept as it is. It
+/// reaches any field, even one named like an option of the command (`add`, `unset`, `set`…).
+fn with_set(flags: Flags) -> std::result::Result<Flags, String> {
+    flags
+        .into_iter()
+        .map(|(name, value)| match name.as_str() {
+            "set" => match value.split_once('=') {
+                Some(("", _)) => Err("--set needs a field name before the '=', e.g. --set unset=yes".to_owned()),
+                Some((field, v)) => Ok((field.to_owned(), v.to_owned())),
+                None => Err(format!(
+                    "--set takes FIELD=VALUE, e.g. --set unset=yes (to set a field named 'set': --set set={value})"
+                )),
+            },
+            _ => Ok((name, value)),
+        })
+        .collect()
+}
+
 /// `--last-solved` finds a field named `last_solved`; an exact match wins.
 /// `records list`/`export` options that were given and share a name with a field of the collection
 /// (#178): the option keeps its meaning (command options never take a name away from fields, ADR
 /// 0031), so say how to filter the field instead.
 fn shadowed_fields(cmd: &RecordsCmd, schema: &Value) -> Vec<String> {
+    // `update`/`complete`'s own options (#205): set the field with `--set` instead.
+    let set_hint = |given: [(&str, bool, &str); 3]| -> Vec<String> {
+        given
+            .into_iter()
+            .filter(|(name, used, _)| *used && field(schema, name).is_some())
+            .map(|(name, _, what)| format!("(--{name} {what}; to set the field '{name}', use --set {name}=VALUE)"))
+            .collect()
+    };
     let (limit, offset, refine) = match cmd {
         RecordsCmd::List { limit, offset, refine, .. } => (limit.is_some(), offset.is_some(), refine),
         RecordsCmd::Export { refine, .. } => (false, false, refine),
+        RecordsCmd::Update { unset, items, .. } | RecordsCmd::Complete { unset, items, .. } => {
+            return set_hint([
+                ("unset", !unset.is_empty(), "clears a field"),
+                ("add", items.iter().any(|i| i.add), "adds to a list field"),
+                ("remove", items.iter().any(|i| !i.add), "removes from a list field"),
+            ]);
+        }
+        RecordsCmd::Reopen { collection, id, clear_stamp: true } if field(schema, "clear_stamp").is_some() => {
+            return vec![format!(
+                "(--clear-stamp clears the date completing set; to change the field 'clear_stamp', \
+                 use shimmer records update {collection}/{id} --set clear_stamp=VALUE)"
+            )];
+        }
         _ => return Vec::new(),
     };
     let given = [
@@ -835,7 +879,8 @@ fn field<'a>(schema: &'a Value, name: &str) -> Option<&'a Value> {
 fn typed(schema: &Value, flag: &str, raw: &str) -> Result<(String, Value)> {
     let name = field_name(schema, flag);
     let kind = field(schema, &name).and_then(|f| f["type"].as_str()).unwrap_or("string");
-    let bad = |want: &str| Error::invalid_params(format!("--{flag} expects {want}, got '{raw}'"));
+    // Names the field, not the option: with `--set unset=x` there is no `--unset` (#217).
+    let bad = |want: &str| Error::invalid_params(format!("field '{name}' expects {want}, got '{raw}'"));
     let value = match kind {
         "int" => Value::from(raw.parse::<i64>().map_err(|_| bad("a whole number"))?),
         "bool" => Value::Bool(match raw {
@@ -1221,13 +1266,16 @@ pub fn show(cmd: &RecordsCmd, data: &Value, schema: &Value) -> String {
         RecordsCmd::Collections => collections(data),
         // The id comes from the reply: the daemon may have made it (ADR 0018).
         // In full, never cut like a table cell: it's what the person types next.
-        RecordsCmd::Add { collection, .. } => format!("added {collection}/{}", data["id"].as_str().unwrap_or_default()),
+        RecordsCmd::Add { collection, .. } => {
+            format!("{} {collection}/{}", paint(Role::Success, "added"), data["id"].as_str().unwrap_or_default())
+        }
         RecordsCmd::Rename { collection, id, new_id, .. } => {
             format!("✓ {collection}/{id} renamed to {collection}/{new_id}")
         }
-        RecordsCmd::Update { collection, id, .. } => format!("updated {collection}/{id}"),
+        RecordsCmd::Update { collection, id, .. } => format!("{} {collection}/{id}", paint(Role::Success, "updated")),
         RecordsCmd::Remove { collection, id, .. } => {
-            format!("removed {collection}/{id} (undo: shimmer records restore {collection}/{id})")
+            let removed = paint(Role::Success, "removed");
+            format!("{removed} {collection}/{id} (undo: shimmer records restore {collection}/{id})")
         }
         RecordsCmd::Restore { collection, id } => format!("✓ {collection}/{id} restored"),
         RecordsCmd::Check { collection } => check_report(collection, data),
@@ -1338,7 +1386,7 @@ fn peek(data: &Value, id: &str) -> Result<String> {
 fn template_in_full(t: &Value, categories: &[Value]) -> String {
     let id = t["id"].as_str().unwrap_or_default();
     let list = |key: &str| t[key].as_array().cloned().unwrap_or_default();
-    let mut out = format!("{id}: {}", cell(&t["label"]));
+    let mut out = format!("{}: {}", paint(Role::Name, id), cell(&t["label"]));
     if let Some(category) = categories.iter().find(|c| c["id"] == t["category"]) {
         let _ = write!(out, "  ({})", cell(&category["label"]));
     }
@@ -1348,7 +1396,7 @@ fn template_in_full(t: &Value, categories: &[Value]) -> String {
     out.push('\n');
 
     let fields = list("fields");
-    let _ = writeln!(out, "\nFields ({}; * = required)", fields.len());
+    let _ = writeln!(out, "\n{}", paint(Role::Heading, &format!("Fields ({}; * = required)", fields.len())));
     let width =
         fields.iter().map(|f| cell(&f["name"]).chars().count() + usize::from(f["required"] == true)).max().unwrap_or(0);
     for f in &fields {
@@ -1360,29 +1408,32 @@ fn template_in_full(t: &Value, categories: &[Value]) -> String {
         if notes.is_empty() {
             notes.push("text".into());
         }
-        let _ = writeln!(out, "{}", format!("  {name:<width$}  {}", notes.join(", ")).trim_end());
+        let pad = " ".repeat(width.saturating_sub(name.chars().count()));
+        let name = paint(Role::Name, &name);
+        let _ = writeln!(out, "{}", format!("  {name}{pad}  {}", notes.join(", ")).trim_end());
     }
     if let Some(title) = t["title"].as_str() {
         let _ = writeln!(out, "  each record is shown as: {title}");
     }
 
-    let _ = writeln!(out, "\nWhen you complete a record\n  {}", wrap(&completing(t), 88, "  "));
+    let _ =
+        writeln!(out, "\n{}\n  {}", paint(Role::Heading, "When you complete a record"), wrap(&completing(t), 88, "  "));
 
     let notes = list("notes");
     if !notes.is_empty() {
-        out.push_str("\nGood to know\n");
+        let _ = writeln!(out, "\n{}", paint(Role::Heading, "Good to know"));
         for note in &notes {
             let _ = writeln!(out, "  • {}", wrap(note.as_str().unwrap_or_default(), 86, "    "));
         }
     }
     let examples = list("examples");
     if !examples.is_empty() {
-        out.push_str("\nHow it works (<collection> is the name you give it)\n");
+        let _ = writeln!(out, "\n{}", paint(Role::Heading, "How it works (<collection> is the name you give it)"));
         for line in &examples {
             let _ = writeln!(out, "{}", format!("  {}", line.as_str().unwrap_or_default()).trim_end());
         }
     }
-    let related: Vec<String> = list("related").iter().map(cell).collect();
+    let related: Vec<String> = list("related").iter().map(|r| paint(Role::Name, &cell(r))).collect();
     if !related.is_empty() {
         let _ = writeln!(out, "\nGoes with: {} (shimmer records peek NAME)", related.join(", "));
     }
@@ -1437,15 +1488,17 @@ fn check_report(collection: &str, data: &Value) -> String {
     let checked = data["checked"].as_u64().unwrap_or(0);
     let problems = data["problems"].as_array().cloned().unwrap_or_default();
     if problems.is_empty() {
-        return format!("checked {checked} record(s) in {collection}; all fit");
+        return format!("checked {checked} record(s) in {collection}; {}", paint(Role::Success, "all fit"));
     }
-    let mut out = format!("checked {checked} record(s) in {collection}; {} with problems", problems.len());
+    let with_problems = format!("{} with problems", problems.len());
+    let mut out = format!("checked {checked} record(s) in {collection}; {}", paint(Role::Warning, &with_problems));
     let width = problems.iter().map(|p| cell(&p["id"]).chars().count()).max().unwrap_or(0);
     for p in &problems {
         let id = cell(&p["id"]);
         for (i, problem) in p["problems"].as_array().into_iter().flatten().enumerate() {
             let shown = if i == 0 { id.as_str() } else { "" };
-            let _ = write!(out, "\n  {shown:width$}  {}", problem.as_str().unwrap_or_default());
+            let pad = " ".repeat(width - shown.chars().count());
+            let _ = write!(out, "\n  {}{pad}  {}", paint(Role::Name, shown), problem.as_str().unwrap_or_default());
         }
     }
     out
@@ -1539,14 +1592,15 @@ fn has_status(schema: &Value) -> bool {
 }
 
 fn item(collection: &str, id: &str, data: &Value, schema: &Value) -> String {
+    let name = paint(Role::Name, &format!("{collection}/{id}"));
     let mut out = match has_status(schema) {
-        true => format!("{collection}/{id}  ({})", cell(&data["status"])),
-        false => format!("{collection}/{id}"),
+        true => format!("{name}  ({})", crate::style::state(&cell(&data["status"]))),
+        false => name,
     };
     let keys = columns(data, schema);
     let width = keys.iter().map(|k| k.chars().count()).max().unwrap_or(0);
     for key in keys {
-        let _ = write!(out, "\n  {key:width$}  {}", shown(schema, &key, &data[key.as_str()]));
+        let _ = write!(out, "\n  {}  {}", crate::style::label(&key, width), shown(schema, &key, &data[key.as_str()]));
     }
     out
 }
@@ -2223,6 +2277,49 @@ mod tests {
     }
 
     #[test]
+    fn set_reaches_any_field_even_one_named_like_an_option() {
+        // #205: `--add`, `--remove`, `--unset` and `--clear-stamp` keep their meaning; `--set
+        // FIELD=VALUE` reaches the field whatever it's called.
+        let schema = json!({"fields": [
+            {"name": "add", "type": "string"}, {"name": "unset", "type": "int"},
+            {"name": "set", "type": "string"}, {"name": "tags", "type": "list"}]});
+        let p = |w: &[&str]| parse_words(w).unwrap();
+        let fields = |w: &[&str]| request(&p(w), &schema).unwrap().1["fields"].clone();
+        assert_eq!(fields(&["update", "t/x", "--set", "add=yes"]), json!({"add": "yes"}));
+        assert_eq!(fields(&["update", "t/x", "--set", "unset=3", "--unset", "add"]), json!({"unset": 3, "add": null}));
+        assert_eq!(fields(&["complete", "t/x", "--set", "set=a=b"]), json!({"set": "a=b"}), "the first '=' splits");
+        assert_eq!(
+            fields(&["add", "t", "x", "--set", "add=1", "--set", "tags=a, b"]),
+            json!({"add": "1", "tags": ["a", "b"]})
+        );
+        let e = parse_words(&["update", "t/x", "--set", "nope"]).unwrap_err();
+        assert!(e.contains("--set takes FIELD=VALUE") && e.contains("--set set=nope"), "{e}");
+        // #217: an empty field name says so, rather than suggesting `--set set==v`.
+        let e = parse_words(&["update", "t/x", "--set", "=v"]).unwrap_err();
+        assert_eq!(e, "--set needs a field name before the '=', e.g. --set unset=yes");
+        // #217: a type error names the field, since the option `--unset` was never typed.
+        let e = request(&p(&["update", "t/x", "--set", "unset=many"]), &schema).unwrap_err();
+        assert_eq!(e.message, "field 'unset' expects a whole number, got 'many'");
+    }
+
+    #[test]
+    fn an_update_option_named_like_a_field_says_how_to_set_the_field() {
+        let schema = json!({"fields": [{"name": "add"}, {"name": "unset"}, {"name": "clear_stamp"}, {"name": "tags"}]});
+        let p = |w: &[&str]| parse_words(w).unwrap();
+        assert_eq!(
+            shadowed_fields(&p(&["update", "t/x", "--unset", "tags", "--add", "tags", "a"]), &schema),
+            [
+                "(--unset clears a field; to set the field 'unset', use --set unset=VALUE)",
+                "(--add adds to a list field; to set the field 'add', use --set add=VALUE)",
+            ]
+        );
+        assert!(shadowed_fields(&p(&["complete", "t/x", "--set", "add=1"]), &schema).is_empty(), "--set used: no hint");
+        let reopen = shadowed_fields(&p(&["reopen", "t/x", "--clear-stamp"]), &schema);
+        assert!(reopen[0].contains("use shimmer records update t/x --set clear_stamp=VALUE"), "{reopen:?}");
+        assert!(shadowed_fields(&p(&["reopen", "t/x", "--clear-stamp"]), &json!({"fields": []})).is_empty());
+    }
+
+    #[test]
     fn misuse() {
         assert_eq!(parse_words(&[]).unwrap(), RecordsCmd::Help);
         assert!(parse_words(&["frob"]).unwrap_err().contains("unknown records command"));
@@ -2256,7 +2353,7 @@ mod tests {
 
         let bad = parse_words(&["add", "leetcode/x", "--attempts", "three"]).unwrap();
         let e = request(&bad, &leetcode()).unwrap_err();
-        assert_eq!(e.message, "--attempts expects a whole number, got 'three'");
+        assert_eq!(e.message, "field 'attempts' expects a whole number, got 'three'");
 
         // Without a schema everything goes as a string and the daemon judges it.
         let (_, params) = request(&bad, &Value::Null).unwrap();

@@ -378,6 +378,8 @@ fn at_a_terminal(home: &Home, editor: &str, args: &[&str]) -> String {
         false => script.args(["-q", "/dev/null", "sh", "-c", &command]),
     };
     let o = script
+        // A terminal colours output (#189); these tests read the words, not the colours.
+        .env("NO_COLOR", "1")
         .env("SHIMMER_HOME", home.dir.path().join("home"))
         .env("SHIMMER_SOCKET", home.socket())
         .env("XDG_CONFIG_HOME", home.dir.path().join("config"))

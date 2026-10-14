@@ -131,8 +131,9 @@ $ shimmer records list jobs --missing oa_deadline
 
 - **Relative dates** (`--due-within 7d`, "this week"). They need "today" in the configured
   timezone (ADR 0009), which the CLI doesn't know. A later op param such as `{"lte": "today+7"}`
-  resolved by the daemon is the likely shape; left until someone needs it.
+  resolved by the daemon is the likely shape; left until someone needs it. **Done since:** `today`,
+  `today+N`, `today-N`, resolved by the daemon (ADR 0024 §5).
 - **`or` across fields** ("stage is offer *or* priority is dream"). `in` covers the common case
-  within a field.
-- **Titles in the list response** (ADR 0017 "Not done here"): still left out.
+  within a field. **Done since:** `"or"` in the filter, `--or` in the CLI (ADR 0024 §5).
+- **Titles in the list response** (ADR 0017 "Not done here"): still left out. **Done since:** ADR 0024 §5.
 - **Raising the 500 limit**: with the index (M4).
