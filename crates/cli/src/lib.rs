@@ -10,6 +10,7 @@ mod client;
 mod complete;
 mod csv;
 mod editor;
+mod first;
 mod flags;
 mod follow;
 pub mod packs;
@@ -246,11 +247,14 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
     if let Command::Workspaces(cmd) = &args.command {
         return workspaces::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
     }
+    if let Command::Call { op, params, first: Some(yes) } = &args.command {
+        return call_first(&mut client, op, params.clone(), *yes).await.map(|data| Some(output(args, &data)));
+    }
     let (op, params) = match &args.command {
         Command::Ping => (ops::CORE_PING, json!({})),
         Command::Manifest => (ops::CORE_MANIFEST, json!({})),
         Command::Shutdown => (ops::CORE_SHUTDOWN, json!({})),
-        Command::Call { op, params } => (op.as_str(), params.clone()),
+        Command::Call { op, params, .. } => (op.as_str(), params.clone()),
         Command::Help
         | Command::Records(_)
         | Command::Workspaces(_)
@@ -262,6 +266,32 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
     };
     let data = client.call(op, params).await?;
     Ok(Some(output(args, &data)))
+}
+
+/// `call OP --first` (#222): only for an op the manifest says is queued, since the daemon ignores
+/// the queue block on an inline one and a silent no-op would mislead.
+async fn call_first(client: &mut Client, op: &str, params: Value, yes: bool) -> Result<Value> {
+    let manifest = client.call(ops::CORE_MANIFEST, json!({})).await?;
+    let spec = manifest["modules"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|m| m["commands"].as_array().into_iter().flatten())
+        .find(|c| c["op"] == op);
+    // The core, queue and scheduler ops aren't in a module's list, and all answer at once.
+    match spec {
+        Some(c) if c["execution"].get("queued").is_some() => {}
+        Some(_) => return Err(Error::invalid_params(format!("--first is for queued ops; '{op}' answers at once"))),
+        None => {
+            return Err(Error::invalid_params(format!(
+                "--first is for queued ops; '{op}' isn't one in 'shimmer manifest'"
+            )))
+        }
+    }
+    match first::send(client, op, params, yes, &mut workspaces::Terminal).await? {
+        Some(data) => Ok(data),
+        None => Ok(json!({"queued": false})),
+    }
 }
 
 /// `None` when there is nothing to do: `shimmer shutdown` with no daemon running.
