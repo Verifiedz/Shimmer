@@ -25,6 +25,8 @@ commands:
   call OP [PARAMS]      send any op; PARAMS is a JSON object (default {});
        [--first [--yes]]  --first: a queued op ahead of its lane (asks first)
   shutdown              stop the daemon
+  completions SHELL     print Tab completion for bash, zsh or fish, to load in your shell:
+                        source <(shimmer completions zsh), e.g. in ~/.zshrc
   daemon                run the daemon in the foreground (Ctrl-C to stop)
   mockd                 run the mock daemon for building clients (shimmer mockd --help)
 
@@ -32,6 +34,8 @@ options:
   --socket PATH         talk to this socket instead of the default; never auto-starts
   --json                print the daemon's raw JSON instead of formatted output
   --pack NAME           use this command pack for one command ('none' for plain names);
+                        goes before the command
+  --no-color            no colour (also when NO_COLOR is set, or output isn't a terminal);
                         goes before the command
   -h, --help            show this help; with --canonical, without the active pack's aliases
 

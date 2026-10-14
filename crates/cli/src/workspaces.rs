@@ -22,6 +22,7 @@ use crate::editor;
 use crate::follow::{follow, Followed};
 use crate::render::{self, cell, table, wrap};
 use crate::schedules;
+use crate::style::{paint, Role};
 
 pub const USAGE: &str = "usage: shimmer workspaces <command>
 
@@ -474,7 +475,7 @@ pub async fn run(client: &mut Client, cmd: &WorkspacesCmd, json: bool, prompt: &
         }
         WorkspacesCmd::Remove { id } => {
             let data = client.call("workspaces.remove", id_params(id)).await?;
-            Ok(out(&data, format!("removed {id} (undo: shimmer workspaces restore {id})")))
+            Ok(out(&data, format!("{} {id} (undo: shimmer workspaces restore {id})", paint(Role::Success, "removed"))))
         }
         WorkspacesCmd::Restore { id } => {
             let data = client.call("workspaces.restore", id_params(id)).await?;
@@ -977,7 +978,7 @@ fn template_in_full(t: &Value, categories: &[Value]) -> String {
     let id = t["id"].as_str().unwrap_or_default();
     let list = |key: &str| t[key].as_array().cloned().unwrap_or_default();
     let category = categories.iter().find(|c| c["id"] == t["category"]).map(|c| cell(&c["label"]));
-    let mut out = format!("{id}: {}", cell(&t["label"]));
+    let mut out = format!("{}: {}", paint(Role::Name, id), cell(&t["label"]));
     if let Some(category) = category {
         let _ = write!(out, "  ({category})");
     }
@@ -988,7 +989,7 @@ fn template_in_full(t: &Value, categories: &[Value]) -> String {
         if items.is_empty() {
             continue;
         }
-        let _ = writeln!(out, "\n{heading}");
+        let _ = writeln!(out, "\n{}", paint(Role::Heading, heading));
         for item in &items {
             let _ = writeln!(out, "  • {}", wrap(item.as_str().unwrap_or_default(), 86, "    "));
         }
@@ -996,7 +997,8 @@ fn template_in_full(t: &Value, categories: &[Value]) -> String {
 
     let steps = list("steps");
     if !steps.is_empty() {
-        let _ = writeln!(out, "\nWhen you activate it ({} steps, one after another)", steps.len());
+        let title = format!("When you activate it ({} steps, one after another)", steps.len());
+        let _ = writeln!(out, "\n{}", paint(Role::Heading, &title));
         let name_width = steps.iter().map(|s| cell(&s["name"]).chars().count()).max().unwrap_or(0);
         let how_width = steps.iter().map(|s| how_it_runs(s).chars().count()).max().unwrap_or(0);
         for (i, step) in steps.iter().enumerate() {
@@ -1005,23 +1007,27 @@ fn template_in_full(t: &Value, categories: &[Value]) -> String {
             let indent = " ".repeat(line.chars().count());
             let width = 100usize.saturating_sub(indent.len()).max(30);
             let what = wrap(step["description"].as_str().unwrap_or_default(), width, &indent);
+            // Coloured after measuring, so the escape codes don't count towards the indent.
+            let line = line.replacen(name, &paint(Role::Name, name), 1);
             let _ = writeln!(out, "{}", format!("{line}{what}").trim_end());
         }
     }
     if let Some(stop) = t["on_stop"].as_str() {
-        let _ = writeln!(out, "\nWhen you stop it\n  {}", wrap(stop, 88, "  "));
+        let _ = writeln!(out, "\n{}\n  {}", paint(Role::Heading, "When you stop it"), wrap(stop, 88, "  "));
     }
 
     let questions = list("questions");
     if questions.is_empty() {
-        out.push_str("\nNo questions\n");
+        let _ = writeln!(out, "\n{}", paint(Role::Heading, "No questions"));
     } else {
-        out.push_str("\nQuestions (asked when you make one; or answer with --set NAME=ANSWER)\n");
+        let title = "Questions (asked when you make one; or answer with --set NAME=ANSWER)";
+        let _ = writeln!(out, "\n{}", paint(Role::Heading, title));
         let width = questions.iter().map(|q| cell(&q["name"]).chars().count()).max().unwrap_or(0);
         let pad = " ".repeat(width + 4);
         for q in &questions {
             let name = q["name"].as_str().unwrap_or_default();
-            let _ = writeln!(out, "  {name:<width$}  {}", q["prompt"].as_str().unwrap_or_default());
+            let gap = " ".repeat(width.saturating_sub(name.chars().count()));
+            let _ = writeln!(out, "  {}{gap}  {}", paint(Role::Name, name), q["prompt"].as_str().unwrap_or_default());
             let mut facts = Vec::new();
             if let Some(choices) = q["choices"].as_array() {
                 facts.push(choices.iter().map(|c| c.as_str().unwrap_or_default()).collect::<Vec<_>>().join(" | "));
@@ -1118,8 +1124,8 @@ fn created(id: &str, template: &str) -> String {
 pub fn list(data: &Value) -> String {
     let items = data["workspaces"].as_array().map(Vec::as_slice).unwrap_or_default();
     if items.is_empty() {
-        return "no workspaces yet: add a folder with a workspace.toml under data/workspaces/ \
-                in your Shimmer folder (ADR 0012)"
+        return "no workspaces yet: see 'shimmer workspaces templates', then \
+                'shimmer workspaces new NAME --from TEMPLATE'"
             .into();
     }
     let rows: Vec<Vec<String>> = items
@@ -1140,7 +1146,7 @@ pub fn list(data: &Value) -> String {
 /// `workspaces.status` in full.
 pub fn status(data: &Value) -> String {
     let id = data["id"].as_str().unwrap_or_default();
-    let mut out = format!("{id}  ({})", cell(&data["state"]));
+    let mut out = format!("{}  ({})", paint(Role::Name, id), crate::style::state(&cell(&data["state"])));
     if let Some(label) = data["label"].as_str() {
         let _ = write!(out, "  {label}");
     }
@@ -1158,7 +1164,9 @@ pub fn status(data: &Value) -> String {
                 Some(t) => format!("{}, timeout {t}s", cell(&s["mode"])),
                 None => cell(&s["mode"]),
             };
-            let _ = write!(out, "\n    {}  {:width$}  {mode}", cell(&s["index"]), cell(&s["name"]));
+            let name = cell(&s["name"]);
+            let pad = " ".repeat(width.saturating_sub(name.len()));
+            let _ = write!(out, "\n    {}  {}{pad}  {mode}", cell(&s["index"]), paint(Role::Name, &name));
             if let Some(d) = s["description"].as_str() {
                 let _ = write!(out, "  ({d})");
             }
@@ -1175,7 +1183,8 @@ pub fn status(data: &Value) -> String {
     if let Some(d) = data.get("dirty").filter(|d| d.is_object()) {
         let _ = write!(
             out,
-            "\n  dirty: step {}: {} (at {})",
+            "\n  {}: step {}: {} (at {})",
+            paint(Role::Error, "dirty"),
             cell(&d["failed_step"]),
             d["reason"].as_str().unwrap_or_default(),
             cell(&d["failed_at"])
