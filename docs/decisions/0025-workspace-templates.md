@@ -701,7 +701,8 @@ Rules:
   community repository.
 - Hyper-V and other Windows VM software: the Windows launch backend is still a sketch.
 - Showing a project's tracker items on launch (`shimmer records list … --filter`), which needs
-  the records query work (ADR 0019) on master first. A one-line step to add later.
+  the records query work (ADR 0019) on master first. A one-line step to add later. (The query
+  work is on master now; the step isn't added yet.)
 - Placing windows on Hyprland workspaces or monitors, and `vercel env pull` (needs the Vercel
   CLI and a login): easy extra steps for anyone who wants them, not defaults.
 - Windows (`.ps1` versions): the launch backend for Windows is still a sketch (ADR 0010 §7).

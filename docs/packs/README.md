@@ -152,6 +152,25 @@ A folder with the same name as a built-in pack replaces it.
 If your pack ever breaks, Shimmer doesn't: it prints one warning and runs with the real names,
 and `shimmer packs check NAME` tells you what to fix.
 
+### Your own colours
+
+Shimmer colours its output by meaning, in the logo's palette. A pack can change any of the six
+roles with a `[colors]` section; roles it leaves out keep the Shimmer colour:
+
+```toml
+[colors]
+success = "#00ff88"   # ✓ lines
+error   = "#ff3366"   # ✗, dirty, the "shimmer:" before an error
+heading = "#00ffcc"   # headings and table headers
+name    = "#99aaff"   # names and ids you can type (a table's first column)
+warning = "#ffcc00"   # things left open
+hint    = "#888888"   # hints in brackets
+```
+
+Colours are only used on a terminal: never in `--json` or piped output, and never with
+`NO_COLOR` set or `--no-color` given. An unknown role or a colour that isn't `#rrggbb` is a
+problem `shimmer packs check` reports.
+
 ## Commands on their own: where they go, and what's skipped
 
 `shimmer packs use` puts a link per alias in `~/.local/bin` (or `link_dir` in `cli.toml`), pointing
