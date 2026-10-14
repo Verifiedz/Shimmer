@@ -6,7 +6,7 @@
 use std::fmt::Write as _;
 
 use serde_json::{json, Map, Value};
-use shimmer_core::Result;
+use shimmer_core::{Error, Result};
 
 use crate::client::Client;
 use crate::render::cell;
@@ -53,7 +53,9 @@ pub fn line(t: &Value) -> String {
 }
 
 /// Move one schedule: the same trigger added again with `changes` merged into its params (paused
-/// if it was), then the old one removed. The old one stays if adding fails. Its new id.
+/// if it was), then the old one removed. Its new id. Never leaves two copies silently (#179): if
+/// adding fails the old one stays; if pausing the copy fails the copy is removed again; and an
+/// error says plainly when both are left. #166 would make this one atomic daemon op.
 pub async fn move_one(client: &mut Client, t: &Value, changes: &Map<String, Value>) -> Result<String> {
     let mut params = t["params"].clone();
     for (k, v) in changes {
@@ -67,10 +69,33 @@ pub async fn move_one(client: &mut Client, t: &Value, changes: &Map<String, Valu
     }
     let new = client.call("scheduler.add", add).await?;
     let new_id = new["trigger_id"].as_str().unwrap_or_default().to_owned();
+    let old_id = cell(&t["id"]);
     if t["paused"] == true {
-        client.call("scheduler.pause", json!({"trigger_id": new_id})).await?;
+        if let Err(e) = client.call("scheduler.pause", json!({"trigger_id": new_id})).await {
+            // An active copy of a paused schedule would fire: take the copy back out.
+            return Err(match client.call("scheduler.remove", json!({"trigger_id": new_id})).await {
+                Ok(_) => e,
+                Err(_) => Error::new(
+                    e.code,
+                    format!(
+                        "{}; the new copy {new_id} is active while {old_id} is paused: remove it with \
+                         'shimmer scheduler remove {new_id}'",
+                        e.message
+                    ),
+                ),
+            });
+        }
     }
-    client.call("scheduler.remove", json!({"trigger_id": t["id"]})).await?;
+    if let Err(e) = client.call("scheduler.remove", json!({"trigger_id": t["id"]})).await {
+        return Err(Error::new(
+            e.code,
+            format!(
+                "{}; both {old_id} and its copy {new_id} now exist: remove the old one with \
+                 'shimmer scheduler remove {old_id}'",
+                e.message
+            ),
+        ));
+    }
     Ok(new_id)
 }
 
@@ -214,6 +239,93 @@ mod tests {
             "\n  2 schedules still use jobs:\n    usr-6 records.list, every 60s\n    usr-7 records.complete, every 60s\n  \
              they'll fail until you restore it (shimmer records restore-collection jobs) or remove them \
              (shimmer scheduler remove ID)"
+        );
+    }
+
+    /// A daemon for `move_one`: `scheduler.add` gives `usr-new`; the op named in `fail` (and, with
+    /// `fail_cleanup`, the removal of the copy too) fails; every op is logged.
+    async fn scheduler_daemon(
+        sock: &std::path::Path,
+        fail: &'static str,
+        fail_cleanup: bool,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+        use shimmer_proto::{decode_client, encode, ClientFrame, ServerFrame};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = log.clone();
+        let listener = tokio::net::UnixListener::bind(sock).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (rd, mut wr) = stream.into_split();
+            let mut lines = BufReader::new(rd).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let frame = match decode_client(&line).unwrap() {
+                    ClientFrame::Hello { .. } => ServerFrame::welcome("test", "s1"),
+                    ClientFrame::Request { id, op, params, .. } => {
+                        let target = params["trigger_id"].as_str().unwrap_or("").to_owned();
+                        seen.lock().unwrap().push(format!("{op} {target}").trim().to_owned());
+                        let fails = op == fail || (fail_cleanup && op == "scheduler.remove" && target == "usr-new");
+                        if fails {
+                            ServerFrame::err(id, Error::unavailable(format!("{op} broke")))
+                        } else if op == "scheduler.add" {
+                            ServerFrame::ok(id, json!({"trigger_id": "usr-new"}))
+                        } else {
+                            ServerFrame::ok(id, json!({}))
+                        }
+                    }
+                    _ => continue,
+                };
+                wr.write_all(encode(&frame).unwrap().as_bytes()).await.unwrap();
+            }
+        });
+        log
+    }
+
+    fn paused() -> Value {
+        json!({"id": "usr-old", "op": "records.list", "params": {"collection": "jobs"},
+               "schedule": {"every": 86400}, "catch_up": "skip", "paused": true})
+    }
+
+    #[tokio::test]
+    async fn a_failed_pause_takes_the_active_copy_back_out() {
+        // #179: the copy of a paused schedule would fire while unpaused, so it's removed again.
+        let dir = tempfile::TempDir::new().unwrap();
+        let sock = dir.path().join("s.sock");
+        let log = scheduler_daemon(&sock, "scheduler.pause", false).await;
+        let mut client = Client::connect(&sock).await.unwrap();
+        let e = move_one(&mut client, &paused(), &names(&[("collection", "applications")])).await.unwrap_err();
+        assert_eq!(e.message, "scheduler.pause broke");
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["scheduler.add", "scheduler.pause usr-new", "scheduler.remove usr-new"],
+            "the old one is never touched"
+        );
+    }
+
+    #[tokio::test]
+    async fn when_a_copy_or_the_old_one_is_left_the_error_says_which_and_how_to_remove_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Pausing the copy fails, and so does taking it back out.
+        let sock = dir.path().join("a.sock");
+        scheduler_daemon(&sock, "scheduler.pause", true).await;
+        let mut client = Client::connect(&sock).await.unwrap();
+        let e = move_one(&mut client, &paused(), &names(&[("collection", "x")])).await.unwrap_err();
+        assert!(
+            e.message.contains("the new copy usr-new is active while usr-old is paused")
+                && e.message.contains("shimmer scheduler remove usr-new"),
+            "{}",
+            e.message
+        );
+        // The copy is in place but the old one can't be removed.
+        let sock = dir.path().join("b.sock");
+        scheduler_daemon(&sock, "scheduler.remove", false).await;
+        let mut client = Client::connect(&sock).await.unwrap();
+        let e = move_one(&mut client, &paused(), &names(&[("collection", "x")])).await.unwrap_err();
+        assert!(
+            e.message.contains("both usr-old and its copy usr-new now exist")
+                && e.message.contains("shimmer scheduler remove usr-old"),
+            "{}",
+            e.message
         );
     }
 }

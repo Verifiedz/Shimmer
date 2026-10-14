@@ -132,12 +132,12 @@ pub fn parse(words: Vec<String>) -> std::result::Result<ScheduleCmd, String> {
 }
 
 /// The one op + params a schedulable workspaces command sends: activate, stop or cleanup, without
-/// `--wait`. Shared with `scheduler list`, which reads a schedule back through it (ADR 0031 §3).
+/// `--wait` or `--first`. Shared with `scheduler list`, which reads a schedule back through it (ADR 0031 §3).
 pub fn workspaces_op(cmd: &WorkspacesCmd) -> Option<(&'static str, Value)> {
     match cmd {
-        WorkspacesCmd::Activate { id, wait: false } => Some(("workspaces.activate", json!({"id": id}))),
-        WorkspacesCmd::Stop { id, wait: false } => Some(("workspaces.stop", json!({"id": id}))),
-        WorkspacesCmd::Cleanup { id, wait: false } => Some(("workspaces.cleanup", json!({"id": id}))),
+        WorkspacesCmd::Activate { id, wait: false, first: None } => Some(("workspaces.activate", json!({"id": id}))),
+        WorkspacesCmd::Stop { id, wait: false, first: None } => Some(("workspaces.stop", json!({"id": id}))),
+        WorkspacesCmd::Cleanup { id, wait: false, first: None } => Some(("workspaces.cleanup", json!({"id": id}))),
         _ => None,
     }
 }
@@ -327,6 +327,13 @@ async fn request(client: &mut Client, command: &[String]) -> Result<(&'static st
             | WorkspacesCmd::Cleanup { wait: true, .. } => {
                 Err(not("--wait follows a launch as it happens, and a scheduled one runs with no one waiting"))
             }
+            // A trigger can't carry a request's `queue` block (#222): a scheduled run is the
+            // scheduler's own task and takes its turn, so `--first` would be silently lost.
+            WorkspacesCmd::Activate { first: Some(_), .. }
+            | WorkspacesCmd::Stop { first: Some(_), .. }
+            | WorkspacesCmd::Cleanup { first: Some(_), .. } => Err(not(
+                "--first jumps the queue as you run it; a scheduled run is the scheduler's own and takes its turn",
+            )),
             cmd => match workspaces_op(&cmd) {
                 Some((op, params)) => {
                     known_workspace(client, op, params["id"].as_str().unwrap_or_default()).await?;
