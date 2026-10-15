@@ -61,6 +61,9 @@ pub struct NewTrigger {
     pub lane: Option<String>,
 }
 
+/// What `--catch-up` takes, as typed (shell completion offers these, #188).
+pub const CATCH_UP: &[&str] = &["skip", "run-once", "backfill"];
+
 const CATCH_UP_HELP: &str = "skip (drop missed runs), run-once (one run on waking, however many were missed) \
                              or backfill (one run for each missed time)";
 
