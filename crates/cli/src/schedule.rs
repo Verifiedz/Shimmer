@@ -288,7 +288,7 @@ pub async fn run(client: &mut Client, cmd: &ScheduleCmd, json: bool, prompt: &mu
     };
     Ok(format!(
         "✓ scheduled {} · {} · catch-up {}\n  first run: {first}\n  id {short} (shimmer scheduler show {short})",
-        plan.command.join(" "),
+        typed(&plan.command),
         plan.when.words,
         catch_up.replace('_', "-"),
     ))
@@ -372,6 +372,12 @@ fn ask_catch_up(prompt: &mut dyn Prompt, when: &When) -> Result<&'static str> {
     }
 }
 
+/// The command as the person typed it, quoted where a shell needs it (`records add notes --title
+/// 'Two Sum'`), as `scheduler list` shows it.
+fn typed(command: &[String]) -> String {
+    command.iter().map(|w| crate::scheduler::shell_word(w)).collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,6 +391,15 @@ mod tests {
             ScheduleCmd::Add(p) => p,
             ScheduleCmd::Help => panic!("help"),
         }
+    }
+
+    #[test]
+    fn the_reply_quotes_the_command_as_typed() {
+        assert_eq!(
+            typed(&w(&["records", "add", "notes", "--title", "Two Sum"])),
+            "records add notes --title 'Two Sum'"
+        );
+        assert_eq!(typed(&w(&["workspaces", "stop", "site"])), "workspaces stop site");
     }
 
     #[test]

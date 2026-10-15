@@ -274,7 +274,9 @@ What each shell shows:
 | Grouped and coloured | – | ✓ (Shimmer's colours) | your fish theme |
 
 In zsh, the suggestions are grouped and coloured in Shimmer's palette; a `[colors]` section changes
-them, and `NO_COLOR=1` turns them off. bash can't show descriptions.
+them, and `NO_COLOR=1` turns them off. That's read when your shell starts, so set it in your
+environment; `shimmer --no-color completions zsh` prints the same script. bash can't show
+descriptions.
 
 ### Contributing
 

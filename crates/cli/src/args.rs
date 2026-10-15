@@ -25,6 +25,7 @@ commands:
                         workspaces activate site (shimmer schedule --help)
   scheduler …           list, pause, resume and remove schedules (shimmer scheduler --help)
   packs …               command packs: themed aliases for these commands (shimmer packs --help)
+  doctor                check everything and say how to fix what's wrong
   call OP [PARAMS]      send any op; PARAMS is a JSON object (default {});
        [--first [--yes]]  --first: a queued op ahead of its lane (asks first)
   shutdown              stop the daemon
@@ -56,6 +57,8 @@ pub enum Command {
         params: Value,
         first: Option<bool>,
     },
+    Doctor,
+    DoctorHelp,
     Records(RecordsCmd),
     Workspaces(WorkspacesCmd),
     Queue(QueueCmd),
@@ -105,6 +108,7 @@ impl Args {
             (true, Some("scheduler")) => Command::Scheduler(SchedulerCmd::Help),
             (true, Some("schedule")) => Command::Schedule(crate::schedule::ScheduleCmd::Help),
             (true, Some("packs")) => Command::Packs(PacksCmd::Help),
+            (true, Some("doctor")) => Command::DoctorHelp,
             (true, _) => Command::Help,
             (false, _) => command(words)?,
         };
@@ -133,6 +137,9 @@ fn command(words: Vec<String>) -> Result<Command, String> {
     }
     if word == "packs" {
         return packs::parse(rest).map(Command::Packs);
+    }
+    if word == "doctor" {
+        return crate::doctor::parse(rest).map(|()| Command::Doctor);
     }
     if word == "call" {
         return call(rest);

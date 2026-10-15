@@ -30,10 +30,16 @@ Each built-in template belongs to one category, set in the module next to the te
 
 | Category | Heading | Templates |
 |---|---|---|
-| `job-hunt` | Job hunt | interview-questions, interviews, job-applications, networking-events, offers, outreach, stories |
-| `practice` | Practice | leetcode |
+| `applying` | Applying | interviews, job-applications, networking-events, offers, outreach |
+| `interview-prep` | Interview prep | interview-questions, leetcode, stories |
 | `career` | Career history | certifications, education, employment, projects |
-| `life` | Life admin | addresses, charity, documents, subscriptions |
+| `paperwork` | Paperwork | addresses, documents |
+| `money` | Money | charity, subscriptions |
+
+**Changed since (#190):** the first version had four uneven categories (`job-hunt` with seven
+templates mixing applying with preparing, `practice` with one, and `life` mixing paperwork with
+money). They're now the five above, with a rule a test checks: every category holds at least two
+templates, and a template that fits nowhere gets a new, named category, never a catch-all.
 
 `records.templates` takes `{"id"?, "file"?}`, both optional, so `{}` still works:
 

@@ -66,8 +66,9 @@ commands:
         Don't use --wait from a workspace's own step scripts: launches run one at a time.
         With --json: the op's result, or {\"result_missed\": true, \"task\": {…}} when it
         succeeded but its result was lost to dropped events (then fields like log are absent).
---first run it ahead of everything waiting in the workspaces lane. Shows what it would run
-        ahead of and asks first (--yes to skip that); never stops what's already running.
+--first run it ahead of everything waiting in the workspaces lane (behind anything already run
+        first). Shows what it would run ahead of and asks first (--yes to skip that); never
+        stops what's already running. With force-relaunch, --yes answers both its questions.
 --yes   skip the question. Needed when no one is at the keyboard (scripts).
 
 A workspace is a folder under data/workspaces/ in your Shimmer folder, holding a
@@ -668,6 +669,8 @@ async fn queued(
         None => client.call(kind.op(), json!({"id": id})).await?,
         Some(yes) => match crate::first::send(client, kind.op(), json!({"id": id}), yes, prompt).await? {
             Some(handle) => handle,
+            // Said no to running first: nothing was sent, and --json says so as JSON (#230).
+            None if json => return Ok(render::json(&json!({"queued": false}))),
             None => return Ok(format!("{id}: nothing queued")),
         },
     };
@@ -676,7 +679,7 @@ async fn queued(
         return Ok(match (json, first) {
             (true, _) => render::json(&handle),
             (false, None) => queued_message(kind, id, task),
-            (false, Some(_)) => queued_message(kind, id, task).replacen(" (task", " first in its lane (task", 1),
+            (false, Some(_)) => first_message(kind, id, task, handle["position"].as_u64().unwrap_or(0)),
         });
     }
     let look = format!("shimmer workspaces status {id}");
@@ -723,6 +726,17 @@ fn shown_log(text: &str, log: &str) -> Vec<String> {
         lines.insert(0, format!("  … (the whole log: {log})"));
     }
     lines
+}
+
+/// After `--first`: where it landed. `position` is its place among the waiting tasks; anything
+/// ahead of it was run first earlier, which a new `--first` doesn't jump (#230).
+fn first_message(kind: Queued, id: &str, task: &str, position: u64) -> String {
+    let place = match position {
+        0 => " first in its lane".to_owned(),
+        1 => " in its lane, behind 1 task already run first".to_owned(),
+        n => format!(" in its lane, behind {n} tasks already run first"),
+    };
+    queued_message(kind, id, task).replacen(" (task", &format!("{place} (task"), 1)
 }
 
 fn queued_message(kind: Queued, id: &str, task: &str) -> String {
@@ -1315,6 +1329,20 @@ mod tests {
             let e = parse_words(words).unwrap_err();
             assert!(e.contains(expected), "{words:?}: {e}");
         }
+    }
+
+    #[test]
+    fn first_says_where_it_landed() {
+        // #230 (Wasay's #223 review): a second --first lands behind the first, so "first in its
+        // lane" is only said when it is.
+        let first = first_message(Queued::Activate, "c", "t1", 0);
+        assert!(first.starts_with("queued the launch of c first in its lane (task t1)"), "{first}");
+        let behind = first_message(Queued::Activate, "d", "t2", 1);
+        assert!(
+            behind.starts_with("queued the launch of d in its lane, behind 1 task already run first (task t2)"),
+            "{behind}"
+        );
+        assert!(first_message(Queued::Stop, "e", "t3", 2).contains("behind 2 tasks already run first"));
     }
 
     #[test]

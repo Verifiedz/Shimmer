@@ -432,7 +432,7 @@ fn parses_back_to(words: &[String], op: &str, params: &Value, schemas: &Schemas)
 }
 
 /// `text` as one word a shell reads back as it is: bare when it's safe, else in single quotes.
-fn shell_word(text: &str) -> String {
+pub(crate) fn shell_word(text: &str) -> String {
     let safe = |c: char| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c);
     if !text.is_empty() && text.chars().all(safe) {
         text.to_owned()

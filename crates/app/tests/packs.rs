@@ -80,8 +80,9 @@ fn no_pack_by_default_and_packs_need_no_daemon() {
 fn use_links_aliases_that_run_shimmer_and_the_whole_command() {
     let home = Home::with_leetcode();
     let out = ok(shimmer(&home, &["packs", "use", "short"]));
-    assert!(out.starts_with("✓ active pack: short (Short)\n  linked 53 commands into"), "{out}");
-    assert_eq!(links(&home).len(), 53);
+    let n = commands();
+    assert!(out.starts_with(&format!("✓ active pack: short (Short)\n  linked {n} commands into")), "{out}");
+    assert_eq!(links(&home).len(), n);
 
     // On their own, through the links: ping starts the daemon; a record goes in and is completed.
     assert!(ok(bare(&home, "up", &[])).starts_with("pong"));
@@ -109,7 +110,8 @@ fn switching_swaps_the_links_and_none_removes_them() {
     assert!(links(&home).contains(&"ikuzo".to_string()));
 
     let out = ok(shimmer(&home, &["packs", "use", "ship-it"]));
-    assert!(out.contains("linked 53") && out.contains("removed 53"), "{out}");
+    let n = commands();
+    assert!(out.contains(&format!("linked {n}")) && out.contains(&format!("removed {n}")), "{out}");
     assert!(links(&home).contains(&"deploy".to_string()) && !links(&home).contains(&"ikuzo".to_string()));
 
     ok(shimmer(&home, &["packs", "use", "starship", "--no-link"]));
@@ -121,6 +123,12 @@ fn switching_swaps_the_links_and_none_removes_them() {
     assert!(ok(shimmer(&home, &["ping"])).starts_with("pong"));
 }
 
+/// How many commands a built-in pack links: every one a pack can name (ADR 0029). Read from the
+/// CLI, so adding a command doesn't mean editing this file.
+fn commands() -> usize {
+    shimmer_cli::packs::pack::TARGETS.len()
+}
+
 #[cfg(unix)]
 #[test]
 fn nothing_of_the_users_is_ever_overwritten_or_removed() {
@@ -129,7 +137,8 @@ fn nothing_of_the_users_is_ever_overwritten_or_removed() {
     std::fs::write(bin(&home).join("deploy"), "my own deploy script").unwrap();
 
     let out = ok(shimmer(&home, &["packs", "use", "ship-it"]));
-    assert!(out.contains("linked 52") && out.contains("skipped deploy: it already exists"), "{out}");
+    let linked = format!("linked {}", commands() - 1);
+    assert!(out.contains(&linked) && out.contains("skipped deploy: it already exists"), "{out}");
     ok(shimmer(&home, &["packs", "use", "none"]));
     assert_eq!(links(&home), ["deploy"]);
     assert_eq!(std::fs::read_to_string(bin(&home).join("deploy")).unwrap(), "my own deploy script");
