@@ -1,9 +1,9 @@
 # 0032. Notify: an inbox and desktop notifications, built for more ways to reach you
 
-Status: proposed · Raised by Dev B · Needs sign-off: Dev A (§1 adds a `Ctx` capability and moves a
-helper into `crates/core`; §2 is daemon code; §1 and §7 change CLAUDE.md and `docs/protocol.md`,
-CLAUDE.md §4) · Dev C notified (new ops and topics, §5–§6) · Amends ADR 0005 (where an
-exhausted delivery goes)
+Status: proposed · Raised by Dev B · Needs sign-off: Dev A (§1 adds a `Ctx` capability to
+`crates/core`; §2 is daemon code; §1 and §7 change CLAUDE.md and `docs/protocol.md`, CLAUDE.md §4) ·
+Dev C notified (new ops and topics, §6) · Amends ADR 0005 (where an exhausted delivery goes) ·
+"Message me when X" rules are automations' (ADR 0035, #238), not notify's: §5
 
 ## Context
 
@@ -32,14 +32,12 @@ Decided before this ADR (with the team, in the planning for this):
 
 - The MVP's ways to reach you are **desktop notifications and an inbox in Shimmer**, working as one
   system. Phone (ntfy), email, chat webhooks and the rest come later, each as one small sink.
-- Notify templates use **the same format as records' and workspaces'** for now; #202 makes one
-  shared convention for every module after the MVP.
 - **When** to remind ("a day before the interview") is calendar's and the scheduler's job, not
   notify's. Calendar is its own ADR, later.
 
 ## Decision
 
-### 1. `core`: a desktop capability, and the text renderer shared
+### 1. `core`: a desktop capability
 
 **`Ctx.desktop`**, the same pattern as `Ctx.launcher` (ADR 0010) and `Ctx.http` (ADR 0027):
 
@@ -65,13 +63,6 @@ impl Desktop {
 - A module can show a note and nothing else: no program, no path, no handle.
 - `crates/core/src/testing.rs` gains `FakeDesktop`, which records every note shown (or fails, on
   request), for module tests against the in-memory `Ctx` (§12 rule 13).
-
-**`core::text`**: records' `{field}` / `[optional part]` renderer (ADR 0017 §2, ADR 0024 §5;
-`render_title`, `title_parts` and `plain_parts` in `crates/modules/records/src/schema.rs`) moves to
-`crates/core/src/text.rs` as `Template::parse(&str)` and `Template::render(&Map<String, Value>)`.
-Records calls it; its behaviour, errors and tests are unchanged. Notify renders its messages with
-it, so a message template and a record title read the same way. Two modules needing the same
-helper is the case ADR 0014 put helpers in `core` for.
 
 ### 2. Daemon: the real desktop backend
 
@@ -110,7 +101,7 @@ at = 2026-10-14T13:00:00Z
 priority = "high"            # low | normal | high
 title = "site couldn't launch"
 body = "Step 2/5 (install) failed. Log: logs/site-01M4….log"
-source = "alert:workspace_dirty"   # send | fallback | alert:<name> | rule:<id>
+source = "alert:workspace_dirty"   # send | fallback | alert:<name>
 state = "delivered"          # pending | held | delivered | failed
 read = false
 
@@ -157,11 +148,10 @@ meant to be committable to git (§1.4). The VM template's `SSH_PASSWORD_ITEM` wo
 **`notify.send`** (queued, lane `notify`):
 
 ```
-{"title", "body"?, "priority"?: "low"|"normal"|"high", "rule"?, "fields"?}
+{"title", "body"?, "priority"?: "low"|"normal"|"high"}
 ```
 
-1. Build the message: `title` and `body` as given; or, with `rule`, that rule's templates rendered
-   with `fields`. A call from ADR 0005's fallback carries `failure_code`, `failure_reason` and
+1. Build the message: `title` and `body` as given. A call from ADR 0005's fallback carries `failure_code`, `failure_reason` and
    `failure_detail`; with no `title`, notify writes one from them ("Scheduled task failed: …"). The
    `priority` key the queue stamps is the message's priority. A `message` key, the name ADR 0005's
    examples and tests use (`queue/fallback.rs`), is read as `body` when there's no `body`, so a
@@ -180,7 +170,8 @@ meant to be committable to git (§1.4). The VM template's `SSH_PASSWORD_ITEM` wo
 (ADR 0009), and may cross midnight. Unset means none. When quiet hours end, the held messages become
 **one** summary popup ("3 messages while you were away: …") and are marked delivered.
 
-- The summary is sent by **`notify.flush`** (queued, lane `notify`), run by a module trigger every
+- The summary is sent by **`notify.flush`** (queued, lane `notify`), run by a module trigger, id
+  `notify.flush` (the daemon doesn't namespace module trigger ids, so the module names it so), every
   hour (`Schedule::Every`, `CatchUp::Skip`), on daemon start, and on the first event notify sees
   after quiet hours end. A trigger can't be set for the configured end time itself:
   `Module::triggers()` runs before `init`, with no config. So the summary is at most an hour late,
@@ -216,68 +207,37 @@ meant to be committable to git (§1.4). The VM template's `SSH_PASSWORD_ITEM` wo
   `"recovered": true` in that case (additive, workspaces module).
 - From `on_event`, notify **enqueues** `notify.send` (`ctx.queue`); it never delivers inline. A slow
   popup never holds up the event bus, and every send shows in `shimmer queue`.
-- **Notify never reacts to its own work**, in the alerts and in rules (§5) alike, so nothing it does
-  can set off another message. Every `notify.send` is a queued task, so its own work isn't only the
-  `notify.*` topics. Notify ignores an event when:
-  - its topic is `notify.*`;
-  - its payload's `op` starts with `notify.`: `queue.task.enqueued`, `.started`, `.finished`,
-    `.failed`, `.cancelled`, `.promoted` and `.reordered` of a notify task, `queue.fallback.*` (a
-    fallback is always a `notify.*` op) and `scheduler.trigger.fired` for a trigger that runs one;
-  - its payload's `trigger_id` starts with `notify.`: `scheduler.trigger.missed` and `.skipped` for
-    notify's own `notify.flush` trigger carry no `op`;
-  - its topic is `queue.task.progress`: it carries no `op`, and is never worth a message.
+- **An alert never fires for notify's own work.** The alerts match only the two events above, and
+  ignore a `queue.task.failed` whose `op` starts with `notify.` (a scheduled `notify send`, or a
+  fallback, that failed): the inbox already has that message as `failed`, and an alert about it
+  would go the same way. So nothing notify does can set off another message. Rules that react to
+  any event, where loops are the real risk, are automations' (§5), with their own guard.
 
-  Without this, a rule on `queue.task.finished`, `queue.*` or `*` would match the finish of its own
-  `notify.send`, which would send again, forever: a popup and an inbox file each time. And a rule on
-  `scheduler.*` would send every hour, when `notify.flush` fires. `notify.create_rule` also refuses
-  `on = "*"`: a message for every event is never what anyone wants.
+### 5. Rules ("message me when X") are automations'
 
-### 5. Rules and templates
-
-A **rule** says "when this happens, send this message". It's a file the user can read and edit,
-`data/notify/rules/<id>.toml`:
+An earlier draft of this ADR gave notify its own rules: files saying "when this event happens, send
+this message", with templates and `notify.create_rule` / `rules` / `remove_rule`. That is one case
+of a general mechanism, a rule whose action is `notify.send`, so it moves to **automations (ADR
+0035, #238)**, which runs any op when an event matches:
 
 ```toml
-# Created from Shimmer's record-done template
 [rule]
-id = "leetcode-solved"
-label = "A LeetCode problem solved"
-on = "records.item.completed"      # a topic, or a pattern like records.item.*
-when = { collection = "leetcode" } # payload fields that must match (optional)
-priority = "low"
-
-[message]
-title = "Solved: {title}"
-body = "[{difficulty}, ]{collection}/{id}"
+on = "records.item.completed"
+when = { collection = "leetcode" }
+[do]
+op = "notify.send"
+params = { title = "Solved: {title}", priority = "low" }
 ```
 
-- `on` takes the same patterns as an IPC subscription (`a.b.c`, `a.*`, `*`; `docs/protocol.md`).
-- `when` matches the event's payload by equality; every key must match.
-- The message's `{field}` and `[optional part]` are filled from the event's payload, with
-  `core::text` (§1). For record events (whose payload is `{collection, id, title, deadlines, item}`),
-  the record's own fields from `item` are available directly too (`{difficulty}`); where a name is
-  in both, the payload's wins, so `{title}` is the record's readable title (ADR 0017).
-- Rules load at `init` and reload when one is created or removed. They're matched in `on_event`, as
-  the alerts are, and ignore the same events (§4: notify never reacts to its own work).
-
-A **template** makes a rule, in the format records' and workspaces' templates use: one TOML file in
-`crates/modules/notify/templates/`, a header comment with notes and "How it works" examples, a
-category, and `[[question]]` blocks as in workspace templates (ADR 0025 §3). The answers replace
-`${NAME}` in the rule when it's created, so the stored rule is plain and hand-editable (e.g. `when =
-{ collection = "${COLLECTION}" }`). `${NAME}` may only appear inside a quoted string in a template,
-and each answer is escaped as TOML string content (`"`, `\` and newlines), by the `toml` crate as
-workspace templates' `[env]` answers are. So an answer can never end the string early, break the file, or add a
-key such as `priority`; the created rule is parsed and checked like any rule before it's written. Built in, kept few (the template debloat comes right after the
-MVP):
-
-| Template | Makes a rule for |
-|---|---|
-| `record-done` | a record completed in one collection |
-| `record-added` | a record added to one collection |
-| `task-failed` | any task failing, optionally in one lane |
-| `workspace-launched` | a workspace launched (low priority) |
-
-Every built-in template is tested end to end, as ADR 0025 §6a requires of workspace templates.
+- One rules system instead of two: one file format, one set of templates, one loop guard, one
+  place to look for "why did I get this message".
+- Notify keeps delivery only: `notify.send`, the inbox, sinks, quiet hours, and the two built-in
+  alerts (§4), which stay module code because they're on for everyone by default.
+- The `{field}` renderer (`core::text`) moves to `core` with automations, which fills params from an
+  event; notify doesn't need it.
+- Until automations ships, the built-in alerts, ADR 0005's fallbacks, `shimmer notify send` and
+  scheduled messages (`shimmer schedule … notify send "…"`) all work; "message me when X" waits for
+  it.
 
 ### 6. Ops and topics
 
@@ -288,13 +248,8 @@ Every built-in template is tested end to end, as ADR 0025 §6a requires of works
 | `notify.list` | inline | `{"unread"?, "state"?, "limit"?}` | `{"items":[…]}`, newest first |
 | `notify.get` | inline | `{"id"}` | one item |
 | `notify.mark_read` | inline | `{"ids":[…]}` or `{"all": true}` | `{"marked": N}` |
-| `notify.templates` | inline | `{"id"?, "file"?}` | `{"templates":[…],"categories":[…]}`, as `records.templates` |
-| `notify.create_rule` | inline | `{"id","template","values"?,"label"?}` | the rule |
-| `notify.rules` | inline | `{}` | `{"rules":[…]}` |
-| `notify.remove_rule` | inline | `{"id"}` | `{"removed": true}` |
 
-Topics: `notify.message.received`, `.held`, `.sent`, `.exhausted`, `.read`; `notify.rule.created`,
-`.removed`.
+Topics: `notify.message.received`, `.held`, `.sent`, `.exhausted`, `.read`.
 
 **These replace the names CLAUDE.md and `docs/protocol.md` use for notify today** (`notify.sent`,
 `notify.fallback_used`, `notify.exhausted`). `core` requires a topic to have at least three
@@ -310,12 +265,10 @@ shimmer notify show ID                        one message in full (marks it read
 shimmer notify read [ID…|--all]               mark as read
 shimmer notify send TITLE [--body TEXT] [--priority low|normal|high]
 shimmer notify test                           send "Shimmer can reach you" to every medium
-shimmer notify templates [CATEGORY] · peek TEMPLATE · new ID --from TEMPLATE [--set Q=A]…
-shimmer notify rules · remove-rule ID
 ```
 
-- Built from the existing pieces: `render::table`, the templates listing and `peek`, workspace
-  templates' question prompts, the colour roles (#189) for state (held = warning, failed = error).
+- Built from the existing pieces: `render::table` and the colour roles (#189) for state (held =
+  warning, failed = error).
 - Every command gets a pack target and an alias in each built-in pack (ADR 0029).
 - `notify send` is one op, so `shimmer schedule` can schedule it once ADR 0031 lands:
   `shimmer schedule weekdays 09:00 --catch-up skip notify send "Standup in 15 minutes"`.
@@ -330,16 +283,16 @@ shimmer notify rules · remove-rule ID
 - Shimmer can reach the user with no network and no account; nothing it sends is lost.
 - A scheduled task's fallback works for the first time (ADR 0005), and a dirty workspace warns as
   §10.3 asks.
-- New ways to reach you are one sink each; new things to be told about are one rule or template,
-  with no code.
-- `core` gains one capability and one shared helper; the daemon gains one backend and one field on
-  an event (`queue.task.failed`'s `fallback`); workspaces gains one field on an event
-  (`workspaces.session.dirty`'s `recovered`). Records' titles move onto the shared helper, unchanged.
+- New ways to reach you are one sink each; new things to be told about are one automation rule
+  (ADR 0035), with no code.
+- `core` gains one capability; the daemon gains one backend and one field on an event
+  (`queue.task.failed`'s `fallback`); workspaces gains one field on an event
+  (`workspaces.session.dirty`'s `recovered`).
 - Every failure the user is told about produces one message: the fallback's, or an alert, never
   both.
 - Built in this order, stacked in an `integration/notify` umbrella: this ADR → `core` (§1) → the
   daemon backend and `fallback` flag (§2) → the module: inbox, send, desktop, quiet hours, alerts,
-  and the CLI for them (§3–§4) → rules and templates (§5) → docs (§7).
+  and the CLI for them (§3–§4) → docs (§7).
 
 ## Not done here
 
@@ -350,7 +303,7 @@ shimmer notify rules · remove-rule ID
 - **Batching** beyond the quiet-hours summary, and routing priorities to particular sinks: config
   that waits until there's more than one sink.
 - **An inbox view in the TUI**: Dev C's, built on `notify.list` and the `notify.message.*` topics.
-- **Moving notify templates to #202's shared convention**, after the MVP.
+- **"Message me when X" rules and their templates**: automations (ADR 0035, §5 above).
 
 ## Alternatives considered
 
