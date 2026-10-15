@@ -1,7 +1,7 @@
 # 0035. Automations: "when this happens, do that", written by users
 
 Status: proposed · Raised by Dev B (#228) · Needs sign-off: Dev A (§4 changes `Event` and `Ctx` in
-`crates/core`; §5 moves two helpers into `core`; CLAUDE.md §1.1 gains a row, CLAUDE.md §4) · Dev C
+`crates/core`; §5 moves three helpers into `core`; CLAUDE.md §1.1 gains a row, CLAUDE.md §4) · Dev C
 notified (new ops and topics, §8) · Amends ADR 0032 §5 (notify's rules)
 
 ## Context
@@ -81,7 +81,7 @@ params = { id = "interview-prep" }
   - a value that is exactly `"{field}"` takes that payload value **with its type** (a number stays
     a number, a list stays a list);
   - `{field}` inside other text is filled in as text, with `[optional]` parts, by `core::text`
-    (ADR 0032 §1): `"Solved: {title}"`.
+    (§5): `"Solved: {title}"`.
   ```toml
   # A posting found by a fetcher becomes an application ([rule]'s id and label left out)
   [rule]
@@ -151,9 +151,9 @@ Events with no cause (a person's command, the scheduler, a module's own work) st
 Legitimate rules are never paused or rate-limited. Automations also never reacts to its own
 `automations.*` topics.
 
-### 5. Two helpers move into `core` (ADR 0014's pattern)
+### 5. Three helpers move into `core` (ADR 0014's pattern)
 
-A module may depend only on `core` (§3 rule 1). Automations needs two things that live elsewhere:
+A module may depend only on `core` (§3 rule 1). Automations needs three things that live elsewhere:
 
 - **Topic patterns:** `is_valid_pattern` and `topic_matches` live in `crates/proto/src/topic.rs`.
   They move to `core`; `proto` re-exports them, so clients are unchanged. (ADR 0032's notify rules
@@ -165,6 +165,12 @@ A module may depend only on `core` (§3 rule 1). Automations needs two things th
   its schema checks (which operator applies to which field type, enum order) on top and calls it
   for the comparisons. Records' behaviour and tests are unchanged. One difference, documented:
   without a schema, enums compare as text, so rules use `in` for enum values rather than `lt`/`gt`.
+- **The text renderer:** records' `{field}` / `[optional part]` renderer (ADR 0017 §2, ADR 0024 §5;
+  `render_title`, `title_parts` and `plain_parts` in `crates/modules/records/src/schema.rs`) moves
+  to `core::text` as `Template::parse(&str)` and `Template::render(&Map<String, Value>)`, for filling
+  a rule's params. Records calls it; its behaviour, errors and tests are unchanged, so a message
+  and a record title read the same way. (ADR 0032 first planned this move for notify's rules; with
+  those here, it's done here.)
 
 ### 6. Notify's rules become automations (amends ADR 0032 §5)
 
@@ -180,12 +186,12 @@ A module may depend only on `core` (§3 rule 1). Automations needs two things th
   op = "notify.send"
   params = { title = "Solved: {title}", priority = "low" }
   ```
-- ADR 0032 §5's rule file, its four rule templates (record-done, record-added, task-failed,
-  workspace-launched) and `notify.create_rule` / `rules` / `remove_rule` move here as automation
-  templates and ops. Notify is smaller and can ship before automations; until automations exists,
-  only the built-in alerts and direct `notify.send` work.
-- ADR 0032's loop guard (§4: notify ignores its own work) still holds for its built-in alerts; for
-  rules, §4 above replaces it.
+- ADR 0032 §5 already leaves these to this ADR: notify's rule file, its four rule templates
+  (record-done, record-added, task-failed, workspace-launched) and `notify.create_rule` / `rules` /
+  `remove_rule` come here as automation templates and ops. Notify is smaller and can ship before
+  automations; until automations exists, only the built-in alerts and direct `notify.send` work.
+- ADR 0032 §4's guard (an alert never fires for notify's own work) covers its built-in alerts; for
+  rules, §4 above is the guard.
 
 ### 7. Templates
 
@@ -236,7 +242,7 @@ note: rules only run while the daemon runs.
 | §1.5 No identity | Rules belong to the Shimmer folder, not to a user. No `UserId`. |
 | §1.6 Extensible | A new reaction is a file, not code. |
 | §2 Clients hold no logic | Matching, filling and enqueuing are in the module; the CLI only shows and sends. |
-| §3 rules 1–2 | Depends on `core` only; the two helpers it needs move into `core` (§5). |
+| §3 rules 1–2 | Depends on `core` only; the three helpers it needs move into `core` (§5). |
 | §5 `Ctx` is a security decision | No new capability: it uses `bus`, `queue`, `store`, `clock`, `local_tz`. `Event.cause` and `for_task`'s id are data, not powers. |
 | §6.2 Ordering | Enqueued like any task; no `Overridden`. |
 | §11.1–11.2 Failure, no retry | A failed action is an ordinary `queue.task.failed`; automations never retries. |
@@ -259,7 +265,7 @@ filter covers many cases (e.g. every morning, list applications whose `follow_up
 
 - Users connect modules without code; developers write mechanisms, users write workflows.
 - Notify is smaller (§6); kits and an assistant have something safe and inspectable to produce.
-- `core` gains `Event.cause`, a task id in `Ctx::for_task`, and two moved helpers. The daemon stamps
+- `core` gains `Event.cause`, a task id in `Ctx::for_task`, and three moved helpers. The daemon stamps
   causes. CLAUDE.md §1.1 gains a row: `automations` · owns: reactions between events and ops,
   written as data · specialised by: rule templates.
 - Rules only run while the daemon runs (ADR 0034's start-at-login matters more).
