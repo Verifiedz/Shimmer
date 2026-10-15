@@ -352,7 +352,11 @@ fn test_items(source: &str, result: &Value) -> String {
             // The url must survive copy/paste intact -- render::cell's truncation is fine for a
             // title (a preview), but a truncated url is a different, invalid url, not a shorter
             // version of the real one, and silently hands back a 404 instead of the job posting.
-            vec![render::cell(&item["title"]), item["url"].as_str().unwrap_or_default().to_owned()]
+            // Still goes through strip_control: a raw control character has no legitimate place
+            // in a url (RFC 3986 requires percent-encoding one), so dropping it changes nothing
+            // about where a real link points, but it is the one thing that bypasses render::cell
+            // and its own stripping.
+            vec![render::cell(&item["title"]), render::strip_control(item["url"].as_str().unwrap_or_default())]
         })
         .collect();
     let n = items.len();
@@ -379,7 +383,7 @@ fn items(source: Option<&str>, events: &[Value]) -> String {
         None => format!("{n} item{}", if n == 1 { "" } else { "s" }),
     };
     // Never truncated, same reasoning as test_items's own url handling.
-    let url = |p: &Value| p["url"].as_str().unwrap_or_default().to_owned();
+    let url = |p: &Value| render::strip_control(p["url"].as_str().unwrap_or_default());
     let (header, rows): (Vec<String>, Vec<Vec<String>>) = match source {
         Some(_) => (
             ["TITLE", "URL"].map(String::from).to_vec(),
@@ -553,6 +557,19 @@ mod tests {
         let out = test_items("jobbank-canada", &data);
         assert!(out.ends_with(&long_url), "the full url must survive untouched:\n{out}");
         assert!(out.contains('…'), "the long title should still be shortened for display");
+    }
+
+    #[test]
+    fn test_items_strips_control_characters_from_both_title_and_url() {
+        // Both are spec-valid ways a remote source can carry a raw control byte -- a JSON
+        // `\u001b` escape (decoded here directly, same as serde_json would) and a url that
+        // never legitimately contains one (RFC 3986 requires percent-encoding it).
+        let data = json!({"items": [{
+            "title": "Click here\u{1b}[8mhidden\u{1b}[0m",
+            "url": "https://x/1\u{1b}[2J",
+        }]});
+        let out = test_items("evil-source", &data);
+        assert!(!out.contains('\u{1b}'), "no raw control character must reach the rendered output:\n{out:?}");
     }
 
     fn found(source: &str, title: &str, url: &str) -> Value {

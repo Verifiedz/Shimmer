@@ -83,11 +83,23 @@ pub(crate) fn uptime(secs: u64) -> String {
 
 pub(crate) const MAX_CELL: usize = 40;
 
+/// Drops every Unicode control character (`char::is_control`: C0 codes like ESC, and C1).
+/// A field sourced from outside this process -- a fetched title, a scraped one -- can carry
+/// one perfectly legitimately on the wire (a JSON `\u001b` escape, an XML numeric character
+/// reference both decode to a literal control byte once parsed) with nothing upstream of
+/// display ever stripping it back out. Applied to every string this module prints, since a
+/// raw control character reaching a terminal can inject escape sequences the viewer never
+/// typed -- not just a fetchers-only concern, but it is the one place untrusted remote text
+/// reaches this far.
+pub(crate) fn strip_control(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
 /// One value as table text: strings bare, `null` as `-`, long values cut with `…`.
 pub(crate) fn cell(v: &Value) -> String {
     let s = match v {
         Value::Null => "-".to_owned(),
-        Value::String(s) => s.clone(),
+        Value::String(s) => strip_control(s),
         other => other.to_string(),
     };
     if s.chars().count() > MAX_CELL {
@@ -282,6 +294,23 @@ mod tests {
         assert_eq!(ids(templates_selected(&data, Some("leetcode"))), ["leetcode"]);
         assert_eq!(templates_selected(&data, None), data);
         assert_eq!(templates_selected(&data, Some("practice"))["categories"], data["categories"], "headings kept");
+    }
+
+    #[test]
+    fn cell_strips_control_characters_a_fetched_field_could_legitimately_carry() {
+        // A JSON `\u001b` escape or an XML numeric character reference both decode to this
+        // exact byte once parsed -- neither is a parser bug, so nothing upstream catches it.
+        let poisoned = "Click here\u{1b}[8mhidden\u{1b}[0m";
+        let out = cell(&json!(poisoned));
+        // The ESC byte is what makes the rest a live escape sequence; without it, "[8m" and
+        // "[0m" are just harmless literal characters, which is why only ESC needs stripping.
+        assert!(!out.contains('\u{1b}'), "a raw control character must never reach the rendered cell: {out:?}");
+        assert_eq!(out, "Click here[8mhidden[0m");
+    }
+
+    #[test]
+    fn strip_control_leaves_ordinary_text_untouched() {
+        assert_eq!(strip_control("Senior Rust Engineer — remote"), "Senior Rust Engineer — remote");
     }
 
     #[test]
