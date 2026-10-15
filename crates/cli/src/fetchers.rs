@@ -17,7 +17,8 @@ commands:
   status               per-source last-run time and whether it is running
   test SOURCE [FILTER]   fetch one page and show its parsed items; never saves or marks anything seen
   run SOURCE [--wait] [FILTER]  fetch one source now
-  items [SOURCE]       items a real run has actually found and kept, most recent first
+  items [SOURCE] [--contains W,W] [--excludes W,W]  items a real run has actually found and kept,
+                        most recent first
 
 FILTER (test and run only):
   --contains W,W,...    keep only a title containing at least one of these (case-insensitive)
@@ -26,8 +27,11 @@ FILTER (test and run only):
                         (only a source that reads one from config.toml honors this --
                         today, jobbank-canada's search_term, ADR 0028 §16/§17)
 
-When given, each of these replaces -- never merges with -- whatever config.toml's own
-[modules.fetchers.sources.<id>] entry configures, for that one call only.
+When given to test or run, each of these replaces -- never merges with -- whatever
+config.toml's own [modules.fetchers.sources.<id>] entry configures, for that one call only.
+
+items' own --contains/--excludes are a separate, client-side narrowing of what's already
+been found and saved (no --search-term there -- nothing is being fetched).
 
 A source is either one of the built-in ones (hn-whoishiring, weworkremotely) or a configured
 kind (ADR 0028 §2a) under [modules.fetchers.sources.<id>] in config.toml. Add --json to any
@@ -58,6 +62,8 @@ pub enum FetchersCmd {
     },
     Items {
         source: Option<String>,
+        title_contains: Option<Vec<String>>,
+        title_excludes: Option<Vec<String>>,
     },
 }
 
@@ -66,6 +72,17 @@ pub enum FetchersCmd {
 /// itself already rejects an empty value, e.g. `--contains=`).
 fn terms(value: Option<&str>) -> Option<Vec<String>> {
     value.map(|s| s.split(',').map(|t| t.trim().to_owned()).collect())
+}
+
+/// `items`' own `--contains`/`--excludes`, narrowing what's already been found rather than
+/// what a `Source` fetches. Same matching rule as `fetchers`' own `SourceConfig::matches_title`
+/// (case-insensitive substring, OR'd within each list) -- duplicated, not imported, since a
+/// client crate must not depend on a module crate (CLAUDE.md §3).
+fn title_matches(title: &str, contains: &[String], excludes: &[String]) -> bool {
+    let lower = title.to_lowercase();
+    let included = contains.is_empty() || contains.iter().any(|w| lower.contains(&w.to_lowercase()));
+    let excluded = excludes.iter().any(|w| lower.contains(&w.to_lowercase()));
+    included && !excluded
 }
 
 /// `words` are what follows `shimmer fetchers`.
@@ -117,11 +134,20 @@ pub fn parse(words: Vec<String>) -> std::result::Result<FetchersCmd, String> {
                 search_term: flags.value("--search-term").map(str::to_owned),
             })
         }
-        "items" => match rest.as_slice() {
-            [] => Ok(FetchersCmd::Items { source: None }),
-            [source] => Ok(FetchersCmd::Items { source: Some(source.clone()) }),
-            _ => Err("usage: shimmer fetchers items [SOURCE]".into()),
-        },
+        "items" => {
+            let flags =
+                Flags::split(rest, &["--contains", "--excludes"], &[]).map_err(|e| format!("fetchers items: {e}"))?;
+            let source = match flags.positional.as_slice() {
+                [] => None,
+                [source] => Some(source.clone()),
+                _ => return Err("usage: shimmer fetchers items [SOURCE] [--contains W,W] [--excludes W,W]".into()),
+            };
+            Ok(FetchersCmd::Items {
+                source,
+                title_contains: terms(flags.value("--contains")),
+                title_excludes: terms(flags.value("--excludes")),
+            })
+        }
         other => Err(format!("unknown fetchers command '{other}'; see 'shimmer fetchers --help'")),
     }
 }
@@ -165,7 +191,7 @@ pub async fn run(client: &mut Client, cmd: &FetchersCmd, json_out: bool) -> Resu
             let result = follow(client, task).await?;
             Ok(if json_out { render::json(&result) } else { fetched(source, &result) })
         }
-        FetchersCmd::Items { source } => {
+        FetchersCmd::Items { source, title_contains, title_excludes } => {
             // fetchers.item.found is a plain string literal, not an import from shimmer-fetchers
             // -- a client crate must not depend on a module crate (CLAUDE.md §3's dependency
             // rules), same reason every other op name in this file is also a literal.
@@ -173,12 +199,15 @@ pub async fn run(client: &mut Client, cmd: &FetchersCmd, json_out: bool) -> Resu
                 .call("core.events.list", json!({"topic": "fetchers.item.found", "limit": ITEMS_QUERY_LIMIT}))
                 .await?;
             let events = data["events"].as_array().cloned().unwrap_or_default();
+            let contains = title_contains.clone().unwrap_or_default();
+            let excludes = title_excludes.clone().unwrap_or_default();
             let matching: Vec<Value> = events
                 .into_iter()
                 .filter(|e| match source {
                     None => true,
                     Some(s) => e["payload"]["source_name"].as_str() == Some(s.as_str()),
                 })
+                .filter(|e| title_matches(e["payload"]["title"].as_str().unwrap_or_default(), &contains, &excludes))
                 .collect();
             Ok(if json_out { render::json(&json!({"items": matching})) } else { items(source.as_deref(), &matching) })
         }
@@ -441,8 +470,23 @@ mod tests {
                 search_term: Some("new grad software developer".into()),
             })
         );
-        assert_eq!(p(&["items"]), Ok(FetchersCmd::Items { source: None }));
-        assert_eq!(p(&["items", "jobbank-canada"]), Ok(FetchersCmd::Items { source: Some("jobbank-canada".into()) }));
+        assert_eq!(p(&["items"]), Ok(FetchersCmd::Items { source: None, title_contains: None, title_excludes: None }));
+        assert_eq!(
+            p(&["items", "jobbank-canada"]),
+            Ok(FetchersCmd::Items {
+                source: Some("jobbank-canada".into()),
+                title_contains: None,
+                title_excludes: None
+            })
+        );
+        assert_eq!(
+            p(&["items", "jobbank-canada", "--contains", "junior,entry level", "--excludes", "senior"]),
+            Ok(FetchersCmd::Items {
+                source: Some("jobbank-canada".into()),
+                title_contains: Some(vec!["junior".into(), "entry level".into()]),
+                title_excludes: Some(vec!["senior".into()]),
+            })
+        );
     }
 
     #[test]
@@ -555,6 +599,17 @@ mod tests {
         let expected: Vec<String> = ["junior", "entry level", "new grad"].iter().map(|s| s.to_string()).collect();
         assert_eq!(terms(Some("junior, entry level ,new grad")), Some(expected));
         assert_eq!(terms(Some("junior")), Some(vec!["junior".to_string()]));
+    }
+
+    #[test]
+    fn title_matches_is_case_insensitive_and_excludes_win_over_contains() {
+        assert!(title_matches("Junior Rust Engineer", &[], &[]), "no filter at all keeps everything");
+        assert!(title_matches("Junior Rust Engineer", &["junior".into()], &[]));
+        assert!(!title_matches("Senior Rust Engineer", &["junior".into()], &[]), "contains must actually match");
+        assert!(
+            !title_matches("Junior Rust Engineer", &["junior".into()], &["engineer".into()]),
+            "an excludes match drops it even though contains would have kept it"
+        );
     }
 
     #[test]
