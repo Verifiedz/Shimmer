@@ -8,6 +8,7 @@ use shimmer_core::Result;
 use crate::client::Client;
 use crate::flags::Flags;
 use crate::render::{self, table};
+use crate::style::{paint, Role};
 use crate::when;
 
 pub const USAGE: &str = "usage: shimmer scheduler <command>
@@ -61,6 +62,9 @@ pub struct NewTrigger {
     pub catch_up: &'static str,
     pub lane: Option<String>,
 }
+
+/// What `--catch-up` takes, as typed (shell completion offers these, #188).
+pub const CATCH_UP: &[&str] = &["skip", "run-once", "backfill"];
 
 const CATCH_UP_HELP: &str = "skip (drop missed runs), run-once (one run on waking, however many were missed) \
                              or backfill (one run for each missed time)";
@@ -239,8 +243,9 @@ fn trigger(t: &Value, now: DateTime<Utc>, schemas: &Schemas) -> String {
     let time = |v: &Value, none: &str| {
         when::timestamp(v).map_or(none.to_string(), |at| format!("{} ({})", when::local(at), when::relative(at, now)))
     };
-    let mut out = format!("{}  ({})\n", render::cell(&t["id"]), state(t));
-    let mut line = |label: &str, value: String| out.push_str(&format!("  {label:<10}{value}\n"));
+    let id = paint(Role::Name, &render::cell(&t["id"]));
+    let mut out = format!("{id}  ({})\n", crate::style::state(&state(t)));
+    let mut line = |label: &str, value: String| out.push_str(&format!("  {}{value}\n", crate::style::label(label, 10)));
     line("command", command_of(&t["op"], &t["params"], schemas));
     line("op", render::cell(&t["op"]));
     line("params", serde_json::to_string(&t["params"]).unwrap_or_default());
@@ -427,7 +432,7 @@ fn parses_back_to(words: &[String], op: &str, params: &Value, schemas: &Schemas)
 }
 
 /// `text` as one word a shell reads back as it is: bare when it's safe, else in single quotes.
-fn shell_word(text: &str) -> String {
+pub(crate) fn shell_word(text: &str) -> String {
     let safe = |c: char| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c);
     if !text.is_empty() && text.chars().all(safe) {
         text.to_owned()

@@ -106,6 +106,22 @@ promotion does (CLAUDE.md §6.2):
 - Removing every collection brings LeetCode back on the next start (ADR 0008's seeding); that
   stays as it is.
 
+### 5a. Listing and purging removed collections (amendment, #199)
+
+A removed collection could only be restored or deleted by hand, so its records stayed on disk
+forever. As `records.trash` and `records.purge` do for records (ADR 0024 §5):
+
+- **`records.collections` with `"removed": true`** lists the removed collections, each with its
+  label and how many records and trashed records it holds. CLI: `shimmer records collections
+  --removed`. An option on an existing command, so no new pack target.
+- **`records.purge_collection`** (`{"id","confirm"?}`) deletes a removed collection for good: its
+  file, records and trash, in one transaction, emitting **`records.collection.purged`**
+  (`{collection, records}`). It asks first like `remove_collection`: `confirmation_required` with
+  `{"records": N}`, `N` counting the trashed records too, and the message saying how many of each.
+  It only ever looks in `removed-collections/`, so a live collection made later under the same id
+  is never touched. CLI: `shimmer records purge-collection ID [--yes]`, which has a pack target
+  and an alias in each built-in pack (ADR 0029).
+
 ### 6. CLI
 
 ```
@@ -149,5 +165,7 @@ removed applications (42 records)
   shows what wouldn't fit; converting is a later op if needed.
 - **Removing a field's values** from every record (the stranded keys `records.check` reports).
   Leaving them is harmless; an op can come later.
-- **Emptying the trash**, including removed collections (ADR 0020).
+- **Emptying the trash**, including removed collections (ADR 0020). **Done since:** for records,
+  `records.purge` (ADR 0024 §5); for removed collections, `records.purge_collection`, one at a time
+  (§5a). Emptying everything at once is still not done.
 - **Following a rename in other collections' `related`** or in workspace scripts.

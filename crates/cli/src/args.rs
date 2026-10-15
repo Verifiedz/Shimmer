@@ -25,8 +25,12 @@ commands:
                         workspaces activate site (shimmer schedule --help)
   scheduler …           list, pause, resume and remove schedules (shimmer scheduler --help)
   packs …               command packs: themed aliases for these commands (shimmer packs --help)
-  call OP [PARAMS]      send any op; PARAMS is a JSON object (default {})
+  doctor                check everything and say how to fix what's wrong
+  call OP [PARAMS]      send any op; PARAMS is a JSON object (default {});
+       [--first [--yes]]  --first: a queued op ahead of its lane (asks first)
   shutdown              stop the daemon
+  completions SHELL     print Tab completion for bash, zsh or fish, to load in your shell:
+                        source <(shimmer completions zsh), e.g. in ~/.zshrc
   daemon                run the daemon in the foreground (Ctrl-C to stop)
   mockd                 run the mock daemon for building clients (shimmer mockd --help)
 
@@ -34,6 +38,8 @@ options:
   --socket PATH         talk to this socket instead of the default; never auto-starts
   --json                print the daemon's raw JSON instead of formatted output
   --pack NAME           use this command pack for one command ('none' for plain names);
+                        goes before the command
+  --no-color            no colour (also when NO_COLOR is set, or output isn't a terminal);
                         goes before the command
   -h, --help            show this help; with --canonical, without the active pack's aliases
 
@@ -45,7 +51,14 @@ pub enum Command {
     Ping,
     Manifest,
     Shutdown,
-    Call { op: String, params: Value },
+    /// `first`: `--first` (#222), `Some(yes)`.
+    Call {
+        op: String,
+        params: Value,
+        first: Option<bool>,
+    },
+    Doctor,
+    DoctorHelp,
     Records(RecordsCmd),
     Workspaces(WorkspacesCmd),
     Queue(QueueCmd),
@@ -95,6 +108,7 @@ impl Args {
             (true, Some("scheduler")) => Command::Scheduler(SchedulerCmd::Help),
             (true, Some("schedule")) => Command::Schedule(crate::schedule::ScheduleCmd::Help),
             (true, Some("packs")) => Command::Packs(PacksCmd::Help),
+            (true, Some("doctor")) => Command::DoctorHelp,
             (true, _) => Command::Help,
             (false, _) => command(words)?,
         };
@@ -124,6 +138,12 @@ fn command(words: Vec<String>) -> Result<Command, String> {
     if word == "packs" {
         return packs::parse(rest).map(Command::Packs);
     }
+    if word == "doctor" {
+        return crate::doctor::parse(rest).map(|()| Command::Doctor);
+    }
+    if word == "call" {
+        return call(rest);
+    }
     if let Some(opt) = rest.iter().find(|w| w.starts_with('-') && w.len() > 1) {
         return Err(format!("unknown option '{}'", opt.split('=').next().unwrap_or(opt)));
     }
@@ -142,7 +162,22 @@ fn command(words: Vec<String>) -> Result<Command, String> {
 }
 
 fn call(rest: Vec<String>) -> Result<Command, String> {
-    let mut rest = rest.into_iter();
+    let (mut first, mut yes) = (false, false);
+    let mut words = Vec::new();
+    for word in rest {
+        match word.as_str() {
+            "--first" => first = true,
+            "--yes" | "-y" => yes = true,
+            w if w.starts_with('-') && w.len() > 1 => {
+                return Err(format!("unknown option '{}'", w.split('=').next().unwrap_or(w)))
+            }
+            _ => words.push(word),
+        }
+    }
+    if yes && !first {
+        return Err("'call' takes --yes only with --first".into());
+    }
+    let mut rest = words.into_iter();
     let op = rest.next().ok_or("call needs an op, e.g. 'shimmer call core.ping'")?;
     let params = match rest.next() {
         None => Value::Object(Default::default()),
@@ -157,7 +192,7 @@ fn call(rest: Vec<String>) -> Result<Command, String> {
     if rest.next().is_some() {
         return Err("call takes an op and at most one PARAMS argument; quote the JSON".into());
     }
-    Ok(Command::Call { op, params })
+    Ok(Command::Call { op, params, first: first.then_some(yes) })
 }
 
 #[cfg(test)]
@@ -192,16 +227,27 @@ mod tests {
     fn call_takes_an_op_and_optional_object() {
         assert_eq!(
             parse(&["call", "core.ping"]).unwrap().command,
-            Command::Call { op: "core.ping".into(), params: json!({}) }
+            Command::Call { op: "core.ping".into(), params: json!({}), first: None }
         );
         assert_eq!(
             parse(&["call", "records.list", r#"{"collection":"leetcode"}"#]).unwrap().command,
-            Command::Call { op: "records.list".into(), params: json!({"collection": "leetcode"}) }
+            Command::Call { op: "records.list".into(), params: json!({"collection": "leetcode"}), first: None }
         );
         assert!(parse(&["call"]).unwrap_err().contains("needs an op"));
         assert!(parse(&["call", "x.y", "{nope"]).unwrap_err().contains("not valid JSON"));
         assert!(parse(&["call", "x.y", "[1]"]).unwrap_err().contains("JSON object"));
         assert!(parse(&["call", "x.y", "{}", "extra"]).unwrap_err().contains("at most one"));
+        // #222.
+        assert_eq!(
+            parse(&["call", "workspaces.activate", r#"{"id":"x"}"#, "--first", "--yes"]).unwrap().command,
+            Command::Call { op: "workspaces.activate".into(), params: json!({"id": "x"}), first: Some(true) }
+        );
+        assert_eq!(
+            parse(&["call", "x.y", "--first"]).unwrap().command,
+            Command::Call { op: "x.y".into(), params: json!({}), first: Some(false) }
+        );
+        assert!(parse(&["call", "x.y", "--yes"]).unwrap_err().contains("--yes only with --first"));
+        assert!(parse(&["call", "x.y", "--priority", "override"]).unwrap_err().contains("unknown option '--priority'"));
     }
 
     #[test]

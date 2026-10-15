@@ -237,6 +237,10 @@ fn schedule_runs_a_normal_command_in_plain_words() {
     assert!(!o.status.success() && stderr(&o).contains("--catch-up skip, run-once or backfill"), "{}", stderr(&o));
     let o = home.shimmer(&["schedule", "daily", "09:00", "--catch-up", "skip", "records", "list", "leetcode"]);
     assert!(stderr(&o).contains("can't be scheduled"), "{}", stderr(&o));
+    // `--first` (#222) can't ride on a trigger, so it's refused rather than dropped.
+    let o =
+        home.shimmer(&["schedule", "daily", "09:00", "--catch-up", "skip", "workspaces", "activate", "x", "--first"]);
+    assert!(stderr(&o).contains("--first jumps the queue"), "{}", stderr(&o));
 
     // A typo is refused when it's scheduled, not every day after (#185's review).
     let o = home.shimmer(&["schedule", "daily", "09:00", "--catch-up", "skip", "records", "complete", "nosuch/x"]);

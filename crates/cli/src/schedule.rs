@@ -76,6 +76,13 @@ fn is_command_word(word: &str) -> bool {
             .any(|w| w == word)
 }
 
+/// What can be scheduled: the commands that make exactly one change (ADR 0031 §1). Running one
+/// checks it in [`request`]; completion offers only these after `shimmer schedule WHEN`.
+pub const SCHEDULABLE: [(&str, &[&str]); 2] = [
+    ("records", &["add", "update", "complete", "reopen", "remove", "restore"]),
+    ("workspaces", &["activate", "stop", "cleanup"]),
+];
+
 /// `shimmer`'s own options that go before the command (`--pack`, `--canonical`, `--no-color`):
 /// put after `schedule`, they're not the schedule's.
 const FRONT_FLAGS: &[&str] = &["--pack", "--canonical", "--no-color"];
@@ -132,12 +139,12 @@ pub fn parse(words: Vec<String>) -> std::result::Result<ScheduleCmd, String> {
 }
 
 /// The one op + params a schedulable workspaces command sends: activate, stop or cleanup, without
-/// `--wait`. Shared with `scheduler list`, which reads a schedule back through it (ADR 0031 §3).
+/// `--wait` or `--first`. Shared with `scheduler list`, which reads a schedule back through it (ADR 0031 §3).
 pub fn workspaces_op(cmd: &WorkspacesCmd) -> Option<(&'static str, Value)> {
     match cmd {
-        WorkspacesCmd::Activate { id, wait: false } => Some(("workspaces.activate", json!({"id": id}))),
-        WorkspacesCmd::Stop { id, wait: false } => Some(("workspaces.stop", json!({"id": id}))),
-        WorkspacesCmd::Cleanup { id, wait: false } => Some(("workspaces.cleanup", json!({"id": id}))),
+        WorkspacesCmd::Activate { id, wait: false, first: None } => Some(("workspaces.activate", json!({"id": id}))),
+        WorkspacesCmd::Stop { id, wait: false, first: None } => Some(("workspaces.stop", json!({"id": id}))),
+        WorkspacesCmd::Cleanup { id, wait: false, first: None } => Some(("workspaces.cleanup", json!({"id": id}))),
         _ => None,
     }
 }
@@ -162,7 +169,7 @@ fn catch_up_word(word: &str) -> std::result::Result<&'static str, String> {
 }
 
 /// `WHEN` from the front of `words`, and how many words it took.
-fn parse_when(words: &[String]) -> std::result::Result<(When, usize), String> {
+pub(crate) fn parse_when(words: &[String]) -> std::result::Result<(When, usize), String> {
     let at = |i: usize| words.get(i).map(String::as_str);
     let first = at(0).unwrap_or_default();
     match first {
@@ -288,7 +295,7 @@ pub async fn run(client: &mut Client, cmd: &ScheduleCmd, json: bool, prompt: &mu
     };
     Ok(format!(
         "✓ scheduled {} · {} · catch-up {}\n  first run: {first}\n  id {short} (shimmer scheduler show {short})",
-        plan.command.join(" "),
+        typed(&plan.command),
         plan.when.words,
         catch_up.replace('_', "-"),
     ))
@@ -302,7 +309,7 @@ async fn request(client: &mut Client, command: &[String]) -> Result<(&'static st
     let not = |why: &str| Error::invalid_params(format!("'{word} {sub}' can't be scheduled: {why}"));
     match word.as_str() {
         "records" => {
-            if !matches!(sub, "add" | "update" | "complete" | "reopen" | "remove" | "restore") {
+            if !SCHEDULABLE[0].1.contains(&sub) {
                 return Err(not(
                     "only records add, update, complete, reopen, remove and restore can (one change each, nothing to read)",
                 ));
@@ -327,6 +334,13 @@ async fn request(client: &mut Client, command: &[String]) -> Result<(&'static st
             | WorkspacesCmd::Cleanup { wait: true, .. } => {
                 Err(not("--wait follows a launch as it happens, and a scheduled one runs with no one waiting"))
             }
+            // A trigger can't carry a request's `queue` block (#222): a scheduled run is the
+            // scheduler's own task and takes its turn, so `--first` would be silently lost.
+            WorkspacesCmd::Activate { first: Some(_), .. }
+            | WorkspacesCmd::Stop { first: Some(_), .. }
+            | WorkspacesCmd::Cleanup { first: Some(_), .. } => Err(not(
+                "--first jumps the queue as you run it; a scheduled run is the scheduler's own and takes its turn",
+            )),
             cmd => match workspaces_op(&cmd) {
                 Some((op, params)) => {
                     known_workspace(client, op, params["id"].as_str().unwrap_or_default()).await?;
@@ -365,6 +379,12 @@ fn ask_catch_up(prompt: &mut dyn Prompt, when: &When) -> Result<&'static str> {
     }
 }
 
+/// The command as the person typed it, quoted where a shell needs it (`records add notes --title
+/// 'Two Sum'`), as `scheduler list` shows it.
+fn typed(command: &[String]) -> String {
+    command.iter().map(|w| crate::scheduler::shell_word(w)).collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,6 +398,15 @@ mod tests {
             ScheduleCmd::Add(p) => p,
             ScheduleCmd::Help => panic!("help"),
         }
+    }
+
+    #[test]
+    fn the_reply_quotes_the_command_as_typed() {
+        assert_eq!(
+            typed(&w(&["records", "add", "notes", "--title", "Two Sum"])),
+            "records add notes --title 'Two Sum'"
+        );
+        assert_eq!(typed(&w(&["workspaces", "stop", "site"])), "workspaces stop site");
     }
 
     #[test]
