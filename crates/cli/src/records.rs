@@ -43,6 +43,7 @@ commands:
                                        filter it with --filter FIELD=VALUE
   get COLLECTION/ID                    show one record
   update COLLECTION/ID [--FIELD VALUE]… [--unset FIELD]…
+                                       change a record's fields
        [--add FIELD VALUE]… [--remove FIELD VALUE]…  change items of a list field
        [--set FIELD=VALUE]…            any field, even one named like an option (add, unset…)
   complete COLLECTION/ID [--FIELD VALUE]… [--unset FIELD]…
