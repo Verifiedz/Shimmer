@@ -218,6 +218,8 @@ pack and how to make your own.
 shimmer manifest              # registered modules, their operations and lanes
 shimmer call OP '{...}'       # send any operation with JSON params, e.g. shimmer call queue.list
 shimmer shutdown              # stop the daemon
+shimmer startup on            # start the daemon every time you log in, so schedules run after a restart
+shimmer startup status        # whether it's on; 'shimmer startup off' turns it off
 shimmer daemon                # run the daemon in the foreground with its logs (stop any running one first)
 shimmer --help                # every command
 ```

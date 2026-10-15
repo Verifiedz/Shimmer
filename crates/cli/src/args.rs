@@ -10,6 +10,7 @@ use crate::packs::cmd::{self as packs, PacksCmd};
 use crate::queue::{self, QueueCmd};
 use crate::records::{self, RecordsCmd};
 use crate::scheduler::{self, SchedulerCmd};
+use crate::startup::{self, StartupCmd};
 use crate::workspaces::{self, WorkspacesCmd};
 
 pub const USAGE: &str = "usage: shimmer [--socket PATH] [--json] <command>
@@ -23,6 +24,7 @@ commands:
   scheduler …           run things on a schedule (shimmer scheduler --help)
   packs …               command packs: themed aliases for these commands (shimmer packs --help)
   doctor                check everything and say how to fix what's wrong
+  startup …             start the daemon every time you log in (shimmer startup --help)
   call OP [PARAMS]      send any op; PARAMS is a JSON object (default {});
        [--first [--yes]]  --first: a queued op ahead of its lane (asks first)
   shutdown              stop the daemon
@@ -61,6 +63,7 @@ pub enum Command {
     Queue(QueueCmd),
     Scheduler(SchedulerCmd),
     Packs(PacksCmd),
+    Startup(StartupCmd),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -104,6 +107,7 @@ impl Args {
             (true, Some("scheduler")) => Command::Scheduler(SchedulerCmd::Help),
             (true, Some("packs")) => Command::Packs(PacksCmd::Help),
             (true, Some("doctor")) => Command::DoctorHelp,
+            (true, Some("startup")) => Command::Startup(StartupCmd::Help),
             (true, _) => Command::Help,
             (false, _) => command(words)?,
         };
@@ -129,6 +133,9 @@ fn command(words: Vec<String>) -> Result<Command, String> {
     }
     if word == "packs" {
         return packs::parse(rest).map(Command::Packs);
+    }
+    if word == "startup" {
+        return startup::parse(rest).map(Command::Startup);
     }
     if word == "doctor" {
         return crate::doctor::parse(rest).map(|()| Command::Doctor);
