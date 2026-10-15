@@ -1,8 +1,6 @@
 //! `shimmer fetchers …`: sources that reach outward for new items (ADR 0028). Every command is
 //! one of the `fetchers` module's own ops; nothing here decides anything (CLAUDE.md §2).
 
-use std::fmt::Write as _;
-
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use shimmer_core::{Error, ErrorCode, Result};
@@ -319,15 +317,21 @@ fn test_items(source: &str, result: &Value) -> String {
     if items.is_empty() {
         return format!("{source}: no items parsed");
     }
-    let mut out = format!("{source}: {} item{}\n", items.len(), if items.len() == 1 { "" } else { "s" });
-    for item in &items {
-        // The url must survive copy/paste intact -- render::cell's truncation is fine for a
-        // title (a preview), but a truncated url is a different, invalid url, not a shorter
-        // version of the real one, and silently hands back a 404 instead of the job posting.
-        let url = item["url"].as_str().unwrap_or_default();
-        let _ = writeln!(out, "  {}  {url}", render::cell(&item["title"]));
-    }
-    out.trim_end().to_string()
+    let rows: Vec<Vec<String>> = items
+        .iter()
+        .map(|item| {
+            // The url must survive copy/paste intact -- render::cell's truncation is fine for a
+            // title (a preview), but a truncated url is a different, invalid url, not a shorter
+            // version of the real one, and silently hands back a 404 instead of the job posting.
+            vec![render::cell(&item["title"]), item["url"].as_str().unwrap_or_default().to_owned()]
+        })
+        .collect();
+    let n = items.len();
+    format!(
+        "{source}: {n} item{}\n{}",
+        if n == 1 { "" } else { "s" },
+        table(&["TITLE".to_owned(), "URL".to_owned()], &rows)
+    )
 }
 
 /// Every `fetchers.item.found` event matched, most recent first -- `core.events.list` itself
@@ -341,22 +345,30 @@ fn items(source: Option<&str>, events: &[Value]) -> String {
         };
     }
     let n = events.len();
-    let mut out = match source {
-        Some(s) => format!("{s}: {n} item{}\n", if n == 1 { "" } else { "s" }),
-        None => format!("{n} item{}\n", if n == 1 { "" } else { "s" }),
+    let summary = match source {
+        Some(s) => format!("{s}: {n} item{}", if n == 1 { "" } else { "s" }),
+        None => format!("{n} item{}", if n == 1 { "" } else { "s" }),
     };
-    for ev in events.iter().rev() {
-        let p = &ev["payload"];
-        // Never truncated, same reasoning as test_items's own url handling.
-        let url = p["url"].as_str().unwrap_or_default();
-        let _ = match source {
-            Some(_) => writeln!(out, "  {}  {url}", render::cell(&p["title"])),
-            None => {
-                writeln!(out, "  [{}] {}  {url}", p["source_name"].as_str().unwrap_or("?"), render::cell(&p["title"]))
-            }
-        };
-    }
-    out.trim_end().to_string()
+    // Never truncated, same reasoning as test_items's own url handling.
+    let url = |p: &Value| p["url"].as_str().unwrap_or_default().to_owned();
+    let (header, rows): (Vec<String>, Vec<Vec<String>>) = match source {
+        Some(_) => (
+            ["TITLE", "URL"].map(String::from).to_vec(),
+            events.iter().rev().map(|ev| vec![render::cell(&ev["payload"]["title"]), url(&ev["payload"])]).collect(),
+        ),
+        None => (
+            ["SOURCE", "TITLE", "URL"].map(String::from).to_vec(),
+            events
+                .iter()
+                .rev()
+                .map(|ev| {
+                    let p = &ev["payload"];
+                    vec![p["source_name"].as_str().unwrap_or("?").to_owned(), render::cell(&p["title"]), url(p)]
+                })
+                .collect(),
+        ),
+    };
+    format!("{summary}\n{}", table(&header, &rows))
 }
 
 #[cfg(test)]
@@ -483,7 +495,7 @@ mod tests {
     fn test_items_lists_title_and_url_or_says_there_were_none() {
         let data = json!({"source": "hn-whoishiring", "items": [{"title": "Acme is hiring", "url": "https://x/1"}]});
         let out = test_items("hn-whoishiring", &data);
-        assert_eq!(out, "hn-whoishiring: 1 item\n  Acme is hiring  https://x/1");
+        assert_eq!(out, "hn-whoishiring: 1 item\nTITLE           URL\nAcme is hiring  https://x/1");
         assert_eq!(test_items("hn-whoishiring", &json!({"items": []})), "hn-whoishiring: no items parsed");
     }
 
@@ -512,16 +524,17 @@ mod tests {
         let out = items(None, &events);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "2 items");
+        assert_eq!(lines[1], "SOURCE          TITLE        URL");
         // events arrive oldest-first; display must flip to newest-first.
-        assert!(lines[1].contains("weworkremotely") && lines[1].contains("Rust role"), "{out}");
-        assert!(lines[2].contains("hn-whoishiring") && lines[2].contains("Acme hiring"), "{out}");
+        assert!(lines[2].contains("weworkremotely") && lines[2].contains("Rust role"), "{out}");
+        assert!(lines[3].contains("hn-whoishiring") && lines[3].contains("Acme hiring"), "{out}");
     }
 
     #[test]
     fn items_for_one_source_omits_the_source_label() {
         let events = vec![found("jobbank-canada", "Software Engineer", "https://x/1")];
         let out = items(Some("jobbank-canada"), &events);
-        assert_eq!(out, "jobbank-canada: 1 item\n  Software Engineer  https://x/1");
+        assert_eq!(out, "jobbank-canada: 1 item\nTITLE              URL\nSoftware Engineer  https://x/1");
     }
 
     #[test]
