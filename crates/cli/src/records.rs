@@ -21,7 +21,8 @@ use crate::workspaces::Prompt;
 pub const USAGE: &str = "usage: shimmer records <command>
 
 commands:
-  collections                          list collections and their fields
+  collections [--removed]              list collections and their fields; --removed: the
+                                       removed ones, to restore or purge
   templates [CATEGORY]                 list ready-made collections to start from, by category
   peek TEMPLATE [--file]               everything about one template: its fields, what completing
                                        does, examples; --file prints the file exactly
@@ -78,6 +79,8 @@ changing a collection:
                                        restore-collection brings it back); lists the
                                        schedules that name it, which fail until restored
   restore-collection ID                bring a removed collection back
+  purge-collection ID [--yes]          delete a removed collection and its records for good
+                                       (asks first)
 
 A record can be written COLLECTION/ID or COLLECTION ID. Field names come from the
 collection: see 'shimmer records collections'. A field named like an option (add, unset, set…)
@@ -193,6 +196,13 @@ pub enum RecordsCmd {
     RestoreCollection {
         id: String,
     },
+    /// `collections --removed` (#199).
+    RemovedCollections,
+    /// Delete a removed collection for good (#199). `yes`: without asking.
+    PurgeCollection {
+        id: String,
+        yes: bool,
+    },
     /// `id`: one trashed record; `None`: the whole trash (ADR 0024 §5).
     Purge {
         collection: String,
@@ -275,7 +285,12 @@ pub fn parse(words: Vec<String>) -> std::result::Result<RecordsCmd, String> {
         rest = kept;
     }
     let force = take_flag(&mut rest, sub == "remove", "--force");
-    let yes = take_flag(&mut rest, matches!(sub.as_str(), "remove-collection" | "import" | "purge"), "--yes");
+    let yes = take_flag(
+        &mut rest,
+        matches!(sub.as_str(), "remove-collection" | "import" | "purge" | "purge-collection"),
+        "--yes",
+    );
+    let removed = take_flag(&mut rest, sub == "collections", "--removed");
     let move_schedules =
         take_flag(&mut rest, matches!(sub.as_str(), "rename" | "rename-collection"), "--move-schedules");
     let with_records = take_flag(&mut rest, sub == "copy-collection", "--with-records");
@@ -292,9 +307,10 @@ pub fn parse(words: Vec<String>) -> std::result::Result<RecordsCmd, String> {
         "help" => Ok(RecordsCmd::Help),
         "collections" => {
             no_flags()?;
-            match positional.is_empty() {
-                true => Ok(RecordsCmd::Collections),
-                false => Err("'records collections' takes no arguments".into()),
+            match (positional.is_empty(), removed) {
+                (true, false) => Ok(RecordsCmd::Collections),
+                (true, true) => Ok(RecordsCmd::RemovedCollections),
+                (false, _) => Err("'records collections' takes no arguments".into()),
             }
         }
         "add" => {
@@ -432,13 +448,15 @@ pub fn parse(words: Vec<String>) -> std::result::Result<RecordsCmd, String> {
             }
             Ok(RecordsCmd::CopyCollection { id, to, label, with_records })
         }
-        "check" | "rename-field" | "rename-collection" | "remove-collection" | "restore-collection" => {
+        "check" | "rename-field" | "rename-collection" | "remove-collection" | "restore-collection"
+        | "purge-collection" => {
             no_flags()?;
             let usage = match sub.as_str() {
                 "check" => "usage: shimmer records check COLLECTION",
                 "rename-field" => "usage: shimmer records rename-field COLLECTION FROM TO",
                 "rename-collection" => "usage: shimmer records rename-collection ID NEW_ID [--move-schedules]",
                 "remove-collection" => "usage: shimmer records remove-collection ID [--yes]",
+                "purge-collection" => "usage: shimmer records purge-collection ID [--yes]",
                 _ => "usage: shimmer records restore-collection ID",
             };
             let p = positional;
@@ -452,6 +470,7 @@ pub fn parse(words: Vec<String>) -> std::result::Result<RecordsCmd, String> {
                 }
                 ("remove-collection", [id]) => RecordsCmd::RemoveCollection { id: id.clone(), yes },
                 ("restore-collection", [id]) => RecordsCmd::RestoreCollection { id: id.clone() },
+                ("purge-collection", [id]) => RecordsCmd::PurgeCollection { id: id.clone(), yes },
                 _ => return Err(usage.into()),
             })
         }
@@ -553,7 +572,9 @@ impl RecordsCmd {
             | Self::Edit { .. }
             | Self::CopyCollection { .. }
             | Self::RemoveCollection { .. }
-            | Self::RestoreCollection { .. } => None,
+            | Self::RestoreCollection { .. }
+            | Self::RemovedCollections
+            | Self::PurgeCollection { .. } => None,
         }
     }
 }
@@ -605,6 +626,8 @@ pub fn request(cmd: &RecordsCmd, schema: &Value) -> Result<(&'static str, Value)
             return request(&list, schema);
         }
         RecordsCmd::Collections => ("records.collections", json!({})),
+        RecordsCmd::RemovedCollections => ("records.collections", json!({"removed": true})),
+        RecordsCmd::PurgeCollection { id, .. } => ("records.purge_collection", json!({"id": id})),
         RecordsCmd::Add { collection, id, set } => {
             let mut params = json!({"collection": collection, "fields": fields(set)?});
             if let Some(id) = id {
@@ -997,8 +1020,13 @@ pub async fn run(client: &mut Client, cmd: &RecordsCmd, json: bool, prompt: &mut
                     }
                 }
                 RecordsCmd::Purge { collection, yes, .. } => {
-                    if !confirm_purge(prompt, *yes, collection, &e.message)? {
+                    if !confirm_purge(prompt, *yes, &format!("'{collection}'s trash"), &e.message)? {
                         return Ok("nothing purged".into());
+                    }
+                }
+                RecordsCmd::PurgeCollection { id, yes } => {
+                    if !confirm_purge(prompt, *yes, &format!("the removed collection '{id}'"), &e.message)? {
+                        return Ok(format!("kept {id} (shimmer records restore-collection {id} brings it back)"));
                     }
                 }
                 _ => return Err(e),
@@ -1220,13 +1248,13 @@ fn export(items: &[Value], schema: &Value, format: Format) -> String {
 
 /// Whether to go ahead with purging, given the daemon's message saying what goes. There is no
 /// undo, so without a person there it needs --yes.
-fn confirm_purge(prompt: &mut dyn Prompt, yes: bool, collection: &str, message: &str) -> Result<bool> {
+fn confirm_purge(prompt: &mut dyn Prompt, yes: bool, what: &str, message: &str) -> Result<bool> {
     if yes {
         return Ok(true);
     }
     if !prompt.interactive() {
         return Err(Error::invalid_params(format!(
-            "refusing to purge '{collection}'s trash without confirmation; pass --yes to do it anyway"
+            "refusing to purge {what} without confirmation; pass --yes to do it anyway"
         )));
     }
     eprintln!("{}. This can't be undone.", message.split(';').next().unwrap_or(message));
@@ -1314,6 +1342,10 @@ pub fn show(cmd: &RecordsCmd, data: &Value, schema: &Value) -> String {
             cell(&data["records"])
         ),
         RecordsCmd::RestoreCollection { id } => format!("✓ {id} restored"),
+        RecordsCmd::RemovedCollections => removed_collections(data),
+        RecordsCmd::PurgeCollection { id, .. } => {
+            format!("✓ {id} is deleted for good ({} record(s))", cell(&data["records"]))
+        }
         RecordsCmd::Trash { collection } => match data["items"].as_array().is_none_or(Vec::is_empty) {
             true => {
                 let mut out = format!("nothing in {collection}'s trash");
@@ -1503,6 +1535,26 @@ fn check_report(collection: &str, data: &Value) -> String {
         }
     }
     out
+}
+
+/// `collections --removed` (#199): what can be restored or purged.
+fn removed_collections(data: &Value) -> String {
+    let all = data["collections"].as_array().map(Vec::as_slice).unwrap_or_default();
+    if all.is_empty() {
+        return "no removed collections".into();
+    }
+    let rows: Vec<Vec<String>> = all
+        .iter()
+        .map(|c| {
+            let label = c["label"].as_str().unwrap_or("(its file doesn't parse)").to_owned();
+            vec![cell(&c["id"]), label, cell(&c["records"]), cell(&c["trash"])]
+        })
+        .collect();
+    let headings = ["ID", "LABEL", "RECORDS", "IN TRASH"].map(String::from);
+    format!(
+        "{}\nrestore-collection ID brings one back; purge-collection ID deletes it for good",
+        table(&headings, &rows)
+    )
 }
 
 fn collections(data: &Value) -> String {
@@ -2550,8 +2602,44 @@ lru-cache  todo    LRU Cache  medium      -            2         true
                 unreachable!("never asked without a terminal")
             }
         }
-        assert!(confirm_purge(&mut Script, false, "jobs", "x").unwrap_err().message.contains("--yes"));
-        assert!(confirm_purge(&mut Script, true, "jobs", "x").unwrap());
+        assert!(confirm_purge(&mut Script, false, "'jobs's trash", "x").unwrap_err().message.contains("--yes"));
+        assert!(confirm_purge(&mut Script, true, "'jobs's trash", "x").unwrap());
+    }
+
+    #[test]
+    fn removed_collections_are_listed_and_purge_collection_asks_first() {
+        // #199.
+        let list = parse_words(&["collections", "--removed"]).unwrap();
+        assert_eq!(list, RecordsCmd::RemovedCollections);
+        assert_eq!(request(&list, &Value::Null).unwrap(), ("records.collections", json!({"removed": true})));
+        assert!(parse_words(&["trash", "jobs", "--removed"]).is_err(), "--removed is only for collections");
+        let data = json!({"collections": [
+            {"id": "jobs", "label": "Job applications", "records": 42, "trash": 3},
+            {"id": "broken", "records": 1, "trash": 0}]});
+        let out = show(&list, &data, &Value::Null);
+        assert!(out.contains("jobs") && out.contains("Job applications") && out.contains("42"), "{out}");
+        assert!(out.contains("(its file doesn't parse)"), "{out}");
+        assert!(
+            out.ends_with("restore-collection ID brings one back; purge-collection ID deletes it for good"),
+            "{out}"
+        );
+        assert_eq!(show(&list, &json!({"collections": []}), &Value::Null), "no removed collections");
+
+        let purge = parse_words(&["purge-collection", "jobs"]).unwrap();
+        assert_eq!(purge, RecordsCmd::PurgeCollection { id: "jobs".into(), yes: false });
+        assert_eq!(request(&purge, &Value::Null).unwrap(), ("records.purge_collection", json!({"id": "jobs"})));
+        assert_eq!(
+            parse_words(&["purge-collection", "jobs", "--yes"]).unwrap(),
+            RecordsCmd::PurgeCollection { id: "jobs".into(), yes: true }
+        );
+        assert!(parse_words(&["purge-collection"]).unwrap_err().contains("usage: shimmer records purge-collection ID"));
+        assert_eq!(
+            show(&purge, &json!({"purged": true, "records": 45}), &Value::Null),
+            "✓ jobs is deleted for good (45 record(s))"
+        );
+        let mut no_terminal = Scripted { interactive: false, answer: false };
+        let e = confirm_purge(&mut no_terminal, false, "the removed collection 'jobs'", "x").unwrap_err();
+        assert!(e.message.contains("refusing to purge the removed collection 'jobs'"), "{}", e.message);
     }
 
     #[test]
