@@ -62,6 +62,13 @@ struct Opt {
     values: Vec<String>,
 }
 
+/// A help summary as a one-line description: without a trailing example (`…, e.g.` continues on
+/// the next line) or the punctuation that led into more text (#230).
+fn tidy(summary: &str) -> String {
+    let cut = summary.find(", e.g.").or_else(|| summary.strip_suffix(" e.g.").map(str::len)).unwrap_or(summary.len());
+    summary[..cut].trim_end_matches([';', ':', ',', ' ']).to_owned()
+}
+
 /// Every command a help page lists, in its order. Entries are the lines two spaces in under a
 /// title like `commands:` or `moving data:`; a command listed twice (`queue move`) is merged.
 fn commands(usage: &str) -> Vec<Cmd> {
@@ -96,11 +103,19 @@ fn commands(usage: &str) -> Vec<Cmd> {
                 }
             }
         } else if indent >= 4 && text.starts_with('[') {
-            // A continuation: more options for the command above.
+            // A continuation: more options for the command above, maybe with its description.
             if let Some(i) = current {
-                let (more, _) = split_entry(text);
+                let (more, said) = split_entry(text);
                 let extra = parse_synopsis(&format!("{} {more}", out[i].word), String::new());
                 merge(&mut out[i], extra);
+                if out[i].summary.is_empty() {
+                    out[i].summary = tidy(&said);
+                }
+            }
+        } else if indent >= 4 {
+            // A line of text under a command whose first line had no room for one (`export`).
+            if let Some(i) = current.filter(|i| out[*i].summary.is_empty()) {
+                out[i].summary = tidy(text);
             }
         }
     }
@@ -161,7 +176,7 @@ fn tokenize(text: &str) -> Vec<String> {
 
 fn parse_synopsis(synopsis: &str, summary: String) -> Cmd {
     let tokens = tokenize(synopsis);
-    let mut cmd = Cmd { word: tokens.first().cloned().unwrap_or_default(), summary, ..Cmd::default() };
+    let mut cmd = Cmd { word: tokens.first().cloned().unwrap_or_default(), summary: tidy(&summary), ..Cmd::default() };
     let mut i = 1;
     while i < tokens.len() {
         let token = tokens[i].trim_end_matches('…');
@@ -873,7 +888,8 @@ mod tests {
             assert!(
                 read.contains(&group),
                 "`shimmer {group} …` is in the help, but complete.rs's modules() doesn't read its help \
-                 page, so its subcommands won't complete. Add (\"{group}\", crate::{group}::USAGE)."
+                 page, so its subcommands won't complete. Add (\"{group}\", <its help's USAGE constant>), as \
+                 the others in modules() are."
             );
         }
     }
@@ -906,7 +922,13 @@ mod tests {
         assert_eq!(new.positionals, [vec!["ID".to_owned()]]);
         assert!(new.options.iter().any(|o| o.name == "--from" && o.args == ["TEMPLATE"]));
         assert!(new.options.iter().any(|o| o.name == "--label"));
-        assert_eq!(new.summary, "create a collection from a template, e.g.");
+        assert_eq!(new.summary, "create a collection from a template", "cut before its example (#230)");
+        // #230: a command whose first line has no room for a description takes the next line's.
+        let summary = |word: &str| records.iter().find(|c| c.word == word).unwrap().summary.clone();
+        assert_eq!(summary("add"), "add a record");
+        assert_eq!(summary("update"), "change a record's fields");
+        assert_eq!(summary("complete"), "mark done and stamp the collection's date field");
+        assert_eq!(summary("export"), "write records to stdout; imports back unchanged");
         let list = records.iter().find(|c| c.word == "list").unwrap();
         assert!(list.field_flags);
         let status = list.options.iter().find(|o| o.name == "--status").unwrap();

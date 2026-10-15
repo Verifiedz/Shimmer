@@ -82,6 +82,7 @@ pub const TARGETS: &[Target] = &[
     Target { op: "records.rename_collection", words: &["records", "rename-collection"] },
     Target { op: "records.remove_collection", words: &["records", "remove-collection"] },
     Target { op: "records.restore_collection", words: &["records", "restore-collection"] },
+    Target { op: "records.purge_collection", words: &["records", "purge-collection"] },
     // ADR 0030: `peek` and `edit` have no op of their own, so they're named like
     // `workspaces.edit`.
     Target { op: "records.peek", words: &["records", "peek"] },
@@ -424,7 +425,7 @@ label = "My Pack"
 
     #[test]
     fn every_target_is_an_op_with_its_command_words() {
-        assert_eq!(TARGETS.len(), 53);
+        assert_eq!(TARGETS.len(), 54);
         // Where the CLI's word differs from the op's verb (ADR 0015 §1).
         let renamed = [
             ("queue.task", "show"),
