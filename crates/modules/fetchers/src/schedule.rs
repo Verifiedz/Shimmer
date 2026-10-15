@@ -96,6 +96,14 @@ pub struct SourceConfig {
     /// `json-api` only: required, and must be greater than 0, when `pagination = "offset"`.
     #[serde(default)]
     pub page_size: Option<u32>,
+    /// `json-api` only: the field within each item that marks it still open. When set, an
+    /// item whose value there is the boolean `false` is dropped before dedup ever sees it --
+    /// a feed that keeps already-closed postings around (e.g. a community-maintained
+    /// listings archive) would otherwise surface dead links as "new". Missing, non-boolean,
+    /// or `true` all pass through unfiltered; omitted entirely means no such field exists
+    /// and nothing is dropped on this basis.
+    #[serde(default)]
+    pub active_field: Option<String>,
     /// A title must contain at least one of these (case-insensitive substring, OR-matched)
     /// to be kept. Empty means no inclusion filter at all -- everything passes this stage.
     #[serde(default)]
@@ -253,6 +261,13 @@ impl FetchersConfig {
                                 if value.as_deref().unwrap_or_default().trim().is_empty() {
                                     return Err(Error::invalid_params(format!(
                                         "sources.{id}: kind \"json-api\" needs a non-empty {field_name}"
+                                    )));
+                                }
+                            }
+                            if let Some(field) = &source.active_field {
+                                if field.trim().is_empty() {
+                                    return Err(Error::invalid_params(format!(
+                                        "sources.{id}: kind \"json-api\" active_field must be non-empty when given"
                                     )));
                                 }
                             }
@@ -651,6 +666,33 @@ mod tests {
         assert!(err.message.contains("cursor"), "{}", err.message);
     }
 
+    #[test]
+    fn a_json_api_kind_takes_an_optional_active_field() {
+        let cfg = FetchersConfig::from_value(&json!({
+            "sources": {"acme-jobs": {
+                "enabled": true, "interval": "daily", "kind": "json-api",
+                "url": "https://example.test/jobs", "id_field": "id", "title_field": "title", "url_field": "url",
+                "active_field": "active",
+            }}
+        }))
+        .unwrap();
+        assert_eq!(cfg.sources["acme-jobs"].active_field.as_deref(), Some("active"));
+    }
+
+    #[test]
+    fn a_json_api_kind_rejects_a_blank_active_field() {
+        let err = FetchersConfig::from_value(&json!({
+            "sources": {"acme-jobs": {
+                "enabled": true, "interval": "daily", "kind": "json-api",
+                "url": "https://example.test/jobs", "id_field": "id", "title_field": "title", "url_field": "url",
+                "active_field": "  ",
+            }}
+        }))
+        .unwrap_err();
+        assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams);
+        assert!(err.message.contains("active_field"), "{}", err.message);
+    }
+
     fn source(enabled: bool, interval_s: u64) -> SourceConfig {
         SourceConfig {
             enabled,
@@ -664,6 +706,7 @@ mod tests {
             url_base: None,
             pagination: None,
             page_size: None,
+            active_field: None,
             title_contains: Vec::new(),
             title_excludes: Vec::new(),
             search_term: None,

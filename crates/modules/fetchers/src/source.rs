@@ -124,6 +124,7 @@ fn resolve_from(config: &FetchersConfig, id: &str) -> Result<Option<std::sync::A
                 url_field,
                 cfg.url_base.clone(),
                 pagination,
+                cfg.active_field.clone(),
             ))))
         }
         Some(other) => {

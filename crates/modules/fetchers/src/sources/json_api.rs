@@ -43,6 +43,10 @@ pub struct JsonApi {
     /// url field is a site-relative path, not already absolute.
     url_base: Option<String>,
     pagination: Pagination,
+    /// The field marking an item still open; `false` there drops the item before dedup ever
+    /// sees it. `None` means no such field is configured, so nothing is dropped on this
+    /// basis.
+    active_field: Option<String>,
 }
 
 impl JsonApi {
@@ -56,8 +60,9 @@ impl JsonApi {
         url_field: String,
         url_base: Option<String>,
         pagination: Pagination,
+        active_field: Option<String>,
     ) -> Self {
-        Self { id, url, items_path, id_field, title_field, url_field, url_base, pagination }
+        Self { id, url, items_path, id_field, title_field, url_field, url_base, pagination, active_field }
     }
 }
 
@@ -98,6 +103,11 @@ impl Source for JsonApi {
 
         let mut items = Vec::new();
         for item in array {
+            if let Some(field) = &self.active_field {
+                if item.get(field.as_str()) == Some(&Value::Bool(false)) {
+                    continue;
+                }
+            }
             let Some(source_id) = field_as_string(item, &self.id_field) else { continue };
             let Some(title) = field_as_string(item, &self.title_field) else { continue };
             let Some(raw_url) = field_as_string(item, &self.url_field) else { continue };
@@ -171,6 +181,7 @@ mod tests {
             "absolute_url".to_string(),
             None,
             Pagination::None,
+            None,
         )
     }
 
@@ -217,6 +228,7 @@ mod tests {
             "hostedUrl".into(),
             None,
             Pagination::None,
+            None,
         );
 
         let page = api.fetch_page(&env.ctx, None).await.unwrap();
@@ -239,6 +251,7 @@ mod tests {
             "job_path".into(),
             Some("https://example.test".into()),
             Pagination::Offset { page_size: 50 },
+            None,
         );
 
         let page = api.fetch_page(&env.ctx, None).await.unwrap();
@@ -267,6 +280,7 @@ mod tests {
             "url".into(),
             None,
             Pagination::Offset { page_size: 2 },
+            None,
         );
 
         let first = api.fetch_page(&env.ctx, None).await.unwrap();
@@ -276,6 +290,32 @@ mod tests {
         let second = api.fetch_page(&env.ctx, first.next_cursor.as_deref()).await.unwrap();
         assert_eq!(second.items.len(), 1);
         assert!(second.next_cursor.is_none(), "a short page means this was the last one");
+    }
+
+    #[tokio::test]
+    async fn active_field_false_drops_the_item_but_missing_or_true_pass_through() {
+        const PAGE: &str = r#"{"jobs": [
+            {"id": 1, "title": "Closed role", "absolute_url": "https://x/1", "active": false},
+            {"id": 2, "title": "Open role", "absolute_url": "https://x/2", "active": true},
+            {"id": 3, "title": "No active field at all", "absolute_url": "https://x/3"}
+        ]}"#;
+        let env = TestEnv::new("fetchers");
+        stub(&env, "https://example.test/jobs", ok(PAGE));
+        let api = JsonApi::new(
+            "acme-jobs".into(),
+            "https://example.test/jobs".into(),
+            "jobs".into(),
+            "id".into(),
+            "title".into(),
+            "absolute_url".into(),
+            None,
+            Pagination::None,
+            Some("active".into()),
+        );
+
+        let page = api.fetch_page(&env.ctx, None).await.unwrap();
+        let ids: Vec<&str> = page.items.iter().map(|i| i.source_id.as_str()).collect();
+        assert_eq!(ids, ["2", "3"], "only the item explicitly marked inactive is dropped");
     }
 
     #[tokio::test]

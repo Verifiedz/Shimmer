@@ -545,6 +545,7 @@ mod tests {
             url_base: None,
             pagination: None,
             page_size: None,
+            active_field: None,
             title_contains: Vec::new(),
             title_excludes: Vec::new(),
             search_term: None,
