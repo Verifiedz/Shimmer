@@ -76,6 +76,13 @@ fn is_command_word(word: &str) -> bool {
             .any(|w| w == word)
 }
 
+/// What can be scheduled: the commands that make exactly one change (ADR 0031 §1). Running one
+/// checks it in [`request`]; completion offers only these after `shimmer schedule WHEN`.
+pub const SCHEDULABLE: [(&str, &[&str]); 2] = [
+    ("records", &["add", "update", "complete", "reopen", "remove", "restore"]),
+    ("workspaces", &["activate", "stop", "cleanup"]),
+];
+
 /// `shimmer`'s own options that go before the command (`--pack`, `--canonical`, `--no-color`):
 /// put after `schedule`, they're not the schedule's.
 const FRONT_FLAGS: &[&str] = &["--pack", "--canonical", "--no-color"];
@@ -162,7 +169,7 @@ fn catch_up_word(word: &str) -> std::result::Result<&'static str, String> {
 }
 
 /// `WHEN` from the front of `words`, and how many words it took.
-fn parse_when(words: &[String]) -> std::result::Result<(When, usize), String> {
+pub(crate) fn parse_when(words: &[String]) -> std::result::Result<(When, usize), String> {
     let at = |i: usize| words.get(i).map(String::as_str);
     let first = at(0).unwrap_or_default();
     match first {
@@ -302,7 +309,7 @@ async fn request(client: &mut Client, command: &[String]) -> Result<(&'static st
     let not = |why: &str| Error::invalid_params(format!("'{word} {sub}' can't be scheduled: {why}"));
     match word.as_str() {
         "records" => {
-            if !matches!(sub, "add" | "update" | "complete" | "reopen" | "remove" | "restore") {
+            if !SCHEDULABLE[0].1.contains(&sub) {
                 return Err(not(
                     "only records add, update, complete, reopen, remove and restore can (one change each, nothing to read)",
                 ));
