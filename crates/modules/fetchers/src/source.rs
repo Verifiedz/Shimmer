@@ -57,10 +57,11 @@ pub trait Source: Send + Sync {
 }
 
 /// The fixed, compiled-in sources (ADR 0028 §10). Not a plugin registry -- adding one of
-/// these is adding a line here. Unrelated to, and unaffected by, `config.toml`: each is
-/// always present whether or not it has a `[modules.fetchers.sources.*]` entry at all
-/// (ADR 0028 §2a -- a `kind`-less config entry only ever adjusts one of these by id, never
-/// replaces or disables its presence here).
+/// these is adding a line here. A `kind`-less config entry for one of these ids adjusts it
+/// (ADR 0028 §2a) -- it never replaces or disables its presence here, and [`resolve`] and
+/// [`find`] can always build one by id with zero config at all, same as before. Whether one
+/// shows up *unprompted* in `fetchers.list`/`fetchers.status` is a separate question
+/// [`known`] answers differently (ADR 0028 §19).
 pub fn registry() -> Vec<std::sync::Arc<dyn Source>> {
     vec![
         std::sync::Arc::new(crate::sources::hn::HnWhoIsHiring),
@@ -134,12 +135,17 @@ fn resolve_from(config: &FetchersConfig, id: &str) -> Result<Option<std::sync::A
     }
 }
 
-/// Every source the daemon currently knows about: the fixed [`registry`], plus one instance
-/// per configured `kind` entry (ADR 0028 §2a). What `fetchers.list`/`fetchers.status` show,
-/// and the universe [`resolve`] can ever return something for.
+/// Every source `fetchers.list`/`fetchers.status` surface *unprompted*: a fixed [`registry`]
+/// source only once the user has given it a `[modules.fetchers.sources.<id>]` entry of its
+/// own (even a bare, disabled one), plus one instance per configured `kind` entry (ADR 0028
+/// §2a) -- never the whole fixed registry regardless of interest (ADR 0028 §19). This is
+/// *not* the universe [`resolve`] can build something for -- that still falls back to the
+/// fixed registry by id with zero config at all, so `fetchers test hn-whoishiring` keeps
+/// working for anyone who already knows the id; this only governs what shows up for someone
+/// who never asked.
 pub fn known(ctx: &Ctx) -> Result<Vec<std::sync::Arc<dyn Source>>> {
     let config = FetchersConfig::load(ctx)?;
-    let mut sources = registry();
+    let mut sources: Vec<_> = registry().into_iter().filter(|s| config.sources.contains_key(s.id())).collect();
     for (id, cfg) in &config.sources {
         if cfg.kind.is_some() {
             if let Some(s) = resolve_from(&config, id)? {
@@ -169,22 +175,28 @@ mod tests {
     }
 
     #[test]
-    fn known_includes_the_fixed_registry_with_no_config_at_all() {
+    fn known_includes_nothing_from_the_fixed_registry_with_no_config_at_all() {
+        // CLAUDE.md §1's "general before specific" -- a user with no interest in job hunting
+        // must not see hn-whoishiring/weworkremotely/jobbank-canada show up unprompted just
+        // because they're compiled in (ADR 0028 §19).
         let env = TestEnv::new("fetchers");
         let ids: Vec<_> = known(&env.ctx).unwrap().iter().map(|s| s.id().to_string()).collect();
-        assert_eq!(ids, vec!["hn-whoishiring", "weworkremotely", "jobbank-canada"]);
+        assert_eq!(ids, Vec::<String>::new());
+        // Explicit invocation by id is a separate, unaffected path.
+        assert!(resolve(&env.ctx, "hn-whoishiring").unwrap().is_some());
     }
 
     #[test]
-    fn known_adds_every_configured_kind_instance_on_top_of_the_fixed_registry() {
+    fn known_includes_a_fixed_source_only_once_it_has_its_own_entry() {
         let mut env = TestEnv::new("fetchers");
         env.ctx.config = ModuleConfig::new(serde_json::json!({
             "sources": {
+                "hn-whoishiring": {"enabled": false, "interval": "daily"},
                 "my-team-blog": {"enabled": true, "interval": "hourly", "kind": "rss", "url": "https://example.test/feed.xml"},
             }
         }));
         let ids: Vec<_> = known(&env.ctx).unwrap().iter().map(|s| s.id().to_string()).collect();
-        assert_eq!(ids, vec!["hn-whoishiring", "weworkremotely", "jobbank-canada", "my-team-blog"]);
+        assert_eq!(ids, vec!["hn-whoishiring", "my-team-blog"], "weworkremotely/jobbank-canada were never configured");
     }
 
     #[test]
@@ -204,6 +216,6 @@ mod tests {
         assert_eq!(source.method(), Method::Api);
 
         let ids: Vec<_> = known(&env.ctx).unwrap().iter().map(|s| s.id().to_string()).collect();
-        assert_eq!(ids, vec!["hn-whoishiring", "weworkremotely", "jobbank-canada", "figma-jobs"]);
+        assert_eq!(ids, vec!["figma-jobs"]);
     }
 }

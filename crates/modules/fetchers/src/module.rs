@@ -233,8 +233,9 @@ impl Fetchers {
         }
     }
 
-    /// Every source the daemon knows about (the fixed registry plus every configured `kind`
-    /// instance, ADR 0028 §2a) cross-referenced with its own `config.toml` entry, if any.
+    /// Every source the user has actually opted into seeing: a fixed-registry source once it
+    /// has its own config entry, plus every configured `kind` instance (ADR 0028 §2a/§19),
+    /// cross-referenced with that entry.
     async fn list(&self, ctx: &Ctx) -> Result<Value> {
         let config = FetchersConfig::load(ctx)?;
         let sources: Vec<Value> = source::known(ctx)?
@@ -904,7 +905,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_shows_the_fixed_sources_disabled_by_default_and_a_configured_kind_enabled() {
+    async fn list_shows_only_an_opted_into_fixed_source_and_a_configured_kind() {
         let mut env = TestEnv::new("fetchers");
         env.ctx.config = ModuleConfig::new(json!({
             "sources": {
@@ -915,7 +916,10 @@ mod tests {
 
         let out = Fetchers::default().list(&env.ctx).await.unwrap();
         let sources = out["sources"].as_array().unwrap();
-        assert_eq!(sources.len(), 4, "{sources:?}");
+        // weworkremotely/jobbank-canada are compiled in but never configured here, so a user
+        // with no interest in job hunting never sees them (ADR 0028 §19).
+        assert_eq!(sources.len(), 2, "{sources:?}");
+        assert!(sources.iter().all(|s| s["id"] != "weworkremotely" && s["id"] != "jobbank-canada"), "{sources:?}");
 
         let hn = sources.iter().find(|s| s["id"] == "hn-whoishiring").unwrap();
         assert_eq!(
@@ -923,13 +927,6 @@ mod tests {
             (Some("api"), Some(true), None)
         );
         assert_eq!(hn["interval_s"], 86_400);
-
-        let wwr = sources.iter().find(|s| s["id"] == "weworkremotely").unwrap();
-        assert_eq!(
-            (wwr["method"].as_str(), wwr["enabled"].as_bool(), wwr["interval_s"].is_null()),
-            (Some("scrape"), Some(false), true),
-            "never configured -- disabled by default, no interval (ADR 0028 §5)"
-        );
 
         let blog = sources.iter().find(|s| s["id"] == "my-team-blog").unwrap();
         assert_eq!(
@@ -940,7 +937,16 @@ mod tests {
 
     #[tokio::test]
     async fn status_reports_last_run_and_whether_a_source_is_mid_fetch() {
-        let env = TestEnv::new("fetchers");
+        let mut env = TestEnv::new("fetchers");
+        // Both must have their own entry to show up in status at all (ADR 0028 §19) --
+        // fetching hn-whoishiring works regardless (resolve() needs none), but seeing it
+        // and weworkremotely listed afterward does not.
+        env.ctx.config = ModuleConfig::new(json!({
+            "sources": {
+                "hn-whoishiring": {"enabled": true, "interval": "daily"},
+                "weworkremotely": {"enabled": false, "interval": schedule::MIN_INTERVAL_SCRAPE_S},
+            }
+        }));
         let fetchers = Fetchers::default();
         stub_one_hn_comment(&env, 10, "<p>Acme | Remote<p>Hiring.");
         fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None, None).await.unwrap();

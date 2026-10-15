@@ -673,6 +673,43 @@ Confirmed live: `simplify-newgrad` configured with `active_field = "active"` dro
 4236 title-matching items to 894 once already-closed postings were excluded, and the first
 real `fetchers run` against it reported 50 new items, all genuinely open.
 
+### 19. Amendment: an unconfigured fixed source is not `known`
+
+§10's three reference sources are all job boards, and §2a's `registry()` made them "always
+present whether or not it has a `[modules.fetchers.sources.*]` entry at all" — so every
+Shimmer user saw `hn-whoishiring`, `weworkremotely`, and `jobbank-canada` in `fetchers list`/
+`fetchers status` from a fresh install, regardless of whether they have any interest in job
+hunting. That's the opposite of CLAUDE.md §1's "general before specific": job hunting is one
+`fetchers` use case among several (tech news, docs sites, transcript APIs), not one the
+compiled binary should privilege by always showing up unprompted.
+
+The three got hand-written `Source` impls for a reason that has nothing to do with being job
+boards: `hn-whoishiring` needs a two-stage fetch (a thread, then each comment) the generic
+`json-api` kind's flat-array model can't express, and `weworkremotely`/`jobbank-canada` are
+`Method::Scrape` (crawled HTML, needing a `robots.txt` check), which neither generic kind
+covers at all (both are `Method::Api`-only). Every other job source added since (§15's
+`figma-jobs`, `robinhood-jobs`, `simplify-newgrad`, …) needed zero Rust — plain `kind =
+"json-api"`/`"rss"` config, same as a tech-news or weather-alerts source. So "jobs" was never
+privileged in the *mechanism* — only in these three ids always being listed regardless of
+configuration.
+
+- **`source::known` now requires a `[modules.fetchers.sources.<id>]` entry — even a bare,
+  disabled one — before a fixed-registry source is included.** `registry()`, `find()`, and
+  `resolve()` are unchanged: `fetchers test hn-whoishiring`/`fetchers run weworkremotely`
+  still work with zero config at all, exactly as before. Only what `fetchers.list`/
+  `fetchers.status` surface *unprompted* changed.
+- **§5's "sources default disabled" is a different axis and is untouched.** An entry with no
+  `enabled` key still starts `false`. This amendment is about whether a source is *listed at
+  all* with no entry, not what an entry's own default is.
+- **No config schema change.** The same bare entry that already worked for adjusting a fixed
+  source's `interval`/filters now does double duty as the opt-in.
+
+Not done here: a one-command "job template" that writes `hn-whoishiring`/`weworkremotely`/
+`jobbank-canada` entries into `config.toml` in one step, the way `records`/`workspaces`
+templates (ADR 0022, ADR 0025) already work for their own modules. Worth doing — it's the
+natural way someone who *does* want job sources turns them on without hand-typing three TOML
+blocks — but it is its own, separable piece of work, not a prerequisite for this fix.
+
 ## Not done here
 
 - Credentials/secret storage for a future authenticated source. **Not** blocked by the
@@ -689,3 +726,5 @@ real `fetchers run` against it reported 50 new items, all genuinely open.
 - Headless-browser scraping for JS-rendered sites.
 - A `core` change that would let `Module::triggers()` read config directly (§5's finding) —
   would affect every module, not just this one; not proposed here.
+- A "job template" that opts into the three fixed sources in one command (§19) — separable
+  follow-up, not a prerequisite for §19's own fix.
