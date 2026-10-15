@@ -1,8 +1,8 @@
 # 0017. Collections describe what their data means: title, roles, unique, related, extra
 
-Status: proposed · Raised by Dev B (records roadmap, item 2) · Needs sign-off: Dev A (event
-payloads, docs/protocol.md) · Dev C notified (new collection keys and event fields) · No `core`
-or `proto` change
+Status: accepted (records roadmap, #101) · Raised by Dev B (records roadmap, item 2) · Signed off:
+Dev A (event payloads, docs/protocol.md) · Dev C notified (new collection keys and event fields) ·
+No `core` or `proto` change
 
 ## Context
 
@@ -175,7 +175,7 @@ jobs   Jobs   company*, url (url, unique), stage (oa|interview), apply_by (date,
 
 - **Titles in `records.list` / `records.get` responses.** Items are flat and a field may be named
   `title` (§2); a response-level `titles` map can come with filters and sorting (roadmap item 4)
-  if clients need it.
+  if clients need it. **Done since:** `records.list` returns `titles` (ADR 0024 §5).
 - **More roles** (`email`, `phone`, `started`, …): each by ADR when a feature needs it.
 - **`unique` across several fields together** (company + job id): not needed yet.
 - **Reminder timing** (how long before a deadline): the calendar's decision, possibly through

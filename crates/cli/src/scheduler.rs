@@ -8,6 +8,7 @@ use shimmer_core::Result;
 use crate::client::Client;
 use crate::flags::Flags;
 use crate::render::{self, table};
+use crate::style::{paint, Role};
 use crate::when;
 
 pub const USAGE: &str = "usage: shimmer scheduler <command>
@@ -59,6 +60,9 @@ pub struct NewTrigger {
     pub catch_up: &'static str,
     pub lane: Option<String>,
 }
+
+/// What `--catch-up` takes, as typed (shell completion offers these, #188).
+pub const CATCH_UP: &[&str] = &["skip", "run-once", "backfill"];
 
 const CATCH_UP_HELP: &str = "skip (drop missed runs), run-once (one run on waking, however many were missed) \
                              or backfill (one run for each missed time)";
@@ -141,8 +145,17 @@ pub async fn run(client: &mut Client, cmd: &SchedulerCmd, json: bool) -> Result<
                 return Ok(render::json(&data));
             }
             let id = data["trigger_id"].as_str().unwrap_or("?").to_string();
-            let all = client.call("scheduler.list", json!({})).await?;
-            return Ok(added(&id, find(&all, &id), now));
+            // Just the new trigger, as `show` gets it (#104). It's already added, so if this
+            // fails the command still succeeds (a script must not add it again), and says why
+            // the details are missing.
+            return Ok(match client.call("scheduler.get", json!({"trigger_id": id})).await {
+                Ok(t) => added(&id, Some(&t), now),
+                Err(e) => format!(
+                    "{}\n  (couldn't fetch its details: {}; see 'shimmer scheduler show {id}')",
+                    added(&id, None, now),
+                    e.code
+                ),
+            });
         }
         SchedulerCmd::Pause { id } => one(id, "scheduler.pause"),
         SchedulerCmd::Resume { id } => one(id, "scheduler.resume"),
@@ -161,10 +174,6 @@ pub async fn run(client: &mut Client, cmd: &SchedulerCmd, json: bool) -> Result<
         "scheduler.resume" => format!("✓ resumed {id}: it fires again from now on"),
         _ => format!("✓ removed {id}"),
     })
-}
-
-fn find<'a>(data: &'a Value, id: &str) -> Option<&'a Value> {
-    data["triggers"].as_array()?.iter().find(|t| t["id"].as_str() == Some(id))
 }
 
 fn added(id: &str, t: Option<&Value>, now: DateTime<Utc>) -> String {
@@ -210,8 +219,9 @@ fn trigger(t: &Value, now: DateTime<Utc>) -> String {
     let time = |v: &Value, none: &str| {
         when::timestamp(v).map_or(none.to_string(), |at| format!("{} ({})", when::local(at), when::relative(at, now)))
     };
-    let mut out = format!("{}  ({})\n", render::cell(&t["id"]), state(t));
-    let mut line = |label: &str, value: String| out.push_str(&format!("  {label:<10}{value}\n"));
+    let id = paint(Role::Name, &render::cell(&t["id"]));
+    let mut out = format!("{id}  ({})\n", crate::style::state(&state(t)));
+    let mut line = |label: &str, value: String| out.push_str(&format!("  {}{value}\n", crate::style::label(label, 10)));
     line("op", render::cell(&t["op"]));
     line("params", serde_json::to_string(&t["params"]).unwrap_or_default());
     line("schedule", schedule(&t["schedule"]));
@@ -372,17 +382,61 @@ mod tests {
     fn show_and_added_read_naturally() {
         let now = Utc::now();
         let data = sample(now);
-        let out = trigger(find(&data, "usr-1").unwrap(), now);
+        let usr1 = &data["triggers"][0];
+        assert_eq!(usr1["id"], "usr-1");
+        let out = trigger(usr1, now);
         assert!(out.starts_with("usr-1  (active)\n  op        records.list\n  params    {\"collection\":\"leetcode\"}\n  schedule  every 2d"), "{out}");
         assert!(
             out.contains("  lane      the op's own") && out.contains("(in 2h)") && out.contains("  last run  never"),
             "{out}"
         );
-        let msg = added("usr-1", find(&data, "usr-1"), now);
+        let msg = added("usr-1", Some(usr1), now);
         assert!(
             msg.starts_with("✓ added trigger usr-1: records.list every 2d, catch-up run-once\n  first run: in 2h ("),
             "{msg}"
         );
-        assert!(find(&data, "nope").is_none());
+        assert_eq!(added("usr-9", None, now), "✓ added trigger usr-9", "still says it was added");
+    }
+
+    /// A daemon that accepts `scheduler.add` and fails every other request, as one would if
+    /// `scheduler.get` broke right after the trigger was created.
+    async fn add_only_daemon(sock: &std::path::Path) {
+        use shimmer_proto::{decode_client, encode, ClientFrame, ServerFrame};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::UnixListener::bind(sock).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (rd, mut wr) = stream.into_split();
+            let mut lines = BufReader::new(rd).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let frame = match decode_client(&line).unwrap() {
+                    ClientFrame::Hello { .. } => ServerFrame::welcome("test", "s1"),
+                    ClientFrame::Request { id, op, .. } if op == "scheduler.add" => {
+                        ServerFrame::ok(id, json!({"trigger_id": "usr-new"}))
+                    }
+                    ClientFrame::Request { id, op, .. } => {
+                        ServerFrame::err(id, shimmer_core::Error::unavailable(format!("{op} broke")))
+                    }
+                    _ => continue,
+                };
+                wr.write_all(encode(&frame).unwrap().as_bytes()).await.unwrap();
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn add_still_succeeds_and_says_why_when_its_details_cant_be_fetched() {
+        // Wasay's review of #169: the trigger exists either way, so the command succeeds (a
+        // script must not retry and add it twice), and says why it shows only the id.
+        let dir = tempfile::TempDir::new().unwrap();
+        let sock = dir.path().join("s.sock");
+        add_only_daemon(&sock).await;
+        let mut client = Client::connect(&sock).await.unwrap();
+        let cmd = p(&["add", "records.list", "--every", "1d", "--catch-up", "skip"]).unwrap();
+        let out = run(&mut client, &cmd, false).await.unwrap();
+        assert_eq!(
+            out,
+            "✓ added trigger usr-new\n  (couldn't fetch its details: unavailable; see 'shimmer scheduler show usr-new')"
+        );
     }
 }

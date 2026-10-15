@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use shimmer_core::{Error, Event, Result};
-use shimmer_proto::{decode_server, encode, ClientFrame, ServerFrame, PROTOCOL_VERSION};
+use shimmer_proto::{decode_server, encode, ClientFrame, QueueControl, ServerFrame, PROTOCOL_VERSION};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
@@ -28,6 +28,8 @@ pub struct Client {
     subscribed: bool,
     /// Events that arrived while waiting for a response, oldest first.
     events: VecDeque<Event>,
+    /// What the daemon's `welcome` said it is.
+    daemon_version: String,
 }
 
 impl Client {
@@ -36,7 +38,14 @@ impl Client {
     pub async fn connect(socket: &Path) -> std::result::Result<Self, ConnectError> {
         let stream = UnixStream::connect(socket).await.map_err(ConnectError::Io)?;
         let (rd, wr) = stream.into_split();
-        let mut client = Self { rd: BufReader::new(rd), wr, next_id: 0, subscribed: false, events: VecDeque::new() };
+        let mut client = Self {
+            rd: BufReader::new(rd),
+            wr,
+            next_id: 0,
+            subscribed: false,
+            events: VecDeque::new(),
+            daemon_version: String::new(),
+        };
         client.handshake().await.map_err(ConnectError::Protocol)?;
         Ok(client)
     }
@@ -52,18 +61,31 @@ impl Client {
             .await
             .map_err(|_| Error::unavailable("daemon did not answer the handshake"))??;
         match frame {
-            ServerFrame::Welcome { .. } => Ok(()),
+            ServerFrame::Welcome { daemon_version, .. } => {
+                self.daemon_version = daemon_version;
+                Ok(())
+            }
             ServerFrame::Error { error, .. } => Err(error),
             other => Err(Error::bad_request(format!("expected welcome, got {}", kind(&other)))),
         }
     }
 
+    /// The version the daemon gave in its `welcome`.
+    pub fn daemon_version(&self) -> &str {
+        &self.daemon_version
+    }
+
     /// Send one request and wait for its response. Events arriving meanwhile are kept for
     /// [`next_event`](Self::next_event) once subscribed, and skipped before that.
     pub async fn call(&mut self, op: &str, params: Value) -> Result<Value> {
+        self.call_queued(op, params, None).await
+    }
+
+    /// [`call`](Self::call) with the request frame's `queue` block (docs/protocol.md, "Queue
+    /// control on the request frame"): only `--first` sends one (#222).
+    pub async fn call_queued(&mut self, op: &str, params: Value, queue: Option<QueueControl>) -> Result<Value> {
         let id = self.fresh_id();
-        let request =
-            ClientFrame::Request { v: PROTOCOL_VERSION, id: id.clone(), op: op.to_owned(), params, queue: None };
+        let request = ClientFrame::Request { v: PROTOCOL_VERSION, id: id.clone(), op: op.to_owned(), params, queue };
         self.send(&request).await?;
         tokio::time::timeout(REQUEST_TIMEOUT, self.response(&id))
             .await

@@ -1,7 +1,7 @@
 # 0014. Shared helpers in `core`: params decoding and the module write lock
 
-Status: proposed · Raised by Dev B (issue #67, from Dev A's reviews of #55 and #56) · Needs
-sign-off: Dev A (`core` is change-controlled, CLAUDE.md §4; also touches `crates/daemon`) · No
+Status: accepted (M3, #73) · Raised by Dev B (issue #67, from Dev A's reviews of #55 and #56) ·
+Signed off: Dev A (`core` is change-controlled, CLAUDE.md §4; also touches `crates/daemon`) · No
 `proto` change, nothing user-visible
 
 ## Context

@@ -21,6 +21,9 @@ pub struct Front {
     pub pack: Option<String>,
     /// `--canonical`: help without the active pack's aliases.
     pub canonical: bool,
+    /// `--no-color`: plain output (#189). Before the command only, so it never takes a name from
+    /// a record's fields.
+    pub no_color: bool,
 }
 
 /// Flags `shimmer` itself takes before the command word, and whether each takes a value.
@@ -31,13 +34,14 @@ const GLOBAL_FLAGS: &[(&str, bool)] = &[
     ("--help", false),
     ("--pack", true),
     ("--canonical", false),
+    ("--no-color", false),
 ];
 
 /// Take `--pack NAME` and `--canonical` off the front of the command line. They only count
 /// before the command word, so `shimmer records add … --pack x` still reaches a records field
 /// called `pack`.
 pub fn take_front_flags(args: Vec<String>) -> Result<Front, String> {
-    let mut front = Front { args: Vec::with_capacity(args.len()), pack: None, canonical: false };
+    let mut front = Front { args: Vec::with_capacity(args.len()), pack: None, canonical: false, no_color: false };
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let (flag, inline) = split_flag(&arg);
@@ -47,6 +51,7 @@ pub fn take_front_flags(args: Vec<String>) -> Result<Front, String> {
                 front.pack = Some(value.ok_or("--pack needs a value: a pack name, or 'none'")?);
             }
             ("--canonical", _) => front.canonical = true,
+            ("--no-color", _) => front.no_color = true,
             (_, Some((_, true))) => {
                 front.args.push(arg.clone());
                 if inline.is_none() {
@@ -285,9 +290,15 @@ mod tests {
     #[test]
     fn pack_and_canonical_come_off_the_front_only() {
         let f = take_front_flags(args(&["--pack", "short", "--json", "up"])).unwrap();
-        assert_eq!(f, Front { args: args(&["--json", "up"]), pack: Some("short".into()), canonical: false });
+        assert_eq!(
+            f,
+            Front { args: args(&["--json", "up"]), pack: Some("short".into()), canonical: false, no_color: false }
+        );
         let f = take_front_flags(args(&["--pack=none", "--help", "--canonical"])).unwrap();
-        assert_eq!(f, Front { args: args(&["--help"]), pack: Some("none".into()), canonical: true });
+        assert_eq!(f, Front { args: args(&["--help"]), pack: Some("none".into()), canonical: true, no_color: false });
+        let f = take_front_flags(args(&["--no-color", "records", "add", "x", "--no-color", "y"])).unwrap();
+        assert!(f.no_color, "taken before the command");
+        assert_eq!(f.args, args(&["records", "add", "x", "--no-color", "y"]), "after it, it's the command's");
         let f = take_front_flags(args(&["--socket", "/s", "--pack", "starship", "comms"])).unwrap();
         assert_eq!((f.args, f.pack.as_deref()), (args(&["--socket", "/s", "comms"]), Some("starship")));
         // After the command word they belong to the command.
@@ -402,9 +413,9 @@ mod tests {
         let help = help_section(&short());
         let lines: Vec<&str> = help.lines().collect();
         assert_eq!(lines[0], "aliases (short pack; 'shimmer --help --canonical' hides these):");
-        assert_eq!(lines[1].trim_end(), "  up       shimmer ping");
-        assert_eq!(lines[19].trim_end(), "  wreset   shimmer workspaces reset");
-        assert_eq!(lines[28].trim_end(), "  sdel     shimmer scheduler remove");
-        assert_eq!(lines.len(), 30);
+        assert_eq!(lines[1].trim_end(), "  up        shimmer ping");
+        assert_eq!(lines[33].trim_end(), "  wreset    shimmer workspaces reset");
+        assert_eq!(lines[53].trim_end(), "  sdel      shimmer scheduler remove");
+        assert_eq!(lines.len(), 55);
     }
 }

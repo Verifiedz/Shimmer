@@ -925,6 +925,34 @@ async fn check_reports_what_does_not_fit_and_changes_nothing() {
 }
 
 #[tokio::test]
+async fn health_is_one_ok_line_when_every_collection_is_fine() {
+    let (r, env) = setup().await;
+    add_two_sum(&r, &env).await;
+    let data = call(&r, &env, "records.health", json!({})).await.unwrap();
+    assert_eq!(data, json!({"checks": [{"status": "ok", "message": "1 collection and 1 record, all fine"}]}));
+}
+
+#[tokio::test]
+async fn health_reports_unloadable_collections_and_records_that_dont_fit() {
+    let (r, env) = setup().await;
+    add_two_sum(&r, &env).await;
+    env.ctx.store.write("items/leetcode/bad.toml", "difficulty = \"trivial\"\n").unwrap();
+    env.ctx.store.write("collections/broken.toml", "[collection\n").unwrap();
+    let before = topics(&env).len();
+
+    let data = call(&r, &env, "records.health", json!({})).await.unwrap();
+    let checks = data["checks"].as_array().unwrap();
+    assert_eq!(checks.len(), 2, "{data}");
+    assert_eq!(checks[0]["status"], "fail");
+    assert!(checks[0]["message"].as_str().unwrap().contains("broken"), "{data}");
+    assert_eq!(checks[1]["status"], "warn");
+    assert_eq!(checks[1]["message"], "leetcode: 1 record doesn't fit the collection");
+    assert_eq!(checks[1]["fix"]["op"], "records.check");
+    assert_eq!(checks[1]["fix"]["params"], json!({"collection": "leetcode"}));
+    assert_eq!(topics(&env).len(), before, "nothing written");
+}
+
+#[tokio::test]
 async fn rename_field_moves_values_everywhere_in_one_step() {
     let (r, env) = setup().await;
     add_two_sum(&r, &env).await;
@@ -983,6 +1011,94 @@ async fn rename_collection_moves_everything() {
     assert_eq!(e.code, ErrorCode::Conflict);
 }
 
+/// A collection whose records point at each other (`follows`) and at LeetCode problems.
+const PLAN: &str = "# My plan.\n[collection]\nid = \"plan\"\nlabel = \"Plan\" # what it's for\n\n\
+[[field]]\nname = \"title\"\ntype = \"string\"\nrequired = true\n\n\
+[[field]]\nname = \"follows\"\ntype = \"ref\"\ncollection = \"plan\"\n\n\
+[[field]]\nname = \"problem\"\ntype = \"ref\"\ncollection = \"leetcode\"\n";
+
+#[tokio::test]
+async fn copy_collection_copies_the_file_and_only_with_records_its_records() {
+    let (r, env) = setup().await;
+    add_two_sum(&r, &env).await;
+    env.ctx.store.write("collections/plan.toml", PLAN).unwrap();
+    for (id, fields) in [
+        ("week-1", json!({"title": "Week 1", "problem": "two-sum"})),
+        ("week-2", json!({"title": "Week 2", "follows": "week-1"})),
+    ] {
+        call(&r, &env, "records.add", json!({"collection": "plan", "id": id, "fields": fields})).await.unwrap();
+    }
+    call(&r, &env, "records.complete", json!({"collection": "plan", "id": "week-1"})).await.unwrap();
+    call(&r, &env, "records.remove", json!({"collection": "plan", "id": "week-2"})).await.unwrap();
+    call(&r, &env, "records.restore", json!({"collection": "plan", "id": "week-2"})).await.unwrap();
+    call(&r, &env, "records.add", json!({"collection": "plan", "id": "gone", "fields": {"title": "Gone"}}))
+        .await
+        .unwrap();
+    call(&r, &env, "records.remove", json!({"collection": "plan", "id": "gone"})).await.unwrap();
+    let before = env.backend.events().len();
+
+    // Empty: the file only, comments kept, refs into itself pointed at the copy, others not.
+    let empty = call(&r, &env, "records.copy_collection", json!({"id": "plan", "to": "plan-b"})).await.unwrap();
+    assert_eq!((empty["id"].as_str(), empty["records"].as_u64()), (Some("plan-b"), Some(0)));
+    let text = file(&env, "collections/plan-b.toml").unwrap();
+    assert_eq!(
+        text,
+        PLAN.replace("id = \"plan\"", "id = \"plan-b\"").replace("collection = \"plan\"", "collection = \"plan-b\"")
+    );
+    assert!(env.backend.list("records", "items/plan-b").unwrap().is_empty());
+    let events: Vec<_> = env.backend.events().into_iter().skip(before).collect();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].topic, "records.collection.copied");
+    assert_eq!(events[0].payload, json!({"collection": "plan-b", "from": "plan", "records": 0}));
+
+    // With records: every live record exactly as written (status, stamps), the trash left behind.
+    let before = env.backend.events().len();
+    let full = call(
+        &r,
+        &env,
+        "records.copy_collection",
+        json!({"id": "plan", "to": "plan-c", "label": "Plan C", "with_records": true}),
+    )
+    .await
+    .unwrap();
+    assert_eq!((full["label"].as_str(), full["records"].as_u64()), (Some("Plan C"), Some(2)));
+    assert!(file(&env, "collections/plan-c.toml").unwrap().contains("label = \"Plan C\" # what it's for"));
+    for id in ["week-1", "week-2"] {
+        assert_eq!(
+            file(&env, &format!("items/plan-c/{id}.toml")),
+            file(&env, &format!("items/plan/{id}.toml")),
+            "{id}"
+        );
+    }
+    assert!(file(&env, "items/plan-c/gone.toml").is_none() && file(&env, "trash/plan-c/gone.toml").is_none());
+    let week1 = call(&r, &env, "records.get", json!({"collection": "plan-c", "id": "week-1"})).await.unwrap();
+    assert_eq!((week1["status"].as_str(), week1["problem"].as_str()), (Some("done"), Some("two-sum")));
+    // The copy's refs resolve inside the copy: it all fits.
+    let check = call(&r, &env, "records.check", json!({"collection": "plan-c"})).await.unwrap();
+    assert_eq!(check["problems"], json!([]), "{check}");
+    let events: Vec<_> = env.backend.events().into_iter().skip(before).collect();
+    let topics: Vec<&str> = events.iter().map(|e| e.topic.as_str()).collect();
+    assert_eq!(topics, ["records.collection.copied", "records.item.created", "records.item.created"]);
+    assert!(events[1..].iter().all(|e| e.payload["collection"] == "plan-c"));
+    // The original is untouched.
+    assert_eq!(file(&env, "collections/plan.toml").unwrap(), PLAN);
+    assert_eq!(env.backend.list("records", "items/plan").unwrap().len(), 2);
+
+    // Mistakes change nothing.
+    let before = env.backend.events().len();
+    for (params, code) in [
+        (json!({"id": "plan", "to": "plan-b"}), ErrorCode::Conflict),
+        (json!({"id": "plan", "to": "Bad Id"}), ErrorCode::InvalidParams),
+        (json!({"id": "plan", "to": "../x"}), ErrorCode::InvalidParams),
+        (json!({"id": "nope", "to": "x"}), ErrorCode::NotFound),
+        (json!({"id": "plan", "to": "x", "label": " "}), ErrorCode::InvalidParams),
+    ] {
+        assert_eq!(call(&r, &env, "records.copy_collection", params.clone()).await.unwrap_err().code, code, "{params}");
+    }
+    assert_eq!(env.backend.events().len(), before);
+    assert!(file(&env, "collections/x.toml").is_none());
+}
+
 #[tokio::test]
 async fn remove_collection_asks_first_then_restore_brings_it_all_back() {
     let (r, env) = setup().await;
@@ -1025,24 +1141,33 @@ async fn every_template_is_listed_and_creates_a_valid_collection() {
     assert_eq!(
         ids,
         [
-            "addresses",
-            "certifications",
-            "charity",
-            "documents",
-            "education",
-            "employment",
+            // By category (ADR 0030 §1), then id.
             "interview-questions",
             "interviews",
             "job-applications",
-            "leetcode",
             "networking-events",
             "offers",
             "outreach",
-            "projects",
             "stories",
+            "leetcode",
+            "certifications",
+            "education",
+            "employment",
+            "projects",
+            "addresses",
+            "charity",
+            "documents",
             "subscriptions"
         ]
     );
+    let categories: Vec<&str> =
+        data["categories"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
+    assert_eq!(categories, ["job-hunt", "practice", "career", "life"]);
+    for t in data["templates"].as_array().unwrap() {
+        assert!(categories.contains(&t["category"].as_str().unwrap()), "{t}");
+        assert!(t["examples"].as_array().is_some_and(|e| !e.is_empty()), "{}: no examples", t["id"]);
+        assert!(t.get("file").is_none(), "{}: the file only when asked", t["id"]);
+    }
 
     for template in &ids {
         let id = format!("my-{template}");
@@ -1060,6 +1185,55 @@ async fn every_template_is_listed_and_creates_a_valid_collection() {
     // And each one is usable right away.
     let check = call(&r, &env, "records.check", json!({"collection": "my-job-applications"})).await.unwrap();
     assert_eq!(check["checked"], 0);
+}
+
+#[tokio::test]
+async fn templates_gives_one_in_full_with_its_notes_and_file() {
+    let (r, env) = setup().await;
+    let data = call(&r, &env, "records.templates", json!({"id": "addresses", "file": true})).await.unwrap();
+    let all = data["templates"].as_array().unwrap();
+    assert_eq!(all.len(), 1);
+    let t = &all[0];
+    assert_eq!((t["id"].as_str(), t["category"].as_str()), (Some("addresses"), Some("life")));
+    // The header's privacy paragraph, as one line; the examples as written.
+    let notes = t["notes"].as_array().unwrap();
+    assert!(notes.iter().any(|n| n.as_str().unwrap().starts_with("Private information: this file")), "{notes:?}");
+    assert!(!notes.iter().any(|n| n.as_str().unwrap().contains("Created from")), "{notes:?}");
+    assert!(t["examples"][0].as_str().unwrap().starts_with("shimmer records add <collection> --street"), "{t}");
+    // The file is the template exactly: what `records.create_collection` copies.
+    assert_eq!(t["file"].as_str().unwrap(), include_str!("../templates/addresses.toml"));
+    assert_eq!(data["categories"].as_array().unwrap().len(), 4, "the headings come along");
+
+    let e = call(&r, &env, "records.templates", json!({"id": "chess"})).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::NotFound);
+    assert!(e.message.contains("no template 'chess' (there are: addresses, certifications"), "{}", e.message);
+    // Nothing written, nothing emitted: it's a read.
+    assert!(env.backend.events().is_empty());
+}
+
+#[tokio::test]
+async fn collections_say_which_template_they_came_from() {
+    let (r, env) = setup().await;
+    call(&r, &env, "records.create_collection", json!({"id": "jobs", "template": "job-applications"})).await.unwrap();
+    call(&r, &env, "records.copy_collection", json!({"id": "jobs", "to": "jobs-2"})).await.unwrap();
+    // One whose header was edited away, and one that names a template that isn't built in.
+    let text = file(&env, "collections/jobs.toml").unwrap();
+    let edited = text
+        .replace("Created from Shimmer's job-applications template.", "Mine.")
+        .replace("id = \"jobs\"", "id = \"mine\"");
+    env.ctx.store.write("collections/mine.toml", edited).unwrap();
+    let chess = text.replace("job-applications template", "chess template").replace("id = \"jobs\"", "id = \"chess\"");
+    env.ctx.store.write("collections/chess.toml", chess).unwrap();
+
+    let data = call(&r, &env, "records.collections", json!({})).await.unwrap();
+    let from = |id: &str| {
+        data["collections"].as_array().unwrap().iter().find(|c| c["id"] == id).unwrap().get("template").cloned()
+    };
+    assert_eq!(from("jobs"), Some(json!("job-applications")));
+    assert_eq!(from("jobs-2"), Some(json!("job-applications")), "a copy says what its original came from");
+    assert_eq!(from("leetcode"), None, "written by hand (the test fixture)");
+    assert_eq!(from("mine"), None);
+    assert_eq!(from("chess"), None);
 }
 
 #[tokio::test]
@@ -1811,4 +1985,64 @@ async fn a_file_that_cant_be_read_is_reported_and_hides_nothing() {
     let list = call(&r, &env, "records.list", json!({"collection": "leetcode"})).await.unwrap();
     assert_eq!(list["total"], 1);
     assert!(list["skipped"][0].as_str().unwrap().contains("garbled.toml"), "{list}");
+}
+
+/// A collection with a unique field and a reference between its own records, for #99.
+const UNREADABLE_PLAN: &str = "[collection]\nid = \"plan\"\nlabel = \"Plan\"\n\n\
+[[field]]\nname = \"title\"\ntype = \"string\"\nrequired = true\n\n\
+[[field]]\nname = \"url\"\ntype = \"string\"\nunique = true\n\n\
+[[field]]\nname = \"follows\"\ntype = \"ref\"\ncollection = \"plan\"\n";
+
+#[tokio::test]
+async fn one_unreadable_record_never_blocks_writes_renames_imports_or_the_trash() {
+    // #99: an unreadable record file (here invalid UTF-8) used to abort every op that scans the
+    // collection: unique checks on each write, reference checks, import, the trash and
+    // rename_field. Now it's skipped, and reported where the person would otherwise not know.
+    let (r, env) = setup().await;
+    env.ctx.store.write("collections/plan.toml", UNREADABLE_PLAN).unwrap();
+    let add = |id: &str, fields: Value| json!({"collection": "plan", "id": id, "fields": fields});
+    call(&r, &env, "records.add", add("a", json!({"title": "A", "url": "https://x"}))).await.unwrap();
+    call(&r, &env, "records.add", add("b", json!({"title": "B", "follows": "a"}))).await.unwrap();
+    call(&r, &env, "records.add", add("gone", json!({"title": "Gone"}))).await.unwrap();
+    call(&r, &env, "records.remove", json!({"collection": "plan", "id": "gone"})).await.unwrap();
+    env.ctx.store.write("items/plan/garbled.toml", vec![0xff, 0xfe, b'x']).unwrap();
+    env.ctx.store.write("trash/plan/garbled-too.toml", vec![0xff, 0xfe, b'y']).unwrap();
+
+    // Unique checks run on every write: they skip it, and still catch a real duplicate.
+    call(&r, &env, "records.add", add("c", json!({"title": "C", "url": "https://y"}))).await.unwrap();
+    let dup = call(&r, &env, "records.add", add("d", json!({"title": "D", "url": "https://x"}))).await.unwrap_err();
+    assert_eq!(dup.code, ErrorCode::Conflict, "{}", dup.message);
+    let update = json!({"collection": "plan", "id": "c", "fields": {"title": "C2"}});
+    call(&r, &env, "records.update", update).await.unwrap();
+
+    // Reference checks: renaming a still repoints b.
+    call(&r, &env, "records.rename", json!({"collection": "plan", "id": "a", "new_id": "a2"})).await.unwrap();
+    let b = call(&r, &env, "records.get", json!({"collection": "plan", "id": "b"})).await.unwrap();
+    assert_eq!(b["follows"], "a2");
+
+    // Import.
+    let rows = json!({"collection": "plan", "rows": [{"id": "e", "title": "E"}]});
+    assert_eq!(call(&r, &env, "records.import", rows).await.unwrap()["added"], json!(["e"]));
+
+    // The trash lists what it can read, and says what it couldn't.
+    let trash = call(&r, &env, "records.trash", json!({"collection": "plan"})).await.unwrap();
+    assert_eq!(trash["items"].as_array().unwrap().len(), 1, "{trash}");
+    assert_eq!(trash["items"][0]["id"], "gone");
+    assert!(trash["skipped"][0].as_str().unwrap().contains("garbled-too.toml"), "{trash}");
+
+    // rename_field renames everywhere it can, and names the files it couldn't (they keep the old
+    // name): the unreadable ones and one that's valid text but broken TOML.
+    env.ctx.store.write("items/plan/broken.toml", "title = [unclosed").unwrap();
+    let renamed = call(&r, &env, "records.rename_field", json!({"collection": "plan", "from": "title", "to": "name"}))
+        .await
+        .unwrap();
+    assert_eq!(renamed["updated"], 5, "a2, b, c, e and gone in the trash: {renamed}");
+    let skipped: Vec<&str> = renamed["skipped"].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
+    assert_eq!(skipped.len(), 3, "{skipped:?}");
+    for name in ["garbled.toml", "garbled-too.toml", "broken.toml"] {
+        assert!(skipped.iter().any(|s| s.contains(name)), "{name} not in {skipped:?}");
+    }
+    // Nothing unreadable: no `skipped` key at all, as in records.list.
+    let clean = call(&r, &env, "records.trash", json!({"collection": "leetcode"})).await.unwrap();
+    assert!(clean.get("skipped").is_none(), "{clean}");
 }

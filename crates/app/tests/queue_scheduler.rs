@@ -5,13 +5,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{stderr, stdout, Home};
-
-fn ok(home: &Home, args: &[&str]) -> String {
-    let o = home.shimmer(args);
-    assert!(o.status.success(), "{args:?} failed: {}{}", stdout(&o), stderr(&o));
-    stdout(&o)
-}
+use common::{ok, stderr, Home};
 
 /// Poll `shimmer args…` until its output contains `want`, for up to 10 s.
 fn wait_for(home: &Home, args: &[&str], want: &str) -> String {

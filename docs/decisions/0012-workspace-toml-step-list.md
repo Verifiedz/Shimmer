@@ -1,7 +1,8 @@
 # 0012. `workspace.toml`: the step list, its fields, and how it is checked
 
-Status: proposed · Raised by Dev B (issue #31) · Needs sign-off: Dev A (defines the script ABI he
-consumes through `Launcher`, CLAUDE.md §10.1) · No `core` or `proto` change
+Status: accepted (M3, #41; implemented in #55) · Raised by Dev B (issue #31) · Signed off: Dev A
+(defines the script ABI he consumes through `Launcher`, CLAUDE.md §10.1) · No `core` or `proto`
+change
 
 ## Context
 

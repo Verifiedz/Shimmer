@@ -1,7 +1,7 @@
 # 0010. Workspaces: the `Ctx` launcher capability and where its data lives
 
-Status: proposed · Raised by Dev A · Needs sign-off: Dev A, Dev B (CLAUDE.md §4, changes `core`)
-· Amended after PR review: §2a (multi-step launches), and code/doc drift on `session_id`
+Status: accepted (M3, #71) · Raised by Dev A · Signed off: Dev A, Dev B (CLAUDE.md §4, changes
+`core`) · Amended after PR review: §2a (multi-step launches), and code/doc drift on `session_id`
 resolved (§2, §9, "Not done here") · Amended during the real `LaunchBackend`'s
 implementation (`m3-launch-backend`): §9's `session_id` random field is no longer
 `rand::random()` — see §9 "Amendment: `instance_id`, not pure `rand::random()`". · Amended

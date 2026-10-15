@@ -1,8 +1,8 @@
 # 0021. Collections over time: reference lists, checking, renaming, removing
 
-Status: proposed · Raised by Dev B (records roadmap, items 9 and 10; issue #81) · Needs sign-off:
-Dev A (new ops and topics in `records`, docs/protocol.md, a new dependency) · Dev C notified
-(items can lack `status`) · No `core` or `proto` change
+Status: accepted (records roadmap, #101) · Raised by Dev B (records roadmap, items 9 and 10; issue
+#81) · Signed off: Dev A (new ops and topics in `records`, docs/protocol.md, a new dependency) ·
+Dev C notified (items can lack `status`) · No `core` or `proto` change
 
 ## Context
 
@@ -149,5 +149,6 @@ removed applications (42 records)
   shows what wouldn't fit; converting is a later op if needed.
 - **Removing a field's values** from every record (the stranded keys `records.check` reports).
   Leaving them is harmless; an op can come later.
-- **Emptying the trash**, including removed collections (ADR 0020).
+- **Emptying the trash**, including removed collections (ADR 0020). **Done since:** for records,
+  `records.purge` (ADR 0024 §5). Removed collections still can't be emptied except by hand.
 - **Following a rename in other collections' `related`** or in workspace scripts.

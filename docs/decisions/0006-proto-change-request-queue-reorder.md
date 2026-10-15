@@ -1,6 +1,7 @@
 # 0006. Proto change request: `queue.reorder` op constant
 
-Status: **proposed** · Needs sign-off: Dev A, Dev B · Dev C to be notified (CLAUDE.md §4)
+Status: accepted (M2, #46; landed on master in #45) · Signed off: Dev A, Dev B · Dev C to be
+notified (CLAUDE.md §4)
 
 Raised by Dev A under CLAUDE.md §12 rule 1: a `crates/proto` gap is reported, not worked
 around. No stopgap has been landed in the daemon.

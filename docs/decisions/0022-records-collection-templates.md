@@ -1,7 +1,8 @@
 # 0022. Collection templates: ready-made trackers created with one command
 
-Status: proposed · Raised by Dev B (records roadmap, item 1; issue #78) · Needs sign-off: Dev A
-(two new ops in `records`, docs/protocol.md) · Dev C notified · No `core` or `proto` change
+Status: accepted (records roadmap, #101) · Raised by Dev B (records roadmap, item 1; issue #78) ·
+Signed off: Dev A (two new ops in `records`, docs/protocol.md) · Dev C notified · No `core` or
+`proto` change
 
 ## Context
 
@@ -160,4 +161,5 @@ it moves into `core` then, with an ADR, as ADR 0014 did for other helpers.
   `employment`, `addresses`: `completable = false`, ADR 0021).
 - **User templates** in `$SHIMMER_HOME`, and a community template repository.
 - **Kits** that create several collections and a workspace together (#79).
-- **Reference fields** so `interviews.application` is a real link (#80).
+- **Reference fields** so `interviews.application` is a real link (#80). **Done since:** the `ref` type
+  (ADR 0024 §3).

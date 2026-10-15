@@ -322,10 +322,22 @@ fn repo(sb: &Sandbox, dir: &Path, files: &[(&str, &str)]) {
 fn smoke_test_launches_stops_fails_and_cleans_up_without_leftovers() {
     let sb = Sandbox::new();
     sb.create("smoke", "smoke-test", &[]);
+    // The last step is detached: activate returns once it's started, while its shell is still
+    // getting to `exec sleep` (a mkdir, a cat). So wait for it to settle as one sleep, rather than
+    // counting at once (#224).
+    let one_sleep = || {
+        let p = sb.processes("smoke");
+        (p.len() == 1 && p[0].1.starts_with("sleep")).then(|| p[0].0)
+    };
     sb.activate("smoke");
-    assert_eq!(sb.processes("smoke").len(), 1, "its background step runs");
+    sb.wait_for("its background step runs, as one sleep", || one_sleep().is_some());
+    let pid = one_sleep().unwrap();
     sb.activate("smoke");
-    assert_eq!(sb.processes("smoke").len(), 1, "activating again doesn't start a second one");
+    // The second shell sees the first is running and exits. Settled, and still settled a moment
+    // later, it must be the same sleep: a second one would show as two, or as a new pid.
+    sb.wait_for("activating again leaves only the first sleep", || one_sleep() == Some(pid));
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(one_sleep(), Some(pid), "activating again doesn't start a second one");
     sb.stop("smoke");
 
     sb.ok(&["workspaces", "edit", "smoke", "--path"]);
@@ -559,7 +571,12 @@ fn vm_starts_and_stops_a_custom_vm_once_and_only_one_it_started() {
     sb.create("box", "vm", &answers);
     let out = sb.activate("box");
     assert!(up("http://127.0.0.1:18422"), "{out}");
-    assert!(sb.calls().contains("ssh -p 18422 127.0.0.1"), "the terminal runs ssh: {}", sb.calls());
+    // The terminal step is detached: activate returns once it's started, so wait for its call.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !sb.calls().contains("ssh -p 18422 127.0.0.1") {
+        assert!(Instant::now() < deadline, "the terminal runs ssh: {}", sb.calls());
+        std::thread::sleep(Duration::from_millis(50));
+    }
     settles(&sb, "box", "python3 -m http.server 18422", 1, "running");
 
     let again = sb.activate("box");

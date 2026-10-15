@@ -1,8 +1,8 @@
 # 0025. Workspace templates: ready-made workspaces you fill in with your own answers
 
-Status: proposed · Raised by Dev B (issue #68) · Needs sign-off: Dev A (two new ops in
-`workspaces`, docs/protocol.md; the scripts run through his `Launcher`) · Dev C notified ·
-No `core` or `proto` change
+Status: accepted (M3, #96) · Raised by Dev B (issue #68) · Signed off: Dev A (two new ops in
+`workspaces`, docs/protocol.md; the scripts run through his `Launcher`) · Dev C notified · No `core`
+or `proto` change
 
 ## Context
 
@@ -264,11 +264,17 @@ never committed). The editors may ask once to allow automatic tasks. It needs th
 the folder, not a single `OPEN_PATH` file.
 
 **The dev server's output and process id** go in the system temp folder,
-`${TMPDIR:-/tmp}/shimmer-<workspace id>/` (`dev-server.log`, `dev-server.pid`), never inside
+`${TMPDIR:-/tmp}/shimmer-<uid>-<Shimmer folder tag>-<workspace id>/` (`dev-server.log`,
+`dev-server.pid`), private to the user and refused if anything else is already there (#165), never inside
 `$SHIMMER_HOME`: only the daemon writes there (CLAUDE.md §2), and `logs/` is the launcher's
 (ADR 0010 §3). The temp folder is the right lifetime too: a reboot clears it, and a reboot also
 ends the server. A detached step is its own process group (ADR 0010 §3), so cleanup stops the
 server and everything it started with one `kill` of that group.
+
+A workspace created before #165 keeps its own copy of the helper, with the old shared folder.
+To give it the fixed one without touching its steps, copy the built-in helper over its copy:
+`shimmer workspaces peek web-project --file lib/shimmer-open.sh > <Shimmer folder>/data/workspaces/<name>/lib/shimmer-open.sh`
+while the workspace is stopped, or create the workspace again.
 
 **Secrets never go in answers.** `workspace.toml` is meant to be committable with the rest of
 `$SHIMMER_HOME` (CLAUDE.md §7). API keys stay in the project's own `.env.local`. The template's
@@ -695,7 +701,8 @@ Rules:
   community repository.
 - Hyper-V and other Windows VM software: the Windows launch backend is still a sketch.
 - Showing a project's tracker items on launch (`shimmer records list … --filter`), which needs
-  the records query work (ADR 0019) on master first. A one-line step to add later.
+  the records query work (ADR 0019) on master first. A one-line step to add later. (The query
+  work is on master now; the step isn't added yet.)
 - Placing windows on Hyprland workspaces or monitors, and `vercel env pull` (needs the Vercel
   CLI and a login): easy extra steps for anyone who wants them, not defaults.
 - Windows (`.ps1` versions): the launch backend for Windows is still a sketch (ADR 0010 §7).

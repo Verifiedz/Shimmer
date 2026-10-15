@@ -1,7 +1,7 @@
 # 0027. The real HTTP gateway: `RealHttpBackend`
 
-Status: proposed · Raised by Dev A · Needs sign-off: Dev A, Dev B (CLAUDE.md §4, changes `core`)
-· No protocol change
+Status: accepted (M6, #109) · Raised by Dev A · Signed off: Dev A, Dev B (CLAUDE.md §4, changes
+`core`) · No protocol change
 
 ## Context
 
@@ -192,4 +192,5 @@ its own proposal — not decided here.
   authenticated can be requested through this gateway yet. Deferred until a real consumer
   defines the actual need — the same reasoning CLAUDE.md §5 gives for deferring `ViewSpec`
   until there is a renderer to extract it from.
-- The `fetchers` module itself — Dev B's, not started here.
+- The `fetchers` module itself — Dev B's, not started here. (Since then: in progress on the
+  `fetchers` umbrella, #126, with its own ADR 0028 there.)

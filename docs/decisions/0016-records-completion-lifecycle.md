@@ -1,8 +1,8 @@
 # 0016. Records completion lifecycle: reopen, complete with fields, repeated completions
 
-Status: proposed · Raised by Dev B (records roadmap, item 3) · Needs sign-off: Dev A (a new op
-and topic in `records`, docs/protocol.md) · Dev C notified (new op, new topic, new collection
-key) · No `core` or `proto` change
+Status: accepted (records roadmap, #101) · Raised by Dev B (records roadmap, item 3) · Signed off:
+Dev A (a new op and topic in `records`, docs/protocol.md) · Dev C notified (new op, new topic, new
+collection key) · No `core` or `proto` change
 
 ## Context
 
@@ -152,7 +152,8 @@ shimmer: conflict: 'amazon-sde-intern' in 'jobs' was already completed on 2026-1
 - **What a heatmap counts after a reopen.** The events are all there; the index (M4) or the view
   decides.
 - **`changed` in events** (it lists every key sent, not only real changes): records roadmap item 2.
+  **Done since:** `records.item.updated`'s `changed` lists only real changes (ADR 0017).
 - **Collections that can't be completed at all** (`completable = false`): roadmap item 9. When it
-  lands, `records.reopen` is refused there too.
+  lands, `records.reopen` is refused there too. **Done since:** ADR 0021.
 - **Undoing other operations** (update, remove): remove is roadmap item 6; general undo is not
   planned.

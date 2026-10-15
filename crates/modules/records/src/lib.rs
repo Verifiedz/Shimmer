@@ -10,6 +10,7 @@ mod item;
 mod lifecycle;
 mod query;
 mod schema;
+mod templates;
 mod values;
 
 use async_trait::async_trait;
@@ -22,27 +23,6 @@ use shimmer_core::{CommandSpec, Ctx, Error, ErrorCode, Execution, Manifest, Modu
 use crate::item::Item;
 use crate::schema::Collection;
 
-/// Built-in collection templates (ADR 0022), by id. Each is an ordinary collection file whose
-/// `[collection] id` is the template's id; creating one copies it with only the id (and label)
-/// changed.
-const TEMPLATES: &[(&str, &str)] = &[
-    ("addresses", include_str!("../templates/addresses.toml")),
-    ("certifications", include_str!("../templates/certifications.toml")),
-    ("charity", include_str!("../templates/charity.toml")),
-    ("documents", include_str!("../templates/documents.toml")),
-    ("education", include_str!("../templates/education.toml")),
-    ("employment", include_str!("../templates/employment.toml")),
-    ("interview-questions", include_str!("../templates/interview-questions.toml")),
-    ("interviews", include_str!("../templates/interviews.toml")),
-    ("job-applications", include_str!("../templates/job-applications.toml")),
-    ("leetcode", include_str!("../templates/leetcode.toml")),
-    ("networking-events", include_str!("../templates/networking-events.toml")),
-    ("offers", include_str!("../templates/offers.toml")),
-    ("outreach", include_str!("../templates/outreach.toml")),
-    ("projects", include_str!("../templates/projects.toml")),
-    ("stories", include_str!("../templates/stories.toml")),
-    ("subscriptions", include_str!("../templates/subscriptions.toml")),
-];
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 500;
 /// Most rows one `records.import` takes (ADR 0024 §4).
@@ -75,6 +55,7 @@ impl Module for Records {
                 "records.collection.restored",
                 "records.item.removed",
                 "records.collection.created",
+                "records.collection.copied",
                 "records.trash.purged",
             ]
             .map(String::from)
@@ -143,7 +124,11 @@ impl Module for Records {
                 "List a collection's removed records",
                 json!({"type": "object", "required": ["collection"], "properties": {"collection": {"type": "string"}}}),
             ),
-            ("records.templates", "List the built-in collection templates", json!({"type": "object"})),
+            (
+                "records.templates",
+                "List the built-in collection templates",
+                json!({"type": "object", "properties": {"id": {"type": "string"}, "file": {"type": "boolean"}}}),
+            ),
             (
                 "records.create_collection",
                 "Create a collection from a template",
@@ -166,6 +151,13 @@ impl Module for Records {
                 "Give a collection a new id",
                 json!({"type": "object", "required": ["id", "new_id"], "properties": {
                     "id": {"type": "string"}, "new_id": {"type": "string"}}}),
+            ),
+            (
+                "records.copy_collection",
+                "Copy a collection under a new id, empty or with its records",
+                json!({"type": "object", "required": ["id", "to"], "properties": {
+                    "id": {"type": "string"}, "to": {"type": "string"}, "label": {"type": "string"},
+                    "with_records": {"type": "boolean"}}}),
             ),
             (
                 "records.remove_collection",
@@ -191,6 +183,11 @@ impl Module for Records {
                 "records.restore_collection",
                 "Bring a removed collection back with its records",
                 json!({"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}}),
+            ),
+            (
+                "records.health",
+                "Check every collection and its records for problems; changes nothing (ADR 0033)",
+                json!({"type": "object"}),
             ),
         ]
         .into_iter()
@@ -221,14 +218,16 @@ impl Module for Records {
             "records.restore" => self.restore(ctx, decode(params)?),
             "records.trash" => self.trash(ctx, decode(params)?),
             "records.check" => self.check(ctx, decode(params)?),
-            "records.templates" => self.templates(),
+            "records.templates" => templates_of(decode(params)?),
             "records.create_collection" => self.create_collection(ctx, decode(params)?),
             "records.rename_field" => self.rename_field(ctx, decode(params)?),
             "records.rename_collection" => self.rename_collection(ctx, decode(params)?),
+            "records.copy_collection" => self.copy_collection(ctx, decode(params)?),
             "records.remove_collection" => self.remove_collection(ctx, decode(params)?),
             "records.restore_collection" => self.restore_collection(ctx, decode(params)?),
             "records.import" => self.import(ctx, decode(params)?),
             "records.purge" => self.purge(ctx, decode(params)?),
+            "records.health" => self.health(ctx),
             _ => Err(Error::unknown_op(format!("records has no op '{op}'"))),
         }
     }
@@ -296,6 +295,67 @@ struct CreateCollection {
     label: Option<String>,
 }
 
+/// `records.templates` (ADR 0030 §1): every template, or only `id`; with `file`, each one's
+/// text exactly as `records.new` would copy it.
+#[derive(Deserialize, Default)]
+struct WhichTemplates {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    file: bool,
+}
+
+/// Every built-in, by category (in [`templates::CATEGORIES`]' order) then id, as
+/// `records.collections` shows a collection plus its `category`, `notes` and `examples` (from its
+/// header comment), and the categories' headings. Only `id` when it's given.
+fn templates_of(which: WhichTemplates) -> Result<Value> {
+    let mut all: Vec<_> = templates::TEMPLATES.iter().collect();
+    if let Some(id) = &which.id {
+        all.retain(|(t, _, _)| t == id);
+        if all.is_empty() {
+            return Err(no_template(id));
+        }
+    }
+    all.sort_by_key(|(id, category, _)| (templates::rank(category), *id));
+    let wire = |(id, category, text): &&(&str, &str, &str)| -> Result<Value> {
+        let mut out = serde_json::to_value(Collection::parse(id, text)?).unwrap_or_default();
+        let (notes, examples) = templates::header(text);
+        out["category"] = json!(category);
+        out["notes"] = json!(notes);
+        out["examples"] = json!(examples);
+        if which.file {
+            out["file"] = json!(text);
+        }
+        Ok(out)
+    };
+    let categories: Vec<Value> =
+        templates::CATEGORIES.iter().map(|(id, label)| json!({"id": id, "label": label})).collect();
+    Ok(json!({"templates": all.iter().map(wire).collect::<Result<Vec<_>>>()?, "categories": categories}))
+}
+
+/// `invalid_params` unless `id` can name a new collection (it becomes a file name).
+fn new_collection_id(id: &str) -> Result<()> {
+    match is_valid_name(id) {
+        true => Ok(()),
+        false => Err(Error::invalid_params(format!(
+            "'{id}' is not a valid collection id: lowercase letters, digits, '-' or '_', starting with a letter"
+        ))),
+    }
+}
+
+/// Collection file `text` with its label set to `label`, which must not be blank.
+fn relabel(id: &str, text: &str, label: &str) -> Result<String> {
+    if label.trim().is_empty() {
+        return Err(Error::invalid_params("label must not be empty"));
+    }
+    collections::set_label(id, text, label)
+}
+
+/// `not_found` for a template that isn't built in, naming the ones that are.
+fn no_template(id: &str) -> Error {
+    Error::not_found(format!("no template '{id}' (there are: {})", templates::names().join(", ")))
+}
+
 #[derive(Deserialize)]
 struct CollectionOnly {
     collection: String,
@@ -317,6 +377,16 @@ struct CollectionId {
 struct RenameCollection {
     id: String,
     new_id: String,
+}
+
+#[derive(Deserialize)]
+struct CopyCollection {
+    id: String,
+    to: String,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    with_records: bool,
 }
 
 #[derive(Deserialize)]
@@ -369,7 +439,15 @@ impl Records {
                 continue;
             }
             match load_collection(ctx, id) {
-                Ok(c) => out.push(serde_json::to_value(c).unwrap_or_default()),
+                Ok(c) => {
+                    let mut wire = serde_json::to_value(c).unwrap_or_default();
+                    // Where it came from, as its own header says (ADR 0030 §4): nothing stored.
+                    let text = collection_text(ctx, id).unwrap_or_default();
+                    if let Some(template) = templates::origin(&text) {
+                        wire["template"] = json!(template);
+                    }
+                    out.push(wire);
+                }
                 Err(e) if e.code == ErrorCode::InvalidParams => skipped.push(e.message),
                 Err(e) => return Err(e),
             }
@@ -562,34 +640,16 @@ impl Records {
         Ok(wire)
     }
 
-    /// Every built-in template, as `records.collections` shows a collection (ADR 0022 §2).
-    fn templates(&self) -> Result<Value> {
-        let templates = TEMPLATES
-            .iter()
-            .map(|(id, text)| Collection::parse(id, text).map(|c| serde_json::to_value(c).unwrap_or_default()))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(json!({"templates": templates}))
-    }
-
     /// A new collection from a template: its text copied with only the id (and label) changed,
     /// checked, and written with its event in one transaction. Never overwrites (ADR 0022 §2).
     fn create_collection(&self, ctx: &Ctx, p: CreateCollection) -> Result<Value> {
-        if !is_valid_name(&p.id) {
-            return Err(Error::invalid_params(format!(
-                "'{}' is not a valid collection id: lowercase letters, digits, '-' or '_', starting with a letter",
-                p.id
-            )));
-        }
-        let Some((_, text)) = TEMPLATES.iter().find(|(id, _)| *id == p.template) else {
-            let names: Vec<&str> = TEMPLATES.iter().map(|(id, _)| *id).collect();
-            return Err(Error::not_found(format!("no template '{}' (there are: {})", p.template, names.join(", "))));
+        new_collection_id(&p.id)?;
+        let Some(text) = templates::find(&p.template) else {
+            return Err(no_template(&p.template));
         };
         let mut text = collections::set_id(&p.template, text, &p.id)?;
         if let Some(label) = &p.label {
-            if label.trim().is_empty() {
-                return Err(Error::invalid_params("label must not be empty"));
-            }
-            text = collections::set_label(&p.id, &text, label)?;
+            text = relabel(&p.id, &text, label)?;
         }
         // A template that can't produce a valid collection is a bug: fail, don't write it.
         let c = Collection::parse(&p.id, &text)?;
@@ -631,6 +691,42 @@ impl Records {
         Ok(json!({"checked": checked, "problems": out}))
     }
 
+    /// What `shimmer doctor` shows for records (ADR 0033): a collection file that won't load, and
+    /// each collection whose records `records.check` finds problems in. Writes nothing.
+    fn health(&self, ctx: &Ctx) -> Result<Value> {
+        let listed = self.collections(ctx)?;
+        let mut checks = Vec::new();
+        for problem in listed["skipped"].as_array().into_iter().flatten() {
+            let message = problem.as_str().unwrap_or_default();
+            checks.push(json!({"status": "fail", "message": message,
+                "fix": {"summary": "fix or remove the collection file; its records can't be used until then"}}));
+        }
+        let (mut collections, mut records) = (0, 0);
+        for c in listed["collections"].as_array().into_iter().flatten() {
+            let id = c["id"].as_str().unwrap_or_default();
+            let report = self.check(ctx, CollectionOnly { collection: id.to_owned() })?;
+            collections += 1;
+            records += report["checked"].as_u64().unwrap_or(0);
+            let bad = report["problems"].as_array().map_or(0, Vec::len);
+            if bad > 0 {
+                let what = if bad == 1 { "1 record doesn't".to_owned() } else { format!("{bad} records don't") };
+                checks.push(json!({"status": "warn", "subject": id,
+                    "message": format!("{id}: {what} fit the collection"),
+                    "fix": {"summary": "see which, and why", "op": "records.check", "params": {"collection": id}}}));
+            }
+        }
+        if checks.is_empty() {
+            let s = |n: u64, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+            let message = format!(
+                "{} and {}, all fine",
+                s(collections, "collection", "collections"),
+                s(records, "record", "records")
+            );
+            checks.push(json!({"status": "ok", "message": message}));
+        }
+        Ok(json!({"checks": checks}))
+    }
+
     /// Rename a field in the collection file (comments kept) and in every record that has it,
     /// live or trashed, in one transaction (ADR 0021 §3).
     fn rename_field(&self, ctx: &Ctx, p: RenameField) -> Result<Value> {
@@ -649,14 +745,20 @@ impl Records {
         let renamed = collections::rename_field(&c.id, &text, &p.from, &p.to)?;
         let new = Collection::parse(&c.id, &renamed)?;
 
-        let mut writes = Vec::new();
+        let (mut writes, mut skipped) = (Vec::new(), Vec::new());
         for dir in [format!("items/{}", c.id), format!("trash/{}", c.id)] {
             for path in ctx.store.list(&dir)? {
                 let Some(id) = path.strip_prefix(&format!("{dir}/")).and_then(|p| p.strip_suffix(".toml")) else {
                     continue;
                 };
-                let Some(Ok(mut item)) = ctx.store.read_string(&path)?.map(|text| Item::from_toml(id, &text)) else {
-                    continue;
+                // A file it can't read keeps the old name: say which, so it can be fixed (#99).
+                let mut item = match read_item(ctx, &path, id) {
+                    Some(Ok(item)) => item,
+                    Some(Err(e)) => {
+                        skipped.push(e.message);
+                        continue;
+                    }
+                    None => continue,
                 };
                 let Some(value) = item.fields.remove(&p.from) else { continue };
                 if item.fields.contains_key(&p.to) {
@@ -677,15 +779,17 @@ impl Records {
             }
             tx.emit("records.field.renamed", json!({"collection": c.id, "from": p.from, "to": p.to}))
         })?;
-        Ok(json!({"collection": new, "updated": updated}))
+        let mut out = json!({"collection": new, "updated": updated});
+        if !skipped.is_empty() {
+            out["skipped"] = json!(skipped);
+        }
+        Ok(out)
     }
 
     /// Move a collection, its records and its trash to a new id (ADR 0021 §4).
     fn rename_collection(&self, ctx: &Ctx, p: RenameCollection) -> Result<Value> {
         let c = load_collection(ctx, &p.id)?;
-        if !is_valid_name(&p.new_id) {
-            return Err(Error::invalid_params(format!("'{}' is not a valid collection id", p.new_id)));
-        }
+        new_collection_id(&p.new_id)?;
         let _g = self.write.lock();
         if ctx.store.read_string(&collection_path(&p.new_id))?.is_some() {
             return Err(Error::conflict(format!("there is already a collection '{}'", p.new_id)));
@@ -717,6 +821,55 @@ impl Records {
             tx.emit("records.collection.renamed", json!({"collection": c.id, "new_id": p.new_id}))
         })?;
         Ok(serde_json::to_value(new).unwrap_or_default())
+    }
+
+    /// Copy a collection under a new id (ADR 0030 §3): its file with only the id (and label)
+    /// changed, comments kept, and refs into itself pointed at the copy; with `with_records`, every
+    /// live record too, as written. One transaction, one `records.item.created` per record.
+    fn copy_collection(&self, ctx: &Ctx, p: CopyCollection) -> Result<Value> {
+        let c = load_collection(ctx, &p.id)?;
+        new_collection_id(&p.to)?;
+        let mut text = collections::set_id(&c.id, &collection_text(ctx, &c.id)?, &p.to)?;
+        let (retargeted, _) = collections::retarget_refs(&p.to, &text, &c.id, &p.to)?;
+        text = retargeted;
+        if let Some(label) = &p.label {
+            text = relabel(&p.to, &text, label)?;
+        }
+        let copy = Collection::parse(&p.to, &text)?;
+
+        let _g = self.write.lock();
+        if ctx.store.read_string(&collection_path(&p.to))?.is_some() {
+            return Err(Error::conflict(format!("there is already a collection '{}'", p.to)));
+        }
+        // Every record file as written, so nothing about a record changes but where it lives. One
+        // that doesn't parse is copied too (`records check` reports it in both), with no event.
+        let mut records = Vec::new();
+        if p.with_records {
+            let dir = format!("items/{}", c.id);
+            for path in ctx.store.list(&dir)? {
+                let Some(id) = path.strip_prefix(&format!("{dir}/")).and_then(|p| p.strip_suffix(".toml")) else {
+                    continue;
+                };
+                let Some(text) = ctx.store.read_string(&path)? else { continue };
+                let item = Item::from_toml(id, &text).ok();
+                records.push((id.to_owned(), text, item));
+            }
+        }
+        let count = records.len();
+        ctx.store.transaction(|tx| {
+            tx.put(&collection_path(&p.to), text)?;
+            tx.emit("records.collection.copied", json!({"collection": p.to, "from": c.id, "records": count}))?;
+            for (id, text, item) in &records {
+                tx.put(&item_path(&p.to, id), text.as_str())?;
+                if let Some(item) = item {
+                    tx.emit("records.item.created", payload(&copy, item, &item.to_wire(&copy)))?;
+                }
+            }
+            Ok(())
+        })?;
+        let mut out = serde_json::to_value(copy).unwrap_or_default();
+        out["records"] = json!(count);
+        Ok(out)
     }
 
     /// Move a collection and everything in it to `removed-collections/<id>/`, after the caller
@@ -801,7 +954,7 @@ impl Records {
                 continue;
             };
             taken_ids.insert(id.to_owned());
-            if let Some(Ok(record)) = ctx.store.read_string(&path)?.map(|text| Item::from_toml(id, &text)) {
+            if let Some(Ok(record)) = read_item(ctx, &path, id) {
                 for (field, value) in c.unique_values(&record.fields_map()) {
                     taken_values.push((field.to_owned(), value.clone(), id.to_owned()));
                 }
@@ -994,17 +1147,24 @@ impl Records {
     fn trash(&self, ctx: &Ctx, p: CollectionOnly) -> Result<Value> {
         let c = load_collection(ctx, &p.collection)?;
         let dir = format!("trash/{}", c.id);
-        let mut items: Vec<Value> = Vec::new();
+        let (mut items, mut skipped): (Vec<Value>, Vec<String>) = (Vec::new(), Vec::new());
         for path in ctx.store.list(&dir)? {
             let Some(id) = path.strip_prefix(&format!("{dir}/")).and_then(|p| p.strip_suffix(".toml")) else {
                 continue;
             };
-            if let Some(Ok(item)) = ctx.store.read_string(&path)?.map(|text| Item::from_toml(id, &text)) {
-                items.push(item.to_wire(&c));
+            // As in `list`: one bad file is named, and hides nothing else (#99).
+            match read_item(ctx, &path, id) {
+                Some(Ok(item)) => items.push(item.to_wire(&c)),
+                Some(Err(e)) => skipped.push(e.message),
+                None => {}
             }
         }
         items.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
-        Ok(json!({"items": items}))
+        let mut out = json!({"items": items});
+        if !skipped.is_empty() {
+            out["skipped"] = json!(skipped);
+        }
+        Ok(out)
     }
 }
 
@@ -1036,7 +1196,7 @@ fn check_unique(ctx: &Ctx, c: &Collection, id: &str, values: &Map<String, Value>
         if other == id {
             continue;
         }
-        let Some(Ok(record)) = ctx.store.read_string(&path)?.map(|text| Item::from_toml(other, &text)) else {
+        let Some(Ok(record)) = read_item(ctx, &path, other) else {
             continue;
         };
         for (field, value) in &wanted {
@@ -1129,7 +1289,7 @@ fn referrers(ctx: &Ctx, target: &str, id: &str) -> Result<Vec<(Collection, Item)
             let Some(rid) = path.strip_prefix(&format!("{dir}/")).and_then(|p| p.strip_suffix(".toml")) else {
                 continue;
             };
-            let Some(Ok(record)) = ctx.store.read_string(&path)?.map(|text| Item::from_toml(rid, &text)) else {
+            let Some(Ok(record)) = read_item(ctx, &path, rid) else {
                 continue;
             };
             if c.refs_in(&record.fields).iter().any(|(_, t, i)| *t == target && *i == id) {

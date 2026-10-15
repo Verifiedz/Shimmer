@@ -157,7 +157,7 @@ crates/
                  IPC server, indexer.
   modules/
     records/     Collection trait + generic record storage, filtering, metrics.
-    fetchers/    Source trait + fetch execution, dedup, caching.
+    fetchers/    Source trait + fetch execution, dedup.
     workspaces/  Workspace manifests, state machine, script execution.
     notify/      Sink trait + delivery, batching, fallback sinks.
     calendar/    Shared dated entries; registers triggers with the scheduler.
@@ -171,6 +171,9 @@ docs/
   protocol.md    IPC contract. Change-controlled.
   decisions/     ADRs, one file per decision, numbered.
 ```
+
+This is the target layout, not all of it built yet. `crates/app`'s `run_daemon` lists the
+modules actually registered.
 
 ### Dependency rules (enforced, not advisory)
 
@@ -192,8 +195,8 @@ Two rules matter more than the rest:
 2. **No client may depend on `store`, `daemon`, or `modules/*`.** This is what lets Dev C
    build the TUI against `proto` alone, in parallel, without merge conflicts.
 
-Add a `cargo deny` / CI check for these before the tree is large enough to make violations
-expensive.
+CI enforces these with `.dev/check-deps.py`, which reads `cargo metadata` and fails the build on
+a forbidden edge (dev-dependencies count).
 
 ---
 
@@ -253,7 +256,7 @@ instead of by a client, so there is no second handler to keep in sync.
 pub struct CommandSpec {
     pub op: String,
     pub summary: String,
-    pub params_schema: Value,      // JSON Schema; advisory before M3
+    pub params_schema: Value,      // JSON Schema; advisory: the daemon doesn't validate against it
     pub execution: Execution,
 }
 
@@ -454,8 +457,12 @@ $SHIMMER_HOME/
   data/records/collections/*.toml  Record collection definitions (§8, ADR 0008).
   data/records/items/<collection>/<id>.toml  One file per record.
   events/YYYY-MM-DD.jsonl  Append-only event log. One JSON Event per line.
+  data/records/trash/<collection>/<id>.toml  Removed records, until restored or purged (ADR 0020).
+  data/records/removed-collections/<id>/  Removed collections, until restored (ADR 0021).
   data/workspaces/<name>/  workspace.toml + steps/ + cleanup script + state.toml (ADRs 0010, 0012).
-  notifications/failed.jsonl  Deliveries that exhausted every sink (§11.3).
+  data/workspaces/.removed/<name>/  Removed workspaces, until restored (ADR 0026).
+  data/scheduler/triggers/<id>.json  One per trigger, JSON because params are JSON (ADR 0004).
+  notifications/failed.jsonl  Deliveries that exhausted every sink (§11.3). Not built yet (M6).
   packs/<name>/            Command packs: aliases + animations (§15.1). Client-read only.
   .staging/<txid>/         In-flight store transactions (§7.1). Never edit by hand.
   cache/http/<module>/     Gateway response cache (ADR 0027), per module. Safe to delete.
@@ -895,7 +902,8 @@ Rules:
   `shimmer workspaces activate deep-work`. `shimmer packs use` makes this work by linking each
   alias to the binary in `~/.local/bin` (`--no-link` to skip). Linking never overwrites a file
   or shadows a program, and only removes links it made.
-- **Animations never gate execution.** The daemon request is sent immediately; the
+- **Animations never gate execution.** (Not built yet: packs' `[anim]` files are checked but
+  nothing plays them; ADR 0013 §12.) The daemon request is sent immediately; the
   animation plays alongside or after. Animations are disabled automatically when stdout
   is not a TTY, and by `--no-anim` — a workspace script calling `shimmer` through
   `SHIMMER_SOCKET` must never sit waiting on a cutscene.
