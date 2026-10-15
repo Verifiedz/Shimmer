@@ -6,27 +6,32 @@
 /// `[collection] id` is the template's id; creating one copies it with only the id (and label)
 /// changed.
 pub const TEMPLATES: &[(&str, &str, &str)] = &[
-    ("addresses", "life", include_str!("../templates/addresses.toml")),
+    ("addresses", "paperwork", include_str!("../templates/addresses.toml")),
     ("certifications", "career", include_str!("../templates/certifications.toml")),
-    ("charity", "life", include_str!("../templates/charity.toml")),
-    ("documents", "life", include_str!("../templates/documents.toml")),
+    ("charity", "money", include_str!("../templates/charity.toml")),
+    ("documents", "paperwork", include_str!("../templates/documents.toml")),
     ("education", "career", include_str!("../templates/education.toml")),
     ("employment", "career", include_str!("../templates/employment.toml")),
-    ("interview-questions", "job-hunt", include_str!("../templates/interview-questions.toml")),
-    ("interviews", "job-hunt", include_str!("../templates/interviews.toml")),
-    ("job-applications", "job-hunt", include_str!("../templates/job-applications.toml")),
-    ("leetcode", "practice", include_str!("../templates/leetcode.toml")),
-    ("networking-events", "job-hunt", include_str!("../templates/networking-events.toml")),
-    ("offers", "job-hunt", include_str!("../templates/offers.toml")),
-    ("outreach", "job-hunt", include_str!("../templates/outreach.toml")),
+    ("interview-questions", "interview-prep", include_str!("../templates/interview-questions.toml")),
+    ("interviews", "applying", include_str!("../templates/interviews.toml")),
+    ("job-applications", "applying", include_str!("../templates/job-applications.toml")),
+    ("leetcode", "interview-prep", include_str!("../templates/leetcode.toml")),
+    ("networking-events", "applying", include_str!("../templates/networking-events.toml")),
+    ("offers", "applying", include_str!("../templates/offers.toml")),
+    ("outreach", "applying", include_str!("../templates/outreach.toml")),
     ("projects", "career", include_str!("../templates/projects.toml")),
-    ("stories", "job-hunt", include_str!("../templates/stories.toml")),
-    ("subscriptions", "life", include_str!("../templates/subscriptions.toml")),
+    ("stories", "interview-prep", include_str!("../templates/stories.toml")),
+    ("subscriptions", "money", include_str!("../templates/subscriptions.toml")),
 ];
 
 /// The categories, in the order `records.templates` lists them, with their headings.
-pub const CATEGORIES: &[(&str, &str)] =
-    &[("job-hunt", "Job hunt"), ("practice", "Practice"), ("career", "Career history"), ("life", "Life admin")];
+pub const CATEGORIES: &[(&str, &str)] = &[
+    ("applying", "Applying"),
+    ("interview-prep", "Interview prep"),
+    ("career", "Career history"),
+    ("paperwork", "Paperwork"),
+    ("money", "Money"),
+];
 
 /// The template `id`'s text, or `None`.
 pub fn find(id: &str) -> Option<&'static str> {

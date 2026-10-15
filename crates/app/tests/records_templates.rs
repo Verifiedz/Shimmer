@@ -42,7 +42,13 @@ fn templates_are_listed_by_category_and_each_can_be_peeked() {
     let headings: Vec<&str> = listing.lines().filter(|l| !l.starts_with(' ') && l.ends_with(')')).collect();
     assert_eq!(
         headings,
-        ["Job hunt (job-hunt)", "Practice (practice)", "Career history (career)", "Life admin (life)"]
+        [
+            "Applying (applying)",
+            "Interview prep (interview-prep)",
+            "Career history (career)",
+            "Paperwork (paperwork)",
+            "Money (money)"
+        ]
     );
     assert!(listing.contains("shimmer records peek TEMPLATE"), "{listing}");
 
@@ -62,10 +68,12 @@ fn templates_are_listed_by_category_and_each_can_be_peeked() {
     }
 
     // One category on its own.
-    let practice = ok(&home, &["records", "templates", "practice"]);
+    let prep = ok(&home, &["records", "templates", "interview-prep"]);
     assert!(
-        practice.starts_with("Practice (practice)\n  leetcode") && !practice.contains("job-applications"),
-        "{practice}"
+        prep.starts_with("Interview prep (interview-prep)\n  interview-questions")
+            && prep.contains("leetcode")
+            && !prep.contains("job-applications"),
+        "{prep}"
     );
 
     // What completing does, in words, from each kind of collection.
@@ -77,7 +85,9 @@ fn templates_are_listed_by_category_and_each_can_be_peeked() {
 
     // Mistakes say what there is, and fail.
     assert!(fails(&home, &["records", "peek", "chess"]).contains("no template 'chess' (there are: "));
-    assert!(fails(&home, &["records", "peek", "practice"]).contains("'practice' is a category, not a template"));
+    assert!(
+        fails(&home, &["records", "peek", "interview-prep"]).contains("'interview-prep' is a category, not a template")
+    );
     assert!(fails(&home, &["records", "templates", "games"]).contains("no template or category 'games'"));
     assert!(fails(&home, &["records", "peek"]).contains("usage: shimmer records peek TEMPLATE"));
 
@@ -103,7 +113,7 @@ fn peek_file_is_exactly_what_new_creates() {
         assert_eq!(written.trim_end(), expected.trim_end(), "{id}");
     }
     let summary = json(&home, &["records", "peek", "leetcode"]);
-    assert_eq!((summary["id"].as_str(), summary["category"].as_str()), (Some("leetcode"), Some("practice")));
+    assert_eq!((summary["id"].as_str(), summary["category"].as_str()), (Some("leetcode"), Some("interview-prep")));
     assert!(summary.get("file").is_none(), "the file only with --file");
 }
 

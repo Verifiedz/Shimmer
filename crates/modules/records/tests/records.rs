@@ -1201,28 +1201,34 @@ async fn every_template_is_listed_and_creates_a_valid_collection() {
     assert_eq!(
         ids,
         [
-            // By category (ADR 0030 §1), then id.
-            "interview-questions",
+            // By category (ADR 0030 §1, re-sorted in #190), then id.
             "interviews",
             "job-applications",
             "networking-events",
             "offers",
             "outreach",
-            "stories",
+            "interview-questions",
             "leetcode",
+            "stories",
             "certifications",
             "education",
             "employment",
             "projects",
             "addresses",
-            "charity",
             "documents",
+            "charity",
             "subscriptions"
         ]
     );
     let categories: Vec<&str> =
         data["categories"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
-    assert_eq!(categories, ["job-hunt", "practice", "career", "life"]);
+    assert_eq!(categories, ["applying", "interview-prep", "career", "paperwork", "money"]);
+    // #190: every category holds at least two templates. A new template that fits nowhere gets a
+    // new, named category, never a catch-all bucket.
+    for c in &categories {
+        let n = data["templates"].as_array().unwrap().iter().filter(|t| t["category"] == *c).count();
+        assert!(n >= 2, "category '{c}' has {n} template(s); it needs at least two");
+    }
     for t in data["templates"].as_array().unwrap() {
         assert!(categories.contains(&t["category"].as_str().unwrap()), "{t}");
         assert!(t["examples"].as_array().is_some_and(|e| !e.is_empty()), "{}: no examples", t["id"]);
@@ -1254,7 +1260,7 @@ async fn templates_gives_one_in_full_with_its_notes_and_file() {
     let all = data["templates"].as_array().unwrap();
     assert_eq!(all.len(), 1);
     let t = &all[0];
-    assert_eq!((t["id"].as_str(), t["category"].as_str()), (Some("addresses"), Some("life")));
+    assert_eq!((t["id"].as_str(), t["category"].as_str()), (Some("addresses"), Some("paperwork")));
     // The header's privacy paragraph, as one line; the examples as written.
     let notes = t["notes"].as_array().unwrap();
     assert!(notes.iter().any(|n| n.as_str().unwrap().starts_with("Private information: this file")), "{notes:?}");
@@ -1262,7 +1268,7 @@ async fn templates_gives_one_in_full_with_its_notes_and_file() {
     assert!(t["examples"][0].as_str().unwrap().starts_with("shimmer records add <collection> --street"), "{t}");
     // The file is the template exactly: what `records.create_collection` copies.
     assert_eq!(t["file"].as_str().unwrap(), include_str!("../templates/addresses.toml"));
-    assert_eq!(data["categories"].as_array().unwrap().len(), 4, "the headings come along");
+    assert_eq!(data["categories"].as_array().unwrap().len(), 5, "the headings come along");
 
     let e = call(&r, &env, "records.templates", json!({"id": "chess"})).await.unwrap_err();
     assert_eq!(e.code, ErrorCode::NotFound);
