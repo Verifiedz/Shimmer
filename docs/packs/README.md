@@ -90,6 +90,11 @@ belongs to this machine, so copying your Shimmer folder elsewhere doesn't bring 
 | records peek | `hora` | `preview` | `probe` | `rpeek` |
 | records copy-collection | `futago` | `copy-pasta` | `twin-fleet` | `rcpcol` |
 | records edit | `kaizou` | `tweak-schema` | `drydock` | `redit` |
+| fetchers list | `sagasu` | `sources` | `scan-sector` | `flist` |
+| fetchers status | `machiawase` | `crawler-status` | `sensor-status` | `fstat` |
+| fetchers test | `tameshi` | `dry-run` | `trial-run` | `ftest` |
+| fetchers run | `shutsugeki` | `poll` | `deep-scan` | `frun` |
+| fetchers items | `shuukaku` | `inbox` | `haul` | `fitems` |
 
 ## Writing your own
 
@@ -125,6 +130,8 @@ On the right of each alias goes the command it runs, by its op name:
 | `workspaces.force_relaunch`, `workspaces.create` | `shimmer workspaces force-relaunch`, `new` |
 | `queue.list`, `.task`, `.cancel`, `.reorder` | `shimmer queue list`, `show`, `cancel`, `move` |
 | `scheduler.list`, `.get`, `.add`, `.pause`, `.resume`, `.remove` | `shimmer scheduler list`, `show`, `add`, `pause`, `resume`, `remove` |
+| `fetchers.list`, `.status`, `.test`, `.items` | `shimmer fetchers list`, `status`, `test`, `items` |
+| `fetchers.fetch` | `shimmer fetchers run` |
 
 `shimmer packs --help` prints the same list. Your own pack names as many or as few as you like;
 the built-in packs name every one.

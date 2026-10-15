@@ -416,6 +416,6 @@ mod tests {
         assert_eq!(lines[1].trim_end(), "  up        shimmer ping");
         assert_eq!(lines[33].trim_end(), "  wreset    shimmer workspaces reset");
         assert_eq!(lines[53].trim_end(), "  sdel      shimmer scheduler remove");
-        assert_eq!(lines.len(), 55);
+        assert_eq!(lines.len(), 60);
     }
 }

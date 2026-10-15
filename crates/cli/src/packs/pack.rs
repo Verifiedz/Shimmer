@@ -115,6 +115,14 @@ pub const TARGETS: &[Target] = &[
     Target { op: "scheduler.pause", words: &["scheduler", "pause"] },
     Target { op: "scheduler.resume", words: &["scheduler", "resume"] },
     Target { op: "scheduler.remove", words: &["scheduler", "remove"] },
+    // ADR 0028: fetchers' own ops.
+    Target { op: "fetchers.list", words: &["fetchers", "list"] },
+    Target { op: "fetchers.status", words: &["fetchers", "status"] },
+    Target { op: "fetchers.test", words: &["fetchers", "test"] },
+    Target { op: "fetchers.fetch", words: &["fetchers", "run"] },
+    // `items` has no op of its own -- it reads `core.events.list` -- so it's named like
+    // `records.peek`/`workspaces.edit` above.
+    Target { op: "fetchers.items", words: &["fetchers", "items"] },
 ];
 
 /// The command `op` names, if a pack may alias it.
@@ -424,7 +432,7 @@ label = "My Pack"
 
     #[test]
     fn every_target_is_an_op_with_its_command_words() {
-        assert_eq!(TARGETS.len(), 53);
+        assert_eq!(TARGETS.len(), 58);
         // Where the CLI's word differs from the op's verb (ADR 0015 §1).
         let renamed = [
             ("queue.task", "show"),
@@ -432,6 +440,7 @@ label = "My Pack"
             ("records.create_collection", "new"),
             ("workspaces.create", "new"),
             ("scheduler.get", "show"),
+            ("fetchers.fetch", "run"),
         ];
         for t in TARGETS {
             let (module, verb) = t.op.split_once('.').unwrap();
