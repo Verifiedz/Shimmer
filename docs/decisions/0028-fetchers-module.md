@@ -648,6 +648,31 @@ developer"` reaches the real site with that exact query and returns real results
 plain `shimmer fetchers test jobbank-canada` immediately after still uses the configured
 `"junior software developer"` — the override touched nothing persistent.
 
+### 18. Amendment: `active_field` for the `json-api` kind
+
+Configuring `kind = "json-api"` against a community-maintained listings archive (e.g.
+SimplifyJobs' New-Grad-Positions `listings.json`, confirmed live) surfaced a gap: that feed
+keeps already-closed postings in the same array as open ones, flagged only by its own
+boolean `active` field, rather than dropping them. With no way to read that field, `fetch`
+and `test` reported a long-closed posting as "new" exactly like a live one — a dead link
+the first time anyone clicked it.
+
+- **`SourceConfig` gains an optional `active_field`** (`json-api` only): the field within
+  each item marking it still open. Validated at load time only for non-emptiness when
+  given — the field name is no more special than `id_field`/`title_field`/`url_field`.
+- **`JsonApi::fetch_page` drops an item when, and only when, `active_field`'s value there
+  is the boolean `false`.** Missing, non-boolean, or `true` all pass through unfiltered —
+  deliberately conservative: a feed that omits the field sometimes (or always, for every
+  other configured source) must never have items silently dropped because of a guess.
+  Checked before dedup, same stage `title_contains`/`title_excludes` already runs at.
+- **No change to `Source`, `RawItem`, or any other kind.** `rss` and every fixed source are
+  unaffected; `active_field` is meaningless, and left unvalidated, unless `kind =
+  "json-api"`.
+
+Confirmed live: `simplify-newgrad` configured with `active_field = "active"` dropped from
+4236 title-matching items to 894 once already-closed postings were excluded, and the first
+real `fetchers run` against it reported 50 new items, all genuinely open.
+
 ## Not done here
 
 - Credentials/secret storage for a future authenticated source. **Not** blocked by the
