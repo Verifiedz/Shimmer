@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use shimmer_core::Module;
+use shimmer_core::{ErrorCode, Module};
 use shimmer_daemon::{Daemon, DaemonConfig};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
@@ -17,6 +17,11 @@ use tracing_subscriber::EnvFilter;
 /// `tracing-appender` can dip below its cap by one on prune, so this is set one higher than
 /// the week of history we actually want to guarantee.
 const LOG_RETAIN_FILES: usize = 8;
+
+/// `shimmer daemon`'s exit status when another daemon already runs for this folder and answers on
+/// its socket (ADR 0034 §5). Not a failure: a login service (`shimmer startup on`) lists it as
+/// success, so it isn't restarted every few seconds while a daemon a command started is running.
+const ALREADY_RUNNING: u8 = 3;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -93,8 +98,16 @@ async fn run_daemon() -> ExitCode {
     // Every module the daemon runs. A new module is one more line here.
     let modules: Vec<Arc<dyn Module>> =
         vec![Arc::new(shimmer_records::Records::default()), Arc::new(shimmer_workspaces::Workspaces::default())];
-    let daemon = match Daemon::start(DaemonConfig::from_env(), modules).await {
+    let config = DaemonConfig::from_env();
+    let socket = config.socket.clone();
+    let daemon = match Daemon::start(config, modules).await {
         Ok(d) => d,
+        // Refused because one already runs. A lock held by a daemon that doesn't answer is still a
+        // real failure (below), so a login service retries it.
+        Err(e) if e.code == ErrorCode::Conflict && std::os::unix::net::UnixStream::connect(&socket).is_ok() => {
+            eprintln!("shimmer: already running: a daemon answers on {} ({e})", socket.display());
+            return already_running();
+        }
         Err(e) => {
             eprintln!("shimmer: cannot start daemon: {e}");
             return ExitCode::FAILURE;
@@ -108,6 +121,16 @@ async fn run_daemon() -> ExitCode {
     // Also returns when a `core.shutdown` request stops the daemon.
     daemon.wait().await;
     ExitCode::SUCCESS
+}
+
+/// [`ALREADY_RUNNING`], or success when launchd started this daemon: launchd can't be told that
+/// an exit status means success, so any other would be restarted (ADR 0034 §3, §5). launchd names
+/// the job in `XPC_SERVICE_NAME`; a terminal on macOS sets it to `0`.
+fn already_running() -> ExitCode {
+    match std::env::var("XPC_SERVICE_NAME") {
+        Ok(job) if !job.is_empty() && job != "0" => ExitCode::SUCCESS,
+        _ => ExitCode::from(ALREADY_RUNNING),
+    }
 }
 
 async fn run_mockd(args: Vec<String>) -> ExitCode {
