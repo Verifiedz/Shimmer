@@ -189,7 +189,7 @@ shimmer workspaces activate site           # run its steps in order; add --wait 
 shimmer workspaces status site             # steps, last session, and why it's dirty if it is
 shimmer workspaces stop site               # stop what it started
 shimmer queue list                     # what is running and waiting, per lane
-shimmer scheduler list                 # every trigger, when it next fires and its state
+shimmer scheduler list                 # your schedules, when each next fires and its state (--all: modules' too)
 shimmer scheduler add records.list '{"collection":"leetcode"}' --every 1d --catch-up skip
 ```
 

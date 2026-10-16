@@ -229,7 +229,7 @@ fn prints_data(cmd: &Command) -> bool {
             )
             | Command::Workspaces(WorkspacesCmd::List | WorkspacesCmd::Status { .. })
             | Command::Queue(QueueCmd::List { .. } | QueueCmd::Show { .. })
-            | Command::Scheduler(SchedulerCmd::List | SchedulerCmd::Show { .. })
+            | Command::Scheduler(SchedulerCmd::List { .. } | SchedulerCmd::Show { .. })
             | Command::Schedule(_)
     )
 }

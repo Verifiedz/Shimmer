@@ -753,7 +753,15 @@ impl Groups {
 
     async fn triggers(&mut self, source: &mut impl Source) {
         let Some(data) = source.call("scheduler.list", json!({})).await else { return };
-        let all = data["triggers"].as_array().or_else(|| data.as_array()).cloned().unwrap_or_default();
+        let all: Vec<Value> = data["triggers"]
+            .as_array()
+            .or_else(|| data.as_array())
+            .into_iter()
+            .flatten()
+            // The ones you added, as `scheduler list` shows (#244); a module's own is typed whole.
+            .filter(|t| t["source"]["type"] == "user")
+            .cloned()
+            .collect();
         // The same short endings `scheduler list` shows, which every scheduler command accepts.
         let ids: Vec<String> = all.iter().map(|t| text(&t["id"])).collect();
         for (t, short) in all.iter().zip(crate::render::short_ids(&ids)) {
@@ -944,7 +952,12 @@ mod tests {
                        "templates": [{"id": "leetcode", "description": "Problems"}]}),
             ),
             ("workspaces.list", json!({"workspaces": [{"id": "site", "label": "Site", "state": "ready"}]})),
-            ("scheduler.list", json!({"triggers": [{"id": "usr-01JABCDEFGHJKMNPQRSTVWXYZ0", "op": "records.list"}]})),
+            (
+                "scheduler.list",
+                json!({"triggers": [
+                    {"id": "usr-01JABCDEFGHJKMNPQRSTVWXYZ0", "op": "records.list", "source": {"type": "user"}},
+                    {"id": "notify.flush", "op": "notify.flush", "source": {"type": "module", "id": "notify"}}]}),
+            ),
             (
                 "core.manifest",
                 json!({"lanes": [{"id": "default", "max_concurrent": 4}],

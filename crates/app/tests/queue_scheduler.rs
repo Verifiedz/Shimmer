@@ -130,9 +130,12 @@ fn a_trigger_fires_and_can_be_paused_resumed_and_removed() {
             && row.contains("every 1s")
             && row.contains("skip")
             && row.contains("active")
-            && row.ends_with("you"),
-        "{row}"
+            && !row.ends_with("you"),
+        "{row}: no FROM column without --all, every row is yours (#244)"
     );
+    let all = ok(&home, &["scheduler", "list", "--all"]);
+    let row = all.lines().find(|l| l.starts_with(shown(&id))).unwrap_or_else(|| panic!("{all}"));
+    assert!(row.ends_with("you"), "--all says where each came from: {row}");
 
     // The scheduler ticks every second: it fires, and its task runs through the queue.
     let show = wait_for(&home, &["scheduler", "show", &id], "  last run  20"); // a date, not "never"
