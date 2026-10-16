@@ -492,6 +492,38 @@ change or a daemon restart. See `CLAUDE.md` §15.1.
 
 ---
 
+## Automations ops
+
+Rules that react to events by queueing ops (ADR 0035). One file per rule,
+`data/automations/rules/<id>.toml`; every op is inline. A rule's actions are queued with
+`ctx.queue` in each op's own lane (origin `module: automations`), or added as a one-time schedule
+(`after`, source `{"type":"added","id":"automations","label"}`). A rule is checked when created,
+saved and loaded: its `on` pattern, its `when` filter, every op exists and none is
+`automations.*`; a refused rule is `invalid_params` with what's wrong. Each rule is shown as
+`{"id","label","enabled","builtin","on","actions":[{"op","params","after_s"}],"last_fired","loop_stopped_at"}`.
+
+| Op | Execution | Params | Returns |
+|---|---|---|---|
+| `automations.list` | inline | `{}` | `{"rules":[…],"problems":[{"file","error"}]}`: problems are rule files that couldn't be used. |
+| `automations.get` | inline | `{"id"}` | One rule, plus `"text"`: its file. |
+| `automations.create` | inline | `{"id","text"?,"label"?}` | The rule. Without `text`, a commented starter rule, switched off. `conflict` if it exists. |
+| `automations.save` | inline | `{"id","text"}` | The rule. A broken rule is refused and the old one kept. |
+| `automations.remove` | inline | `{"id"}` | `{"removed":true,"rule"}`. Also removes a rule file that couldn't be used. |
+| `automations.enable` / `.disable` | inline | `{"id"}` | The rule; only `enabled` in its file changes. |
+| `automations.reload` | inline | `{}` | `{"rules":N,"problems":[…]}`, after re-reading files edited by hand. |
+| `automations.test` | inline | `{"id","event":{"topic","payload"}}` | `{"rule","enabled","matches","actions":[{"op","params","after_s"}]}`: what it would do, as if on. Runs nothing. |
+| `automations.events` | inline | `{}` | `{"events":[{"topic","description"}]}`: everything a rule can react to. |
+| `automations.history` | inline | `{"id"?,"since"?,"limit"?}` | `{"history":[…]}`, newest first (the last 300 kept): `rule.fired` and `chain.stopped` payloads plus `at` and `kind` (`fired` / `stopped`). |
+| `automations.status` | inline | `{}` | `{"rules","enabled","depth","stopped":[…],"problems":[…]}`. |
+| `automations.depth` | inline | `{}` or `{"depth":N}` (1–10) | `{"depth"}`: how many rules may follow each other in a chain (default 3). |
+| `automations.health` | inline | `{}` | `{"checks":[…]}` in ADR 0033's shape: a `fail` per unusable file, a `warn` for a recently stopped loop, or one `ok` line. |
+
+**The loop guard:** an event whose `cause` is a task automations queued continues that task's
+chain of rules. A rule already in the chain doesn't fire again, and a chain stops at the depth
+limit; either way `automations.chain.stopped` is emitted. Everything else starts a new chain.
+
+---
+
 ## Topic catalogue
 
 Non-exhaustive — modules may add their own. Clients subscribe to patterns and must
@@ -532,6 +564,10 @@ tolerate unknown topics.
 | `records.field.renamed` | `{collection, from, to}`. |
 | `records.collection.renamed` / `.removed` / `.restored` / `.purged` | `{collection, new_id}` / `{collection, records}` / `{collection}` / `{collection, records}`. `.purged`: a removed collection was deleted for good (ADR 0021 §5a). |
 | `records.trash.purged` | `records.purge` deleted trashed records for good. `{collection, records}`, plus `id` when one record was purged. ADR 0024 §5. |
+| `automations.rule.created` / `.edited` / `.removed` / `.enabled` / `.disabled` | `{rule}`. ADR 0035. |
+| `automations.rule.fired` | A rule reacted to an event. `{rule, event: {id, topic}, chain, depth, queued: [{op, task_id, lane}], scheduled: [{op, trigger_id, at}], failed: [{op, error}]}`. |
+| `automations.chain.stopped` | The loop guard stopped a rule. `{chain, rules, rule, reason: "cycle" \| "depth", event: {id, topic}}`. |
+| `automations.settings.changed` | `{depth}`. |
 | `fetchers.item.found` | A source returned a new, deduplicated item. Planned (M6): not emitted by any module yet. |
 | `fetchers.fetch.finished` / `.failed` | A fetch run ended. Planned (M6): not emitted by any module yet. |
 | `calendar.date.registered` | A dated entry was stored. Planned (M6): not emitted by any module yet. |

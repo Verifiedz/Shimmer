@@ -1,0 +1,25 @@
+[package]
+name = "shimmer-automations"
+description = "The automations module: rules that react to events by queueing ops (ADR 0035). Depends on core only."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+shimmer-core = { path = "../../core" }
+async-trait = "0.1"
+chrono = "0.4"
+chrono-tz = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+toml_edit = "0.25"
+
+[dev-dependencies]
+shimmer-core = { path = "../../core", features = ["testing"] }
+tokio = { version = "1", features = ["macros", "rt"] }
