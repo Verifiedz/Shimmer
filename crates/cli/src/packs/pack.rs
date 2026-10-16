@@ -12,7 +12,7 @@ use toml::{Table, Value};
 /// `pack.toml` larger than this is rejected unread.
 pub const MAX_PACK_TOML: u64 = 64 * 1024;
 /// Most aliases one pack may define.
-pub const MAX_ALIASES: usize = 64;
+pub const MAX_ALIASES: usize = 256;
 /// Longest pack id or alias.
 pub const MAX_NAME: usize = 32;
 /// Longest pack label, in characters.
@@ -119,6 +119,21 @@ pub const TARGETS: &[Target] = &[
     Target { op: "scheduler.pause", words: &["scheduler", "pause"] },
     Target { op: "scheduler.resume", words: &["scheduler", "resume"] },
     Target { op: "scheduler.remove", words: &["scheduler", "remove"] },
+    // ADR 0035 §8: automations.
+    Target { op: "automations.list", words: &["automations", "list"] },
+    Target { op: "automations.get", words: &["automations", "show"] },
+    Target { op: "automations.create", words: &["automations", "new"] },
+    Target { op: "automations.save", words: &["automations", "edit"] },
+    Target { op: "automations.remove", words: &["automations", "remove"] },
+    Target { op: "automations.restore", words: &["automations", "restore"] },
+    Target { op: "automations.enable", words: &["automations", "enable"] },
+    Target { op: "automations.disable", words: &["automations", "disable"] },
+    Target { op: "automations.test", words: &["automations", "test"] },
+    Target { op: "automations.events", words: &["automations", "events"] },
+    Target { op: "automations.history", words: &["automations", "history"] },
+    Target { op: "automations.status", words: &["automations", "status"] },
+    Target { op: "automations.depth", words: &["automations", "depth"] },
+    Target { op: "automations.reload", words: &["automations", "reload"] },
 ];
 
 /// The command `op` names, if a pack may alias it.
@@ -428,7 +443,7 @@ label = "My Pack"
 
     #[test]
     fn every_target_is_an_op_with_its_command_words() {
-        assert_eq!(TARGETS.len(), 54);
+        assert_eq!(TARGETS.len(), 68);
         // Where the CLI's word differs from the op's verb (ADR 0015 §1).
         let renamed = [
             ("queue.task", "show"),
@@ -436,6 +451,9 @@ label = "My Pack"
             ("records.create_collection", "new"),
             ("workspaces.create", "new"),
             ("scheduler.get", "show"),
+            ("automations.get", "show"),
+            ("automations.create", "new"),
+            ("automations.save", "edit"),
         ];
         for t in TARGETS {
             let (module, verb) = t.op.split_once('.').unwrap();
@@ -540,7 +558,7 @@ colour = "red"
     #[test]
     fn too_many_aliases_or_too_big_a_file_is_rejected() {
         let many: String = (0..=MAX_ALIASES).map(|i| format!("\"a{i}\" = \"core.ping\"\n")).collect();
-        has(&problems(&with_alias(&many)), "the most a pack may have is 64");
+        has(&problems(&with_alias(&many)), &format!("the most a pack may have is {MAX_ALIASES}"));
         let huge = format!("{GOOD}# {}\n", "x".repeat(MAX_PACK_TOML as usize));
         has(&problems(&huge), "larger than 64 KiB");
     }

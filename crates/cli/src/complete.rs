@@ -27,12 +27,13 @@ use crate::style::{Palette, Role};
 const DAEMON_WAIT: Duration = Duration::from_millis(500);
 
 /// The modules with their own help page, by the command word that opens it.
-fn modules() -> [(&'static str, &'static str); 5] {
+fn modules() -> [(&'static str, &'static str); 6] {
     [
         ("records", crate::records::USAGE),
         ("workspaces", crate::workspaces::USAGE),
         ("queue", crate::queue::USAGE),
         ("scheduler", crate::scheduler::USAGE),
+        ("automations", crate::automations::USAGE),
         ("packs", crate::packs::cmd::USAGE),
     ]
 }
@@ -661,6 +662,9 @@ impl Groups {
             ("queue", "TASK" | "OTHER") => self.tasks(source).await,
             ("queue" | "scheduler", "LANE") => self.lanes(source).await,
             ("scheduler", "TRIGGER") => self.triggers(source).await,
+            ("automations", "RULE") => self.rules("rules", source).await,
+            ("automations", "REMOVED") => self.rules("removed", source).await,
+            ("automations", "FILE") => self.files(),
             ("scheduler" | "", "OP") => self.ops(source).await,
             ("scheduler", "WHAT") => {
                 for v in crate::scheduler::CATCH_UP {
@@ -758,6 +762,17 @@ impl Groups {
         let ids: Vec<String> = all.iter().map(|t| text(&t["id"])).collect();
         for (t, short) in all.iter().zip(crate::render::short_ids(&ids)) {
             self.add("triggers", "triggers", short, text(&t["op"]));
+        }
+    }
+
+    /// Your rules (`rules`), or the removed ones `restore` takes (`removed`).
+    async fn rules(&mut self, which: &str, source: &mut impl Source) {
+        let Some(data) = source.call("automations.list", json!({})).await else { return };
+        for r in data[which].as_array().into_iter().flatten() {
+            match r.as_str() {
+                Some(id) => self.add("rules", "removed rules", id, ""),
+                None => self.add("rules", "rules", text(&r["id"]), text(&r["label"])),
+            }
         }
     }
 
@@ -945,6 +960,7 @@ mod tests {
             ),
             ("workspaces.list", json!({"workspaces": [{"id": "site", "label": "Site", "state": "ready"}]})),
             ("scheduler.list", json!({"triggers": [{"id": "usr-01JABCDEFGHJKMNPQRSTVWXYZ0", "op": "records.list"}]})),
+            ("automations.list", json!({"rules": [{"id": "solved", "label": "Solved"}], "removed": ["old"]})),
             (
                 "core.manifest",
                 json!({"lanes": [{"id": "default", "max_concurrent": 4}],
@@ -1124,6 +1140,10 @@ mod tests {
         assert_eq!(words("records templates ").await, ["practice"]);
         assert_eq!(words("scheduler pause ").await, ["VWXYZ0"], "the short ending lists show, not the whole id");
         assert_eq!(words("call ").await, ["core.ping"]);
+        assert_eq!(words("automations disable ").await, ["solved"]);
+        assert_eq!(words("automations restore ").await, ["old"], "only removed rules come back");
+        assert!(words("automations ").await.contains(&"history".to_owned()));
+        assert!(words("automations test solved --").await.contains(&"--event".to_owned()));
         assert!(words("packs use ").await.contains(&"none".to_owned()));
         assert!(words("packs use ").await.contains(&"short".to_owned()));
         assert!(words("--pack ").await.contains(&"starship".to_owned()));
