@@ -1,0 +1,44 @@
+[template]
+label = "Open a workspace when a field reaches a value"
+description = "Opens one workspace you already have when a record's field changes to a value"
+category = "workspaces"
+good_to_know = [
+    "It runs that workspace's launch steps, exactly as 'shimmer workspaces activate' does",
+    "Only when the field changes to that value: editing something else doesn't open it again",
+]
+
+[[question]]
+name = "COLLECTION"
+prompt = "Which collection (its id)"
+kind = "name"
+required = true
+
+[[question]]
+name = "FIELD"
+prompt = "Which field (e.g. stage)"
+kind = "name"
+required = true
+
+[[question]]
+name = "VALUE"
+prompt = "When it becomes (e.g. interviewing)"
+kind = "text"
+required = true
+
+[[question]]
+name = "WORKSPACE"
+prompt = "Which workspace to open (its id, as 'shimmer workspaces list' shows it)"
+kind = "name"
+required = true
+
+[[rule]]
+text = '''
+[rule]
+label = "Open ${WORKSPACE} when ${FIELD} becomes ${VALUE} in ${COLLECTION}"
+on = "records.item.updated"
+when = { collection = "${COLLECTION}", "item.${FIELD}" = "${VALUE}", changed = "${FIELD}" }
+
+[[do]]
+op = "workspaces.activate"
+params = { id = "${WORKSPACE}" }
+'''

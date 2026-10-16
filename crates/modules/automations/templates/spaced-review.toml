@@ -1,0 +1,33 @@
+[template]
+label = "Remind me to redo it"
+description = "Some days after a record is done (a problem solved), a reminder to redo it"
+category = "reminders"
+good_to_know = [
+    "It only sends a message: nothing else changes",
+    "The reminder waits as a schedule ('shimmer scheduler list' shows it, 'scheduler remove' cancels it)",
+]
+
+[[question]]
+name = "COLLECTION"
+prompt = "Which collection (its id)"
+kind = "name"
+required = true
+
+[[question]]
+name = "DAYS"
+prompt = "How many days later"
+kind = "number"
+default = "60"
+
+[[rule]]
+text = '''
+[rule]
+label = "Remind me to redo ${COLLECTION} problems after ${DAYS} days"
+on = "records.item.completed"
+when = { collection = "${COLLECTION}" }
+
+[[do]]
+op = "notify.send"
+params = { title = "Time to redo: {title}", priority = "low" }
+after = "${DAYS}d"
+'''

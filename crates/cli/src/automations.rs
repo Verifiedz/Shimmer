@@ -21,6 +21,9 @@ commands:
   list                       your rules: on or off, what they react to, what they do
   show RULE                  one rule and its file
   new RULE [--file FILE]     a starter rule (switched off) opened in your editor, or one from FILE
+  new RULE --from TEMPLATE [--set QUESTION=ANSWER]… [--yes]
+                             rules from a template: asks its questions (or takes --set), shows
+                             the rules, and makes them once you say yes (--yes: without asking)
   edit RULE [--file FILE]    open its file in your editor, or replace it with FILE; a broken
                              rule is refused and the old one kept
   remove RULE                remove a rule (restore brings it back)
@@ -35,6 +38,8 @@ commands:
   status                     rules, the depth limit, stopped loops, broken files
   depth [N]                  show or set how many rules may follow each other (1-10, default 3)
   reload                     re-read the rule files after editing them by hand
+  templates [CATEGORY]       ready-made rules, by category
+  peek TEMPLATE              everything about one template: its questions and the rules it makes
 
 A rule is a file in your data folder, data/automations/rules/RULE.toml:
 
@@ -52,23 +57,64 @@ Rules only run while the daemon runs. Add --json to any command for raw output."
 pub enum AutomationsCmd {
     Help,
     List,
-    Show { id: String },
-    New { id: String, file: Option<PathBuf> },
-    Edit { id: String, file: Option<PathBuf> },
-    Remove { id: String },
-    Restore { id: String },
-    Enable { id: String },
-    Disable { id: String },
-    Test { id: String, event: PathBuf },
+    Show {
+        id: String,
+    },
+    New {
+        id: String,
+        file: Option<PathBuf>,
+    },
+    /// `new RULE --from TEMPLATE [--set Q=A]… [--yes]`.
+    FromTemplate {
+        id: String,
+        template: String,
+        set: Vec<(String, String)>,
+        yes: bool,
+    },
+    Templates {
+        which: Option<String>,
+    },
+    Peek {
+        template: String,
+    },
+    Edit {
+        id: String,
+        file: Option<PathBuf>,
+    },
+    Remove {
+        id: String,
+    },
+    Restore {
+        id: String,
+    },
+    Enable {
+        id: String,
+    },
+    Disable {
+        id: String,
+    },
+    Test {
+        id: String,
+        event: PathBuf,
+    },
     Events,
-    History { id: Option<String>, since: Option<DateTime<Utc>>, limit: Option<u64> },
+    History {
+        id: Option<String>,
+        since: Option<DateTime<Utc>>,
+        limit: Option<u64>,
+    },
     Status,
-    Depth { depth: Option<u64> },
+    Depth {
+        depth: Option<u64>,
+    },
     Reload,
 }
 
 /// `words` are what follows `shimmer automations`.
 pub fn parse(words: Vec<String>) -> std::result::Result<AutomationsCmd, String> {
+    if words.first().is_some_and(|w| w == "new") && words.iter().any(|w| w == "--from" || w.starts_with("--from=")) {
+        return from_template(words.into_iter().skip(1));
+    }
     let mut words = words.into_iter();
     let Some(sub) = words.next() else { return Ok(AutomationsCmd::List) };
     let options: &[&str] = match sub.as_str() {
@@ -120,8 +166,37 @@ pub fn parse(words: Vec<String>) -> std::result::Result<AutomationsCmd, String> 
             _ => return Err(usage("[N]")),
         },
         "reload" => none().map(|()| AutomationsCmd::Reload)?,
+        "templates" => match flags.positional.as_slice() {
+            [] => AutomationsCmd::Templates { which: None },
+            [which] => AutomationsCmd::Templates { which: Some(which.clone()) },
+            _ => return Err(usage("[CATEGORY]")),
+        },
+        "peek" => AutomationsCmd::Peek { template: id("TEMPLATE")? },
         other => return Err(format!("unknown automations command '{other}'; see 'shimmer automations --help'")),
     })
+}
+
+/// `new RULE --from TEMPLATE [--set QUESTION=ANSWER]… [--yes]`.
+fn from_template(words: impl Iterator<Item = String>) -> std::result::Result<AutomationsCmd, String> {
+    let usage = "usage: shimmer automations new RULE --from TEMPLATE [--set QUESTION=ANSWER]… [--yes]";
+    let (mut id, mut template, mut set, mut yes) = (None, None, Vec::new(), false);
+    let mut words = words.into_iter();
+    while let Some(word) = words.next() {
+        match word.as_str() {
+            "--from" => template = Some(words.next().ok_or("--from needs a TEMPLATE")?),
+            "--set" => set.push(crate::workspaces::set_answer(&words.next().ok_or("--set needs QUESTION=ANSWER")?)?),
+            "--yes" | "-y" => yes = true,
+            w if w.starts_with("--from=") => template = w.strip_prefix("--from=").map(String::from),
+            w if w.starts_with("--set=") => set.push(crate::workspaces::set_answer(&w["--set=".len()..])?),
+            w if w.starts_with('-') => return Err(format!("automations new: unknown option '{w}'; {usage}")),
+            _ if id.is_none() => id = Some(word),
+            _ => return Err(usage.into()),
+        }
+    }
+    match (id, template) {
+        (Some(id), Some(template)) => Ok(AutomationsCmd::FromTemplate { id, template, set, yes }),
+        _ => Err(usage.into()),
+    }
 }
 
 /// `--since`: a day (from its start, in your local time) or a time as `--once` takes it.
@@ -276,7 +351,7 @@ pub async fn run(client: &mut Client, cmd: &AutomationsCmd, json: bool, prompt: 
             if json {
                 return raw(data);
             }
-            let n = render::cell(&data["depth"]);
+            let n = full(&data["depth"]);
             Ok(match depth {
                 Some(_) => format!("✓ depth is {n}: up to {n} rules may follow each other"),
                 None => {
@@ -284,15 +359,193 @@ pub async fn run(client: &mut Client, cmd: &AutomationsCmd, json: bool, prompt: 
                 }
             })
         }
+        AutomationsCmd::Templates { which } => {
+            let data = client.call("automations.templates", json!({})).await?;
+            let text = render::templates_by_category(
+                &data,
+                which.as_deref(),
+                "automations",
+                ("make rules from it:", "shimmer automations new RULE --from TEMPLATE"),
+                in_full,
+            )?;
+            Ok(if json { render::json(&render::templates_selected(&data, which.as_deref())) } else { text })
+        }
+        AutomationsCmd::Peek { template } => {
+            let data = client.call("automations.templates", json!({})).await?;
+            let t = render::template_named(&data, template, "automations")?;
+            Ok(if json { render::json(t) } else { in_full(t, render::categories(&data)) })
+        }
+        AutomationsCmd::FromTemplate { id, template, set, yes } => {
+            from_template_run(client, id, template, set, *yes, json, prompt).await
+        }
         AutomationsCmd::Reload => {
             let data = client.call("automations.reload", json!({})).await?;
             if json {
                 return raw(data);
             }
-            let mut out = format!("✓ read {} rules", render::cell(&data["rules"]));
+            let mut out = format!("✓ read {} rules", full(&data["rules"]));
             out.push_str(&problems(&data["problems"]));
             Ok(out)
         }
+    }
+}
+
+/// Ask the template's questions, show the rules they make, and make them once agreed (ADR 0035
+/// §9, ADR 0025 §6a): nothing is made before the person has seen it, unless they said --yes.
+async fn from_template_run(
+    client: &mut Client,
+    id: &str,
+    template: &str,
+    set: &[(String, String)],
+    yes: bool,
+    json: bool,
+    prompt: &mut impl Prompt,
+) -> Result<String> {
+    let data = client.call("automations.templates", json!({})).await?;
+    let t = render::template_named(&data, template, "automations")?.clone();
+    if prompt.interactive() && set.is_empty() {
+        eprintln!("{} — {}", paint(Role::Heading, &full(&t["label"])), full(&t["description"]));
+    }
+    let values = crate::workspaces::answers(&t["questions"], set, prompt, &crate::workspaces::Paths::from_env())?;
+    let mut params = json!({"id": id, "template": template, "values": values, "preview": true});
+    let shown = client
+        .call("automations.create", params.clone())
+        .await
+        .map_err(|e| crate::workspaces::how_to_answer(e, prompt))?;
+    let rules = shown["rules"].as_array().cloned().unwrap_or_default();
+    if prompt.interactive() && !yes {
+        for r in &rules {
+            eprintln!(
+                "
+── {} ──
+{}",
+                full(&r["id"]),
+                r["text"].as_str().unwrap_or_default().trim_end()
+            );
+        }
+        let question = match rules.len() {
+            1 => "
+Make this rule? It's on as soon as it's made."
+                .to_owned(),
+            n => format!(
+                "
+Make these {n} rules? They're on as soon as they're made."
+            ),
+        };
+        if !prompt.confirm(&question) {
+            return Ok("nothing made".into());
+        }
+    }
+    params["preview"] = json!(false);
+    let made = client.call("automations.create", params).await?;
+    if json {
+        return Ok(render::json(&made));
+    }
+    let lines: Vec<String> =
+        made["rules"].as_array().into_iter().flatten().map(|r| format!("  {}", summary(r))).collect();
+    Ok(format!(
+        "✓ made from {template}, and on:
+{}
+  switch one off: shimmer automations disable RULE",
+        lines.join("\n")
+    ))
+}
+
+/// One template as `peek` shows it: what it does, what to know, its questions, its rules.
+fn in_full(t: &Value, categories: &[Value]) -> String {
+    let category = categories.iter().find(|c| c["category"] == t["category"] || c["id"] == t["category"]);
+    let mut out = format!(
+        "{}  {}
+{}
+",
+        paint(Role::Name, &full(&t["id"])),
+        full(&t["label"]),
+        full(&t["description"])
+    );
+    if let Some(c) = category {
+        out.push_str(&format!(
+            "category: {} ({})
+",
+            full(&c["label"]),
+            full(&c["id"])
+        ));
+    }
+    let ops: Vec<String> = t["ops"].as_array().into_iter().flatten().map(render::cell).collect();
+    out.push_str(&format!(
+        "runs: {}
+",
+        ops.join(", ")
+    ));
+    out.push_str(&format!(
+        "
+{}
+",
+        paint(Role::Heading, "Good to know")
+    ));
+    for g in t["good_to_know"].as_array().into_iter().flatten() {
+        out.push_str(&format!(
+            "  · {}
+",
+            full(g)
+        ));
+    }
+    out.push_str(&format!(
+        "
+{}
+",
+        paint(Role::Heading, "Questions")
+    ));
+    for q in t["questions"].as_array().into_iter().flatten() {
+        let mut how = full(&q["kind"]);
+        if q["required"] == true {
+            how.push_str(", required");
+        }
+        if let Some(d) = q["default"].as_str() {
+            how.push_str(&format!(", default {d}"));
+        }
+        if let Some(c) = q["choices"].as_array() {
+            how.push_str(&format!(": {}", c.iter().map(render::cell).collect::<Vec<_>>().join(", ")));
+        }
+        out.push_str(&format!(
+            "  {}  {} ({how})
+",
+            full(&q["name"]),
+            full(&q["prompt"])
+        ));
+    }
+    let rules = t["rules"].as_array().map(Vec::as_slice).unwrap_or_default();
+    out.push_str(&format!(
+        "
+{}
+",
+        paint(Role::Heading, if rules.len() == 1 { "The rule it makes" } else { "The rules it makes" })
+    ));
+    for r in rules {
+        let suffix = r["suffix"].as_str().unwrap_or_default();
+        let name = if suffix.is_empty() { "RULE".to_owned() } else { format!("RULE-{suffix}") };
+        out.push_str(&format!(
+            "
+── {name} ──
+{}
+",
+            r["text"].as_str().unwrap_or_default().trim_end()
+        ));
+    }
+    out.push_str(&format!(
+        "
+${{NAME}} is your answer; {{field}} is filled from the event.
+make it: shimmer automations new RULE --from {}",
+        full(&t["id"])
+    ));
+    out
+}
+
+/// A value in full, for sentences; `render::cell` shortens, for table cells.
+fn full(v: &Value) -> String {
+    match v {
+        Value::Null => "-".to_owned(),
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -338,7 +591,7 @@ async fn edit_loop(client: &mut Client, id: &str, text: String, prompt: &mut imp
 
 /// `id` (label): what the rule reacts to.
 fn summary(rule: &Value) -> String {
-    format!("{} ({}): on {}", render::cell(&rule["id"]), render::cell(&rule["label"]), render::cell(&rule["on"]))
+    format!("{} ({}): on {}", full(&rule["id"]), full(&rule["label"]), full(&rule["on"]))
 }
 
 /// The ops a rule runs: `notify.send, workspaces.activate (after 3d)`.
@@ -404,7 +657,7 @@ fn problems(v: &Value) -> String {
         .as_array()
         .into_iter()
         .flatten()
-        .map(|p| format!("  ✗ {}: {}", render::cell(&p["file"]), render::cell(&p["error"])))
+        .map(|p| format!("  ✗ {}: {}", full(&p["file"]), full(&p["error"])))
         .collect();
     match lines.is_empty() {
         true => String::new(),
@@ -417,14 +670,11 @@ fn problems(v: &Value) -> String {
 }
 
 fn show(r: &Value, now: DateTime<Utc>) -> String {
-    let mut out = format!(
-        "{}  ({})\n",
-        paint(Role::Name, &render::cell(&r["id"])),
-        if r["enabled"] == true { "on" } else { "off" }
-    );
+    let mut out =
+        format!("{}  ({})\n", paint(Role::Name, &full(&r["id"])), if r["enabled"] == true { "on" } else { "off" });
     let mut line = |label: &str, value: String| out.push_str(&format!("  {}{value}\n", crate::style::label(label, 12)));
-    line("label", render::cell(&r["label"]));
-    line("reacts to", render::cell(&r["on"]));
+    line("label", full(&r["label"]));
+    line("reacts to", full(&r["on"]));
     line("does", does(r));
     line("last fired", ago(&r["last_fired"], now, "never"));
     if r["loop_stopped_at"].is_string() {
@@ -433,7 +683,7 @@ fn show(r: &Value, now: DateTime<Utc>) -> String {
             format!(
                 "a loop {} (see: shimmer automations history {})",
                 ago(&r["loop_stopped_at"], now, ""),
-                render::cell(&r["id"])
+                full(&r["id"])
             ),
         );
     }
@@ -441,7 +691,7 @@ fn show(r: &Value, now: DateTime<Utc>) -> String {
 }
 
 fn tested(data: &Value) -> String {
-    let id = render::cell(&data["rule"]);
+    let id = full(&data["rule"]);
     if data["matches"] != true {
         return format!("{id} doesn't react to that event (check its 'on' and 'when')");
     }
@@ -449,8 +699,8 @@ fn tested(data: &Value) -> String {
     for a in data["actions"].as_array().into_iter().flatten() {
         let params = serde_json::to_string(&a["params"]).unwrap_or_default();
         out.push_str(&match a["after_s"].as_u64() {
-            Some(s) => format!("\n  schedule {} {params} in {}", render::cell(&a["op"]), when::format_duration(s)),
-            None => format!("\n  queue {} {params}", render::cell(&a["op"])),
+            Some(s) => format!("\n  schedule {} {params} in {}", full(&a["op"]), when::format_duration(s)),
+            None => format!("\n  queue {} {params}", full(&a["op"])),
         });
     }
     if data["enabled"] != true {
@@ -483,8 +733,8 @@ fn history(data: &Value, now: DateTime<Utc>) -> String {
 
 fn entry(e: &Value, now: DateTime<Utc>) -> String {
     let when = ago(&e["at"], now, "?");
-    let rule = render::cell(&e["rule"]);
-    let topic = render::cell(&e["event"]["topic"]);
+    let rule = full(&e["rule"]);
+    let topic = full(&e["event"]["topic"]);
     if e["kind"] == "stopped" {
         let why =
             if e["reason"] == "cycle" { "it was already in the chain (a loop)" } else { "the chain was too deep" };
@@ -492,14 +742,14 @@ fn entry(e: &Value, now: DateTime<Utc>) -> String {
     }
     let mut did = Vec::new();
     for q in e["queued"].as_array().into_iter().flatten() {
-        did.push(format!("queued {}", render::cell(&q["op"])));
+        did.push(format!("queued {}", full(&q["op"])));
     }
     for s in e["scheduled"].as_array().into_iter().flatten() {
         let at = when::timestamp(&s["at"]).map_or("later".into(), |at| when::relative(at, now));
-        did.push(format!("scheduled {} {at}", render::cell(&s["op"])));
+        did.push(format!("scheduled {} {at}", full(&s["op"])));
     }
     for f in e["failed"].as_array().into_iter().flatten() {
-        did.push(format!("✗ {} failed: {}", render::cell(&f["op"]), render::cell(&f["error"])));
+        did.push(format!("✗ {} failed: {}", full(&f["op"]), full(&f["error"])));
     }
     format!("{when}  {rule} on {topic}: {}", did.join(", "))
 }
@@ -507,9 +757,9 @@ fn entry(e: &Value, now: DateTime<Utc>) -> String {
 fn status(data: &Value, now: DateTime<Utc>) -> String {
     let mut out = format!(
         "rules: {} ({} on)\ndepth: {} (shimmer automations depth N)",
-        render::cell(&data["rules"]),
-        render::cell(&data["enabled"]),
-        render::cell(&data["depth"])
+        full(&data["rules"]),
+        full(&data["enabled"]),
+        full(&data["depth"])
     );
     let stopped: Vec<String> =
         data["stopped"].as_array().into_iter().flatten().map(|e| format!("  {}", entry(e, now))).collect();
