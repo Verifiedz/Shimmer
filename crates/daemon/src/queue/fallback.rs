@@ -2,7 +2,7 @@
 //! (§12 rule 10): the queue calls these, and a test can too.
 //!
 //! A fallback names a `notify.*` op and can never itself carry one, so the chain from a failed
-//! task is at most one link and ends in `notify`'s own terminal, `notifications/failed.jsonl`.
+//! task is at most one link and ends in `notify`'s own terminal, its inbox (ADR 0032).
 
 use serde_json::{json, Value};
 use shimmer_core::{EnqueueRequest, Error, ErrorCode, Fallback, ModuleId, Origin, Priority, Task};

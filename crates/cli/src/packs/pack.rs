@@ -136,6 +136,21 @@ pub const TARGETS: &[Target] = &[
     Target { op: "automations.reload", words: &["automations", "reload"] },
     Target { op: "automations.templates", words: &["automations", "templates"] },
     Target { op: "automations.peek", words: &["automations", "peek"] },
+    Target { op: "notify.list", words: &["notify", "list"] },
+    Target { op: "notify.get", words: &["notify", "show"] },
+    Target { op: "notify.count", words: &["notify", "count"] },
+    Target { op: "notify.mark_read", words: &["notify", "mark-read"] },
+    Target { op: "notify.mark_unread", words: &["notify", "mark-unread"] },
+    Target { op: "notify.remove", words: &["notify", "remove"] },
+    Target { op: "notify.send", words: &["notify", "send"] },
+    Target { op: "notify.test", words: &["notify", "test"] },
+    Target { op: "notify.resend", words: &["notify", "resend"] },
+    Target { op: "notify.pause", words: &["notify", "pause"] },
+    Target { op: "notify.resume", words: &["notify", "resume"] },
+    Target { op: "notify.quiet", words: &["notify", "quiet"] },
+    Target { op: "notify.status", words: &["notify", "status"] },
+    Target { op: "notify.builtin_alerts", words: &["notify", "builtin-alerts"] },
+    Target { op: "notify.cap", words: &["notify", "cap"] },
 ];
 
 /// The command `op` names, if a pack may alias it.
@@ -445,7 +460,7 @@ label = "My Pack"
 
     #[test]
     fn every_target_is_an_op_with_its_command_words() {
-        assert_eq!(TARGETS.len(), 70);
+        assert_eq!(TARGETS.len(), 85);
         // Where the CLI's word differs from the op's verb (ADR 0015 §1).
         let renamed = [
             ("queue.task", "show"),
@@ -456,6 +471,7 @@ label = "My Pack"
             ("automations.get", "show"),
             ("automations.create", "new"),
             ("automations.save", "edit"),
+            ("notify.get", "show"),
         ];
         for t in TARGETS {
             let (module, verb) = t.op.split_once('.').unwrap();

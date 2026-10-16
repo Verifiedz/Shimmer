@@ -91,6 +91,7 @@ async fn a_failed_tasks_slot_frees_before_the_next_task_starts() {
     let finished_next = index_of(&seen, "queue.task.finished", &next);
 
     assert!(started_failing < failed, "it ran, then failed");
+    assert_eq!(seen[failed].payload["fallback"], false, "no fallback was sent for it (ADR 0032 §4)");
     assert!(failed < started_next, "the failure is reported before the next task takes the slot");
     assert!(started_next < finished_next);
     assert_eq!(seen[failed].payload["lane"], "slow");
@@ -452,6 +453,7 @@ async fn a_structural_failure_enqueues_the_fallback_in_the_notify_lane() {
     let failed = &seen[index_of(&seen, "queue.task.failed", &primary)];
     assert_eq!(failed.payload["code"], "unavailable");
     assert_eq!(failed.payload["lane"], "slow", "the primary ran in its own lane");
+    assert_eq!(failed.payload["fallback"], true, "a fallback is being sent for this failure (ADR 0032 §4)");
 
     // The fallback is an ordinary task, configured exactly as the trigger declared it.
     let done = until(&mut c, "queue.task.finished", &fallback).await;

@@ -303,9 +303,11 @@ impl QueueInner {
                     (
                         Status::Failed(e.to_string()),
                         "queue.task.failed",
+                        // `fallback`: whether a fallback is being sent for this failure (ADR
+                        // 0032 §4), so notify's alerts never repeat its message.
                         json!({"task_id": task.id, "lane": task.lane, "op": task.op, "origin": task.origin,
                                "error": e.message, "code": e.code, "detail": e.detail,
-                               "retryable": e.is_retryable(), "attempts": 1}),
+                               "retryable": e.is_retryable(), "attempts": 1, "fallback": fallback.is_some()}),
                     )
                 }
             }

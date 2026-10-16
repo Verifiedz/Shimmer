@@ -10,6 +10,7 @@ mod backend;
 mod bus;
 mod config;
 mod core;
+mod desktop;
 mod http_backend;
 mod indexer;
 mod ipc;
