@@ -91,6 +91,20 @@ belongs to this machine, so copying your Shimmer folder elsewhere doesn't bring 
 | records peek | `hora` | `preview` | `probe` | `rpeek` |
 | records copy-collection | `futago` | `copy-pasta` | `twin-fleet` | `rcpcol` |
 | records edit | `kaizou` | `tweak-schema` | `drydock` | `redit` |
+| automations list | `keikaku` | `hooks` | `protocols` | `alist` |
+| automations show | `dore` | `inspect-hook` | `briefing` | `aget` |
+| automations new | `tsukuru` | `add-hook` | `standing-order` | `anew` |
+| automations edit | `naoshite` | `edit-hook` | `revise-orders` | `aedit` |
+| automations remove | `bye-bye` | `unhook` | `belay-that` | `arm` |
+| automations restore | `modotte` | `rehook` | `reinstate` | `aundo` |
+| automations enable | `tsukete` | `flag-on` | `arm-systems` | `aon` |
+| automations disable | `keshite` | `flag-off` | `disarm` | `aoff` |
+| automations test | `tameshi` | `dry-run` | `simulation` | `atest` |
+| automations events | `dekigoto` | `triggers` | `sensor-log` | `aevents` |
+| automations history | `kioku` | `audit-log` | `captains-log` | `alog` |
+| automations status | `genki` | `status-page` | `status-report` | `ast` |
+| automations depth | `fukasa` | `blast-radius` | `chain-of-command` | `adepth` |
+| automations reload | `saikidou` | `hot-reload` | `power-cycle` | `areload` |
 
 ## Writing your own
 

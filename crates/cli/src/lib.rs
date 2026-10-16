@@ -5,6 +5,7 @@
 //! [`packs`]: aliases are rewritten to canonical command words here and never reach the wire.
 
 mod args;
+mod automations;
 mod autostart;
 mod client;
 mod complete;
@@ -33,6 +34,7 @@ use shimmer_core::{Error, Result};
 use shimmer_proto::ops;
 
 pub use args::{Args, Command, USAGE};
+pub use automations::AutomationsCmd;
 pub use client::{Client, ConnectError};
 pub use queue::QueueCmd;
 pub use records::RecordsCmd;
@@ -202,6 +204,7 @@ fn usage_for(args: &[String]) -> &'static str {
             "workspaces" => return workspaces::USAGE,
             "queue" => return queue::USAGE,
             "scheduler" => return scheduler::USAGE,
+            "automations" => return automations::USAGE,
             "schedule" => return schedule::USAGE,
             "packs" => return packs::cmd::USAGE,
             "doctor" => return doctor::USAGE,
@@ -230,6 +233,14 @@ fn prints_data(cmd: &Command) -> bool {
             | Command::Workspaces(WorkspacesCmd::List | WorkspacesCmd::Status { .. })
             | Command::Queue(QueueCmd::List { .. } | QueueCmd::Show { .. })
             | Command::Scheduler(SchedulerCmd::List | SchedulerCmd::Show { .. })
+            | Command::Automations(
+                AutomationsCmd::List
+                    | AutomationsCmd::Show { .. }
+                    | AutomationsCmd::Test { .. }
+                    | AutomationsCmd::History { .. }
+                    | AutomationsCmd::Status
+                    | AutomationsCmd::Reload
+            )
             | Command::Schedule(_)
     )
 }
@@ -242,6 +253,7 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
         Command::Workspaces(WorkspacesCmd::Help) => return Ok(Some(workspaces::USAGE.into())),
         Command::Queue(QueueCmd::Help) => return Ok(Some(queue::USAGE.into())),
         Command::Scheduler(SchedulerCmd::Help) => return Ok(Some(scheduler::USAGE.into())),
+        Command::Automations(AutomationsCmd::Help) => return Ok(Some(automations::USAGE.into())),
         Command::Schedule(schedule::ScheduleCmd::Help) => return Ok(Some(schedule::USAGE.into())),
         Command::DoctorHelp => return Ok(Some(doctor::USAGE.into())),
         // Packs live entirely in the client: no daemon needed.
@@ -258,6 +270,9 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
     }
     if let Command::Scheduler(cmd) = &args.command {
         return scheduler::run(&mut client, cmd, args.json).await.map(Some);
+    }
+    if let Command::Automations(cmd) = &args.command {
+        return automations::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
     }
     if let Command::Workspaces(cmd) = &args.command {
         return workspaces::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
@@ -280,6 +295,7 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
         | Command::Workspaces(_)
         | Command::Queue(_)
         | Command::Scheduler(_)
+        | Command::Automations(_)
         | Command::Schedule(_)
         | Command::Packs(_) => {
             unreachable!("handled above")
@@ -349,6 +365,7 @@ fn output(args: &Args, data: &Value) -> String {
         | Command::Workspaces(_)
         | Command::Queue(_)
         | Command::Scheduler(_)
+        | Command::Automations(_)
         | Command::Schedule(_)
         | Command::Packs(_) => render::json(data),
     }
