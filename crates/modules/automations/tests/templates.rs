@@ -73,7 +73,8 @@ async fn every_template_makes_rules_that_check_with_and_without_optional_answers
     }
     let status = m.handle("automations.status", json!({}), &env.ctx).await.unwrap();
     assert_eq!(status["problems"], json!([]));
-    assert_eq!(status["rules"], 2 * (9 + 2), "stage-creates-workspace makes three rules");
+    // stage-creates-workspace makes three rules; the two built-ins on queue.task.failed are there too.
+    assert_eq!(status["rules"], 2 * (9 + 2) + 2);
 }
 
 #[tokio::test]

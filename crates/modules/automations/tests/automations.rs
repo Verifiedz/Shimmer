@@ -38,6 +38,13 @@ fn event(topic: &str, payload: Value, cause: Option<TaskId>) -> Event {
     Event::new(ModuleId::new("records"), topic, payload, chrono::DateTime::UNIX_EPOCH).caused_by(cause)
 }
 
+/// The built-in rules this catalog loads: the two on `queue.task.failed` (§10).
+const BUILTINS: usize = 2;
+
+fn rule<'a>(listed: &'a Value, id: &str) -> &'a Value {
+    listed["rules"].as_array().unwrap().iter().find(|r| r["id"] == id).unwrap()
+}
+
 fn topics(env: &TestEnv) -> Vec<String> {
     env.backend.events().into_iter().map(|e| e.topic).collect()
 }
@@ -91,7 +98,7 @@ async fn rules_are_files_made_checked_switched_and_removed() {
     let text = String::from_utf8(env.backend.read("automations", "rules/solved.toml").unwrap().unwrap()).unwrap();
     assert!(text.contains("enabled = false") && text.contains("label = \"Tell me when it's done\""), "{text}");
     let listed = call(&m, ctx, "automations.list", json!({})).await.unwrap();
-    assert_eq!(listed["rules"][0]["enabled"], false);
+    assert_eq!(rule(&listed, "solved")["enabled"], false);
     call(&m, ctx, "automations.enable", json!({"id": "solved"})).await.unwrap();
 
     // A starter rule checks, and is off until edited.
@@ -168,7 +175,7 @@ async fn a_matching_event_queues_its_actions_and_schedules_the_delayed_one() {
     let history = call(&m, &env.ctx, "automations.history", json!({"id": "solved"})).await.unwrap();
     assert_eq!(history["history"].as_array().unwrap().len(), 1);
     let listed = call(&m, &env.ctx, "automations.list", json!({})).await.unwrap();
-    assert!(listed["rules"][0]["last_fired"].is_string());
+    assert!(rule(&listed, "solved")["last_fired"].is_string());
 }
 
 /// §3: "when a record is updated, update a record" re-triggers itself; A → B → A too.
@@ -223,7 +230,7 @@ async fn settings_and_hand_edited_files_are_read_and_problems_reported() {
     let ctx = &env.ctx;
 
     let status = call(&m, ctx, "automations.status", json!({})).await.unwrap();
-    assert_eq!((status["rules"].clone(), status["depth"].clone()), (json!(1), json!(5)));
+    assert_eq!((status["rules"].clone(), status["depth"].clone()), (json!(1 + BUILTINS), json!(5)));
     assert_eq!(status["problems"][0]["file"], "rules/bad.toml");
     let health = call(&m, ctx, "automations.health", json!({})).await.unwrap();
     assert_eq!(health["checks"][0]["status"], "fail");
@@ -231,7 +238,7 @@ async fn settings_and_hand_edited_files_are_read_and_problems_reported() {
     // Fixed by hand, then reloaded.
     env.ctx.store.write("rules/bad.toml", DONE).unwrap();
     let reloaded = call(&m, ctx, "automations.reload", json!({})).await.unwrap();
-    assert_eq!((reloaded["rules"].clone(), reloaded["problems"].clone()), (json!(2), json!([])));
+    assert_eq!((reloaded["rules"].clone(), reloaded["problems"].clone()), (json!(2 + BUILTINS), json!([])));
 
     // A broken file can be removed: one way to fix it.
     env.ctx.store.write("rules/worse.toml", "x").unwrap();
