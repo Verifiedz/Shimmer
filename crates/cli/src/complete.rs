@@ -280,10 +280,34 @@ fn alternatives(usage: &str, placeholder: &str) -> Vec<Opt> {
     let title = format!("{placeholder} is exactly one of:");
     let mut lines = usage.lines().skip_while(|l| *l != title).skip(1);
     let mut out = Vec::new();
-    while let Some(line) = lines.next().filter(|l| l.starts_with("  -")) {
+    // Entries until the block ends (a blank or unindented line); an indented line that isn't an
+    // option continues the one above (`--cron-local`'s second line), so it's skipped, not the end.
+    for line in lines.by_ref().take_while(|l| l.starts_with("  ")) {
+        if !line.starts_with("  -") {
+            continue;
+        }
         let (synopsis, _) = split_entry(line.trim_start());
         let words = tokenize(&synopsis);
         out.push(Opt { name: words[0].clone(), args: words[1..].to_vec(), values: Vec::new() });
+    }
+    out
+}
+
+/// The first words of `WHEN` as `shimmer schedule --help` lists them (`WHEN is one of:`), each
+/// with what follows it: `daily` → `HH:MM`, `every` → `DURATION`, `cron` → `"EXPR"`. An example
+/// list of days (`mon,wed,fri`) isn't a word to type, so it's left out.
+fn when_words(usage: &str) -> Vec<(String, String)> {
+    let lines = usage.lines().skip_while(|l| *l != "WHEN is one of:").skip(1);
+    let mut out = Vec::new();
+    for line in lines.take_while(|l| l.starts_with("  ")).filter(|l| !l.starts_with("   ")) {
+        let synopsis = line.trim_start().split("  ").next().unwrap_or_default();
+        for entry in synopsis.split(", ") {
+            if let Some((word, rest)) = entry.split_once(' ') {
+                if !word.contains(',') {
+                    out.push((word.to_owned(), rest.to_owned()));
+                }
+            }
+        }
     }
     out
 }
@@ -401,6 +425,9 @@ impl Groups {
             rest.splice(0..1, target.words.iter().map(|w| w.to_string()));
         }
         let first = rest[0].clone();
+        if first == "schedule" {
+            return self.schedule(&rest[1..], current, cx, source).await;
+        }
         let (cmd, usage, after) = match modules().into_iter().find(|(m, _)| *m == first) {
             Some((module, usage)) => {
                 let subs = commands(usage);
@@ -426,6 +453,79 @@ impl Groups {
         };
         let Some((module, cmd)) = cmd else { return };
         self.arguments(module, &cmd, usage, &after, current, cx, source).await;
+    }
+
+    /// `shimmer schedule WHEN [--catch-up WHAT] [--lane LANE] COMMAND…` (#230): the ways to say
+    /// when, then the schedule's options, then a command that can be scheduled, completed as it is
+    /// on its own. Where the command starts is read as running it reads it (`parse_when`).
+    async fn schedule(&mut self, after: &[String], current: &str, cx: &Context<'_>, source: &mut impl Source) {
+        let usage = crate::schedule::USAGE;
+        let Ok((_, used)) = crate::schedule::parse_when(after) else {
+            // Still saying when: its first word, then nothing to offer for a time or a duration.
+            if after.is_empty() {
+                for (word, hint) in when_words(usage) {
+                    self.add("when", "when", word, hint);
+                }
+            }
+            return;
+        };
+        let synopsis = usage.lines().next().unwrap_or_default().trim_start_matches("usage: shimmer ");
+        let own = parse_synopsis(synopsis, String::new());
+        let mut i = used;
+        while i < after.len() && after[i].starts_with("--") {
+            if !after[i].contains('=') && i + 1 == after.len() {
+                // `--catch-up <Tab>`, `--lane <Tab>`.
+                let wants = own.options.iter().find(|o| o.name == after[i]).and_then(|o| o.args.first());
+                if let Some(placeholder) = wants {
+                    self.placeholder("scheduler", "", placeholder, None, current, cx, source).await;
+                }
+                return;
+            }
+            i += if after[i].contains('=') { 1 } else { 2 };
+        }
+        let schedulable = |words: &[&str]| {
+            crate::schedule::SCHEDULABLE
+                .iter()
+                .any(|(group, subs)| words.len() == 2 && words[0] == *group && subs.contains(&words[1]))
+        };
+        let Some(word) = after.get(i) else {
+            if current.starts_with('-') {
+                for o in &own.options {
+                    self.add("options", "options", o.name.clone(), o.args.join(" "));
+                }
+                return;
+            }
+            let top = commands(crate::args::USAGE);
+            for (group, _) in crate::schedule::SCHEDULABLE {
+                let summary = top.iter().find(|c| c.word == group).map(|c| c.summary.clone()).unwrap_or_default();
+                self.add("commands", "commands", group, summary);
+            }
+            if let Some(pack) = cx.pack {
+                for (alias, target) in pack.aliases.iter().filter(|(_, t)| schedulable(t.words)) {
+                    self.add("aliases", "aliases", alias.clone(), format!("shimmer {}", target.words.join(" ")));
+                }
+            }
+            return;
+        };
+        // The command, its alias written out as running it does (`rewrite_inner`).
+        let mut command: Vec<String> = after[i..].to_vec();
+        if let Some(target) = cx.pack.and_then(|p| p.aliases.get(word)) {
+            command.splice(0..1, target.words.iter().map(|w| w.to_string()));
+        }
+        let Some((module, usage)) = modules().into_iter().find(|(m, _)| *m == command[0]) else { return };
+        let subs = commands(usage);
+        let Some(sub) = command.get(1) else {
+            for c in subs.iter().filter(|c| schedulable(&[module, &c.word])) {
+                self.add("commands", "commands", c.word.clone(), c.summary.clone());
+            }
+            return;
+        };
+        let Some(mut cmd) = subs.into_iter().find(|c| &c.word == sub && schedulable(&[module, &c.word])) else {
+            return;
+        };
+        // A scheduled run has no one waiting and takes its turn: these are refused there.
+        cmd.options.retain(|o| o.name != "--wait" && o.name != "--first");
+        self.arguments(module, &cmd, usage, &command[2..], current, cx, source).await;
     }
 
     /// After a command: its options, the values they take, and what goes in each position.
@@ -654,8 +754,10 @@ impl Groups {
     async fn triggers(&mut self, source: &mut impl Source) {
         let Some(data) = source.call("scheduler.list", json!({})).await else { return };
         let all = data["triggers"].as_array().or_else(|| data.as_array()).cloned().unwrap_or_default();
-        for t in all {
-            self.add("triggers", "triggers", text(&t["id"]), text(&t["op"]));
+        // The same short endings `scheduler list` shows, which every scheduler command accepts.
+        let ids: Vec<String> = all.iter().map(|t| text(&t["id"])).collect();
+        for (t, short) in all.iter().zip(crate::render::short_ids(&ids)) {
+            self.add("triggers", "triggers", short, text(&t["op"]));
         }
     }
 
@@ -842,7 +944,7 @@ mod tests {
                        "templates": [{"id": "leetcode", "description": "Problems"}]}),
             ),
             ("workspaces.list", json!({"workspaces": [{"id": "site", "label": "Site", "state": "ready"}]})),
-            ("scheduler.list", json!({"triggers": [{"id": "usr-1", "op": "records.list"}]})),
+            ("scheduler.list", json!({"triggers": [{"id": "usr-01JABCDEFGHJKMNPQRSTVWXYZ0", "op": "records.list"}]})),
             (
                 "core.manifest",
                 json!({"lanes": [{"id": "default", "max_concurrent": 4}],
@@ -866,30 +968,26 @@ mod tests {
         words_with(line, &mut daemon()).await
     }
 
-    #[test]
-    fn every_command_group_in_the_help_has_its_subcommands_read() {
-        // A group is written `NAME …` in `shimmer --help` (records, workspaces, queue…). Its
-        // subcommands only complete if `modules()` reads its help page, so a new group (fetchers,
-        // notify, calendar) has to be added there: this says so instead of it being forgotten.
+    #[tokio::test]
+    async fn every_command_with_more_to_type_completes_after_its_name() {
+        // A command written with `…` in `shimmer --help` (`records …`, `schedule WHEN … COMMAND`)
+        // takes more words, so Tab after it should offer some. A new group (fetchers, notify,
+        // calendar) only does once modules() reads its help page; this says so instead of it
+        // being forgotten, whatever shape its help line has (#230: `schedule` slipped past a
+        // check that only knew `NAME …`).
         let groups: Vec<&str> = crate::args::USAGE
             .lines()
             .filter(|l| l.starts_with("  ") && !l.starts_with("   "))
-            .filter_map(|l| {
-                let mut words = l.split_whitespace();
-                match (words.next(), words.next()) {
-                    (Some(name), Some("…")) => Some(name),
-                    _ => None,
-                }
-            })
+            .filter(|l| l.split("  ").find(|p| !p.is_empty()).is_some_and(|synopsis| synopsis.contains('…')))
+            .filter_map(|l| l.split_whitespace().next())
             .collect();
-        assert!(groups.contains(&"records"), "no groups found in the help: {groups:?}");
-        let read: Vec<&str> = modules().iter().map(|(m, _)| *m).collect();
+        assert!(groups.contains(&"records") && groups.contains(&"schedule"), "groups not found: {groups:?}");
         for group in groups {
             assert!(
-                read.contains(&group),
-                "`shimmer {group} …` is in the help, but complete.rs's modules() doesn't read its help \
-                 page, so its subcommands won't complete. Add (\"{group}\", <its help's USAGE constant>), as \
-                 the others in modules() are."
+                !words(&format!("{group} ")).await.is_empty(),
+                "`shimmer {group} <Tab>` offers nothing. If it's a group of subcommands, add \
+                 (\"{group}\", <its help's USAGE constant>) to complete.rs's modules(), as the others are; \
+                 if it reads its words its own way, as `schedule` does, give it its own case in complete()."
             );
         }
     }
@@ -943,7 +1041,8 @@ mod tests {
         let uses = commands(crate::packs::cmd::USAGE).into_iter().find(|c| c.word == "use").unwrap();
         assert_eq!(uses.positionals, [vec!["NAME".to_owned(), "none".to_owned()]]);
         let when: Vec<String> = alternatives(crate::scheduler::USAGE, "WHEN").into_iter().map(|o| o.name).collect();
-        assert_eq!(when, ["--every", "--cron", "--once"]);
+        // `--cron-local`'s summary runs onto a second line; `--once` after it is still read.
+        assert_eq!(when, ["--every", "--cron", "--cron-local", "--once"]);
     }
 
     #[tokio::test]
@@ -968,6 +1067,53 @@ mod tests {
         assert_eq!(words("--json wor").await, ["workspaces"], "a global option before the command");
     }
 
+    #[test]
+    fn the_ways_to_say_when_are_read_from_the_schedule_help() {
+        let when: Vec<String> = when_words(crate::schedule::USAGE).into_iter().map(|(w, _)| w).collect();
+        assert_eq!(when, ["daily", "weekdays", "weekends", "every", "once", "cron", "cron-local"]);
+        assert!(when_words(crate::schedule::USAGE).contains(&("every".into(), "DURATION".into())));
+    }
+
+    #[tokio::test]
+    async fn a_schedule_completes_when_then_its_options_then_the_command() {
+        assert_eq!(words("schedule ").await, ["daily", "weekdays", "weekends", "every", "once", "cron", "cron-local"]);
+        assert_eq!(words("schedule w").await, ["weekdays", "weekends"]);
+        assert!(words("schedule daily ").await.is_empty(), "a time is typed, not picked");
+        assert!(words("schedule once 2026-10-20 ").await.is_empty(), "the time still to come");
+        assert_eq!(words("schedule daily 09:00 ").await, ["records", "workspaces"], "only what can be scheduled");
+        assert_eq!(words("schedule daily 09:00 --").await, ["--catch-up", "--lane"]);
+        assert_eq!(words("schedule every 1d --catch-up ").await, ["skip", "run-once", "backfill"]);
+        assert_eq!(words("schedule every 1d --lane ").await, ["default"]);
+        assert_eq!(
+            words("schedule every 1d --catch-up skip --lane default wor").await,
+            ["workspaces"],
+            "the options' values aren't taken for the command"
+        );
+        assert_eq!(words("schedule daily 09:00 workspaces ").await, ["activate", "cleanup", "stop"]);
+        assert_eq!(words("schedule daily 09:00 records re").await, ["reopen", "remove", "restore"]);
+        assert_eq!(words("schedule daily 09:00 workspaces activate ").await, ["site"]);
+        assert_eq!(words("schedule daily 09:00 records complete lc/").await, ["lc/two-sum"]);
+        let options = words("schedule daily 09:00 workspaces activate site --").await;
+        assert!(!options.contains(&"--wait".to_owned()) && !options.contains(&"--first".to_owned()), "{options:?}");
+        assert!(words("schedule daily 09:00 records list ").await.is_empty(), "list can't be scheduled");
+    }
+
+    #[tokio::test]
+    async fn a_schedule_offers_and_follows_the_packs_aliases() {
+        let pack = crate::packs::builtin::builtin("short").unwrap();
+        let cx = Context { pack: Some(&pack), pack_folders: Vec::new() };
+        let at = |line: &str| -> Vec<String> {
+            std::iter::once("shimmer").chain(line.split(' ')).map(String::from).collect()
+        };
+        let got = |groups: Vec<Group>| -> Vec<String> {
+            groups.into_iter().flat_map(|g| g.candidates).map(|c| c.word).collect()
+        };
+        let offered = got(complete(&at("schedule daily 09:00 "), &cx, &mut daemon()).await);
+        assert!(offered.contains(&"wgo".to_owned()), "workspaces activate's alias: {offered:?}");
+        assert!(!offered.contains(&"wst".to_owned()), "workspaces status can't be scheduled");
+        assert_eq!(got(complete(&at("schedule daily 09:00 wgo "), &cx, &mut daemon()).await), ["site"]);
+    }
+
     #[tokio::test]
     async fn your_own_names() {
         assert_eq!(words("workspaces activate ").await, ["site"]);
@@ -976,7 +1122,7 @@ mod tests {
         assert_eq!(words("records complete lc/").await, ["lc/two-sum"]);
         assert_eq!(words("records new jobs --from ").await, ["leetcode"]);
         assert_eq!(words("records templates ").await, ["practice"]);
-        assert_eq!(words("scheduler pause ").await, ["usr-1"]);
+        assert_eq!(words("scheduler pause ").await, ["VWXYZ0"], "the short ending lists show, not the whole id");
         assert_eq!(words("call ").await, ["core.ping"]);
         assert!(words("packs use ").await.contains(&"none".to_owned()));
         assert!(words("packs use ").await.contains(&"short".to_owned()));

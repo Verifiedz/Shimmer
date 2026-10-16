@@ -19,6 +19,7 @@ mod launcher;
 mod queue;
 mod registry;
 mod scheduler;
+mod short_id;
 
 use std::fs::{self, File};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -156,6 +157,7 @@ impl Daemon {
             core.queue.clone(),
             known_ops,
             lane_ids,
+            cfg.local_timezone,
         ));
         scheduler.load()?;
         scheduler.register_module_triggers(declared)?;
