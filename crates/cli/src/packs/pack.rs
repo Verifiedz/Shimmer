@@ -42,6 +42,8 @@ pub const RESERVED: &[&str] = &[
     "notify",
     "calendar",
     "tui",
+    "doctor",
+    "completions",
     "version",
     "shimmer",
 ];
@@ -80,6 +82,7 @@ pub const TARGETS: &[Target] = &[
     Target { op: "records.rename_collection", words: &["records", "rename-collection"] },
     Target { op: "records.remove_collection", words: &["records", "remove-collection"] },
     Target { op: "records.restore_collection", words: &["records", "restore-collection"] },
+    Target { op: "records.purge_collection", words: &["records", "purge-collection"] },
     // ADR 0030: `peek` and `edit` have no op of their own, so they're named like
     // `workspaces.edit`.
     Target { op: "records.peek", words: &["records", "peek"] },
@@ -129,6 +132,8 @@ pub struct Pack {
     pub aliases: BTreeMap<String, &'static Target>,
     /// Op -> its animation file, relative to the pack's folder (ADR 0013 §12).
     pub anim: BTreeMap<String, String>,
+    /// Colour role (`success`, `error`, …) -> its colour, overriding the Shimmer palette (#189).
+    pub colors: BTreeMap<String, (u8, u8, u8)>,
 }
 
 /// Check a `pack.toml`'s text. `file` names it in every problem, e.g. `my-pack/pack.toml`.
@@ -169,7 +174,13 @@ pub fn check_folder(dir: &Path) -> Result<Pack, Vec<String>> {
 
 /// Every check that needs only the text. Returns what was valid, plus every problem found.
 fn read(file: &str, text: &str) -> (Pack, Vec<String>) {
-    let mut pack = Pack { id: String::new(), label: String::new(), aliases: BTreeMap::new(), anim: BTreeMap::new() };
+    let mut pack = Pack {
+        id: String::new(),
+        label: String::new(),
+        aliases: BTreeMap::new(),
+        anim: BTreeMap::new(),
+        colors: BTreeMap::new(),
+    };
     let mut problems = Vec::new();
     let mut problem = |msg: String| problems.push(format!("{file}: {msg}"));
 
@@ -190,7 +201,8 @@ fn read(file: &str, text: &str) -> (Pack, Vec<String>) {
             ("pack", Value::Table(t)) => read_pack(t, &mut pack, &mut problem),
             ("alias", Value::Table(t)) => read_aliases(t, &mut pack, &mut problem),
             ("anim", Value::Table(t)) => read_anim(t, &mut pack, &mut problem),
-            ("pack" | "alias" | "anim", _) => problem(format!("'{key}' must be a table: [{key}]")),
+            ("colors", Value::Table(t)) => read_colors(t, &mut pack, &mut problem),
+            ("pack" | "alias" | "anim" | "colors", _) => problem(format!("'{key}' must be a table: [{key}]")),
             _ => problem(format!("unknown section or key '{key}'")),
         }
     }
@@ -273,6 +285,23 @@ fn read_anim(t: &Table, pack: &mut Pack, problem: &mut impl FnMut(String)) {
             None => {
                 pack.anim.insert(op.clone(), rel.clone());
             }
+        }
+    }
+}
+
+/// `[colors]`: a role name and a `#rrggbb` colour each, overriding the Shimmer palette (#189).
+fn read_colors(t: &Table, pack: &mut Pack, problem: &mut impl FnMut(String)) {
+    let roles: Vec<&str> = crate::style::Role::ALL.iter().map(|r| r.key()).collect();
+    for (role, value) in t {
+        if !roles.contains(&role.as_str()) {
+            problem(format!("[colors] '{role}' isn't a colour role; the roles are {}", roles.join(", ")));
+            continue;
+        }
+        match value.as_str().and_then(crate::style::parse_hex) {
+            Some(rgb) => {
+                pack.colors.insert(role.clone(), rgb);
+            }
+            None => problem(format!("[colors] {role} must be a colour like \"#db007c\"")),
         }
     }
 }
@@ -372,6 +401,20 @@ label = "My Pack"
     }
 
     #[test]
+    fn a_pack_may_set_its_own_colours_by_role() {
+        // #189: presentation, like aliases; checked at load like the rest.
+        let pack =
+            parse("my-pack/pack.toml", &format!("{GOOD}\n[colors]\nsuccess = \"#00ff88\"\nheading = \"#ABCDEF\"\n"))
+                .unwrap();
+        assert_eq!(pack.colors.get("success"), Some(&(0, 255, 136)));
+        assert_eq!(pack.colors.get("heading"), Some(&(171, 205, 239)));
+        let bad = problems(&format!("{GOOD}\n[colors]\nsparkle = \"#ffffff\"\nerror = \"red\"\n"));
+        has(&bad, "'sparkle' isn't a colour role");
+        has(&bad, "error must be a colour like");
+        assert!(parse("p", GOOD).unwrap().colors.is_empty(), "no [colors]: the Shimmer palette");
+    }
+
+    #[test]
     fn a_good_pack_parses() {
         let pack = parse("my-pack/pack.toml", GOOD).unwrap();
         assert_eq!((pack.id.as_str(), pack.label.as_str()), ("my-pack", "My Pack"));
@@ -382,7 +425,7 @@ label = "My Pack"
 
     #[test]
     fn every_target_is_an_op_with_its_command_words() {
-        assert_eq!(TARGETS.len(), 53);
+        assert_eq!(TARGETS.len(), 54);
         // Where the CLI's word differs from the op's verb (ADR 0015 §1).
         let renamed = [
             ("queue.task", "show"),

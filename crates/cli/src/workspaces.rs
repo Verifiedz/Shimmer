@@ -22,17 +22,19 @@ use crate::editor;
 use crate::follow::{follow, Followed};
 use crate::render::{self, cell, table, wrap};
 use crate::schedules;
+use crate::style::{paint, Role};
 
 pub const USAGE: &str = "usage: shimmer workspaces <command>
 
 commands:
   list                                  list workspaces and their state
   status NAME                           show one workspace in full: steps, last session, why it is dirty
-  activate NAME [--wait]                launch its steps in order
-  cleanup NAME [--wait]                 run a dirty workspace's cleanup script
+  activate NAME [--wait] [--first]      launch its steps in order
+  cleanup NAME [--wait] [--first]       run a dirty workspace's cleanup script
   force-relaunch NAME [--yes] [--wait]  launch a dirty workspace anyway (asks first)
+       [--first]
   reset NAME [--yes]                    clear dirty without running cleanup (asks first)
-  stop NAME [--wait]                    stop what an active workspace started (its dev server,
+  stop NAME [--wait] [--first]          stop what an active workspace started (its dev server,
                                         services, the windows it can close) and say what it left
   remove NAME                           remove a workspace that isn't running
   edit NAME [FILE] [--path]             open its workspace.toml (or FILE in its folder, e.g.
@@ -64,10 +66,17 @@ commands:
         Don't use --wait from a workspace's own step scripts: launches run one at a time.
         With --json: the op's result, or {\"result_missed\": true, \"task\": {…}} when it
         succeeded but its result was lost to dropped events (then fields like log are absent).
+--first run it ahead of everything waiting in the workspaces lane (behind anything already run
+        first). Shows what it would run ahead of and asks first (--yes to skip that); never
+        stops what's already running. With force-relaunch, --yes answers both its questions.
 --yes   skip the question. Needed when no one is at the keyboard (scripts).
 
 A workspace is a folder under data/workspaces/ in your Shimmer folder, holding a
 workspace.toml and its steps/ scripts (ADR 0012). Add --json to any command for raw output.";
+
+/// `--first` on a command that queues work (#222): `Some(yes)` runs it ahead of its lane, asking
+/// first unless `yes`; `None` queues it in turn, as usual.
+pub type First = Option<bool>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum WorkspacesCmd {
@@ -79,15 +88,18 @@ pub enum WorkspacesCmd {
     Activate {
         id: String,
         wait: bool,
+        first: First,
     },
     Cleanup {
         id: String,
         wait: bool,
+        first: First,
     },
     ForceRelaunch {
         id: String,
         yes: bool,
         wait: bool,
+        first: First,
     },
     Reset {
         id: String,
@@ -96,6 +108,7 @@ pub enum WorkspacesCmd {
     Stop {
         id: String,
         wait: bool,
+        first: First,
     },
     /// `file`: inside the workspace folder; `None` is `workspace.toml`.
     Edit {
@@ -197,11 +210,12 @@ pub fn parse(words: Vec<String>) -> std::result::Result<WorkspacesCmd, String> {
         return Ok(WorkspacesCmd::Rename { id, to, move_schedules });
     }
     let mut positional = Vec::new();
-    let (mut yes, mut wait, mut path_only) = (false, false, false);
+    let (mut yes, mut wait, mut path_only, mut first) = (false, false, false, false);
     for word in words {
         match word.as_str() {
             "--yes" | "-y" => yes = true,
             "--wait" => wait = true,
+            "--first" => first = true,
             "--path" if sub == "edit" => path_only = true,
             w if w.starts_with('-') && w.len() > 1 => {
                 return Err(format!("unknown option '{}'", w.split('=').next().unwrap_or(w)));
@@ -210,17 +224,24 @@ pub fn parse(words: Vec<String>) -> std::result::Result<WorkspacesCmd, String> {
         }
     }
     // Which command takes which flag; anything else is a mistake worth naming.
-    let (takes_yes, takes_wait) = match sub.as_str() {
-        "force-relaunch" => (true, true),
-        "activate" | "cleanup" | "stop" => (false, true),
-        "reset" => (true, false),
-        _ => (false, false),
+    let (takes_yes, takes_wait, takes_first) = match sub.as_str() {
+        "force-relaunch" => (true, true, true),
+        // `--yes` there only answers --first's question.
+        "activate" | "cleanup" | "stop" => (first, true, true),
+        "reset" => (true, false, false),
+        _ => (false, false, false),
     };
-    for (given, allowed, flag) in [(yes, takes_yes, "--yes"), (wait, takes_wait, "--wait")] {
+    for (given, allowed, flag) in
+        [(yes, takes_yes, "--yes"), (wait, takes_wait, "--wait"), (first, takes_first, "--first")]
+    {
         if given && !allowed {
-            return Err(format!("'workspaces {sub}' takes no {flag}"));
+            return Err(match flag == "--yes" && takes_first {
+                true => format!("'workspaces {sub}' takes --yes only with --first"),
+                false => format!("'workspaces {sub}' takes no {flag}"),
+            });
         }
     }
+    let first = first.then_some(yes);
     let name = |positional: Vec<String>| -> std::result::Result<String, String> {
         match <[String; 1]>::try_from(positional) {
             Ok([id]) => Ok(id),
@@ -234,11 +255,11 @@ pub fn parse(words: Vec<String>) -> std::result::Result<WorkspacesCmd, String> {
             false => Err("'workspaces list' takes no arguments".into()),
         },
         "status" => Ok(WorkspacesCmd::Status { id: name(positional)? }),
-        "activate" => Ok(WorkspacesCmd::Activate { id: name(positional)?, wait }),
-        "cleanup" => Ok(WorkspacesCmd::Cleanup { id: name(positional)?, wait }),
-        "force-relaunch" => Ok(WorkspacesCmd::ForceRelaunch { id: name(positional)?, yes, wait }),
+        "activate" => Ok(WorkspacesCmd::Activate { id: name(positional)?, wait, first }),
+        "cleanup" => Ok(WorkspacesCmd::Cleanup { id: name(positional)?, wait, first }),
+        "force-relaunch" => Ok(WorkspacesCmd::ForceRelaunch { id: name(positional)?, yes, wait, first }),
         "reset" => Ok(WorkspacesCmd::Reset { id: name(positional)?, yes }),
-        "stop" => Ok(WorkspacesCmd::Stop { id: name(positional)?, wait }),
+        "stop" => Ok(WorkspacesCmd::Stop { id: name(positional)?, wait, first }),
         "remove" => Ok(WorkspacesCmd::Remove { id: name(positional)? }),
         "edit" => {
             let mut words = positional.into_iter();
@@ -426,9 +447,15 @@ pub async fn run(client: &mut Client, cmd: &WorkspacesCmd, json: bool, prompt: &
             let data = client.call("workspaces.status", id_params(id)).await?;
             Ok(out(&data, status(&data)))
         }
-        WorkspacesCmd::Activate { id, wait } => queued(client, Queued::Activate, id, *wait, json).await,
-        WorkspacesCmd::Cleanup { id, wait } => queued(client, Queued::Cleanup, id, *wait, json).await,
-        WorkspacesCmd::Stop { id, wait } => queued(client, Queued::Stop, id, *wait, json).await,
+        WorkspacesCmd::Activate { id, wait, first } => {
+            queued(client, prompt, Queued::Activate, id, (*wait, *first), json).await
+        }
+        WorkspacesCmd::Cleanup { id, wait, first } => {
+            queued(client, prompt, Queued::Cleanup, id, (*wait, *first), json).await
+        }
+        WorkspacesCmd::Stop { id, wait, first } => {
+            queued(client, prompt, Queued::Stop, id, (*wait, *first), json).await
+        }
         WorkspacesCmd::Edit { id, file, path_only } => {
             // Through the daemon first: an unknown workspace is its `not_found`, not a new file.
             client.call("workspaces.status", id_params(id)).await?;
@@ -449,13 +476,13 @@ pub async fn run(client: &mut Client, cmd: &WorkspacesCmd, json: bool, prompt: &
         }
         WorkspacesCmd::Remove { id } => {
             let data = client.call("workspaces.remove", id_params(id)).await?;
-            Ok(out(&data, format!("removed {id} (undo: shimmer workspaces restore {id})")))
+            Ok(out(&data, format!("{} {id} (undo: shimmer workspaces restore {id})", paint(Role::Success, "removed"))))
         }
         WorkspacesCmd::Restore { id } => {
             let data = client.call("workspaces.restore", id_params(id)).await?;
             Ok(out(&data, format!("✓ {id} restored")))
         }
-        WorkspacesCmd::ForceRelaunch { id, yes, wait } => {
+        WorkspacesCmd::ForceRelaunch { id, yes, wait, first } => {
             if !*yes {
                 let current = client.call("workspaces.status", id_params(id)).await?;
                 let question = "Launch it anyway, without cleaning up?";
@@ -463,7 +490,7 @@ pub async fn run(client: &mut Client, cmd: &WorkspacesCmd, json: bool, prompt: &
                     return Ok(format!("{id} was not relaunched"));
                 }
             }
-            queued(client, Queued::ForceRelaunch, id, *wait, json).await
+            queued(client, prompt, Queued::ForceRelaunch, id, (*wait, *first), json).await
         }
         WorkspacesCmd::Templates { which } => {
             let data = client.call("workspaces.templates", json!({})).await?;
@@ -624,16 +651,36 @@ impl Queued {
     }
 }
 
-/// Send a queued op; with `wait`, follow its task to the end.
-async fn queued(client: &mut Client, kind: Queued, id: &str, wait: bool, json: bool) -> Result<String> {
+/// Send a queued op; with `wait`, follow its task to the end; with `first`, ahead of its lane
+/// once the person agrees to what it runs ahead of (#222).
+async fn queued(
+    client: &mut Client,
+    prompt: &mut dyn Prompt,
+    kind: Queued,
+    id: &str,
+    (wait, first): (bool, First),
+    json: bool,
+) -> Result<String> {
     if wait {
         // Before the request, so not even the first event can be missed.
         client.subscribe(&["queue.task.*"]).await?;
     }
-    let handle = client.call(kind.op(), json!({"id": id})).await?;
+    let handle = match first {
+        None => client.call(kind.op(), json!({"id": id})).await?,
+        Some(yes) => match crate::first::send(client, kind.op(), json!({"id": id}), yes, prompt).await? {
+            Some(handle) => handle,
+            // Said no to running first: nothing was sent, and --json says so as JSON (#230).
+            None if json => return Ok(render::json(&json!({"queued": false}))),
+            None => return Ok(format!("{id}: nothing queued")),
+        },
+    };
     let task = handle["task_id"].as_str().ok_or_else(|| Error::internal("no task_id in the queued response"))?;
     if !wait {
-        return Ok(if json { render::json(&handle) } else { queued_message(kind, id, task) });
+        return Ok(match (json, first) {
+            (true, _) => render::json(&handle),
+            (false, None) => queued_message(kind, id, task),
+            (false, Some(_)) => first_message(kind, id, task, handle["position"].as_u64().unwrap_or(0)),
+        });
     }
     let look = format!("shimmer workspaces status {id}");
     match follow(client, task, !json, &look).await {
@@ -679,6 +726,17 @@ fn shown_log(text: &str, log: &str) -> Vec<String> {
         lines.insert(0, format!("  … (the whole log: {log})"));
     }
     lines
+}
+
+/// After `--first`: where it landed. `position` is its place among the waiting tasks; anything
+/// ahead of it was run first earlier, which a new `--first` doesn't jump (#230).
+fn first_message(kind: Queued, id: &str, task: &str, position: u64) -> String {
+    let place = match position {
+        0 => " first in its lane".to_owned(),
+        1 => " in its lane, behind 1 task already run first".to_owned(),
+        n => format!(" in its lane, behind {n} tasks already run first"),
+    };
+    queued_message(kind, id, task).replacen(" (task", &format!("{place} (task"), 1)
 }
 
 fn queued_message(kind: Queued, id: &str, task: &str) -> String {
@@ -934,7 +992,7 @@ fn template_in_full(t: &Value, categories: &[Value]) -> String {
     let id = t["id"].as_str().unwrap_or_default();
     let list = |key: &str| t[key].as_array().cloned().unwrap_or_default();
     let category = categories.iter().find(|c| c["id"] == t["category"]).map(|c| cell(&c["label"]));
-    let mut out = format!("{id}: {}", cell(&t["label"]));
+    let mut out = format!("{}: {}", paint(Role::Name, id), cell(&t["label"]));
     if let Some(category) = category {
         let _ = write!(out, "  ({category})");
     }
@@ -945,7 +1003,7 @@ fn template_in_full(t: &Value, categories: &[Value]) -> String {
         if items.is_empty() {
             continue;
         }
-        let _ = writeln!(out, "\n{heading}");
+        let _ = writeln!(out, "\n{}", paint(Role::Heading, heading));
         for item in &items {
             let _ = writeln!(out, "  • {}", wrap(item.as_str().unwrap_or_default(), 86, "    "));
         }
@@ -953,7 +1011,8 @@ fn template_in_full(t: &Value, categories: &[Value]) -> String {
 
     let steps = list("steps");
     if !steps.is_empty() {
-        let _ = writeln!(out, "\nWhen you activate it ({} steps, one after another)", steps.len());
+        let title = format!("When you activate it ({} steps, one after another)", steps.len());
+        let _ = writeln!(out, "\n{}", paint(Role::Heading, &title));
         let name_width = steps.iter().map(|s| cell(&s["name"]).chars().count()).max().unwrap_or(0);
         let how_width = steps.iter().map(|s| how_it_runs(s).chars().count()).max().unwrap_or(0);
         for (i, step) in steps.iter().enumerate() {
@@ -962,23 +1021,27 @@ fn template_in_full(t: &Value, categories: &[Value]) -> String {
             let indent = " ".repeat(line.chars().count());
             let width = 100usize.saturating_sub(indent.len()).max(30);
             let what = wrap(step["description"].as_str().unwrap_or_default(), width, &indent);
+            // Coloured after measuring, so the escape codes don't count towards the indent.
+            let line = line.replacen(name, &paint(Role::Name, name), 1);
             let _ = writeln!(out, "{}", format!("{line}{what}").trim_end());
         }
     }
     if let Some(stop) = t["on_stop"].as_str() {
-        let _ = writeln!(out, "\nWhen you stop it\n  {}", wrap(stop, 88, "  "));
+        let _ = writeln!(out, "\n{}\n  {}", paint(Role::Heading, "When you stop it"), wrap(stop, 88, "  "));
     }
 
     let questions = list("questions");
     if questions.is_empty() {
-        out.push_str("\nNo questions\n");
+        let _ = writeln!(out, "\n{}", paint(Role::Heading, "No questions"));
     } else {
-        out.push_str("\nQuestions (asked when you make one; or answer with --set NAME=ANSWER)\n");
+        let title = "Questions (asked when you make one; or answer with --set NAME=ANSWER)";
+        let _ = writeln!(out, "\n{}", paint(Role::Heading, title));
         let width = questions.iter().map(|q| cell(&q["name"]).chars().count()).max().unwrap_or(0);
         let pad = " ".repeat(width + 4);
         for q in &questions {
             let name = q["name"].as_str().unwrap_or_default();
-            let _ = writeln!(out, "  {name:<width$}  {}", q["prompt"].as_str().unwrap_or_default());
+            let gap = " ".repeat(width.saturating_sub(name.chars().count()));
+            let _ = writeln!(out, "  {}{gap}  {}", paint(Role::Name, name), q["prompt"].as_str().unwrap_or_default());
             let mut facts = Vec::new();
             if let Some(choices) = q["choices"].as_array() {
                 facts.push(choices.iter().map(|c| c.as_str().unwrap_or_default()).collect::<Vec<_>>().join(" | "));
@@ -1075,8 +1138,8 @@ fn created(id: &str, template: &str) -> String {
 pub fn list(data: &Value) -> String {
     let items = data["workspaces"].as_array().map(Vec::as_slice).unwrap_or_default();
     if items.is_empty() {
-        return "no workspaces yet: add a folder with a workspace.toml under data/workspaces/ \
-                in your Shimmer folder (ADR 0012)"
+        return "no workspaces yet: see 'shimmer workspaces templates', then \
+                'shimmer workspaces new NAME --from TEMPLATE'"
             .into();
     }
     let rows: Vec<Vec<String>> = items
@@ -1097,7 +1160,7 @@ pub fn list(data: &Value) -> String {
 /// `workspaces.status` in full.
 pub fn status(data: &Value) -> String {
     let id = data["id"].as_str().unwrap_or_default();
-    let mut out = format!("{id}  ({})", cell(&data["state"]));
+    let mut out = format!("{}  ({})", paint(Role::Name, id), crate::style::state(&cell(&data["state"])));
     if let Some(label) = data["label"].as_str() {
         let _ = write!(out, "  {label}");
     }
@@ -1115,7 +1178,9 @@ pub fn status(data: &Value) -> String {
                 Some(t) => format!("{}, timeout {t}s", cell(&s["mode"])),
                 None => cell(&s["mode"]),
             };
-            let _ = write!(out, "\n    {}  {:width$}  {mode}", cell(&s["index"]), cell(&s["name"]));
+            let name = cell(&s["name"]);
+            let pad = " ".repeat(width.saturating_sub(name.len()));
+            let _ = write!(out, "\n    {}  {}{pad}  {mode}", cell(&s["index"]), paint(Role::Name, &name));
             if let Some(d) = s["description"].as_str() {
                 let _ = write!(out, "  ({d})");
             }
@@ -1132,7 +1197,8 @@ pub fn status(data: &Value) -> String {
     if let Some(d) = data.get("dirty").filter(|d| d.is_object()) {
         let _ = write!(
             out,
-            "\n  dirty: step {}: {} (at {})",
+            "\n  {}: step {}: {} (at {})",
+            paint(Role::Error, "dirty"),
             cell(&d["failed_step"]),
             d["reason"].as_str().unwrap_or_default(),
             cell(&d["failed_at"])
@@ -1214,7 +1280,7 @@ mod tests {
         }
         assert_eq!(
             parse_words(&["stop", "site", "--wait"]).unwrap(),
-            WorkspacesCmd::Stop { id: "site".into(), wait: true }
+            WorkspacesCmd::Stop { id: "site".into(), wait: true, first: None }
         );
         assert_eq!(parse_words(&["remove", "site"]).unwrap(), WorkspacesCmd::Remove { id: "site".into() });
         assert_eq!(parse_words(&["restore", "site"]).unwrap(), WorkspacesCmd::Restore { id: "site".into() });
@@ -1225,22 +1291,37 @@ mod tests {
     fn queued_commands_take_wait_and_force_relaunch_takes_yes() {
         assert_eq!(
             parse_words(&["activate", "deep-work"]).unwrap(),
-            WorkspacesCmd::Activate { id: "deep-work".into(), wait: false }
+            WorkspacesCmd::Activate { id: "deep-work".into(), wait: false, first: None }
         );
         assert_eq!(
             parse_words(&["activate", "--wait", "deep-work"]).unwrap(),
-            WorkspacesCmd::Activate { id: "deep-work".into(), wait: true }
+            WorkspacesCmd::Activate { id: "deep-work".into(), wait: true, first: None }
         );
         assert_eq!(
             parse_words(&["cleanup", "deep-work", "--wait"]).unwrap(),
-            WorkspacesCmd::Cleanup { id: "deep-work".into(), wait: true }
+            WorkspacesCmd::Cleanup { id: "deep-work".into(), wait: true, first: None }
         );
         assert_eq!(
             parse_words(&["force-relaunch", "deep-work", "--yes", "--wait"]).unwrap(),
-            WorkspacesCmd::ForceRelaunch { id: "deep-work".into(), yes: true, wait: true }
+            WorkspacesCmd::ForceRelaunch { id: "deep-work".into(), yes: true, wait: true, first: None }
+        );
+        // #222: --first on every queued command; --yes then answers its question.
+        assert_eq!(
+            parse_words(&["activate", "x", "--first"]).unwrap(),
+            WorkspacesCmd::Activate { id: "x".into(), wait: false, first: Some(false) }
+        );
+        assert_eq!(
+            parse_words(&["stop", "x", "--first", "--yes", "--wait"]).unwrap(),
+            WorkspacesCmd::Stop { id: "x".into(), wait: true, first: Some(true) }
+        );
+        assert_eq!(
+            parse_words(&["force-relaunch", "x", "--first", "--yes"]).unwrap(),
+            WorkspacesCmd::ForceRelaunch { id: "x".into(), yes: true, wait: false, first: Some(true) }
         );
         for (words, expected) in [
-            (&["activate", "x", "--yes"][..], "'workspaces activate' takes no --yes"),
+            (&["activate", "x", "--yes"][..], "'workspaces activate' takes --yes only with --first"),
+            (&["reset", "x", "--first"], "'workspaces reset' takes no --first"),
+            (&["status", "x", "--first"], "'workspaces status' takes no --first"),
             (&["reset", "x", "--wait"], "'workspaces reset' takes no --wait"),
             (&["status", "x", "--wait"], "'workspaces status' takes no --wait"),
             (&["force_relaunch", "x"], "unknown workspaces command 'force_relaunch'"),
@@ -1248,6 +1329,20 @@ mod tests {
             let e = parse_words(words).unwrap_err();
             assert!(e.contains(expected), "{words:?}: {e}");
         }
+    }
+
+    #[test]
+    fn first_says_where_it_landed() {
+        // #230 (Wasay's #223 review): a second --first lands behind the first, so "first in its
+        // lane" is only said when it is.
+        let first = first_message(Queued::Activate, "c", "t1", 0);
+        assert!(first.starts_with("queued the launch of c first in its lane (task t1)"), "{first}");
+        let behind = first_message(Queued::Activate, "d", "t2", 1);
+        assert!(
+            behind.starts_with("queued the launch of d in its lane, behind 1 task already run first (task t2)"),
+            "{behind}"
+        );
+        assert!(first_message(Queued::Stop, "e", "t3", 2).contains("behind 2 tasks already run first"));
     }
 
     #[test]

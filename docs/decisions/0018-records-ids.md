@@ -110,6 +110,7 @@ $ shimmer records rename jobs/amzon-sde amazon-sde
   The title is the obvious source; add a key only if real collections need something else.
 - **Transliterating non-Latin titles** (`"شركة"` → `sharika`). Those fall back to the date id;
   a transliteration table is a large dependency for a small gain.
-- **Renaming a collection.** Roadmap item 10.
+- **Renaming a collection.** Roadmap item 10. **Done since:** ADR 0021.
 - **Updating references when a record is renamed.** References don't exist yet (roadmap item 13);
-  when they do, they follow `records.item.renamed`.
+  when they do, they follow `records.item.renamed`. **Done since:** `records.rename` rewrites every
+  `ref` to the record in the same transaction (ADR 0024 §3).
