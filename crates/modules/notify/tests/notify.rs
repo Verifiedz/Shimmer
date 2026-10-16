@@ -246,7 +246,11 @@ async fn the_inbox_lists_newest_first_with_filters_and_counts() {
     let one = t.call("notify.get", json!({"id": alert["id"]})).await;
     assert_eq!(one["source"], "alert:workspace_dirty");
     assert!(t.fails("notify.get", json!({"id": "01JD2T0000000000000000000A"})).await.message.contains("no message"));
-    assert!(t.fails("notify.get", json!({"id": "../x"})).await.message.contains("isn't a message id"));
+    assert_eq!(
+        t.fails("notify.get", json!({"id": "../x"})).await.code,
+        ErrorCode::NotFound,
+        "only inbox ids are paths"
+    );
     assert!(t.fails("notify.list", json!({"from": "friends"})).await.message.contains("schedules"));
 }
 
@@ -291,6 +295,34 @@ async fn removing_by_ids_is_at_once_and_in_bulk_asks_first() {
     assert_eq!(t.call("notify.remove", json!({"text": "b", "confirm": true})).await["removed"], 1);
     assert_eq!(titles(&t.call("notify.list", json!({})).await), ["c"]);
     assert!(t.topics().contains(&"notify.message.removed".into()));
+}
+
+#[tokio::test]
+async fn an_id_can_be_the_ending_list_shows_but_never_under_four_characters() {
+    let t = setup();
+    let ids = [t.send("a").await, t.send("b").await, t.send("c").await];
+
+    // `short` is worked out against the whole inbox, so even a one-message page gives one that
+    // finds its message (#246's review).
+    let page = t.call("notify.list", json!({"limit": 1})).await;
+    let short = page["items"][0]["short"].as_str().unwrap().to_owned();
+    assert!(short.len() >= 6 && ids[2].ends_with(&short), "{short}");
+    assert_eq!(t.call("notify.get", json!({"id": short.to_lowercase()})).await["title"], "c");
+    let list = t.call("notify.list", json!({})).await;
+    for item in list["items"].as_array().unwrap() {
+        assert_eq!(t.call("notify.get", json!({"id": item["short"]})).await["id"], item["id"]);
+    }
+
+    // `shimmer notify remove 5`: one character never picks a message, even when only one ends so.
+    for written in [&ids[0][25..], &ids[0][23..]] {
+        let e = t.fails("notify.remove", json!({"ids": [written]})).await;
+        assert_eq!(e.code, ErrorCode::InvalidParams, "{written}");
+        assert!(e.message.contains("at least 4"), "{}", e.message);
+    }
+    assert_eq!(t.files("inbox").len(), 3, "nothing removed");
+    assert_eq!(t.call("notify.mark_read", json!({"ids": [&ids[0][20..]]})).await["marked"], 1);
+    assert_eq!(t.call("notify.remove", json!({"ids": [&ids[1][20..], &ids[2]]})).await["removed"], 2);
+    assert_eq!(titles(&t.call("notify.list", json!({})).await), ["a"]);
 }
 
 #[tokio::test]
