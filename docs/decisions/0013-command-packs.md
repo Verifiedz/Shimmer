@@ -189,7 +189,8 @@ the file it's in.
   (`shimmer_core::ids::is_valid_name`: `[a-z][a-z0-9_-]*`, so it starts with a letter), is at
   most 32 characters, and is not `none`.
 - `[pack] label` is required: one line, 1–40 characters, no control characters.
-- `[alias]` has at least one entry and at most 64.
+- `[alias]` has at least one entry and at most 256 (raised from 64 when notify, ADR 0032, took the
+  commands a built-in pack must name, ADR 0029, past it).
 
 **Each alias:**
 
