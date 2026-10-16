@@ -15,12 +15,15 @@ fn call(home: &Home, op: &str, params: Value) -> Value {
     serde_json::from_slice(&o.stdout).unwrap()
 }
 
-/// `notify.list` once the queued sends have run: `n` messages, for up to 10 s.
+/// `notify.list` once the queued sends have run: `n` messages, none still `pending`, for up to
+/// 10 s. A message is written as `pending` when it lands, then again once delivery was tried:
+/// looking in between would see `pending` (it did, on CI).
 fn inbox(home: &Home, n: usize) -> Value {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let list = call(home, "notify.list", json!({}));
-        if list["items"].as_array().is_some_and(|i| i.len() == n) {
+        let items = list["items"].as_array().cloned().unwrap_or_default();
+        if items.len() == n && items.iter().all(|m| m["state"] != "pending") {
             return list;
         }
         assert!(Instant::now() < deadline, "the inbox never had {n} messages: {list}");
