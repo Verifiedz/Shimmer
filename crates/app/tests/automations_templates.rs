@@ -176,8 +176,10 @@ fn background_pid() -> Option<(u32, std::path::PathBuf)> {
     Some((pid, dir))
 }
 
-/// Running, not a zombie waiting to be reaped.
+/// Running, not a zombie waiting to be reaped. `ps`, not `/proc`: macOS has no `/proc`.
 fn alive(pid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .is_ok_and(|stat| stat.rsplit(')').next().is_some_and(|rest| !rest.trim_start().starts_with('Z')))
+    std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .is_ok_and(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().starts_with('Z'))
 }
