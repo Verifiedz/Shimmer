@@ -1,6 +1,6 @@
 [package]
 name = "shimmer-notify"
-description = "The notify module (ADR 0032): an inbox of every message, quiet hours, built-in alerts and sinks. Depends on core only."
+description = "The notify module (ADR 0032): an inbox of every message, quiet hours, pause and sinks. Depends on core only."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

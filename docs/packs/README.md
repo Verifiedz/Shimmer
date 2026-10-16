@@ -157,7 +157,9 @@ On the right of each alias goes the command it runs, by its op name:
 | `queue.list`, `.task`, `.cancel`, `.reorder` | `shimmer queue list`, `show`, `cancel`, `move` |
 | `scheduler.list`, `.get`, `.add`, `.pause`, `.resume`, `.remove` | `shimmer scheduler list`, `show`, `add`, `pause`, `resume`, `remove` |
 | `notify.list`, `.count`, `.remove`, `.send`, `.test`, `.resend`, `.pause`, `.resume`, `.quiet`, `.status`, `.cap` | `shimmer notify <verb>` |
-| `notify.get`, `.mark_read`, `.mark_unread`, `.builtin_alerts` | `shimmer notify show`, `mark-read`, `mark-unread`, `builtin-alerts` |
+| `notify.get`, `.mark_read`, `.mark_unread` | `shimmer notify show`, `mark-read`, `mark-unread` |
+| `automations.list`, `.remove`, `.restore`, `.enable`, `.disable`, `.test`, `.events`, `.history`, `.status`, `.depth`, `.reload`, `.templates`, `.peek` | `shimmer automations <verb>` |
+| `automations.get`, `.create`, `.save` | `shimmer automations show`, `new`, `edit` |
 
 `shimmer packs --help` prints the same list. Your own pack names as many or as few as you like;
 the built-in packs name every one.
