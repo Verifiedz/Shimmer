@@ -101,6 +101,22 @@ async fn rules_are_files_made_checked_switched_and_removed() {
     call(&m, ctx, "automations.remove", json!({"id": "mine"})).await.unwrap();
     assert!(env.backend.read("automations", "rules/mine.toml").unwrap().is_none());
     assert_eq!(call(&m, ctx, "automations.get", json!({"id": "mine"})).await.unwrap_err().code, ErrorCode::NotFound);
+    assert_eq!(call(&m, ctx, "automations.list", json!({})).await.unwrap()["removed"], json!(["mine"]));
+
+    // Restored as it was; not over a rule of the same id, and only once.
+    call(&m, ctx, "automations.create", json!({"id": "mine", "text": DONE})).await.unwrap();
+    let busy = call(&m, ctx, "automations.restore", json!({"id": "mine"})).await.unwrap_err();
+    assert_eq!(busy.code, ErrorCode::Conflict);
+    let before = env.backend.read("automations", "rules/solved.toml").unwrap().unwrap();
+    call(&m, ctx, "automations.remove", json!({"id": "solved"})).await.unwrap();
+    let back = call(&m, ctx, "automations.restore", json!({"id": "solved"})).await.unwrap();
+    assert_eq!(
+        (back["rule"]["label"].clone(), back["problem"].clone()),
+        (json!("Tell me when it's done"), json!(null))
+    );
+    assert_eq!(env.backend.read("automations", "rules/solved.toml").unwrap().unwrap(), before, "as it was");
+    let gone = call(&m, ctx, "automations.restore", json!({"id": "solved"})).await.unwrap_err();
+    assert_eq!(gone.code, ErrorCode::NotFound);
     assert_eq!(
         topics(&env),
         [
@@ -108,7 +124,10 @@ async fn rules_are_files_made_checked_switched_and_removed() {
             "automations.rule.disabled",
             "automations.rule.enabled",
             "automations.rule.created",
-            "automations.rule.removed"
+            "automations.rule.removed",
+            "automations.rule.created",
+            "automations.rule.removed",
+            "automations.rule.restored"
         ]
     );
 }
@@ -219,6 +238,15 @@ async fn settings_and_hand_edited_files_are_read_and_problems_reported() {
     call(&m, ctx, "automations.reload", json!({})).await.unwrap();
     call(&m, ctx, "automations.remove", json!({"id": "worse"})).await.unwrap();
     assert_eq!(call(&m, ctx, "automations.status", json!({})).await.unwrap()["problems"], json!([]));
+    // Restored, it's still broken: reported again, not lost.
+    let back = call(&m, ctx, "automations.restore", json!({"id": "worse"})).await.unwrap();
+    assert_eq!(back["rule"], json!(null));
+    assert!(back["problem"].as_str().unwrap().contains("not a rule file"));
+    assert_eq!(
+        call(&m, ctx, "automations.status", json!({})).await.unwrap()["problems"][0]["file"],
+        "rules/worse.toml"
+    );
+    call(&m, ctx, "automations.remove", json!({"id": "worse"})).await.unwrap();
 
     let set = call(&m, ctx, "automations.depth", json!({"depth": 11})).await.unwrap_err();
     assert_eq!(set.code, ErrorCode::InvalidParams);

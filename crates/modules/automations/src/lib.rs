@@ -20,6 +20,8 @@ use chain::{Chain, Chains};
 use rule::Rule;
 
 const RULES: &str = "rules";
+/// Removed rules, until restored: `removed/<id>.toml`.
+const REMOVED: &str = "removed";
 const SETTINGS: &str = "settings.toml";
 const HISTORY: &str = "history.json";
 /// Firings kept in `history.json`, oldest dropped; the event log keeps them all (§8).
@@ -31,10 +33,11 @@ const DEPTH_RANGE: std::ops::RangeInclusive<usize> = 1..=10;
 const LABEL_CHARS: usize = 150;
 
 /// Every topic automations emits, with a line on it for `automations events` (§5.5).
-const TOPICS: [(&str, &str); 8] = [
+const TOPICS: [(&str, &str); 9] = [
     ("automations.rule.created", "a rule was created"),
     ("automations.rule.edited", "a rule was changed"),
-    ("automations.rule.removed", "a rule was removed"),
+    ("automations.rule.removed", "a rule was removed (it can be restored)"),
+    ("automations.rule.restored", "a removed rule came back"),
     ("automations.rule.enabled", "a rule was switched on"),
     ("automations.rule.disabled", "a rule was switched off"),
     ("automations.rule.fired", "a rule reacted to an event"),
@@ -175,7 +178,7 @@ impl Automations {
     fn list(&self, ctx: &Ctx) -> Value {
         let history = history(ctx);
         let rules: Vec<Value> = self.state().rules.values().map(|r| view(r, &history)).collect();
-        json!({"rules": rules, "problems": self.problems()})
+        json!({"rules": rules, "problems": self.problems(), "removed": removed(ctx)})
     }
 
     fn problems(&self) -> Vec<Value> {
@@ -235,7 +238,11 @@ impl Automations {
         if ctx.store.read(&path(id))?.is_none() {
             return Err(Error::not_found(format!("no rule '{id}'")));
         }
+        // Moved, not deleted, so `restore` can bring it back. An older removed rule with the same
+        // id is replaced.
+        let text = ctx.store.read(&path(id))?.unwrap_or_default();
         ctx.store.transaction(|tx| {
+            tx.put(&removed_path(id), text)?;
             tx.delete(&path(id))?;
             tx.emit("automations.rule.removed", json!({"rule": id}))
         })?;
@@ -243,6 +250,36 @@ impl Automations {
         st.rules.remove(id);
         st.problems.retain(|(file, _)| *file != path(id));
         Ok(json!({"removed": true, "rule": id}))
+    }
+
+    /// Bring a removed rule back, as it was. One that no longer checks (an op it names is gone) is
+    /// still restored, and reported like any rule file that can't be used.
+    fn restore(&self, ctx: &Ctx, id: &str) -> Result<Value> {
+        let _g = self.write.lock();
+        let Some(text) = ctx.store.read_string(&removed_path(id))? else {
+            return Err(Error::not_found(format!("no removed rule '{id}'")));
+        };
+        if ctx.store.read(&path(id))?.is_some() {
+            return Err(Error::conflict(format!("a rule '{id}' exists: remove or rename it first")));
+        }
+        ctx.store.transaction(|tx| {
+            tx.put(&path(id), text.as_str())?;
+            tx.delete(&removed_path(id))?;
+            tx.emit("automations.rule.restored", json!({"rule": id}))
+        })?;
+        let parsed = Rule::parse(id, &text, &ctx.catalog, false);
+        let mut st = self.state();
+        match parsed {
+            Ok(rule) => {
+                st.rules.insert(id.to_owned(), rule.clone());
+                drop(st);
+                Ok(json!({"restored": true, "rule": view(&rule, &history(ctx)), "problem": null}))
+            }
+            Err(e) => {
+                st.problems.push((path(id), e.clone()));
+                Ok(json!({"restored": true, "rule": null, "problem": e}))
+            }
+        }
     }
 
     /// Switch a rule on or off, keeping the rest of its file as written.
@@ -391,7 +428,8 @@ impl Module for Automations {
                 json!({"type": "object", "required": ["id", "text"], "properties": {
                     "id": {"type": "string"}, "text": {"type": "string"}}}),
             ),
-            ("automations.remove", "Remove a rule", id()),
+            ("automations.remove", "Remove a rule; it can be restored", id()),
+            ("automations.restore", "Bring a removed rule back", id()),
             ("automations.enable", "Switch a rule on", id()),
             ("automations.disable", "Switch a rule off", id()),
             ("automations.reload", "Re-read the rule files after editing them by hand", json!({"type": "object"})),
@@ -440,6 +478,7 @@ impl Module for Automations {
             "automations.create" => self.create(ctx, decode(params)?),
             "automations.save" => self.save(ctx, decode(params)?),
             "automations.remove" => self.remove(ctx, &decode::<Id>(params)?.id),
+            "automations.restore" => self.restore(ctx, &decode::<Id>(params)?.id),
             "automations.enable" => self.set_enabled(ctx, &decode::<Id>(params)?.id, true),
             "automations.disable" => self.set_enabled(ctx, &decode::<Id>(params)?.id, false),
             "automations.reload" => {
@@ -517,6 +556,20 @@ struct DepthParams {
 
 fn path(id: &str) -> String {
     format!("{RULES}/{id}.toml")
+}
+
+fn removed_path(id: &str) -> String {
+    format!("{REMOVED}/{id}.toml")
+}
+
+/// The ids of removed rules, to restore.
+fn removed(ctx: &Ctx) -> Vec<String> {
+    let files = ctx.store.list(REMOVED).unwrap_or_default();
+    files
+        .iter()
+        .filter_map(|f| f.strip_prefix("removed/").and_then(|f| f.strip_suffix(".toml")))
+        .map(str::to_owned)
+        .collect()
 }
 
 /// `settings.toml`'s depth limit: the default when there's no file or no `depth`.
