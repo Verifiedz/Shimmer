@@ -716,3 +716,18 @@ async fn a_module_removes_only_its_own_one_time_schedules_and_people_pause_them(
     }
     stop(d).await;
 }
+
+/// ADR 0035 §5.7: a module reads every op and topic, the daemon's own topics included.
+#[tokio::test]
+async fn a_modules_catalog_lists_every_op_and_topic() {
+    let env = Env::new();
+    let d = env.start_with_notify().await;
+    let mut c = Client::connect(&env.sock).await;
+    let got = c.call("demo.catalog", json!({})).await.unwrap();
+    let ops: Vec<&str> = got["ops"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    assert!(ops.contains(&"demo.echo") && ops.contains(&"notify.send"), "{ops:?}");
+    assert_eq!(got["topics"]["queue.task.failed"], "a task failed");
+    assert_eq!(got["topics"]["demo.item.saved"], "", "a topic with no description");
+    assert!(got["topics"].get("queue.task.progress").is_none(), "streamed only");
+    stop(d).await;
+}

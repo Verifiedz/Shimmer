@@ -4,6 +4,7 @@
 //! user is (§1.5): no identity, session or token types belong here.
 
 pub mod bus;
+pub mod catalog;
 pub mod clock;
 pub mod ctx;
 pub mod error;
@@ -32,6 +33,7 @@ pub mod testing;
 pub use serde_json::Value;
 
 pub use bus::{Emitter, EventSink};
+pub use catalog::Catalog;
 pub use clock::Clock;
 pub use ctx::{Ctx, ModuleConfig, ProgressFn};
 pub use error::{Error, ErrorCode, Result};

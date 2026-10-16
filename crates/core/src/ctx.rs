@@ -14,6 +14,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::bus::Emitter;
+use crate::catalog::Catalog;
 use crate::clock::Clock;
 use crate::error::{Error, Result};
 use crate::http::HttpGateway;
@@ -76,6 +77,9 @@ pub struct Ctx {
     /// Add a one-time schedule, or remove one this module added (ADR 0035 §5.6). Every module
     /// gets the daemon's; [`Schedules::unavailable`] until it's wired in.
     pub schedules: Schedules,
+    /// Every op and topic in the daemon, read-only, fixed at start (ADR 0035 §5.7). Empty until
+    /// the daemon fills it.
+    pub catalog: Arc<Catalog>,
     /// Cooperative cancellation. Long tasks must poll this.
     pub cancel: CancellationToken,
     pub config: ModuleConfig,
@@ -106,6 +110,7 @@ impl Ctx {
             local_tz,
             launcher: Launcher::unavailable(),
             schedules: Schedules::unavailable(module_id.clone()),
+            catalog: Arc::default(),
             cancel,
             config,
             module_id,

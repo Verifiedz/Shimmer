@@ -12,9 +12,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use shimmer_core::params::decode;
 use shimmer_core::{
-    Clock, Ctx, Emitter, Error, Execution, HttpBackend, HttpGateway, LaneConfig, LaneId, ModuleConfig, ModuleId,
-    NamespacedStore, OneTime, Origin, Priority, ProgressFn, QueueHandle, Result, ScheduleBackend, Schedules, TaskId,
-    TriggerId,
+    Catalog, Clock, Ctx, Emitter, Error, Execution, HttpBackend, HttpGateway, LaneConfig, LaneId, ModuleConfig,
+    ModuleId, NamespacedStore, OneTime, Origin, Priority, ProgressFn, QueueHandle, Result, ScheduleBackend, Schedules,
+    TaskId, TriggerId,
 };
 use shimmer_core::{EnqueueRequest, TaskSubmitter};
 #[cfg(unix)]
@@ -99,6 +99,7 @@ impl Core {
             let submitter: Arc<dyn TaskSubmitter> = Arc::new(QueueFront::new(&queue));
             // Every module gets it (ADR 0035 §5.6): the same power as `ctx.queue`, later.
             let schedules: Arc<dyn ScheduleBackend> = Arc::new(SchedulerFront(weak.clone()));
+            let catalog = Arc::new(catalog(&registry));
 
             let ctxs = registry
                 .entries
@@ -121,6 +122,7 @@ impl Core {
                         ctx.launcher = Launcher::new(real_launcher.clone());
                     }
                     ctx.schedules = Schedules::new(id.clone(), schedules.clone());
+                    ctx.catalog = catalog.clone();
                     if e.manifest.capabilities.iter().any(|c| c == "network") {
                         ctx.http = HttpGateway::new(id.clone(), real_http.clone());
                     }
@@ -272,6 +274,38 @@ impl OpRunner for Core {
             .for_task(task, cancel, progress);
         entry.module.handle(op, params, &ctx).await
     }
+}
+
+/// The daemon's own topics, which no module declares, with what they mean (`docs/protocol.md`).
+/// `queue.task.progress` is left out: it's streamed only, never logged or seen by modules.
+const SERVICE_TOPICS: [(&str, &str); 16] = [
+    ("queue.task.enqueued", "a task joined the queue"),
+    ("queue.task.started", "a task started running"),
+    ("queue.task.finished", "a task finished"),
+    ("queue.task.failed", "a task failed"),
+    ("queue.task.cancelled", "a task was cancelled"),
+    ("queue.task.promoted", "a task was moved to the front of its lane"),
+    ("queue.task.reordered", "a waiting task was moved within its lane"),
+    ("queue.fallback.enqueued", "a failed scheduled task's fallback message was queued"),
+    ("queue.fallback.failed", "a fallback message couldn't be queued"),
+    ("scheduler.trigger.added", "a schedule was added"),
+    ("scheduler.trigger.fired", "a schedule came due and queued its task"),
+    ("scheduler.trigger.missed", "a schedule came due while the computer was off"),
+    ("scheduler.trigger.skipped", "a schedule came due but didn't run"),
+    ("scheduler.trigger.paused", "a schedule was paused"),
+    ("scheduler.trigger.resumed", "a schedule was resumed"),
+    ("scheduler.trigger.removed", "a schedule was removed"),
+];
+
+/// `ctx.catalog` (ADR 0035 §5.7): every module op, and every topic with its description.
+fn catalog(registry: &Registry) -> Catalog {
+    let ops = registry.entries.iter().flat_map(|e| e.commands.iter().cloned());
+    let modules = registry
+        .entries
+        .iter()
+        .flat_map(|e| e.manifest.topics.iter().map(|t| (t.clone(), e.manifest.topic_descriptions.get(t).cloned())));
+    let services = SERVICE_TOPICS.iter().map(|(t, d)| (t.to_string(), Some(d.to_string())));
+    Catalog::new(ops, modules.chain(services))
 }
 
 /// `ctx.schedules`' way to the scheduler, which starts after the modules are initialised: until

@@ -72,6 +72,7 @@ impl Module for Demo {
             spec("demo.put_queued", slow()),
             spec("demo.later", Execution::Inline),
             spec("demo.cancel", Execution::Inline),
+            spec("demo.catalog", Execution::Inline),
         ]
     }
 
@@ -98,6 +99,13 @@ impl Module for Demo {
                 let (op, label) = (params["op"].as_str().unwrap_or(""), params["label"].as_str().unwrap_or(""));
                 let id = ctx.schedules.add_once(op, json!({"from": "later"}), at, label)?;
                 Ok(json!({"trigger_id": id}))
+            }
+            // What `ctx.catalog` says (ADR 0035 §5.7).
+            "demo.catalog" => {
+                let topics: serde_json::Map<String, Value> =
+                    ctx.catalog.topics().map(|(t, d)| (t.to_owned(), json!(d))).collect();
+                let ops: Vec<&str> = ctx.catalog.ops().map(|c| c.op.as_str()).collect();
+                Ok(json!({"ops": ops, "topics": topics}))
             }
             "demo.cancel" => {
                 let id = shimmer_core::TriggerId::new(params["trigger_id"].as_str().unwrap_or(""));
