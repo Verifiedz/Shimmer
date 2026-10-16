@@ -28,6 +28,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
+use shimmer_core::short_id;
 use shimmer_core::store::Tx;
 use shimmer_core::trigger::{CatchUp, Schedule, TriggerSpec};
 use shimmer_core::{
@@ -176,10 +177,7 @@ impl Selection {
                     return Err(Error::invalid_params("ids is empty: name at least one message"));
                 }
                 ids.iter()
-                    .map(|v| {
-                        let id = v.as_str().ok_or_else(|| Error::invalid_params("ids are text"))?;
-                        message::checked_id(id).map(String::from)
-                    })
+                    .map(|v| v.as_str().map(String::from).ok_or_else(|| Error::invalid_params("ids are text")))
                     .collect::<Result<_>>()
                     .map(Self::Ids)
             }
@@ -196,16 +194,13 @@ impl Selection {
         !matches!(self, Self::Ids(_))
     }
 
-    /// The ids it means, oldest first; named ids that don't exist are an error.
+    /// The ids it means, oldest first. A named id may be a unique ending of one (ADR 0031 §4's
+    /// short ids); one that doesn't exist is an error.
     fn resolve(&self, ctx: &Ctx) -> Result<Vec<String>> {
         match self {
-            Self::Ids(ids) => {
-                for id in ids {
-                    if read_message(ctx, id)?.is_none() {
-                        return Err(Error::not_found(format!("no message '{id}'")));
-                    }
-                }
-                Ok(ids.clone())
+            Self::Ids(written) => {
+                let ids = inbox_ids(ctx)?;
+                written.iter().map(|w| short_id::resolve(w, &ids, "message")).collect()
             }
             Self::All => inbox_ids(ctx),
             Self::Filter(f) => Ok(all_messages(ctx)?.into_iter().filter(|m| f.matches(m)).map(|m| m.id).collect()),
@@ -580,7 +575,19 @@ fn list(params: &Value, ctx: &Ctx) -> Result<Value> {
         }
     };
     let messages = all_messages(ctx)?;
-    let items: Vec<Value> = messages.iter().rev().filter(|m| filter.matches(m)).take(limit).map(json_of).collect();
+    // `short` is unique across the whole inbox, not only this page, so it always works given back.
+    let ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
+    let items: Vec<Value> = messages
+        .iter()
+        .rev()
+        .filter(|m| filter.matches(m))
+        .take(limit)
+        .map(|m| {
+            let mut item = json_of(m);
+            item["short"] = json!(short_id::ending(&m.id, &ids));
+            item
+        })
+        .collect();
     let mut out = json!({"items": items, "counts": counts(&messages)});
     let removed = removed_unread(ctx)?;
     if removed > 0 {
@@ -598,15 +605,16 @@ fn count(params: &Value, ctx: &Ctx) -> Result<Value> {
     Ok(out)
 }
 
-/// `notify.get`: `{"id"}`.
+/// `notify.get`: `{"id"}`, the whole id or a unique ending of one.
 fn get(params: &Value, ctx: &Ctx) -> Result<Value> {
-    let id = params
+    let written = params
         .get("id")
         .and_then(Value::as_str)
         .ok_or_else(|| Error::invalid_params("which message? {\"id\": ...}"))?;
-    match read_message(ctx, message::checked_id(id)?)? {
+    let id = short_id::resolve(written, &inbox_ids(ctx)?, "message")?;
+    match read_message(ctx, &id)? {
         Some(m) => Ok(json_of(&m)),
-        None => Err(Error::not_found(format!("no message '{id}'"))),
+        None => Err(Error::not_found(format!("no message '{written}'"))),
     }
 }
 

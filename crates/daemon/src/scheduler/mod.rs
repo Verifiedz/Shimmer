@@ -393,7 +393,7 @@ impl Scheduler {
         if ids.iter().any(|id| id == written) {
             return Ok(written.to_owned());
         }
-        crate::short_id::resolve(written, &ids, "trigger")
+        shimmer_core::short_id::resolve(written, &ids, "trigger")
     }
 
     /// One trigger, in exactly the shape a `scheduler.list` entry has (#76) — `queue show`

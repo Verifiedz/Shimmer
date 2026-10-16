@@ -95,6 +95,11 @@ fn the_notify_commands() {
     assert_eq!(common::ok(&home, &["notify", "count"]).trim(), "0", "show marks it read");
     assert!(common::ok(&home, &["notify", "mark-unread", "--all"]).starts_with("✓ marked 1 message unread"));
 
+    // One character never picks a message, even the only one it ends (#246's review).
+    let typo = common::fails(&home, &["notify", "remove", &id[id.len() - 1..]]);
+    assert!(typo.contains("at least 4"), "{typo}");
+    assert_eq!(common::ok(&home, &["notify", "count"]).trim(), "1", "nothing removed");
+
     // A bulk remove asks first; with no one to ask, it says to add --yes.
     let refused = common::fails(&home, &["notify", "remove", "--all"]);
     assert!(refused.contains("this removes 1 message (1 unread); add --yes"), "{refused}");
