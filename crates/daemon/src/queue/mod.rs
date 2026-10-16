@@ -416,7 +416,7 @@ impl QueueInner {
         let st = self.lock();
         let ids: Vec<String> = st.records.keys().map(ToString::to_string).collect();
         drop(st);
-        crate::short_id::resolve(written, &ids, "task")?.parse()
+        shimmer_core::short_id::resolve(written, &ids, "task")?.parse()
     }
 
     pub fn task_view(&self, id: TaskId) -> Result<Value> {

@@ -17,6 +17,7 @@ pub mod module;
 pub mod params;
 pub mod queue;
 pub mod retry;
+pub mod short_id;
 pub mod store;
 pub mod sync;
 pub mod task;
