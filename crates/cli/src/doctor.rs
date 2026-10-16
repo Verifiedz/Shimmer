@@ -86,7 +86,11 @@ async fn connect(args: &Args, checks: &mut Vec<Check>) -> Option<Client> {
     let mut client = match client {
         Ok(c) => c,
         Err(e) => {
-            let fix = "run 'shimmer daemon' to see why it won't start";
+            // With --socket, doctor never starts a daemon, so "see why it won't start" doesn't fit (#230).
+            let fix = match &args.socket {
+                Some(path) => format!("is a daemon listening at {}?", path.display()),
+                None => "run 'shimmer daemon' to see why it won't start".to_owned(),
+            };
             checks.push(Check::new("daemon", Status::Fail, format!("can't reach it: {}", e.message)).fix(fix));
             return None;
         }
@@ -182,9 +186,15 @@ fn fix(fix: &Value) -> Option<String> {
     let one_word = params.as_object().filter(|p| p.len() == 1).and_then(|p| p.values().next()?.as_str());
     let command = match (pack::target(op), one_word) {
         (Some(t), Some(arg)) if is_plain(arg) => format!("shimmer {} {arg}", t.words.join(" ")),
-        _ => format!("shimmer call {op} '{params}'"),
+        _ => format!("shimmer call {op} {}", single_quoted(&params.to_string())),
     };
     Some(if summary.is_empty() { command } else { format!("{summary}: {command}") })
+}
+
+/// `text` in single quotes for a shell, a `'` inside written as `'\''`, so a fix stays
+/// copy-pasteable whatever its params hold (#230).
+fn single_quoted(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
 }
 
 /// Safe to show unquoted in a shell command.
@@ -280,6 +290,13 @@ mod tests {
             f(json!({"op": "records.check", "params": {"collection": "leetcode"}})),
             "shimmer records check leetcode"
         );
+    }
+
+    #[test]
+    fn a_fix_with_a_quote_in_its_params_stays_pasteable() {
+        // #230 (Wasay's #215 review): the JSON goes in single quotes, so a `'` inside is escaped.
+        let f = fix(&json!({"op": "x.y", "params": {"id": "it's"}})).unwrap();
+        assert_eq!(f, r#"shimmer call x.y '{"id":"it'\''s"}'"#);
     }
 
     #[test]

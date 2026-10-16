@@ -287,11 +287,11 @@ Clients should offer: run cleanup, force relaunch, or open the log. Never auto-f
   ]}}
 ```
 
-Illustrative excerpt — `records` actually registers twenty-one ops (`records.collections`,
+Illustrative excerpt — `records` actually registers twenty-three ops (`records.collections`,
 `.templates`, `.create_collection`,
 `.add`, `.get`, `.list`, `.update`, `.complete`, `.reopen`, `.rename`, `.remove`, `.restore`,
 `.trash`, `.purge`, `.check`, `.rename_field`, `.rename_collection`, `.copy_collection`,
-`.remove_collection`, `.restore_collection`, `.import`) and fourteen topics; see "Records
+`.remove_collection`, `.restore_collection`, `.purge_collection`, `.import`, `.health`) and fifteen topics; see "Records
 ops" below and `docs/decisions/0008-records-collections-and-storage.md` for the full list.
 This example only shows two commands to keep the shape readable.
 
@@ -406,7 +406,7 @@ after a step has run leaves it `dirty`.
 
 | Op | Execution | Params | Returns |
 |---|---|---|---|
-| `records.collections` | inline | `{}` | `{"collections":[...]}`, each collection definition as JSON (+ `"skipped"` naming each malformed collection file). A collection made from a built-in template also has `"template"`: its id, read from the "Created from Shimmer's X template" line its file starts with (absent for one made by hand, or once that line is edited away). ADR 0030 §4. |
+| `records.collections` | inline | `{"removed"?}` | `{"collections":[...]}`, each collection definition as JSON (+ `"skipped"` naming each malformed collection file). A collection made from a built-in template also has `"template"`: its id, read from the "Created from Shimmer's X template" line its file starts with (absent for one made by hand, or once that line is edited away). ADR 0030 §4. With `"removed": true`, the removed collections instead, by id: `{"collections":[{"id","label"?,"records","trash"}]}` (no `label` when its file doesn't parse). ADR 0021 §5a. |
 | `records.add` | inline | `{"collection","id"?,"fields"?}` | The new item, which carries its `id`. Without an `id`, one is made from the collection's `title` (`"Two Sum"` → `two-sum`, then `two-sum-2`, …), or from today's date (`2026-10-05-1`) when there's no title to use. An explicit `id` that exists is `conflict`. ADR 0018. |
 | `records.get` | inline | `{"collection","id"}` | The item. |
 | `records.list` | inline | `{"collection","filter"?,"search"?,"sort"?,"limit"?,"offset"?}` | `{"items","total","titles"}` (+ `"skipped"` if a hand-edited file was unreadable). `titles` is `{id: title}` for the listed items (ADR 0024 §5). Ordered by `sort`, then by id. See below. |
@@ -427,6 +427,7 @@ after a step has run leaves it `dirty`.
 | `records.copy_collection` | inline | `{"id","to","label"?,"with_records"?}` | The new collection, plus `"records":N`. Copies the collection file with only `id` (and `label`) changed, comments kept, and `ref` fields pointing at the collection itself pointed at the copy. With `with_records`, every live record file too, as written (not the trash). One transaction; emits `records.collection.copied {"collection","from","records"}`, then one `records.item.created` per copied record. `conflict` if `to` exists, `not_found` for an unknown `id`. ADR 0030 §3. |
 | `records.remove_collection` | inline | `{"id","confirm"?}` | `{"removed":true,"records":N}`. Without a matching `confirm`, `confirmation_required` with `detail: {"records":N}`; re-send with `"confirm": {"records":N}`. Moves everything to `data/records/removed-collections/<id>/`; emits `records.collection.removed`. |
 | `records.restore_collection` | inline | `{"id"}` | The collection, back with its records and trash; emits `records.collection.restored`. |
+| `records.purge_collection` | inline | `{"id","confirm"?}` | `{"purged":true,"records":N}`. Permanently deletes a removed collection: its file, its records and its trash, `N` counting both. Without a matching `confirm`, `confirmation_required` with `detail: {"records":N}`; re-send with `"confirm": {"records":N}`. `not_found` when there's no removed collection by that id; a live collection with the same id is never touched. Emits `records.collection.purged`. ADR 0021 §5a. |
 | `records.health` | inline | `{}` | `{"checks":[…]}` in the shape ADR 0033 sets: a `fail` for each collection file that won't load, a `warn` for each collection with records `records.check` finds problems in (fix: `records.check` on it), or one `ok` line. Writes nothing. |
 
 All inline — nothing here is slow enough to queue. Items on the wire are flat:
@@ -525,7 +526,7 @@ tolerate unknown topics.
 | `records.collection.created` | `records.create_collection` made a collection from a template. Payload `{collection, template}`. Nothing is created on first start (ADR 0023). |
 | `records.collection.copied` | `records.copy_collection` made a collection from another. Payload `{collection, from, records}`. ADR 0030 §3. |
 | `records.field.renamed` | `{collection, from, to}`. |
-| `records.collection.renamed` / `.removed` / `.restored` | `{collection, new_id}` / `{collection, records}` / `{collection}`. |
+| `records.collection.renamed` / `.removed` / `.restored` / `.purged` | `{collection, new_id}` / `{collection, records}` / `{collection}` / `{collection, records}`. `.purged`: a removed collection was deleted for good (ADR 0021 §5a). |
 | `records.trash.purged` | `records.purge` deleted trashed records for good. `{collection, records}`, plus `id` when one record was purged. ADR 0024 §5. |
 | `fetchers.item.found` | A source returned a new, deduplicated item (one per item, inside the same transaction that updates that source's seen-id set). Payload `{source_name, source_id, title, url, raw_data}`; `raw_data` past 8KiB is replaced with `{"truncated":true,"preview":…}`. |
 | `fetchers.fetch.finished` | A fetch run completed without error. Payload `{source, new_items}`. |
