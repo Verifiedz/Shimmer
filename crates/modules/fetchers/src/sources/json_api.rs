@@ -3,9 +3,9 @@
 //! -- the same "point at data, not code" idea `rss` already established for feeds. Covers an
 //! ATS's public job-board API (e.g. Greenhouse's `{"jobs": [...]}`) or a company's own public
 //! job-search endpoint (e.g. Amazon's paginated `{"jobs": [...]}` with relative urls) with
-//! zero new Rust per site. Does not cover an HTML page (`weworkremotely`, `jobbank-canada`
-//! stay hand-written `Method::Scrape` sources) or an endpoint needing auth headers or a POST
-//! body -- those still need their own `Source`.
+//! zero new Rust per site. Does not cover an HTML page (`weworkremotely` stays a hand-written
+//! `Method::Scrape` source) or an endpoint needing auth headers or a POST body -- those still
+//! need their own `Source`.
 
 use async_trait::async_trait;
 use serde_json::Value;

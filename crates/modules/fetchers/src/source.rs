@@ -66,7 +66,6 @@ pub fn registry() -> Vec<std::sync::Arc<dyn Source>> {
     vec![
         std::sync::Arc::new(crate::sources::hn::HnWhoIsHiring),
         std::sync::Arc::new(crate::sources::wwr::WeWorkRemotely),
-        std::sync::Arc::new(crate::sources::jobbank::JobBankCanada),
     ]
 }
 
@@ -167,18 +166,17 @@ mod tests {
     fn the_registry_has_every_reference_source_and_only_known_ids_resolve() {
         let all = registry();
         let ids: Vec<_> = all.iter().map(|s| s.id()).collect();
-        assert_eq!(ids, vec!["hn-whoishiring", "weworkremotely", "jobbank-canada"]);
+        assert_eq!(ids, vec!["hn-whoishiring", "weworkremotely"]);
         assert!(find("hn-whoishiring").is_some());
         assert!(find("weworkremotely").is_some());
-        assert!(find("jobbank-canada").is_some());
         assert!(find("not-a-real-source").is_none());
     }
 
     #[test]
     fn known_includes_nothing_from_the_fixed_registry_with_no_config_at_all() {
         // CLAUDE.md §1's "general before specific" -- a user with no interest in job hunting
-        // must not see hn-whoishiring/weworkremotely/jobbank-canada show up unprompted just
-        // because they're compiled in (ADR 0028 §19).
+        // must not see hn-whoishiring/weworkremotely show up unprompted just because they're
+        // compiled in (ADR 0028 §19).
         let env = TestEnv::new("fetchers");
         let ids: Vec<_> = known(&env.ctx).unwrap().iter().map(|s| s.id().to_string()).collect();
         assert_eq!(ids, Vec::<String>::new());
@@ -196,7 +194,7 @@ mod tests {
             }
         }));
         let ids: Vec<_> = known(&env.ctx).unwrap().iter().map(|s| s.id().to_string()).collect();
-        assert_eq!(ids, vec!["hn-whoishiring", "my-team-blog"], "weworkremotely/jobbank-canada were never configured");
+        assert_eq!(ids, vec!["hn-whoishiring", "my-team-blog"], "weworkremotely was never configured");
     }
 
     #[test]

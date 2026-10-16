@@ -114,13 +114,6 @@ pub struct SourceConfig {
     /// searched.
     #[serde(default)]
     pub title_excludes: Vec<String>,
-    /// A free-text override for a fixed source's own built-in search query, when that
-    /// source reads it -- today, only `jobbank-canada` does (ADR 0028 §16), replacing its
-    /// default `"software engineer"` query entirely, not narrowing it further the way
-    /// `title_contains` does after the fact. Absent, or blank after trimming, means "use
-    /// that source's own default." Meaningless for a source that never reads it.
-    #[serde(default)]
-    pub search_term: Option<String>,
 }
 
 impl SourceConfig {
@@ -462,17 +455,6 @@ mod tests {
     }
 
     #[test]
-    fn a_search_term_round_trips_through_config_for_a_fixed_source() {
-        let cfg = FetchersConfig::from_value(&json!({
-            "sources": {
-                "jobbank-canada": {"enabled": true, "interval": "daily", "search_term": "junior software developer"},
-            }
-        }))
-        .unwrap();
-        assert_eq!(cfg.sources["jobbank-canada"].search_term.as_deref(), Some("junior software developer"));
-    }
-
-    #[test]
     fn matches_title_with_no_filter_configured_keeps_everything() {
         let s = source(true, MIN_INTERVAL_API_S);
         assert!(s.matches_title("Senior Staff Engineer"));
@@ -578,7 +560,7 @@ mod tests {
 
     #[test]
     fn a_kind_entry_whose_id_collides_with_a_fixed_source_fails_at_load_time() {
-        for id in ["hn-whoishiring", "weworkremotely", "jobbank-canada"] {
+        for id in ["hn-whoishiring", "weworkremotely"] {
             let err = FetchersConfig::from_value(&json!({
                 "sources": {id: {"enabled": true, "interval": "hourly", "kind": "rss", "url": "https://example.test/feed.xml"}}
             }))
@@ -709,7 +691,6 @@ mod tests {
             active_field: None,
             title_contains: Vec::new(),
             title_excludes: Vec::new(),
-            search_term: None,
         }
     }
 

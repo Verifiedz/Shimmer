@@ -23,6 +23,11 @@ Amended (configurable search term): `jobbank-canada`'s query is no longer a comp
 constant — see §16. No `core`/`proto` change, no new op; one new `SourceConfig` field.
 Amended (ad-hoc search term override): `--search-term` on `shimmer fetchers test`/`run`
 — see §17. No `core`/`proto` change; one new optional param on two existing ops.
+Amended (unconfigured fixed source visibility): a fixed source only shows up in `fetchers
+list`/`status` once it has its own config entry — see §19. No `core`/`proto` change.
+Amended (retraction): `jobbank-canada` and its `search_term` feature (§16, §17) removed
+entirely — redundant with `weworkremotely` as the `Method::Scrape` reference — see §20. No
+`core`/`proto` change.
 
 ## Context
 
@@ -374,6 +379,8 @@ Both public, no login, no API key, verified live on 2026-10-06:
   `RealHttpBackend` gap (PR #126 review): a request with no `User-Agent` header at all was
   503'd by this host's bot-defense outright, while the identical request with any
   ordinary-looking `User-Agent` succeeded — not a problem with this source's own code.
+  **Retracted — see §20.** The finding above (the `User-Agent` gap) stands regardless; only
+  the source itself and its `search_term` feature (§16, §17) were removed.
 
 ### 11. Amendment (issue #128): CLI surface
 
@@ -584,69 +591,16 @@ page_size = 50
 
 ### 16. Amendment: a configurable `search_term` for `jobbank-canada`
 
-Live use turned up a real gap: `jobbank-canada`'s search query (`"software engineer"`) was
-a compiled-in constant, so there was no way to point the same source at a different query
-— e.g. `"junior software developer"` — without a code change. Confirmed live that this
-matters: Job Bank's own search does more than literal title matching (results for
-`"junior software developer"` are mostly titled plainly "software developer," matched on
-something beyond the title text — likely a NOC-code or description-level match), so
-`title_contains`/`title_excludes` (§13) filtering *after* a fixed `"software engineer"`
-query cannot recover what a *different* query already surfaces directly.
-
-- **`search_term`** (`SourceConfig`): a free-text override of a fixed source's own
-  built-in query, read by the source itself rather than validated or interpreted by
-  `FetchersConfig::from_value` — there is nothing to validate beyond "is it a string," the
-  same posture `title_contains`/`title_excludes` already take. Blank after trimming is
-  treated identically to absent: both fall back to `jobbank-canada`'s own
-  `DEFAULT_SEARCH_TERM` ("software engineer"), so an empty string in `config.toml` can
-  never become a literal empty query to the real site.
-- **Scoped generically on `SourceConfig`, read only by `jobbank-canada` today** — the same
-  shape `title_contains`/`title_excludes` already have (defined once, any source *could*
-  read them, only some do). No other fixed source currently reads `search_term`;
-  `weworkremotely` has no equivalent free-text query to override (§10: it walks a fixed
-  category-slug rotation, not a search string), and a `json-api`-kind source's query lives
-  in its own configured `url` already.
-- **Built with `url::Url`'s own query encoder, not string interpolation.** The previous
-  hardcoded query was a pre-encoded literal (`"software+engineer"`); once the term became
-  configurable and free-text, naive `format!` interpolation would silently produce a
-  malformed request for any term containing a space, `&`, or other character needing
-  percent-encoding. `url::Url::query_pairs_mut().append_pair(...)` encodes correctly
-  regardless of what the configured term contains.
-- **No `core`/`proto` change, no new op** — one new `SourceConfig` field and a change
-  confined to `crates/modules/fetchers/src/sources/jobbank.rs`.
+**Retracted — see §20.** This amendment added a free-text `search_term` field to
+`SourceConfig`, read only by `jobbank-canada` (§10), so its search query could be set in
+`config.toml` instead of being a compiled-in constant. Removed along with that source: no
+other source ever read it.
 
 ### 17. Amendment: an ad-hoc `--search-term` override
 
-§16 made `search_term` a persistent `config.toml` setting; trying a different phrasing
-still meant an edit plus a daemon restart (same cost §14 already solved for
-`title_contains`/`title_excludes`). This is that same fix, for `search_term`.
-
-- **`fetchers.fetch`/`fetchers.test` gain an optional `search_term` param**, alongside the
-  existing `title_contains`/`title_excludes` (§14). Present: replaces the source's
-  configured `search_term` outright for this one call — same "replace, never merge"
-  posture §14 already established. Absent: unchanged from §16.
-- **No change to the `Source` trait.** `jobbank-canada` already reads `search_term` from
-  `ctx.config` itself (§16); the override is applied by handing it a *different* `Ctx` for
-  this one call, built by `ctx_with_search_term_override` — clones `ctx`, patches a copy of
-  the real `[modules.fetchers]` JSON so `sources.<id>.search_term` is the override, and
-  swaps that onto the clone's `config` field. A source that never reads `search_term`
-  (every source but `jobbank-canada`, today) is completely unaffected by this — the patch
-  changes a value nothing of theirs looks at.
-- **`FetchersConfig::from_value`'s validation requires every entry to have an `interval`.**
-  The patch supplies a harmless placeholder (`"daily"`) only when the source has no real
-  `config.toml` entry at all, since this override never reaches any scheduling code —
-  `fetch`/`test` are both triggered by a direct call, never by a trigger reading the
-  patched config back out.
-- **`shimmer fetchers test SOURCE --search-term TERM`** and the same flag on
-  **`run [--wait]`** (`crates/cli/src/fetchers.rs`): a third flag alongside
-  `--contains`/`--excludes`, same `Flags::split` call, forwarded only when actually given.
-- **No `core`/`proto` change, no new op** — one new optional field on two existing ops' own
-  params.
-
-Confirmed live: `shimmer fetchers test jobbank-canada --search-term "entry level software
-developer"` reaches the real site with that exact query and returns real results, while a
-plain `shimmer fetchers test jobbank-canada` immediately after still uses the configured
-`"junior software developer"` — the override touched nothing persistent.
+**Retracted — see §20.** This amendment added a `--search-term` flag to `shimmer fetchers
+test`/`run` (an ad-hoc, one-call override of §16's field) and the `ctx_with_search_term_override`
+plumbing behind it. Removed along with §16's field — nothing else used either.
 
 ### 18. Amendment: `active_field` for the `json-api` kind
 
@@ -704,11 +658,58 @@ configuration.
 - **No config schema change.** The same bare entry that already worked for adjusting a fixed
   source's `interval`/filters now does double duty as the opt-in.
 
-Not done here: a one-command "job template" that writes `hn-whoishiring`/`weworkremotely`/
-`jobbank-canada` entries into `config.toml` in one step, the way `records`/`workspaces`
-templates (ADR 0022, ADR 0025) already work for their own modules. Worth doing — it's the
-natural way someone who *does* want job sources turns them on without hand-typing three TOML
-blocks — but it is its own, separable piece of work, not a prerequisite for this fix.
+Not done here: a one-command "job template" that writes `hn-whoishiring`/`weworkremotely`
+entries into `config.toml` in one step, the way `records`/`workspaces` templates (ADR 0022,
+ADR 0025) already work for their own modules. Worth doing — it's the natural way someone who
+*does* want job sources turns them on without hand-typing TOML blocks — but it is its own,
+separable piece of work, not a prerequisite for this fix. (`jobbank-canada` was a third
+candidate for this template until §20 retracted it entirely — reintroducing it, if ever
+wanted, means writing a new `Source` impl again, not just adding a config entry.)
+
+### 20. Retraction: `jobbank-canada` and its `search_term` feature
+
+Review discussion on §19 asked a fair follow-up: now that an unconfigured fixed source isn't
+shown by default, why keep ~1,000 lines of code (`jobbank.rs`, its tests, and its fixtures)
+for a source most users will never turn on? Two separate answers came out of that:
+
+- **Binary/runtime bloat from keeping it was negligible** — a user who never configures a
+  source pays nothing at runtime, and §19 already stopped it showing up unprompted.
+- **But `weworkremotely` and `jobbank-canada` were redundant with each other.** Both are
+  `Method::Scrape` + a `robots.txt` check + `html.rs`'s scraping helpers — the only two
+  things in this module exercising that path at all, since every other source (including
+  every other job board — `figma-jobs`, `robinhood-jobs`, `simplify-newgrad`) is
+  `Method::Api` via the generic `rss`/`json-api` kinds. Keeping both taught the identical
+  lesson twice. `weworkremotely` alone still proves `Method::Scrape` end to end;
+  `hn-whoishiring`'s two-stage fetch remains the separate, still-needed proof that a
+  non-flat-array `Method::Api` source is possible.
+
+So, unlike §19 (a visibility change with no deletions), this amendment actually removes
+`jobbank-canada` and everything that existed solely for it:
+
+- `crates/modules/fetchers/src/sources/jobbank.rs` and its tests, `sources/mod.rs`'s
+  `jobbank` module declaration, its entry in `source::registry()`, and its HTML test
+  fixtures (`tests/fixtures/jobbank/`).
+- **The entire `search_term` feature (§16, §17)** — `SourceConfig.search_term`, the
+  `fetchers.fetch`/`fetchers.test` `search_term` param, the CLI's `--search-term` flag on
+  `test`/`run`, and the `ctx_with_search_term_override` plumbing behind it. Nothing else
+  ever read `search_term`; it existed solely for `jobbank-canada`'s own free-text query, so
+  removing the source left the whole feature with no caller.
+- Every test, doc comment, and `ADR` paragraph that existed only to describe `jobbank-canada`
+  or `search_term` (this file's own §16/§17 bodies, now retraction notes; §10's reference
+  entry, now flagged retracted in place rather than deleted, since its `User-Agent`/bot
+  defense finding — the thing that surfaced §6's `RealHttpBackend` gap — is still true and
+  still worth keeping as history).
+- Incidental mentions of `jobbank-canada`/`jobbank.gc.ca` used purely as an arbitrary example
+  string in CLI rendering tests (e.g. `items`'s source-filter tests) are untouched — they
+  test generic logic that never depended on the real source existing.
+
+**No `core`/`proto` change, no version bump** — this is a pure subtraction inside
+`crates/modules/fetchers` and `crates/cli/src/fetchers.rs`, both already change-controlled
+only by Dev B's own module/CLI ownership (CLAUDE.md §13), not §4's shared-contract rule.
+
+Not done here, still: reintroducing a Canada-specific (or any other) job board. If wanted
+later, it needs a new `Source` impl — the "job template" idea above doesn't bring this one
+back, since there's no compiled-in source left for a config entry to opt into.
 
 ## Not done here
 

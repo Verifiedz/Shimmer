@@ -3,8 +3,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use shimmer_core::params::decode;
 use shimmer_core::{
-    CommandSpec, Ctx, Error, ErrorCode, Execution, LaneConfig, Manifest, Module, ModuleConfig, Result, TriggerSpec,
-    WriteLock,
+    CommandSpec, Ctx, Error, ErrorCode, Execution, LaneConfig, Manifest, Module, Result, TriggerSpec, WriteLock,
 };
 
 use crate::dedup::{self, RunGuard};
@@ -80,7 +79,6 @@ impl Module for Fetchers {
                         "source": {"type": "string"},
                         "title_contains": {"type": "array", "items": {"type": "string"}},
                         "title_excludes": {"type": "array", "items": {"type": "string"}},
-                        "search_term": {"type": "string"},
                     },
                 }),
                 execution: Execution::Queued { lane: LANE.into() },
@@ -108,7 +106,6 @@ impl Module for Fetchers {
                         "source": {"type": "string"},
                         "title_contains": {"type": "array", "items": {"type": "string"}},
                         "title_excludes": {"type": "array", "items": {"type": "string"}},
-                        "search_term": {"type": "string"},
                     },
                 }),
                 execution: Execution::Queued { lane: LANE.into() },
@@ -122,14 +119,14 @@ impl Module for Fetchers {
             FETCH_OP => {
                 let p: FetchParams = decode(params)?;
                 let filter = TitleFilterOverride::from_params(p.title_contains, p.title_excludes);
-                self.fetch(ctx, p.source, filter, p.search_term).await
+                self.fetch(ctx, p.source, filter).await
             }
             LIST_OP => self.list(ctx).await,
             STATUS_OP => self.status(ctx).await,
             TEST_OP => {
                 let p: FetchParams = decode(params)?;
                 let filter = TitleFilterOverride::from_params(p.title_contains, p.title_excludes);
-                self.test(ctx, p.source, filter, p.search_term).await
+                self.test(ctx, p.source, filter).await
             }
             _ => Err(Error::unknown_op(format!("fetchers has no op '{op}'"))),
         }
@@ -139,8 +136,6 @@ impl Module for Fetchers {
 #[derive(Deserialize)]
 struct FetchParams {
     source: String,
-    #[serde(default)]
-    search_term: Option<String>,
     #[serde(default)]
     title_contains: Option<Vec<String>>,
     #[serde(default)]
@@ -189,13 +184,7 @@ impl Fetchers {
         Ok(json!({"enqueued": enqueued, "already_running": already_running}))
     }
 
-    async fn fetch(
-        &self,
-        ctx: &Ctx,
-        source_id: String,
-        filter_override: Option<TitleFilterOverride>,
-        search_term_override: Option<String>,
-    ) -> Result<Value> {
+    async fn fetch(&self, ctx: &Ctx, source_id: String, filter_override: Option<TitleFilterOverride>) -> Result<Value> {
         if source_id.trim().is_empty() {
             return Err(Error::invalid_params("source must not be empty"));
         }
@@ -206,8 +195,7 @@ impl Fetchers {
             .try_acquire(&source_id)
             .ok_or_else(|| Error::module_error(format!("source '{source_id}' is already fetching")))?;
 
-        let outcome =
-            self.run_source(ctx, source.as_ref(), filter_override.as_ref(), search_term_override.as_deref()).await;
+        let outcome = self.run_source(ctx, source.as_ref(), filter_override.as_ref()).await;
         // Recorded regardless of outcome -- including failure -- so a broken source is
         // retried at most once per interval (ADR 0028 §5, §6: "after that, wait for the
         // next trigger"), not hammered every tick. Held only across this call -- up to 8
@@ -278,19 +266,10 @@ impl Fetchers {
     /// anything seen"). Deliberately simpler than [`Fetchers::run_source`]: a dry run has no
     /// state of its own to protect, so it skips the overlap guard too -- a `test` can run
     /// alongside a real `fetch` of the same source without conflict.
-    async fn test(
-        &self,
-        ctx: &Ctx,
-        source_id: String,
-        filter_override: Option<TitleFilterOverride>,
-        search_term_override: Option<String>,
-    ) -> Result<Value> {
+    async fn test(&self, ctx: &Ctx, source_id: String, filter_override: Option<TitleFilterOverride>) -> Result<Value> {
         if source_id.trim().is_empty() {
             return Err(Error::invalid_params("source must not be empty"));
         }
-        let effective =
-            search_term_override.as_deref().map(|term| ctx_with_search_term_override(ctx, &source_id, term));
-        let ctx = effective.as_ref().unwrap_or(ctx);
         let source =
             source::resolve(ctx, &source_id)?.ok_or_else(|| Error::not_found(format!("no source '{source_id}'")))?;
         let page = source.fetch_page(ctx, None).await?;
@@ -318,11 +297,8 @@ impl Fetchers {
         ctx: &Ctx,
         source: &dyn Source,
         filter_override: Option<&TitleFilterOverride>,
-        search_term_override: Option<&str>,
     ) -> Result<usize> {
         let source_id = source.id();
-        let effective = search_term_override.map(|term| ctx_with_search_term_override(ctx, source_id, term));
-        let ctx = effective.as_ref().unwrap_or(ctx);
         let mut seen = dedup::load(ctx, source_id)?;
         let now = ctx.clock.now();
         let mut found: Vec<RawItem> = Vec::new();
@@ -425,36 +401,6 @@ fn passes_title_filter(
     }
 }
 
-/// A `Ctx` whose module config has `source_id`'s own `search_term` replaced with `term` for
-/// this one call (ADR 0028 §17) -- built by patching the real `[modules.fetchers]` JSON
-/// rather than adding a field to `Ctx` itself, so a `Source` that reads its own settings
-/// from `ctx.config` (today, only `jobbank-canada`'s `search_term`, §16) picks the override
-/// up transparently, with no change to the `Source` trait. `FetchersConfig::from_value`'s
-/// own validation requires every entry to have an `interval` -- supplied as a harmless
-/// placeholder only when the entry had none of its own, since this override never
-/// schedules anything and the placeholder is never seen by real scheduling code.
-fn ctx_with_search_term_override(ctx: &Ctx, source_id: &str, term: &str) -> Ctx {
-    let mut raw = ctx.config.raw().clone();
-    if !raw.is_object() {
-        raw = json!({});
-    }
-    let sources = raw.as_object_mut().expect("just ensured object").entry("sources").or_insert_with(|| json!({}));
-    if !sources.is_object() {
-        *sources = json!({});
-    }
-    let entry = sources.as_object_mut().expect("just ensured object").entry(source_id).or_insert_with(|| json!({}));
-    if !entry.is_object() {
-        *entry = json!({});
-    }
-    let entry = entry.as_object_mut().expect("just ensured object");
-    entry.insert("search_term".to_string(), json!(term));
-    entry.entry("interval".to_string()).or_insert_with(|| json!("daily"));
-
-    let mut patched = ctx.clone();
-    patched.config = ModuleConfig::new(raw);
-    patched
-}
-
 /// `fetchers.item.found`'s payload (ADR 0028 §3, §9).
 fn item_payload(source_id: &str, item: &RawItem) -> Value {
     json!({
@@ -549,7 +495,6 @@ mod tests {
             active_field: None,
             title_contains: Vec::new(),
             title_excludes: Vec::new(),
-            search_term: None,
         }
     }
 
@@ -592,7 +537,7 @@ mod tests {
         let fetchers = Fetchers::default();
         let _permit = fetchers.running.try_acquire("hn-whoishiring").unwrap();
 
-        let err = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None, None).await.unwrap_err();
+        let err = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::ModuleError);
         // Refused before doing anything -- no run recorded.
         assert!(schedule::load_last_run(&env.ctx).unwrap().is_empty());
@@ -601,14 +546,14 @@ mod tests {
     #[tokio::test]
     async fn an_empty_source_is_rejected() {
         let env = TestEnv::new("fetchers");
-        let err = Fetchers::default().fetch(&env.ctx, "  ".into(), None, None).await.unwrap_err();
+        let err = Fetchers::default().fetch(&env.ctx, "  ".into(), None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidParams);
     }
 
     #[tokio::test]
     async fn an_unregistered_source_is_not_found() {
         let env = TestEnv::new("fetchers");
-        let err = Fetchers::default().fetch(&env.ctx, "not-a-real-source".into(), None, None).await.unwrap_err();
+        let err = Fetchers::default().fetch(&env.ctx, "not-a-real-source".into(), None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);
         // Not even an attempt -- no permit taken, no run recorded.
         assert!(schedule::load_last_run(&env.ctx).unwrap().is_empty());
@@ -652,7 +597,7 @@ mod tests {
         stub_one_hn_comment(&env, 10, "<p>Acme | Remote<p>Hiring Rust engineers.");
 
         let fetchers = Fetchers::default();
-        let out = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None, None).await.unwrap();
+        let out = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None).await.unwrap();
         assert_eq!((out["source"].as_str(), out["new_items"].as_u64()), (Some("hn-whoishiring"), Some(1)));
 
         let events = env.backend.events();
@@ -667,7 +612,7 @@ mod tests {
         assert!(!fetchers.running.is_running("hn-whoishiring"), "the permit must be released on success");
 
         // Re-running with the identical comment still present must not re-emit it.
-        let second = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None, None).await.unwrap();
+        let second = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None).await.unwrap();
         assert_eq!(second["new_items"].as_u64(), Some(0));
         let found_after_second = env.backend.events().iter().filter(|e| e.topic == "fetchers.item.found").count();
         assert_eq!(found_after_second, 1, "an already-seen item must never be emitted twice");
@@ -698,7 +643,7 @@ mod tests {
         }
 
         let fetchers = Fetchers::default();
-        let out = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None, None).await.unwrap();
+        let out = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None).await.unwrap();
         assert_eq!(out["new_items"], 1, "only the junior posting should count as new");
 
         let found: Vec<_> = env.backend.events().into_iter().filter(|e| e.topic == "fetchers.item.found").collect();
@@ -712,7 +657,7 @@ mod tests {
         assert!(!seen.is_new("11"));
 
         // Re-running finds nothing new: the excluded item was never queued for a retry.
-        let second = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None, None).await.unwrap();
+        let second = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None).await.unwrap();
         assert_eq!(second["new_items"], 0);
     }
 
@@ -740,7 +685,7 @@ mod tests {
             );
         }
 
-        let out = Fetchers::default().test(&env.ctx, "hn-whoishiring".into(), None, None).await.unwrap();
+        let out = Fetchers::default().test(&env.ctx, "hn-whoishiring".into(), None).await.unwrap();
         let items = out["items"].as_array().unwrap();
         assert_eq!(items.len(), 1, "{items:?}");
         assert!(items[0]["title"].as_str().unwrap().contains("Junior"));
@@ -773,8 +718,7 @@ mod tests {
         }
 
         let override_filter = TitleFilterOverride { contains: vec!["senior".into()], excludes: Vec::new() };
-        let out =
-            Fetchers::default().test(&env.ctx, "hn-whoishiring".into(), Some(override_filter), None).await.unwrap();
+        let out = Fetchers::default().test(&env.ctx, "hn-whoishiring".into(), Some(override_filter)).await.unwrap();
         let items = out["items"].as_array().unwrap();
         assert_eq!(items.len(), 1, "{items:?}");
         assert!(items[0]["title"].as_str().unwrap().contains("Senior"), "the override must win, not merge with config");
@@ -802,52 +746,10 @@ mod tests {
         }
 
         let override_filter = TitleFilterOverride { contains: Vec::new(), excludes: vec!["senior".into()] };
-        let out =
-            Fetchers::default().fetch(&env.ctx, "hn-whoishiring".into(), Some(override_filter), None).await.unwrap();
+        let out = Fetchers::default().fetch(&env.ctx, "hn-whoishiring".into(), Some(override_filter)).await.unwrap();
         assert_eq!(out["new_items"], 1);
         let seen = dedup::load(&env.ctx, "hn-whoishiring").unwrap();
         assert!(!seen.is_new("10"), "the ad-hoc override must mark a dropped item seen, same as a configured filter");
-    }
-
-    #[tokio::test]
-    async fn an_ad_hoc_search_term_reaches_the_source_and_replaces_the_configured_one() {
-        // jobbank-canada reads search_term from ctx.config itself (ADR 0028 §16) -- this
-        // proves the override (§17) actually arrives there, not just that the plumbing
-        // compiles. Configured to want "a senior query"; the override below asks for
-        // something else entirely and must be what the real request uses.
-        let mut env = TestEnv::new("fetchers");
-        env.ctx.config = ModuleConfig::new(json!({
-            "sources": {"jobbank-canada": {"enabled": false, "interval": "daily", "search_term": "a senior query"}}
-        }));
-        const EMPTY_RESULTS: &str = r#"<html><body><div id="results-list-content"></div></body></html>"#;
-        env.http.responses.lock().unwrap().insert(
-            "https://www.jobbank.gc.ca/robots.txt".to_string(),
-            HttpResponse {
-                status: 200,
-                body: b"User-agent: *\nCrawl-delay: 5\n".to_vec(),
-                from_cache: false,
-                stale: false,
-                retry_after_secs: None,
-            },
-        );
-        env.http.responses.lock().unwrap().insert(
-            "https://www.jobbank.gc.ca/jobsearch/jobsearch?searchstring=junior+software+developer&locationstring=Canada&page=1".to_string(),
-            HttpResponse {
-                status: 200,
-                body: EMPTY_RESULTS.as_bytes().to_vec(),
-                from_cache: false,
-                stale: false,
-                retry_after_secs: None,
-            },
-        );
-
-        // Deliberately no stub for the configured "a senior query" url: if the override were
-        // ignored in favor of config, this would fail with "no stub for...".
-        let out = Fetchers::default()
-            .test(&env.ctx, "jobbank-canada".into(), None, Some("junior software developer".into()))
-            .await
-            .unwrap();
-        assert_eq!(out["items"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]
@@ -888,7 +790,7 @@ mod tests {
         );
 
         let fetchers = Fetchers::default();
-        let out = fetchers.fetch(&env.ctx, "my-team-blog".into(), None, None).await.unwrap();
+        let out = fetchers.fetch(&env.ctx, "my-team-blog".into(), None).await.unwrap();
         assert_eq!((out["source"].as_str(), out["new_items"].as_u64()), (Some("my-team-blog"), Some(1)));
 
         let found: Vec<_> = env.backend.events().into_iter().filter(|e| e.topic == "fetchers.item.found").collect();
@@ -900,7 +802,7 @@ mod tests {
     #[tokio::test]
     async fn an_id_that_is_neither_a_fixed_source_nor_a_configured_kind_is_not_found() {
         let env = TestEnv::new("fetchers");
-        let err = Fetchers::default().fetch(&env.ctx, "not-a-real-source".into(), None, None).await.unwrap_err();
+        let err = Fetchers::default().fetch(&env.ctx, "not-a-real-source".into(), None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);
     }
 
@@ -916,10 +818,10 @@ mod tests {
 
         let out = Fetchers::default().list(&env.ctx).await.unwrap();
         let sources = out["sources"].as_array().unwrap();
-        // weworkremotely/jobbank-canada are compiled in but never configured here, so a user
-        // with no interest in job hunting never sees them (ADR 0028 §19).
+        // weworkremotely is compiled in but never configured here, so a user with no
+        // interest in job hunting never sees it (ADR 0028 §19).
         assert_eq!(sources.len(), 2, "{sources:?}");
-        assert!(sources.iter().all(|s| s["id"] != "weworkremotely" && s["id"] != "jobbank-canada"), "{sources:?}");
+        assert!(sources.iter().all(|s| s["id"] != "weworkremotely"), "{sources:?}");
 
         let hn = sources.iter().find(|s| s["id"] == "hn-whoishiring").unwrap();
         assert_eq!(
@@ -949,7 +851,7 @@ mod tests {
         }));
         let fetchers = Fetchers::default();
         stub_one_hn_comment(&env, 10, "<p>Acme | Remote<p>Hiring.");
-        fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None, None).await.unwrap();
+        fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None).await.unwrap();
 
         let out = fetchers.status(&env.ctx).await.unwrap();
         let sources = out["sources"].as_array().unwrap();
@@ -966,7 +868,7 @@ mod tests {
         let env = TestEnv::new("fetchers");
         stub_one_hn_comment(&env, 10, "<p>Acme | Remote<p>Hiring Rust engineers.");
 
-        let out = Fetchers::default().test(&env.ctx, "hn-whoishiring".into(), None, None).await.unwrap();
+        let out = Fetchers::default().test(&env.ctx, "hn-whoishiring".into(), None).await.unwrap();
         assert_eq!(out["source"], "hn-whoishiring");
         let items = out["items"].as_array().unwrap();
         assert_eq!(items.len(), 1);
@@ -988,7 +890,7 @@ mod tests {
         // A real fetch would be refused right now (see
         // `a_source_already_fetching_is_refused_not_double_run`); `test` must not be, since
         // it never touches the state the overlap guard protects.
-        let out = fetchers.test(&env.ctx, "hn-whoishiring".into(), None, None).await.unwrap();
+        let out = fetchers.test(&env.ctx, "hn-whoishiring".into(), None).await.unwrap();
         assert_eq!(out["items"].as_array().unwrap().len(), 1);
     }
 
@@ -998,7 +900,7 @@ mod tests {
         let env = TestEnv::new("fetchers");
         let fetchers = Fetchers::default();
 
-        let err = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None, None).await.unwrap_err();
+        let err = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::Unavailable);
 
         let last_run = schedule::load_last_run(&env.ctx).unwrap();
@@ -1036,7 +938,7 @@ mod tests {
         let fetchers = Fetchers::default();
 
         let source = source::find("hn-whoishiring").unwrap();
-        let err = fetchers.run_source(&env.ctx, source.as_ref(), None, None).await.unwrap_err();
+        let err = fetchers.run_source(&env.ctx, source.as_ref(), None).await.unwrap_err();
         assert!(env.ctx.cancel.is_cancelled());
         assert_eq!(classify_failure(&env.ctx, &err), "cancelled");
     }
@@ -1047,7 +949,7 @@ mod tests {
         env.ctx.cancel.cancel();
         let fetchers = Fetchers::default();
 
-        let err = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None, None).await.unwrap_err();
+        let err = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None).await.unwrap_err();
         assert_eq!(classify_failure(&env.ctx, &err), "cancelled");
         let failed: Vec<_> = env.backend.events().into_iter().filter(|e| e.topic == "fetchers.fetch.failed").collect();
         assert_eq!(failed[0].payload["reason"], "cancelled");
@@ -1080,7 +982,7 @@ mod tests {
         let fetchers = Fetchers::default();
 
         let source = source::find("hn-whoishiring").unwrap();
-        fetchers.run_source(&ctx, source.as_ref(), None, None).await.unwrap();
+        fetchers.run_source(&ctx, source.as_ref(), None).await.unwrap();
 
         let reported = progress.lock().unwrap();
         assert!(!reported.is_empty(), "at least the first page must report progress");
