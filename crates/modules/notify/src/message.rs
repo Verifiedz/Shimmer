@@ -20,14 +20,6 @@ pub fn held_path(id: &str) -> String {
     format!("{HELD}/{id}")
 }
 
-/// An id from outside (a request), checked before it becomes part of a path.
-pub fn checked_id(id: &str) -> Result<&str> {
-    match ulid::Ulid::from_string(id) {
-        Ok(_) => Ok(id),
-        Err(_) => Err(Error::invalid_params(format!("'{id}' isn't a message id"))),
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Priority {
@@ -206,13 +198,5 @@ mod tests {
         assert_eq!((d.body.as_str(), d.priority, d.source.as_str()), ("your 2pm session", Priority::High, "fallback"));
         let odd = draft(&json!({"failure_code": "unavailable", "priority": "loud"})).unwrap();
         assert_eq!((odd.title.as_str(), odd.priority), ("Scheduled task failed: unavailable", Priority::High));
-    }
-
-    #[test]
-    fn only_a_message_id_becomes_a_path() {
-        assert!(checked_id("01JD2T0000000000000000000A").is_ok());
-        for bad in ["../x", "a/b", "", "01JD2T"] {
-            assert!(checked_id(bad).is_err(), "{bad}");
-        }
     }
 }

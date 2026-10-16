@@ -291,10 +291,9 @@ pub async fn run(client: &mut Client, cmd: &NotifyCmd, json: bool, prompt: &mut 
             Ok(out(data, &|d| list(d, !filters.is_empty(), Utc::now())))
         }
         NotifyCmd::Show { id } => {
-            let id = resolve(client, id).await?;
             let m = client.call("notify.get", json!({"id": id})).await?;
             if m["read"] == false {
-                client.call("notify.mark_read", json!({"ids": [id]})).await?;
+                client.call("notify.mark_read", json!({"ids": [m["id"]]})).await?;
             }
             Ok(out(m, &|m| show(m, Utc::now())))
         }
@@ -306,7 +305,7 @@ pub async fn run(client: &mut Client, cmd: &NotifyCmd, json: bool, prompt: &mut 
         }
         NotifyCmd::Mark { read, selection } => {
             let op = if *read { "notify.mark_read" } else { "notify.mark_unread" };
-            let params = selection_params(client, selection).await?;
+            let params = selection_params(selection);
             let data = client.call(op, params).await?;
             let word = if *read { "read" } else { "unread" };
             Ok(out(data, &|d| match d["marked"].as_u64().unwrap_or(0) {
@@ -332,7 +331,7 @@ pub async fn run(client: &mut Client, cmd: &NotifyCmd, json: bool, prompt: &mut 
             Ok(out(result, &test))
         }
         NotifyCmd::Resend { selection } => {
-            let params = selection_params(client, selection).await?;
+            let params = selection_params(selection);
             let result = queued_result(client, "notify.resend", params).await?;
             Ok(out(result, &resent))
         }
@@ -391,45 +390,21 @@ async fn queued_result(client: &mut Client, op: &str, params: Value) -> Result<V
     }
 }
 
-/// An id as typed: a whole one, or the ending `list` shows (any case).
-async fn resolve(client: &mut Client, id: &str) -> Result<String> {
-    if id.len() == 26 {
-        return Ok(id.to_uppercase());
-    }
-    let all = client.call("notify.list", json!({"limit": 1_000_000})).await?;
-    let want = id.to_uppercase();
-    let found: Vec<String> = all["items"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|m| m["id"].as_str())
-        .filter(|full| full.ends_with(&want))
-        .map(String::from)
-        .collect();
-    match found.as_slice() {
-        [one] => Ok(one.clone()),
-        [] => Err(Error::not_found(format!("no message ending '{id}' (see shimmer notify list)"))),
-        _ => Err(Error::invalid_params(format!("'{id}' ends {} messages: give more of it", found.len()))),
-    }
-}
-
-async fn selection_params(client: &mut Client, s: &Selection) -> Result<Value> {
+/// The params naming `s`'s messages. Ids go as typed: the daemon finds the message an ending
+/// means, or says it's too short or ends several (ADR 0031 §4).
+fn selection_params(s: &Selection) -> Value {
     if !s.ids.is_empty() {
-        let mut ids = Vec::new();
-        for id in &s.ids {
-            ids.push(resolve(client, id).await?);
-        }
-        return Ok(json!({"ids": ids}));
+        return json!({"ids": s.ids});
     }
     if s.all {
-        return Ok(json!({"all": true}));
+        return json!({"all": true});
     }
-    Ok(s.filters.params())
+    s.filters.params()
 }
 
 /// `remove`: named ids at once; anything bulk says how many and asks first.
 async fn remove(client: &mut Client, s: &Selection, yes: bool, json: bool, prompt: &mut dyn Prompt) -> Result<String> {
-    let mut params = selection_params(client, s).await?;
+    let mut params = selection_params(s);
     if yes {
         params["confirm"] = json!(true);
     }
@@ -502,6 +477,13 @@ fn line_text(m: &Value) -> String {
     }
 }
 
+/// The ending a list shows for a message: the daemon's `short`, unique across the whole inbox
+/// rather than only these rows, so it always works given back (#246's review). The whole id if
+/// it has none.
+fn short(m: &Value) -> String {
+    m["short"].as_str().or(m["id"].as_str()).unwrap_or_default().to_owned()
+}
+
 /// `notify list`: one line per message, then a footer with the counts and the next command.
 fn list(data: &Value, filtered: bool, now: DateTime<Utc>) -> String {
     let items = data["items"].as_array().cloned().unwrap_or_default();
@@ -509,12 +491,9 @@ fn list(data: &Value, filtered: bool, now: DateTime<Utc>) -> String {
     if items.is_empty() {
         out.push_str(if filtered { "no messages match" } else { "no messages yet" });
     } else {
-        let ids: Vec<String> = items.iter().map(|m| m["id"].as_str().unwrap_or_default().to_owned()).collect();
-        let short = render::short_ids(&ids);
         let rows: Vec<Vec<String>> = items
             .iter()
-            .zip(&short)
-            .map(|(m, id)| {
+            .map(|m| {
                 let unread = if m["read"] == false { "●" } else { " " };
                 let high = if m["priority"] == "high" { "!" } else { " " };
                 let at = when::timestamp(&m["at"]).map_or("-".into(), |t| when::relative(t, now));
@@ -527,7 +506,7 @@ fn list(data: &Value, filtered: bool, now: DateTime<Utc>) -> String {
                 let text = if state.is_empty() { text } else { format!("{text}  {state}") };
                 vec![
                     format!("{unread}{high}"),
-                    id.clone(),
+                    short(m),
                     at,
                     from(m["source"].as_str().unwrap_or_default()).into(),
                     text,
@@ -553,8 +532,7 @@ fn list(data: &Value, filtered: bool, now: DateTime<Utc>) -> String {
         (true, false, false) => parts.push(format!("{} shown · in all: {}", items.len(), totals.join(", "))),
     }
     if !items.is_empty() {
-        let first = render::short_ids(&[items[0]["id"].as_str().unwrap_or_default().to_owned()]).remove(0);
-        parts.push(format!("see one: shimmer notify show {first}"));
+        parts.push(format!("see one: shimmer notify show {}", short(&items[0])));
     }
     if !parts.is_empty() {
         let _ = write!(out, "\n{}", paint(Role::Hint, &parts.join(" · ")));
