@@ -106,7 +106,9 @@ fn the_notify_commands() {
     assert!(common::ok(&home, &["notify", "resume"]).starts_with("✓ resumed"));
     let quiet = common::ok(&home, &["notify", "quiet", "22:00-08:00", "--weekends", "00:00-10:00"]);
     assert!(quiet.contains("every day  22:00-08:00") && quiet.contains("weekends   00:00-10:00"), "{quiet}");
-    assert!(common::ok(&home, &["notify", "builtin-alerts", "off", "workspace-dirty"]).contains("workspace-dirty"));
+    // The alerts are automations' built-in rules now (ADR 0035 §10).
+    assert!(common::ok(&home, &["automations", "disable", "workspace-dirty"]).contains("✓ workspace-dirty is off"));
+    assert!(common::fails(&home, &["notify", "builtin-alerts"]).contains("unknown notify command"));
     assert!(common::ok(&home, &["notify", "cap", "500"]).starts_with("✓ the inbox keeps at most 500"));
     let test = common::ok(&home, &["notify", "test"]);
     assert!(test.starts_with("Sent \"Shimmer can reach you\" to:\n  desktop ✓"), "{test}");

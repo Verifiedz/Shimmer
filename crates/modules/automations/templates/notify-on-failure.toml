@@ -23,5 +23,5 @@ when = { op = { ne = "notify.send" }, lane = "${LANE}" } # if LANE
 
 [[do]]
 op = "notify.send"
-params = { title = "Failed: {op}", body = "{error}", priority = "high" }
+params = { title = "Failed: {op}", body = "{error}", priority = "high", from = "automation:${RULE}" }
 '''

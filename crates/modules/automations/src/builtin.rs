@@ -18,7 +18,7 @@ when = { code = "workspace_dirty", fallback = { ne = true }, lane = { ne = "noti
 
 [[do]]
 op = "notify.send"
-params = { title = "{detail.workspace} couldn't launch", body = "Step {detail.failed_step} failed. Log: {detail.log}. Then: {detail.fix}", priority = "high" }
+params = { title = "{detail.workspace} couldn't launch", body = "Step {detail.failed_step} failed. Log: {detail.log}. Then: {detail.fix}", priority = "high", from = "automation:workspace-dirty" }
 "#,
     ),
     (
@@ -32,7 +32,7 @@ when = { recovered = true }
 
 [[do]]
 op = "notify.send"
-params = { title = "{workspace} was left half-launched", body = "Shimmer stopped during step {failed_step}. Log: {log}. Then: shimmer workspaces cleanup {workspace}", priority = "high" }
+params = { title = "{workspace} was left half-launched", body = "Shimmer stopped during step {failed_step}. Log: {log}. Then: shimmer workspaces cleanup {workspace}", priority = "high", from = "automation:workspace-half-launched" }
 "#,
     ),
     (
@@ -46,7 +46,7 @@ when = { "origin.type" = "scheduler", code = { ne = "workspace_dirty" }, fallbac
 
 [[do]]
 op = "notify.send"
-params = { title = "Scheduled {op} failed", body = "{error}", priority = "high" }
+params = { title = "Scheduled {op} failed", body = "{error}", priority = "high", from = "automation:scheduled-task-failed" }
 "#,
     ),
     (
@@ -59,7 +59,7 @@ on = "automations.chain.stopped"
 
 [[do]]
 op = "notify.send"
-params = { title = "Automation {rule} was stopped", body = "It would have set itself off again ({reason}). What happened: shimmer automations history {rule}", priority = "high" }
+params = { title = "Automation {rule} was stopped", body = "It would have set itself off again ({reason}). What happened: shimmer automations history {rule}", priority = "high", from = "automation:loop-stopped" }
 "#,
     ),
 ];

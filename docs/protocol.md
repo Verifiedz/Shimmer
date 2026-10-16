@@ -538,7 +538,7 @@ limit; either way `automations.chain.stopped` is emitted. Everything else starts
 
 ADR 0032. Every op that picks messages takes the same filters, all optional and combined:
 `{"unread"?, "read"?, "state"?: "pending"|"held"|"delivered"|"failed",
-"from"?: "send"|"schedules"|"fallbacks"|"alerts"|"automations", "priority"?: "low"|"normal"|"high",
+"from"?: "send"|"schedules"|"fallbacks"|"automations", "priority"?: "low"|"normal"|"high",
 "since"?, "before"?, "text"?}`. `since`/`before` are a date (`2026-10-01`, the start of that local
 day), a local `2026-10-01 14:00`, or RFC 3339; `text` matches the title or body, ignoring case.
 
@@ -556,12 +556,11 @@ day), a local `2026-10-01 14:00`, or RFC 3339; `text` matches the title or body,
 | `notify.pause` | inline | `{"until"?: RFC 3339 after now, "all"?}` | `{"paused":{"since","until"?,"all"}}`; holds low and normal (and high with `all`) until `resume` or `until` |
 | `notify.resume` | inline | `{}` | `{"was_paused","held"}`; enqueues `notify.flush` when something waited |
 | `notify.quiet` | inline | `{}` shows; `{"every_day"|"weekdays"|"weekends"|"mon"…"sun": "22:00-08:00" or null}` sets or clears; `{"off":true}` clears all | `{"quiet":{…},"quiet_now"}` |
-| `notify.builtin_alerts` | inline | `{}` lists; `{"name","on"}` switches one (`workspace_dirty`, `scheduled_task_failed`; dashes accepted) | `{"alerts":{"workspace_dirty","scheduled_task_failed"}}` |
 | `notify.cap` | inline | `{}` shows; `{"max":N}` (at least 100) sets and applies it | `{"max","messages","removed_unread"?}` |
-| `notify.status` | inline | `{}` | `{"paused","quiet","quiet_now","builtin_alerts","cap","counts","removed_unread","sinks","settings_problem"}` |
+| `notify.status` | inline | `{}` | `{"paused","quiet","quiet_now","cap","counts","removed_unread","sinks","settings_problem"}` |
 
 A message: `{"id","at","priority","title","body"?,"source","state","read","delivery":[{"medium","at","ok","error"?}]}`.
-`source` is `send`, `schedule`, `fallback`, `alert:<name>` or `automation:<rule>`. Messages are files
+`source` is `send`, `schedule`, `fallback` or `automation:<rule>` (a rule's message, built-in ones too: ADR 0035 §10). Messages are files
 in `data/notify/inbox/`; settings are `data/notify/settings.toml`.
 
 ## Topic catalogue
@@ -617,7 +616,7 @@ tolerate unknown topics.
 | `notify.message.exhausted` | Every sink failed; it stays in the inbox as `failed`. `{id, errors:[{medium, error}]}`. |
 | `notify.message.read` / `.unread` / `.removed` | `{ids}`; `.removed` also `reason`: `removed` or `cap`. |
 | `notify.pause.started` / `.ended` | `{until, all}` / `{held}`. |
-| `notify.settings.changed` | A setting changed: one of `{quiet}`, `{builtin_alerts}`, `{cap}`. |
+| `notify.settings.changed` | A setting changed: one of `{quiet}`, `{cap}`. |
 
 `queue.task.failed` is the topic a dashboard most needs: it is how failures become visible
 without polling, and it is how the elevated-priority dirty-workspace warning reaches the

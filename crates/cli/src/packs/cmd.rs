@@ -45,7 +45,7 @@ An alias stands for shimmer plus a whole command. In pack.toml it names one of t
   automations.templates  automations.peek
   notify.list  notify.get  notify.count  notify.mark_read  notify.mark_unread  notify.remove
   notify.send  notify.test  notify.resend  notify.pause  notify.resume  notify.quiet
-  notify.status  notify.builtin_alerts  notify.cap
+  notify.status  notify.cap
 
 Your own packs go in packs/<name>/pack.toml in your Shimmer folder (see docs/packs/README.md).
 The active pack is kept in ~/.config/shimmer/cli.toml; aliases are linked into ~/.local/bin.";

@@ -120,7 +120,6 @@ belongs to this machine, so copying your Shimmer folder elsewhere doesn't bring 
 | notify resume | `okite` | `unsnooze` | `open-channel` | `nresume` |
 | notify quiet | `shizuka-ni` | `focus-time` | `night-watch` | `nquiet` |
 | notify status | `genki` | `dashboard` | `bridge-report` | `nst` |
-| notify builtin-alerts | `keikoku` | `alerting` | `red-alert` | `nalerts` |
 | notify cap | `genkai` | `retention` | `memory-banks` | `ncap` |
 
 ## Writing your own
