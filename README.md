@@ -190,7 +190,8 @@ shimmer workspaces status site             # steps, last session, and why it's d
 shimmer workspaces stop site               # stop what it started
 shimmer queue list                     # what is running and waiting, per lane
 shimmer scheduler list                 # your schedules, when each next fires and its state (--all: modules' too)
-shimmer scheduler add records.list '{"collection":"leetcode"}' --every 1d --catch-up skip
+shimmer scheduler add weekdays 09:00 --catch-up skip workspaces activate site   # the command as you'd type it
+shimmer scheduler add mon,wed,fri 18:00 --catch-up skip records complete habits/gym
 ```
 
 A workspace is a folder in `$SHIMMER_HOME/data/workspaces/<name>/` holding a `workspace.toml`
