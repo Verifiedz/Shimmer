@@ -29,6 +29,11 @@ impl LocalTimezone {
             .map_err(|_| Error::invalid_params(format!("unknown IANA timezone '{iana_name}'")))
     }
 
+    /// The zone itself, for working out local times (ADR 0031 §2).
+    pub fn tz(&self) -> Tz {
+        self.0
+    }
+
     pub fn name(&self) -> &'static str {
         self.0.name()
     }

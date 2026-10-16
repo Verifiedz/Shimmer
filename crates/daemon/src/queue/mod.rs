@@ -355,14 +355,14 @@ impl QueueInner {
                     "queue.task.cancelled",
                     json!({"task_id": id, "lane": task.lane, "op": task.op, "was": "queued"}),
                 );
-                Ok(json!({"cancelled": true, "was": "queued"}))
+                Ok(json!({"cancelled": true, "was": "queued", "task_id": id}))
             }
             Status::Running => {
                 // Cooperative: the task ends when it next polls `ctx.cancel`.
                 if let Some(t) = &st.records[&id].cancel {
                     t.cancel();
                 }
-                Ok(json!({"cancelled": true, "was": "running"}))
+                Ok(json!({"cancelled": true, "was": "running", "task_id": id}))
             }
             done => Err(Error::not_cancellable(format!("task {id} already {}", done.name()))),
         }
@@ -401,7 +401,20 @@ impl QueueInner {
                 json!({"task_id": id, "lane": lane, "before": before, "queue_version": new_version}),
             );
         }
-        Ok(json!({"queue_version": new_version}))
+        Ok(json!({"queue_version": new_version, "task_id": id}))
+    }
+
+    /// A task id as a client wrote it: the full id, or a unique ending of one, case insensitive
+    /// (ADR 0031 §4). A ULID starts with its creation time, so ids made close together share
+    /// their start; the end is random. Several matches are `conflict`, none `not_found`.
+    pub fn resolve(&self, written: &str) -> Result<TaskId> {
+        if let Ok(id) = written.parse::<TaskId>() {
+            return Ok(id);
+        }
+        let st = self.lock();
+        let ids: Vec<String> = st.records.keys().map(ToString::to_string).collect();
+        drop(st);
+        crate::short_id::resolve(written, &ids, "task")?.parse()
     }
 
     pub fn task_view(&self, id: TaskId) -> Result<Value> {

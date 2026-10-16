@@ -550,7 +550,7 @@ fn number(flag: &str, value: &str) -> std::result::Result<usize, String> {
 // ---------------------------------------------------------------- requests
 
 impl RecordsCmd {
-    fn collection(&self) -> Option<&str> {
+    pub(crate) fn collection(&self) -> Option<&str> {
         match self {
             Self::Help | Self::Collections | Self::Templates { .. } | Self::Peek { .. } | Self::New { .. } => None,
             Self::Add { collection, .. }
@@ -1279,7 +1279,7 @@ fn confirm_removal(prompt: &mut dyn Prompt, yes: bool, id: &str, detail: &Value)
     Ok(prompt.confirm("Remove it?"))
 }
 
-async fn schema(client: &mut Client, id: &str) -> Result<Value> {
+pub(crate) async fn schema(client: &mut Client, id: &str) -> Result<Value> {
     let all = client.call("records.collections", json!({})).await?;
     let found = all["collections"].as_array().and_then(|cs| cs.iter().find(|c| c["id"] == id)).cloned();
     Ok(found.unwrap_or(Value::Null))
