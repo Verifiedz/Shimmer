@@ -552,12 +552,20 @@ fn list(data: &Value, filtered: bool, now: DateTime<Utc>) -> String {
         let header = ["", "ID", "WHEN", "FROM", "MESSAGE"].map(String::from);
         out.push_str(&render::table(&header, &rows));
     }
+    // The counts are the whole inbox's; on a filtered list, say how many are shown first, so
+    // "3 unread" under one row doesn't read as that row's count.
     let c = &data["counts"];
+    let totals: Vec<String> = [("unread", "unread"), ("held", "held"), ("failed", "failed")]
+        .iter()
+        .filter_map(|(key, word)| c[key].as_u64().filter(|n| *n > 0).map(|n| format!("{n} {word}")))
+        .collect();
     let mut parts = Vec::new();
-    for (key, word) in [("unread", "unread"), ("held", "held"), ("failed", "failed")] {
-        if let Some(n) = c[key].as_u64().filter(|n| *n > 0) {
-            parts.push(format!("{n} {word}"));
-        }
+    match (filtered, items.is_empty(), totals.is_empty()) {
+        (false, _, _) => parts.extend(totals),
+        (true, true, true) => {}
+        (true, true, false) => parts.push(format!("in all: {}", totals.join(", "))),
+        (true, false, true) => parts.push(format!("{} shown", items.len())),
+        (true, false, false) => parts.push(format!("{} shown · in all: {}", items.len(), totals.join(", "))),
     }
     if !items.is_empty() {
         let first = render::short_ids(&[items[0]["id"].as_str().unwrap_or_default().to_owned()]).remove(0);
@@ -877,8 +885,17 @@ mod tests {
         );
         assert!(lines[2].starts_with("  ") && lines[2].contains("Standup") && lines[2].contains("schedule"), "{out}");
         assert!(lines[3].starts_with("1 unread · 1 failed · see one: shimmer notify show"), "{out}");
+        let filtered = list(&json!({"items": [data["items"][1].clone()], "counts": data["counts"].clone()}), true, now);
+        assert!(
+            filtered.lines().last().unwrap().starts_with("1 shown · in all: 1 unread, 1 failed · see one:"),
+            "a filtered list says what it shows, then the inbox's totals: {filtered}"
+        );
         assert_eq!(list(&json!({"items": [], "counts": {}}), false, now), "no messages yet");
         assert_eq!(list(&json!({"items": [], "counts": {}}), true, now), "no messages match");
+        assert_eq!(
+            list(&json!({"items": [], "counts": {"unread": 2}}), true, now),
+            "no messages match\nin all: 2 unread"
+        );
     }
 
     #[test]
