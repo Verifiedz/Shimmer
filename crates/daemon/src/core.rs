@@ -42,6 +42,7 @@ pub struct Core {
 impl Core {
     /// Wire every module to its capabilities. Infallible: all validation happened when the
     /// registry and lanes were built.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         registry: Registry,
         lanes: Vec<LaneConfig>,
@@ -50,6 +51,7 @@ impl Core {
         clock: Clock,
         shutdown: CancellationToken,
         socket: &Path,
+        secrets: Arc<dyn crate::secrets::SecretStore>,
     ) -> Arc<Self> {
         // A module gets a populated, usable `Launcher` only if its manifest declares the
         // `"process"` capability (ADR 0010 §4); every other module keeps `Ctx::new`'s
@@ -76,6 +78,8 @@ impl Core {
                 backend.store.home().to_path_buf(),
                 config.http.clone(),
                 clock.clone(),
+                config.credentials.clone(),
+                secrets,
             )
             .expect("building the http client"),
         );

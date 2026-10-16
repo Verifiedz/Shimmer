@@ -6,9 +6,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use serde_json::Value;
-use shimmer_core::{Error, LocalTimezone, Result};
+use shimmer_core::{Error, LocalTimezone, ModuleId, Result};
 
-use crate::http_backend::{HostLimits, HttpConfig};
+use crate::http_backend::{CredentialBinding, HostLimits, HttpConfig};
 
 #[derive(Debug, Default)]
 pub struct Config {
@@ -20,6 +20,10 @@ pub struct Config {
     pub local_timezone: LocalTimezone,
     /// `[http]` (ADR 0027): the real gateway's rate limits, cache and timeout.
     pub http: HttpConfig,
+    /// `[credentials.<name>]` (ADR 0036 §2): which module and host a named credential is
+    /// bound to. The secret value itself never lives here -- resolved separately, by name,
+    /// through a `SecretStore` (`crates/daemon/src/secrets.rs`).
+    pub credentials: HashMap<String, CredentialBinding>,
 }
 
 impl Config {
@@ -90,8 +94,33 @@ impl Config {
         if let Some(http) = root.get("http") {
             cfg.http = parse_http(http)?;
         }
+        if let Some(credentials) = root.get("credentials").and_then(|c| c.as_table()) {
+            for (name, entry) in credentials {
+                cfg.credentials.insert(name.clone(), parse_credential(name, entry)?);
+            }
+        }
         Ok(cfg)
     }
+}
+
+/// `[credentials.<name>]` (ADR 0036 §2): `module`, `host` and `header` are all required --
+/// a credential with no module to restrict it to, or no host to restrict it to, would be
+/// usable anywhere by anything, which defeats the entire point of binding it.
+fn parse_credential(name: &str, entry: &toml::Value) -> Result<CredentialBinding> {
+    let table = entry
+        .as_table()
+        .ok_or_else(|| Error::invalid_params(format!("config.toml: credentials.{name} must be a table")))?;
+    let field =
+        |key: &str| {
+            table.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).ok_or_else(|| {
+                Error::invalid_params(format!("config.toml: credentials.{name} needs a non-empty {key}"))
+            })
+        };
+    Ok(CredentialBinding {
+        module: ModuleId::new(field("module")?),
+        host: field("host")?.to_owned(),
+        header: field("header")?.to_owned(),
+    })
 }
 
 fn number(v: &toml::Value) -> Option<f64> {
@@ -299,6 +328,23 @@ mod tests {
     #[test]
     fn rejects_a_non_positive_rate() {
         assert!(Config::parse("[http]\ndefault_requests_per_sec = 0\n").is_err());
+    }
+
+    #[test]
+    fn parses_a_credentials_section() {
+        let text = "[credentials.my-api-key]\nmodule = \"fetchers\"\nhost = \"api.example.com:443\"\nheader = \"Authorization\"\n";
+        let cfg = Config::parse(text).unwrap();
+        let cred = &cfg.credentials["my-api-key"];
+        assert_eq!(cred.module, ModuleId::new("fetchers"));
+        assert_eq!(cred.host, "api.example.com:443");
+        assert_eq!(cred.header, "Authorization");
+    }
+
+    #[test]
+    fn a_credential_missing_a_required_field_is_rejected() {
+        let e =
+            Config::parse("[credentials.my-api-key]\nmodule = \"fetchers\"\nheader = \"Authorization\"\n").unwrap_err();
+        assert!(e.message.contains("host"), "{}", e.message);
     }
 
     #[test]

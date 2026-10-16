@@ -19,6 +19,7 @@ mod launcher;
 mod queue;
 mod registry;
 mod scheduler;
+mod secrets;
 mod short_id;
 
 use std::fs::{self, File};
@@ -94,6 +95,7 @@ impl Daemon {
         }
 
         let cfg = config::Config::load(store.home())?;
+        let secrets = secrets::load_chain()?;
         let registry = Registry::build(modules)?;
         let lanes = registry.lanes(&cfg)?;
         let declared: Vec<_> = registry
@@ -107,7 +109,8 @@ impl Daemon {
         let shutdown = CancellationToken::new();
         let bus = Bus::new();
         let backend = Arc::new(Backend { store: store.clone(), bus: bus.clone() });
-        let core = Core::new(registry, lanes, &cfg, backend, config.clock.clone(), shutdown.clone(), &config.socket);
+        let core =
+            Core::new(registry, lanes, &cfg, backend, config.clock.clone(), shutdown.clone(), &config.socket, secrets);
         let tracker = TaskTracker::new();
 
         // Subscribe before init so events a module emits while initialising are not missed.
