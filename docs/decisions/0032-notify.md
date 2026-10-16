@@ -303,7 +303,7 @@ Every op that picks messages takes the same **filters** (all optional, all combi
 | `notify.test` | queued (`notify`) | `{}` | `{"deliveries":[…]}`: a test message to every sink, past quiet hours and pause |
 | `notify.resend` | queued (`notify`) | `{"ids":[…]}` or filters | `{"items":[…]}`: each message tried again, the new deliveries recorded on it, its state updated |
 | `notify.flush` | queued (`notify`) | `{}` | `{"delivered": N}` |
-| `notify.list` | inline | filters, `limit`? (default 50) | `{"items":[…], "counts":{…}}`, newest first |
+| `notify.list` | inline | filters, `limit`? (default 50) | `{"items":[…], "counts":{…}}`, newest first; each item has its `short` ending |
 | `notify.count` | inline | filters | `{"count": N, "unread", "high", "held", "failed"}` |
 | `notify.get` | inline | `{"id"}` | one item |
 | `notify.mark_read` / `notify.mark_unread` | inline | `{"ids":[…]}`, `{"all": true}` or filters | `{"marked": N}` |
@@ -314,6 +314,13 @@ Every op that picks messages takes the same **filters** (all optional, all combi
 | `notify.builtin_alerts` | inline | `{}` lists; `{"name", "on"}` switches one | the alerts and whether each is on |
 | `notify.cap` | inline | `{}` shows; `{"max": N}` sets (at least 100) | `{"max": N, "messages": N}` |
 | `notify.status` | inline | `{}` | settings, whether paused or quiet now, counts, sinks, a broken settings file if any |
+
+**Ids are short ids, matched by the module.** Every `id` and `ids` entry may be a unique ending of a
+message id, as tasks and triggers are (ADR 0031 §4): at least 4 characters, `conflict` when several
+match, `not_found` when none does, so a stray keystroke can't remove a message. The matching lives in
+`core::short_id`, shared with the queue and scheduler, never in a client (CLAUDE.md §2). A list
+item's `short` is worked out against the whole inbox, not the page returned, so an ending copied from
+`list` always works given back (found in #246's review).
 
 Topics: `notify.message.received`, `.held`, `.sent`, `.exhausted`, `.read`, `.unread`, `.removed`;
 `notify.pause.started`, `.ended`; `notify.settings.changed`.
