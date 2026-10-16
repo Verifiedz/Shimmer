@@ -174,9 +174,14 @@ A module may depend only on `core` (§3 rule 1). Automations needs three things 
 
 ### 6. Notify's rules become automations (amends ADR 0032 §5)
 
-- **Notify keeps delivery only:** `notify.send`, the inbox, desktop popups, quiet hours, and its two
-  built-in alerts (a workspace went dirty; a scheduled task failed), which stay module code
-  because they're on for everyone by default (ADR 0032 §4).
+- **Notify keeps delivery only:** `notify.send`, the inbox, desktop popups, quiet hours and pause.
+- **Notify's two built-in alerts** (a workspace went dirty; a scheduled task failed, ADR 0032 §4)
+  live in notify only until this ships. Then they become two **built-in rules** that come with
+  Shimmer: on by default, shown in `shimmer automations list` marked built in, switchable with
+  `automations disable` / `enable`, and never removable, so a fresh install always warns about a
+  dirty workspace (CLAUDE.md §10.3) and one can't be lost by accident. Notify's alert code and its
+  `builtin-alerts` command go; `shimmer notify builtin-alerts` then says where they moved, and a
+  switch already set in notify's settings carries over. One place for every "when X, do Y".
 - **"Message me when X" is an automation** whose action is `notify.send`:
   ```toml
   [rule]
