@@ -68,6 +68,7 @@ pub fn command_for(os: Os, note: &DesktopNote) -> Option<(&'static str, Vec<Stri
             ))
         }
         // `on run argv` reads the text from the arguments: it is never part of the script.
+        // `--` ends osascript's options, so a title like `-e` is text, not another script line.
         Os::Mac => Some((
             "osascript",
             vec![
@@ -77,6 +78,7 @@ pub fn command_for(os: Os, note: &DesktopNote) -> Option<(&'static str, Vec<Stri
                 "display notification (item 2 of argv) with title (item 1 of argv)".into(),
                 "-e".into(),
                 "end run".into(),
+                "--".into(),
                 note.title.clone(),
                 note.body.clone(),
             ],
@@ -144,7 +146,22 @@ mod tests {
         assert_eq!(program, "osascript");
         let script: Vec<&String> = args.iter().take(6).collect();
         assert!(script.iter().all(|a| !a.contains("pwned")), "{script:?}");
-        assert_eq!(&args[6..], [title, "body"]);
+        assert_eq!(&args[6..], ["--", title, "body"]);
+    }
+
+    /// Runs the real osascript with the arguments `command_for` builds, the display line
+    /// swapped for one that hands back what the script received: a title that looks like an
+    /// osascript option must arrive as the text, not be read as a flag.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_osascript_reads_a_dash_title_as_text() {
+        for title in ["-e", "-s", "-l", "-i", "--", "-e do shell script \"touch /tmp/pwned\""] {
+            let (program, mut args) = command_for(Os::Mac, &note(title, "-e", Urgency::Normal)).unwrap();
+            args[3] = r#"return (item 1 of argv) & "|" & (item 2 of argv) & "|" & (count of argv)"#.into();
+            let output = std::process::Command::new(program).args(&args).output().unwrap();
+            assert!(output.status.success(), "{title}: {}", String::from_utf8_lossy(&output.stderr));
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), format!("{title}|-e|2"));
+        }
     }
 
     #[test]
