@@ -199,6 +199,13 @@ after = "3d"                      # 30m, 2h, 3d, 1w, 60d…
      `"desktop"`). Revisit if non-Shimmer code ever runs inside the daemon: persistence is a
      different power from "now", and a capability would make it visible in a manifest.
    - It's also what a calendar or reminders feature would use.
+7. **A read-only catalog of ops and topics.** A module can't see `core.manifest`, yet automations
+   checks that a rule's ops exist (§1) and lists what a rule can react to (`automations events`).
+   `Ctx` gains `catalog`: every module op (its `CommandSpec`) and every topic with its description,
+   the daemon's own `queue.*` and `scheduler.*` topics included. Fixed at daemon start, as the
+   registry is. It grants nothing: it's what `core.manifest` already tells any client.
+   - **Not chosen: checking in the CLI.** No `core` change, but clients would hold logic (§2), and a
+     rule edited by hand would skip the check and only fail when it fires.
 
 ### 6. Trust: the same as a schedule
 
