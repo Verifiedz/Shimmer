@@ -18,6 +18,7 @@ pub mod packs;
 mod queue;
 mod records;
 mod render;
+mod schedule;
 mod scheduler;
 mod schedules;
 mod style;
@@ -128,6 +129,8 @@ async fn run_line(alias: Option<String>, args: Vec<String>) -> ExitCode {
         }
     }
     let args = packs::active::rewrite(line, active.pack.as_ref());
+    // `shimmer schedule WHEN … ALIAS …`: the alias where the scheduled command starts, too.
+    let args = schedule::rewrite_inner(args, active.pack.as_ref());
 
     let usage = usage_for(&args);
     let args = match Args::parse(args) {
@@ -199,6 +202,7 @@ fn usage_for(args: &[String]) -> &'static str {
             "workspaces" => return workspaces::USAGE,
             "queue" => return queue::USAGE,
             "scheduler" => return scheduler::USAGE,
+            "schedule" => return schedule::USAGE,
             "packs" => return packs::cmd::USAGE,
             "doctor" => return doctor::USAGE,
             _ => return USAGE,
@@ -226,6 +230,7 @@ fn prints_data(cmd: &Command) -> bool {
             | Command::Workspaces(WorkspacesCmd::List | WorkspacesCmd::Status { .. })
             | Command::Queue(QueueCmd::List { .. } | QueueCmd::Show { .. })
             | Command::Scheduler(SchedulerCmd::List | SchedulerCmd::Show { .. })
+            | Command::Schedule(_)
     )
 }
 
@@ -237,6 +242,7 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
         Command::Workspaces(WorkspacesCmd::Help) => return Ok(Some(workspaces::USAGE.into())),
         Command::Queue(QueueCmd::Help) => return Ok(Some(queue::USAGE.into())),
         Command::Scheduler(SchedulerCmd::Help) => return Ok(Some(scheduler::USAGE.into())),
+        Command::Schedule(schedule::ScheduleCmd::Help) => return Ok(Some(schedule::USAGE.into())),
         Command::DoctorHelp => return Ok(Some(doctor::USAGE.into())),
         // Packs live entirely in the client: no daemon needed.
         Command::Packs(cmd) => return packs::cmd::run(cmd, &packs::cmd::Env::from_process()).map(Some),
@@ -256,6 +262,9 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
     if let Command::Workspaces(cmd) = &args.command {
         return workspaces::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
     }
+    if let Command::Schedule(cmd) = &args.command {
+        return schedule::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
+    }
     if let Command::Call { op, params, first: Some(yes) } = &args.command {
         return call_first(&mut client, op, params.clone(), *yes).await.map(|data| Some(output(args, &data)));
     }
@@ -271,6 +280,7 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
         | Command::Workspaces(_)
         | Command::Queue(_)
         | Command::Scheduler(_)
+        | Command::Schedule(_)
         | Command::Packs(_) => {
             unreachable!("handled above")
         }
@@ -339,6 +349,7 @@ fn output(args: &Args, data: &Value) -> String {
         | Command::Workspaces(_)
         | Command::Queue(_)
         | Command::Scheduler(_)
+        | Command::Schedule(_)
         | Command::Packs(_) => render::json(data),
     }
 }

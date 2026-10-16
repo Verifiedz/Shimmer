@@ -23,7 +23,11 @@ pub struct TriggerSpec {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Schedule {
+    /// Five-field cron, in UTC.
     Cron(String),
+    /// Five-field cron in the configured `local_timezone` (ADR 0009), so 9am stays 9am across a
+    /// clock change (ADR 0031 §2). `{"cron_local": "0 9 * * 1-5"}` on the wire.
+    CronLocal(String),
     /// Whole seconds on the wire.
     Every(#[serde(with = "duration_secs")] Duration),
     Once(DateTime<Utc>),
