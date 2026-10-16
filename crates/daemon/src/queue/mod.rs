@@ -35,7 +35,14 @@ const SOURCE: &str = "queue";
 /// Executes one op. Implemented by the daemon core; the queue just calls it.
 #[async_trait]
 pub trait OpRunner: Send + Sync {
-    async fn run_op(&self, op: &str, params: Value, cancel: CancellationToken, progress: ProgressFn) -> Result<Value>;
+    async fn run_op(
+        &self,
+        task: TaskId,
+        op: &str,
+        params: Value,
+        cancel: CancellationToken,
+        progress: ProgressFn,
+    ) -> Result<Value>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -255,9 +262,9 @@ impl QueueInner {
             None => Err(Error::unavailable("daemon is shutting down")),
             Some(runner) => {
                 let progress = self.progress_fn(task.id, task.lane.clone());
-                let (op, params, cancel) = (task.op.clone(), task.params.clone(), token.clone());
+                let (id, op, params, cancel) = (task.id, task.op.clone(), task.params.clone(), token.clone());
                 // Own task, so a panicking module fails this task instead of the queue.
-                let joined = tokio::spawn(async move { runner.run_op(&op, params, cancel, progress).await }).await;
+                let joined = tokio::spawn(async move { runner.run_op(id, &op, params, cancel, progress).await }).await;
                 joined.unwrap_or_else(|e| Err(Error::internal(format!("task panicked: {e}"))))
             }
         };

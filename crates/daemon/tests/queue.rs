@@ -576,3 +576,20 @@ async fn a_fallback_that_cannot_be_enqueued_is_reported_and_never_stalls_the_lan
     assert_eq!(until(&mut c, "queue.task.finished", &next).await.last().unwrap().payload["task_id"], next.as_str());
     stop(d).await;
 }
+
+/// ADR 0035 §5.1: what automations follows a chain of rules by.
+#[tokio::test]
+async fn events_a_queued_task_emits_carry_it_as_their_cause() {
+    let env = Env::new();
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    c.subscribe(&["demo.item.saved"]).await;
+    let task = task_id(&c.call("demo.put_queued", json!({})).await.unwrap());
+    for _ in 0..2 {
+        let ev = c.event("demo.item.saved").await;
+        assert_eq!(ev.cause.map(|t| t.to_string()), Some(task.clone()), "{:?}", ev.payload);
+    }
+    c.call("demo.put", json!({"key": "k", "val": "v"})).await.unwrap();
+    assert_eq!(c.event("demo.item.saved").await.cause, None, "answered inline: no task");
+    stop(d).await;
+}

@@ -166,7 +166,8 @@ Ops with `execution: inline` ignore it.
 {"v":1,"kind":"event","event":{
   "id":"01JD2K…","at":"2026-09-16T14:03:11Z","source":"fetchers",
   "topic":"fetchers.fetch.finished",
-  "payload":{"source":"hn-whoishiring","new_items":12}}}
+  "payload":{"source":"hn-whoishiring","new_items":12},
+  "cause":"01JD2N…"}}
 ```
 
 Topic patterns support a trailing `*` on a segment boundary: `records.*`,
@@ -176,6 +177,11 @@ Topic patterns support a trailing `*` on a segment boundary: `records.*`,
 The event object is byte-identical to the one appended to
 `$SHIMMER_HOME/events/YYYY-MM-DD.jsonl`. One definition in `shimmer-core`. The one exception to
 "every streamed event is logged" is `queue.task.progress`, which is streamed only.
+
+`cause` is the id of the queued task the event was emitted from, and is absent for anything
+else: a request answered inline, or the queue's own `queue.task.*` events (ADR 0035 §5.1).
+Automations uses it to follow a chain of rules; a client may ignore it. Older log lines have no
+`cause` and read unchanged.
 
 **Backpressure:** each connection has a bounded event queue (1024). If a client does not
 drain it, the daemon drops the oldest and sends
@@ -346,7 +352,7 @@ client can say which one it hit.
 
 | Op | Execution | Params | Returns |
 |---|---|---|---|
-| `scheduler.list` | inline | `{}` | `{"triggers":[…]}`, each `{"id","op","params","schedule","catch_up","lane","fallback","next_due","last_run","paused","done","source"}`. `done` is a `once` trigger that has fired; `source` is `{"type":"user"}` or `{"type":"module","id"}`. |
+| `scheduler.list` | inline | `{}` | `{"triggers":[…]}`, each `{"id","op","params","schedule","catch_up","lane","fallback","next_due","last_run","paused","done","source"}`. `done` is a `once` trigger that has fired; `source` is `{"type":"user"}`, `{"type":"module","id"}` (declared by a module), or `{"type":"added","id","label"}`: a one-time schedule a module added while running (ADR 0035 §5.6), removed once it has run (`scheduler.trigger.removed`, `reason: "ran"`). Module ones answer `scheduler.remove` with `conflict`; pause them instead. |
 | `scheduler.get` | inline | `{"trigger_id"}` | One trigger, same shape as a `scheduler.list` entry, or `not_found`. |
 | `scheduler.add` | inline | `{"schedule","op","params","catch_up","lane"?,"fallback"?}` | `{"trigger_id"}` |
 | `scheduler.remove` | inline | `{"trigger_id"}` | `{"removed":true,"trigger_id"}` (the full id) |

@@ -12,9 +12,10 @@ use crate::ctx::{Ctx, ModuleConfig};
 use crate::error::{Error, Result};
 use crate::event::Event;
 use crate::http::{HttpBackend, HttpGateway, HttpResponse};
-use crate::ids::{ModuleId, TaskId};
+use crate::ids::{ModuleId, TaskId, TriggerId};
 use crate::launcher::{LaunchBackend, LaunchStep, Launcher, StepOutcome};
 use crate::queue::{EnqueueRequest, QueueHandle, TaskHandle, TaskSubmitter};
+use crate::schedules::{OneTime, ScheduleBackend, Schedules};
 use crate::store::{validate_path, StoreBackend, TxPlan, Write};
 
 /// In-memory store that is also the event sink. Committed events are inspectable.
@@ -125,6 +126,29 @@ impl LaunchBackend for FakeLauncher {
     }
 }
 
+/// Records the one-time schedules modules add (ADR 0035 §5.6). Nothing fires: a test that wants
+/// a schedule to run calls the module's op itself.
+#[derive(Default)]
+pub struct FakeSchedules {
+    pub added: Mutex<Vec<(ModuleId, TriggerId, OneTime)>>,
+}
+
+impl ScheduleBackend for FakeSchedules {
+    fn add_once(&self, module: &ModuleId, once: OneTime) -> Result<TriggerId> {
+        let mut added = self.added.lock().unwrap();
+        let id = TriggerId::new(format!("{module}-{}", added.len() + 1));
+        added.push((module.clone(), id.clone(), once));
+        Ok(id)
+    }
+
+    fn remove(&self, module: &ModuleId, id: &TriggerId) -> Result<bool> {
+        let mut added = self.added.lock().unwrap();
+        let before = added.len();
+        added.retain(|(m, i, _)| !(m == module && i == id));
+        Ok(added.len() < before)
+    }
+}
+
 /// A `Ctx` wired to in-memory fakes, with the fakes exposed for assertions.
 pub struct TestEnv {
     pub ctx: Ctx,
@@ -132,6 +156,7 @@ pub struct TestEnv {
     pub queue: Arc<StubQueue>,
     pub http: Arc<StubHttp>,
     pub launcher: Arc<FakeLauncher>,
+    pub schedules: Arc<FakeSchedules>,
     pub clock: Clock,
 }
 
@@ -156,7 +181,9 @@ impl TestEnv {
             id,
         );
         ctx.launcher = Launcher::new(launcher.clone());
-        Self { ctx, backend, queue, http, launcher, clock }
+        let schedules = Arc::new(FakeSchedules::default());
+        ctx.schedules = Schedules::new(ctx.module_id.clone(), schedules.clone());
+        Self { ctx, backend, queue, http, launcher, schedules, clock }
     }
 }
 

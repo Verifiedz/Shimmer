@@ -505,11 +505,13 @@ fn state(t: &Value) -> String {
     }
 }
 
-/// `you`, or `module <id>` for one a module declared (it can be paused, not removed).
+/// `you`, `module <id>` for one a module declared, or `<id>: <label>` for a one-time schedule a
+/// module added (ADR 0035 §5.6). Module ones can be paused, not removed.
 fn source(v: &Value) -> String {
     match v["type"].as_str() {
         Some("user") => "you".into(),
         Some("module") => format!("module {}", v["id"].as_str().unwrap_or("?")),
+        Some("added") => format!("{}: {}", v["id"].as_str().unwrap_or("?"), v["label"].as_str().unwrap_or("")),
         _ => render::cell(v),
     }
 }
@@ -635,6 +637,12 @@ mod tests {
             ["digest", "notify.digest {}", "cron 0 9 * * 1 (UTC)", "skip", "-", "3m ago", "paused", "module notify"]
         );
         assert!(list(&json!({"triggers": []}), now, &Schemas::new()).starts_with("no triggers yet"));
+    }
+
+    #[test]
+    fn a_modules_one_time_schedule_shows_who_added_it_and_why() {
+        let added = json!({"type": "added", "id": "automations", "label": "follow up on acme (rule nudge)"});
+        assert_eq!(source(&added), "automations: follow up on acme (rule nudge)");
     }
 
     fn schemas() -> Schemas {

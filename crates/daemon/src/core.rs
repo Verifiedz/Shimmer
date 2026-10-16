@@ -13,7 +13,8 @@ use serde_json::{json, Value};
 use shimmer_core::params::decode;
 use shimmer_core::{
     Clock, Ctx, Emitter, Error, Execution, HttpBackend, HttpGateway, LaneConfig, LaneId, ModuleConfig, ModuleId,
-    NamespacedStore, Origin, Priority, ProgressFn, QueueHandle, Result,
+    NamespacedStore, OneTime, Origin, Priority, ProgressFn, QueueHandle, Result, ScheduleBackend, Schedules, TaskId,
+    TriggerId,
 };
 use shimmer_core::{EnqueueRequest, TaskSubmitter};
 #[cfg(unix)]
@@ -96,6 +97,8 @@ impl Core {
             let runner: Weak<dyn OpRunner> = weak.clone();
             let queue = QueueInner::new(&lanes, ops, backend.clone(), clock.clone(), runner, shutdown.clone());
             let submitter: Arc<dyn TaskSubmitter> = Arc::new(QueueFront::new(&queue));
+            // Every module gets it (ADR 0035 §5.6): the same power as `ctx.queue`, later.
+            let schedules: Arc<dyn ScheduleBackend> = Arc::new(SchedulerFront(weak.clone()));
 
             let ctxs = registry
                 .entries
@@ -117,6 +120,7 @@ impl Core {
                     if e.manifest.capabilities.iter().any(|c| c == "process") {
                         ctx.launcher = Launcher::new(real_launcher.clone());
                     }
+                    ctx.schedules = Schedules::new(id.clone(), schedules.clone());
                     if e.manifest.capabilities.iter().any(|c| c == "network") {
                         ctx.http = HttpGateway::new(id.clone(), real_http.clone());
                     }
@@ -239,6 +243,7 @@ impl Core {
                     namespace: e.manifest.namespace.clone(),
                     commands: e.commands.clone(),
                     topics: e.manifest.topics.clone(),
+                    topic_descriptions: e.manifest.topic_descriptions.clone(),
                 })
                 .collect(),
         }
@@ -247,7 +252,14 @@ impl Core {
 
 #[async_trait]
 impl OpRunner for Core {
-    async fn run_op(&self, op: &str, params: Value, cancel: CancellationToken, progress: ProgressFn) -> Result<Value> {
+    async fn run_op(
+        &self,
+        task: TaskId,
+        op: &str,
+        params: Value,
+        cancel: CancellationToken,
+        progress: ProgressFn,
+    ) -> Result<Value> {
         let (entry, _) =
             self.registry.command(op).ok_or_else(|| Error::unknown_op(format!("no module registered op '{op}'")))?;
         if !entry.ready.load(Ordering::Acquire) {
@@ -257,8 +269,29 @@ impl OpRunner for Core {
             .ctxs
             .get(&entry.manifest.id)
             .ok_or_else(|| Error::internal("module has no ctx"))?
-            .for_task(cancel, progress);
+            .for_task(task, cancel, progress);
         entry.module.handle(op, params, &ctx).await
+    }
+}
+
+/// `ctx.schedules`' way to the scheduler, which starts after the modules are initialised: until
+/// then (in `Module::init`) it answers `unavailable`.
+struct SchedulerFront(Weak<Core>);
+
+impl SchedulerFront {
+    fn scheduler(&self) -> Result<Arc<Scheduler>> {
+        let core = self.0.upgrade().ok_or_else(|| Error::unavailable("daemon is shutting down"))?;
+        core.scheduler.get().cloned().ok_or_else(|| Error::unavailable("the scheduler isn't running yet"))
+    }
+}
+
+impl ScheduleBackend for SchedulerFront {
+    fn add_once(&self, module: &ModuleId, once: OneTime) -> Result<TriggerId> {
+        self.scheduler()?.add_once(module, once)
+    }
+
+    fn remove(&self, module: &ModuleId, id: &TriggerId) -> Result<bool> {
+        ScheduleBackend::remove(&*self.scheduler()?, module, id)
     }
 }
 
