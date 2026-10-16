@@ -1,0 +1,654 @@
+//! The automations module (ADR 0035): "when this happens, do that". A rule reacts to an event
+//! (`on`, `when`) by queueing ops (`[[do]]`), each in its own lane as if a person had run it, or by
+//! scheduling one for later (`after`). One TOML file per rule; a loop guard follows chains of rules
+//! through `Event.cause`. Depends on `core` only (CLAUDE.md §3).
+
+pub mod chain;
+pub mod rule;
+
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use shimmer_core::params::decode;
+use shimmer_core::{local_date, CommandSpec, Ctx, Error, Event, Execution, Manifest, Module, Result, WriteLock};
+
+use chain::{Chain, Chains};
+use rule::Rule;
+
+const RULES: &str = "rules";
+/// Removed rules, until restored: `removed/<id>.toml`.
+const REMOVED: &str = "removed";
+const SETTINGS: &str = "settings.toml";
+const HISTORY: &str = "history.json";
+/// Firings kept in `history.json`, oldest dropped; the event log keeps them all (§8).
+const HISTORY_KEPT: usize = 300;
+/// The depth limit's default and range (§3).
+const DEPTH: usize = 3;
+const DEPTH_RANGE: std::ops::RangeInclusive<usize> = 1..=10;
+/// A one-time schedule's label is one short line (the scheduler takes up to 200 characters).
+const LABEL_CHARS: usize = 150;
+
+/// Every topic automations emits, with a line on it for `automations events` (§5.5).
+const TOPICS: [(&str, &str); 9] = [
+    ("automations.rule.created", "a rule was created"),
+    ("automations.rule.edited", "a rule was changed"),
+    ("automations.rule.removed", "a rule was removed (it can be restored)"),
+    ("automations.rule.restored", "a removed rule came back"),
+    ("automations.rule.enabled", "a rule was switched on"),
+    ("automations.rule.disabled", "a rule was switched off"),
+    ("automations.rule.fired", "a rule reacted to an event"),
+    ("automations.chain.stopped", "a chain of rules was stopped: a loop, or too deep"),
+    ("automations.settings.changed", "automations' settings changed"),
+];
+
+#[derive(Default)]
+pub struct Automations {
+    /// Held around every read-check-write of automations' files (ADR 0014).
+    write: WriteLock,
+    state: Mutex<State>,
+}
+
+#[derive(Debug, Default)]
+struct State {
+    rules: BTreeMap<String, Rule>,
+    /// Rule files that couldn't be used, and why: shown, never silently skipped (§1).
+    problems: Vec<(String, String)>,
+    chains: Chains,
+    depth: usize,
+}
+
+impl Automations {
+    fn state(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Re-read every rule file and the settings.
+    fn load(&self, ctx: &Ctx) -> Result<()> {
+        let mut rules = BTreeMap::new();
+        let mut problems = Vec::new();
+        for path in ctx.store.list(RULES)? {
+            let Some(id) = path.strip_prefix("rules/").and_then(|f| f.strip_suffix(".toml")) else { continue };
+            let text = ctx.store.read_string(&path)?.unwrap_or_default();
+            match Rule::parse(id, &text, &ctx.catalog, false) {
+                Ok(r) => {
+                    rules.insert(id.to_owned(), r);
+                }
+                Err(e) => problems.push((path.clone(), e)),
+            }
+        }
+        let depth = match settings(ctx) {
+            Ok(d) => d,
+            Err(e) => {
+                problems.push((SETTINGS.to_owned(), e));
+                DEPTH
+            }
+        };
+        let mut st = self.state();
+        st.rules = rules;
+        st.problems = problems;
+        st.depth = depth;
+        Ok(())
+    }
+
+    fn rule(&self, id: &str) -> Result<Rule> {
+        self.state().rules.get(id).cloned().ok_or_else(|| Error::not_found(format!("no rule '{id}'")))
+    }
+
+    // ------------------------------------------------------------------ reacting
+
+    /// Every matching rule fires (§2), unless the loop guard stops it (§3).
+    async fn react(&self, ev: &Event, ctx: &Ctx) -> Result<()> {
+        let today = local_date(ctx.clock.now(), &ctx.local_tz);
+        let (matched, chain, depth) = {
+            let st = self.state();
+            let matched: Vec<Rule> = st
+                .rules
+                .values()
+                .filter(|r| r.matches(&ev.topic, &ev.payload, today, ctx.local_tz.tz()))
+                .cloned()
+                .collect();
+            (matched, st.chains.of(ev.cause, &ev.id.to_string()), st.depth)
+        };
+        for rule in matched {
+            match chain.next(&rule.id, depth) {
+                Ok(next) => self.fire(&rule, ev, next, ctx).await?,
+                Err(stop) => {
+                    let payload = json!({"chain": chain.id, "rules": chain.rules, "rule": rule.id,
+                        "reason": stop.as_str(), "event": {"id": ev.id, "topic": ev.topic}});
+                    self.record(ctx, "automations.chain.stopped", payload)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Queue or schedule each of `rule`'s actions. One failing doesn't stop the others (§1).
+    async fn fire(&self, rule: &Rule, ev: &Event, chain: Chain, ctx: &Ctx) -> Result<()> {
+        let mut queued = Vec::new();
+        let mut scheduled = Vec::new();
+        let mut failed = Vec::new();
+        for action in &rule.actions {
+            let params = rule::fill(&action.params, &ev.payload);
+            match action.after {
+                Some(wait) => {
+                    let at = ctx.clock.now() + wait;
+                    match ctx.schedules.add_once(&action.op, params, at, &label(rule)) {
+                        Ok(id) => scheduled.push(json!({"op": action.op, "trigger_id": id, "at": at})),
+                        Err(e) => failed.push(json!({"op": action.op, "error": e.message})),
+                    }
+                }
+                None => match ctx.queue.enqueue(&action.op, params).await {
+                    Ok(h) => {
+                        self.state().chains.remember(h.task_id, chain.clone());
+                        queued.push(json!({"op": action.op, "task_id": h.task_id, "lane": h.lane}));
+                    }
+                    Err(e) => failed.push(json!({"op": action.op, "error": e.message})),
+                },
+            }
+        }
+        let payload = json!({"rule": rule.id, "event": {"id": ev.id, "topic": ev.topic}, "chain": chain.id,
+            "depth": chain.rules.len(), "queued": queued, "scheduled": scheduled, "failed": failed});
+        self.record(ctx, "automations.rule.fired", payload)
+    }
+
+    /// Emit `topic` and add it to the history, together (§7.1).
+    fn record(&self, ctx: &Ctx, topic: &str, payload: Value) -> Result<()> {
+        let _g = self.write.lock();
+        let mut history = history(ctx);
+        let kind = topic.rsplit('.').next().unwrap_or(topic);
+        let mut entry = payload.clone();
+        entry["at"] = json!(ctx.clock.now());
+        entry["kind"] = json!(kind);
+        history.push(entry);
+        let drop = history.len().saturating_sub(HISTORY_KEPT);
+        history.drain(..drop);
+        let text = serde_json::to_vec_pretty(&history).map_err(|e| Error::internal(e.to_string()))?;
+        ctx.store.transaction(|tx| {
+            tx.put(HISTORY, text)?;
+            tx.emit(topic, payload)
+        })
+    }
+
+    // ------------------------------------------------------------------ ops
+
+    fn list(&self, ctx: &Ctx) -> Value {
+        let history = history(ctx);
+        let rules: Vec<Value> = self.state().rules.values().map(|r| view(r, &history)).collect();
+        json!({"rules": rules, "problems": self.problems(), "removed": removed(ctx)})
+    }
+
+    fn problems(&self) -> Vec<Value> {
+        self.state().problems.iter().map(|(file, error)| json!({"file": file, "error": error})).collect()
+    }
+
+    fn get(&self, ctx: &Ctx, id: &str) -> Result<Value> {
+        let rule = self.rule(id)?;
+        let mut v = view(&rule, &history(ctx));
+        v["text"] = json!(ctx.store.read_string(&path(id))?.unwrap_or_default());
+        Ok(v)
+    }
+
+    /// A new rule from `text`, or a starter rule, switched off, to edit (§8).
+    fn create(&self, ctx: &Ctx, p: Create) -> Result<Value> {
+        let _g = self.write.lock();
+        if ctx.store.read(&path(&p.id))?.is_some() {
+            return Err(Error::conflict(format!("rule '{}' already exists", p.id)));
+        }
+        let text = match p.text {
+            Some(t) => t,
+            None => starter(ctx, p.label.as_deref().unwrap_or("")),
+        };
+        self.write_rule(ctx, &p.id, &text, "automations.rule.created")
+    }
+
+    /// Replace a rule's file with `text`, after checking it: a broken rule is refused and the old
+    /// one kept (§8).
+    fn save(&self, ctx: &Ctx, p: Save) -> Result<Value> {
+        let _g = self.write.lock();
+        if ctx.store.read(&path(&p.id))?.is_none() {
+            return Err(Error::not_found(format!("no rule '{}'", p.id)));
+        }
+        self.write_rule(ctx, &p.id, &p.text, "automations.rule.edited")
+    }
+
+    fn write_rule(&self, ctx: &Ctx, id: &str, text: &str, topic: &str) -> Result<Value> {
+        let rule = Rule::parse(id, text, &ctx.catalog, false).map_err(Error::invalid_params)?;
+        ctx.store.transaction(|tx| {
+            tx.put(&path(id), text)?;
+            tx.emit(topic, json!({"rule": id}))
+        })?;
+        let mut st = self.state();
+        st.problems.retain(|(file, _)| *file != path(id));
+        st.rules.insert(id.to_owned(), rule.clone());
+        drop(st);
+        Ok(view(&rule, &history(ctx)))
+    }
+
+    fn remove(&self, ctx: &Ctx, id: &str) -> Result<Value> {
+        let _g = self.write.lock();
+        let known = self.state().rules.get(id).map(|r| r.builtin);
+        if known == Some(true) {
+            return Err(Error::conflict(format!("'{id}' is built in: switch it off instead")));
+        }
+        // A broken rule file can be removed too: that's one way to fix it.
+        if ctx.store.read(&path(id))?.is_none() {
+            return Err(Error::not_found(format!("no rule '{id}'")));
+        }
+        // Moved, not deleted, so `restore` can bring it back. An older removed rule with the same
+        // id is replaced.
+        let text = ctx.store.read(&path(id))?.unwrap_or_default();
+        ctx.store.transaction(|tx| {
+            tx.put(&removed_path(id), text)?;
+            tx.delete(&path(id))?;
+            tx.emit("automations.rule.removed", json!({"rule": id}))
+        })?;
+        let mut st = self.state();
+        st.rules.remove(id);
+        st.problems.retain(|(file, _)| *file != path(id));
+        Ok(json!({"removed": true, "rule": id}))
+    }
+
+    /// Bring a removed rule back, as it was. One that no longer checks (an op it names is gone) is
+    /// still restored, and reported like any rule file that can't be used.
+    fn restore(&self, ctx: &Ctx, id: &str) -> Result<Value> {
+        let _g = self.write.lock();
+        let Some(text) = ctx.store.read_string(&removed_path(id))? else {
+            return Err(Error::not_found(format!("no removed rule '{id}'")));
+        };
+        if ctx.store.read(&path(id))?.is_some() {
+            return Err(Error::conflict(format!("a rule '{id}' exists: remove or rename it first")));
+        }
+        ctx.store.transaction(|tx| {
+            tx.put(&path(id), text.as_str())?;
+            tx.delete(&removed_path(id))?;
+            tx.emit("automations.rule.restored", json!({"rule": id}))
+        })?;
+        let parsed = Rule::parse(id, &text, &ctx.catalog, false);
+        let mut st = self.state();
+        match parsed {
+            Ok(rule) => {
+                st.rules.insert(id.to_owned(), rule.clone());
+                drop(st);
+                Ok(json!({"restored": true, "rule": view(&rule, &history(ctx)), "problem": null}))
+            }
+            Err(e) => {
+                st.problems.push((path(id), e.clone()));
+                Ok(json!({"restored": true, "rule": null, "problem": e}))
+            }
+        }
+    }
+
+    /// Switch a rule on or off, keeping the rest of its file as written.
+    fn set_enabled(&self, ctx: &Ctx, id: &str, on: bool) -> Result<Value> {
+        let _g = self.write.lock();
+        self.rule(id)?;
+        let text = ctx.store.read_string(&path(id))?.unwrap_or_default();
+        let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|e| Error::internal(e.to_string()))?;
+        doc["rule"]["enabled"] = toml_edit::value(on);
+        let text = doc.to_string();
+        let rule = Rule::parse(id, &text, &ctx.catalog, false).map_err(Error::invalid_params)?;
+        let topic = if on { "automations.rule.enabled" } else { "automations.rule.disabled" };
+        ctx.store.transaction(|tx| {
+            tx.put(&path(id), text.as_str())?;
+            tx.emit(topic, json!({"rule": id}))
+        })?;
+        self.state().rules.insert(id.to_owned(), rule.clone());
+        Ok(view(&rule, &history(ctx)))
+    }
+
+    /// What `id` would do for a sample event, without doing it (§8).
+    fn test(&self, ctx: &Ctx, p: Test) -> Result<Value> {
+        let rule = self.rule(&p.id)?;
+        let today = local_date(ctx.clock.now(), &ctx.local_tz);
+        // A switched-off rule is tested as if on: you're checking what it would do.
+        let mut on = rule.clone();
+        on.enabled = true;
+        let matched = on.matches(&p.event.topic, &p.event.payload, today, ctx.local_tz.tz());
+        let actions: Vec<Value> = match matched {
+            false => Vec::new(),
+            true => rule
+                .actions
+                .iter()
+                .map(|a| {
+                    json!({"op": a.op, "params": rule::fill(&a.params, &p.event.payload),
+                           "after_s": a.after.map(|d| d.num_seconds())})
+                })
+                .collect(),
+        };
+        Ok(json!({"rule": rule.id, "enabled": rule.enabled, "matches": matched, "actions": actions}))
+    }
+
+    fn events(&self, ctx: &Ctx) -> Value {
+        let events: Vec<Value> = ctx.catalog.topics().map(|(t, d)| json!({"topic": t, "description": d})).collect();
+        json!({"events": events})
+    }
+
+    fn history(&self, ctx: &Ctx, p: HistoryParams) -> Value {
+        let limit = p.limit.unwrap_or(50).min(HISTORY_KEPT);
+        let entries: Vec<Value> = history(ctx)
+            .into_iter()
+            .rev()
+            .filter(|e| p.id.as_deref().is_none_or(|id| e["rule"] == id))
+            .filter(|e| p.since.is_none_or(|since| at(e).is_some_and(|at| at >= since)))
+            .take(limit)
+            .collect();
+        json!({"history": entries})
+    }
+
+    fn status(&self, ctx: &Ctx) -> Value {
+        let stopped: Vec<Value> = history(ctx).into_iter().rev().filter(|e| e["kind"] == "stopped").take(5).collect();
+        let st = self.state();
+        let on = st.rules.values().filter(|r| r.enabled).count();
+        json!({"rules": st.rules.len(), "enabled": on, "depth": st.depth, "stopped": stopped,
+               "problems": st.problems.iter().map(|(f, e)| json!({"file": f, "error": e})).collect::<Vec<_>>()})
+    }
+
+    fn depth(&self, ctx: &Ctx, p: DepthParams) -> Result<Value> {
+        let Some(depth) = p.depth else { return Ok(json!({"depth": self.state().depth})) };
+        if !DEPTH_RANGE.contains(&depth) {
+            return Err(Error::invalid_params(format!("depth is {} to {}", DEPTH_RANGE.start(), DEPTH_RANGE.end())));
+        }
+        let _g = self.write.lock();
+        let text = ctx.store.read_string(SETTINGS)?.unwrap_or_default();
+        let mut doc = text.parse::<toml_edit::DocumentMut>().unwrap_or_default();
+        doc["depth"] = toml_edit::value(depth as i64);
+        ctx.store.transaction(|tx| {
+            tx.put(SETTINGS, doc.to_string())?;
+            tx.emit("automations.settings.changed", json!({"depth": depth}))
+        })?;
+        let mut st = self.state();
+        st.depth = depth;
+        st.problems.retain(|(file, _)| file != SETTINGS);
+        Ok(json!({"depth": depth}))
+    }
+
+    /// ADR 0033's shape: unusable files, rules naming ops that are gone, recent stopped loops.
+    fn health(&self, ctx: &Ctx) -> Value {
+        let mut checks = Vec::new();
+        for (file, error) in &self.state().problems {
+            checks.push(json!({"status": "fail", "subject": file, "message": format!("{file}: {error}"),
+                "fix": {"summary": "fix the file and run `automations.reload`, or remove the rule"}}));
+        }
+        let stopped = history(ctx).into_iter().rev().filter(|e| e["kind"] == "stopped").take(1).next();
+        if let Some(s) = stopped {
+            let rule = s["rule"].as_str().unwrap_or("?").to_owned();
+            checks.push(json!({"status": "warn", "subject": rule,
+                "message": format!("a loop was stopped at rule '{rule}' ({})", s["reason"].as_str().unwrap_or("?")),
+                "fix": {"summary": "see what happened", "op": "automations.history", "params": {"id": rule}}}));
+        }
+        if checks.is_empty() {
+            let n = self.state().rules.len();
+            checks.push(
+                json!({"status": "ok", "message": format!("{n} rule{}, all fine", if n == 1 { "" } else { "s" })}),
+            );
+        }
+        json!({"checks": checks})
+    }
+}
+
+#[async_trait]
+impl Module for Automations {
+    fn manifest(&self) -> Manifest {
+        Manifest {
+            id: "automations".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            namespace: "automations".into(),
+            topics: TOPICS.iter().map(|(t, _)| t.to_string()).collect(),
+            topic_descriptions: TOPICS.iter().map(|(t, d)| (t.to_string(), d.to_string())).collect(),
+            capabilities: vec![],
+        }
+    }
+
+    async fn init(&self, ctx: &Ctx) -> Result<()> {
+        self.load(ctx)
+    }
+
+    fn commands(&self) -> Vec<CommandSpec> {
+        let id = || json!({"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}});
+        [
+            (
+                "automations.list",
+                "Every rule: on or off, what it reacts to, when it last fired",
+                json!({"type": "object"}),
+            ),
+            ("automations.get", "One rule, and its file's text", id()),
+            (
+                "automations.create",
+                "Make a rule from its text, or a starter rule (switched off) to edit",
+                json!({"type": "object", "required": ["id"], "properties": {
+                    "id": {"type": "string"}, "text": {"type": "string"}, "label": {"type": "string"}}}),
+            ),
+            (
+                "automations.save",
+                "Replace a rule's text; a broken rule is refused and the old one kept",
+                json!({"type": "object", "required": ["id", "text"], "properties": {
+                    "id": {"type": "string"}, "text": {"type": "string"}}}),
+            ),
+            ("automations.remove", "Remove a rule; it can be restored", id()),
+            ("automations.restore", "Bring a removed rule back", id()),
+            ("automations.enable", "Switch a rule on", id()),
+            ("automations.disable", "Switch a rule off", id()),
+            ("automations.reload", "Re-read the rule files after editing them by hand", json!({"type": "object"})),
+            (
+                "automations.test",
+                "What a rule would do for a sample event, without doing it",
+                json!({"type": "object", "required": ["id", "event"], "properties": {
+                    "id": {"type": "string"},
+                    "event": {"type": "object", "required": ["topic"], "properties": {
+                        "topic": {"type": "string"}, "payload": {"type": "object"}}}}}),
+            ),
+            ("automations.events", "Everything a rule can react to, with what it means", json!({"type": "object"})),
+            (
+                "automations.history",
+                "What rules did recently, newest first",
+                json!({"type": "object", "properties": {
+                    "id": {"type": "string"}, "since": {"type": "string", "format": "date-time"},
+                    "limit": {"type": "integer", "minimum": 1}}}),
+            ),
+            ("automations.status", "Rules, the depth limit, stopped loops, broken files", json!({"type": "object"})),
+            (
+                "automations.depth",
+                "Show or set how many rules may follow each other (1-10)",
+                json!({"type": "object", "properties": {"depth": {"type": "integer", "minimum": 1, "maximum": 10}}}),
+            ),
+            (
+                "automations.health",
+                "Check the rules for problems; changes nothing (ADR 0033)",
+                json!({"type": "object"}),
+            ),
+        ]
+        .into_iter()
+        .map(|(op, summary, params_schema)| CommandSpec {
+            op: op.into(),
+            summary: summary.into(),
+            params_schema,
+            execution: Execution::Inline,
+        })
+        .collect()
+    }
+
+    async fn handle(&self, op: &str, params: Value, ctx: &Ctx) -> Result<Value> {
+        match op {
+            "automations.list" => Ok(self.list(ctx)),
+            "automations.get" => self.get(ctx, &decode::<Id>(params)?.id),
+            "automations.create" => self.create(ctx, decode(params)?),
+            "automations.save" => self.save(ctx, decode(params)?),
+            "automations.remove" => self.remove(ctx, &decode::<Id>(params)?.id),
+            "automations.restore" => self.restore(ctx, &decode::<Id>(params)?.id),
+            "automations.enable" => self.set_enabled(ctx, &decode::<Id>(params)?.id, true),
+            "automations.disable" => self.set_enabled(ctx, &decode::<Id>(params)?.id, false),
+            "automations.reload" => {
+                self.load(ctx)?;
+                Ok(json!({"rules": self.state().rules.len(), "problems": self.problems()}))
+            }
+            "automations.test" => self.test(ctx, decode(params)?),
+            "automations.events" => Ok(self.events(ctx)),
+            "automations.history" => Ok(self.history(ctx, decode(params)?)),
+            "automations.status" => Ok(self.status(ctx)),
+            "automations.depth" => self.depth(ctx, decode(params)?),
+            "automations.health" => Ok(self.health(ctx)),
+            _ => Err(Error::unknown_op(op)),
+        }
+    }
+
+    async fn on_event(&self, ev: &Event, ctx: &Ctx) -> Result<()> {
+        self.react(ev, ctx).await
+    }
+}
+
+// ---------------------------------------------------------------------- params
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Id {
+    id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Create {
+    id: String,
+    text: Option<String>,
+    label: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Save {
+    id: String,
+    text: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Test {
+    id: String,
+    event: SampleEvent,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SampleEvent {
+    topic: String,
+    #[serde(default)]
+    payload: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryParams {
+    id: Option<String>,
+    since: Option<DateTime<Utc>>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DepthParams {
+    depth: Option<usize>,
+}
+
+// ---------------------------------------------------------------------- helpers
+
+fn path(id: &str) -> String {
+    format!("{RULES}/{id}.toml")
+}
+
+fn removed_path(id: &str) -> String {
+    format!("{REMOVED}/{id}.toml")
+}
+
+/// The ids of removed rules, to restore.
+fn removed(ctx: &Ctx) -> Vec<String> {
+    let files = ctx.store.list(REMOVED).unwrap_or_default();
+    files
+        .iter()
+        .filter_map(|f| f.strip_prefix("removed/").and_then(|f| f.strip_suffix(".toml")))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `settings.toml`'s depth limit: the default when there's no file or no `depth`.
+fn settings(ctx: &Ctx) -> std::result::Result<usize, String> {
+    let Some(text) = ctx.store.read_string(SETTINGS).map_err(|e| e.message)? else { return Ok(DEPTH) };
+    let table: toml::Table = toml::from_str(&text).map_err(|e| format!("not a settings file: {}", e.message()))?;
+    match table.get("depth") {
+        None => Ok(DEPTH),
+        Some(v) => match v.as_integer().and_then(|n| usize::try_from(n).ok()) {
+            Some(n) if DEPTH_RANGE.contains(&n) => Ok(n),
+            _ => Err(format!("depth is {} to {}, using {DEPTH}", DEPTH_RANGE.start(), DEPTH_RANGE.end())),
+        },
+    }
+}
+
+/// The history, oldest first. A broken file reads as empty: it's a convenience, the event log
+/// has everything.
+fn history(ctx: &Ctx) -> Vec<Value> {
+    ctx.store
+        .read_string(HISTORY)
+        .ok()
+        .flatten()
+        .and_then(|t| serde_json::from_str::<Vec<Value>>(&t).ok())
+        .unwrap_or_default()
+}
+
+fn at(entry: &Value) -> Option<DateTime<Utc>> {
+    entry["at"].as_str()?.parse().ok()
+}
+
+/// A rule as `list`, `get` and the rest return it.
+fn view(r: &Rule, history: &[Value]) -> Value {
+    let mine = |kind: &str| history.iter().rev().find(|e| e["rule"] == r.id && e["kind"] == kind).and_then(at);
+    let actions: Vec<Value> = r
+        .actions
+        .iter()
+        .map(|a| json!({"op": a.op, "params": a.params, "after_s": a.after.map(|d| d.num_seconds())}))
+        .collect();
+    json!({"id": r.id, "label": r.label, "enabled": r.enabled, "builtin": r.builtin, "on": r.on,
+           "actions": actions, "last_fired": mine("fired"), "loop_stopped_at": mine("stopped")})
+}
+
+/// What `scheduler list` shows for a delayed action: the rule it came from.
+fn label(r: &Rule) -> String {
+    let text = format!("rule {}: {}", r.id, r.label);
+    match text.char_indices().nth(LABEL_CHARS) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text,
+    }
+}
+
+/// A starter rule (§8), switched off, that checks: it names an event and an op that exist.
+fn starter(ctx: &Ctx, label: &str) -> String {
+    let topic = ["records.item.completed"]
+        .into_iter()
+        .find(|t| ctx.catalog.has_topic(t))
+        .map(str::to_owned)
+        .or_else(|| ctx.catalog.topics().map(|(t, _)| t.to_owned()).find(|t| !t.starts_with("automations.")))
+        .unwrap_or_else(|| "*".into());
+    let op = ["notify.send"]
+        .into_iter()
+        .find(|o| ctx.catalog.op(o).is_some())
+        .map(str::to_owned)
+        .or_else(|| ctx.catalog.ops().map(|c| c.op.clone()).find(|o| !o.starts_with("automations.")))
+        .unwrap_or_default();
+    let label = if label.trim().is_empty() { "My rule" } else { label.trim() };
+    format!(
+        r#"# A rule: when an event happens (on, when), run ops (each [[do]]). Switched off until you
+# turn it on: shimmer automations enable <id>. Events: shimmer automations events.
+[rule]
+label = {label:?}
+enabled = false
+on = "{topic}"                     # a topic or a pattern: records.item.*, *
+# when = {{ collection = "jobs" }}  # conditions on the event, as in records' filters
+
+[[do]]
+op = "{op}"                        # any op except automations.*
+params = {{ title = "Done: {{title}}" }}   # {{field}} is filled from the event
+# after = "3d"                     # wait first: 30m, 2h, 3d, 1w
+"#
+    )
+}
