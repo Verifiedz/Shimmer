@@ -440,7 +440,10 @@ impl Groups {
                 };
                 let Some(cmd) = subs.iter().find(|c| &c.word == sub).cloned() else { return };
                 let cmd = if cmd.list_options {
-                    let list = subs.iter().find(|c| c.word == "list").cloned().unwrap_or_default();
+                    let mut list = subs.iter().find(|c| c.word == "list").cloned().unwrap_or_default();
+                    // Paging is list's own: the commands that take its filters (records export,
+                    // notify count, mark-read, mark-unread, remove) refuse --limit and --offset.
+                    list.options.retain(|o| o.name != "--limit" && o.name != "--offset");
                     Cmd { field_flags: true, ..merged(cmd, list) }
                 } else {
                     cmd
@@ -1128,6 +1131,20 @@ mod tests {
         assert!(offered.contains(&"wgo".to_owned()), "workspaces activate's alias: {offered:?}");
         assert!(!offered.contains(&"wst".to_owned()), "workspaces status can't be scheduled");
         assert_eq!(got(complete(&at("schedule daily 09:00 wgo "), &cx, &mut daemon()).await), ["site"]);
+    }
+
+    #[tokio::test]
+    async fn commands_that_take_lists_filters_dont_offer_its_paging() {
+        for line in ["records export lc --", "notify count --", "notify mark-read --", "notify remove --"] {
+            let offered = words(line).await;
+            assert!(
+                !offered.contains(&"--limit".to_owned()) && !offered.contains(&"--offset".to_owned()),
+                "{line}: {offered:?}"
+            );
+        }
+        assert!(words("notify count --").await.contains(&"--unread".to_owned()), "the filters still come");
+        assert!(words("records export lc --").await.contains(&"--status".to_owned()));
+        assert!(words("notify list --").await.contains(&"--limit".to_owned()), "list keeps its own");
     }
 
     #[tokio::test]

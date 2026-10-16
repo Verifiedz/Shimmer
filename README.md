@@ -213,7 +213,8 @@ shimmer schedule weekdays 08:45 --catch-up skip notify send "Standup in 15"
 
 Every message lands in an inbox first (`$SHIMMER_HOME/data/notify/inbox/`), then appears as a
 desktop notification: `notify-send` on Linux (the `libnotify-bin` package), `osascript` on macOS.
-Nothing is lost if it can't be shown. Shimmer also tells you by itself when a workspace couldn't
+Nothing is lost if it can't be shown. Normal and high priority pop up; on GNOME, low priority goes
+straight to the notification list without popping up (on macOS every priority pops up the same). Shimmer also tells you by itself when a workspace couldn't
 launch or a scheduled task failed (`shimmer notify builtin-alerts`). On a machine with no screen,
 `[desktop] show = false` in `config.toml` logs notifications instead. ADR 0032 has the details;
 `shimmer notify --help` lists every command.
