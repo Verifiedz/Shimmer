@@ -1,6 +1,7 @@
 //! Notify end to end (ADR 0032), through the real binary and a real daemon: a message sent as a
-//! queued task lands in the inbox file, and the inbox ops work over the socket. There's no sink
-//! yet (the desktop one comes with `Ctx.desktop`), so a message is kept as `failed`.
+//! queued task lands in the inbox file, goes to the desktop, and the inbox ops work over the
+//! socket. Every test home has `[desktop] show = false`, so the real backend logs each note
+//! instead of popping it up.
 
 mod common;
 
@@ -41,11 +42,16 @@ fn a_message_sent_through_the_queue_lands_in_the_inbox() {
     let m = &list["items"][0];
     assert_eq!(
         (m["title"].as_str(), m["priority"].as_str(), m["state"].as_str()),
-        (Some("Build finished"), Some("high"), Some("failed"))
+        (Some("Build finished"), Some("high"), Some("delivered"))
     );
     let id = m["id"].as_str().unwrap();
     let file = std::fs::read_to_string(home.dir.path().join(format!("home/data/notify/inbox/{id}.toml"))).unwrap();
     assert!(file.contains("title = \"Build finished\""), "files are the truth: {file}");
+
+    // The real desktop backend took it and, with `show = false`, logged it instead of showing it.
+    let logs = std::fs::read_dir(home.dir.path().join("home/logs")).unwrap();
+    let logged: String = logs.filter_map(|e| std::fs::read_to_string(e.unwrap().path()).ok()).collect();
+    assert!(logged.contains("desktop note") && logged.contains("Build finished"), "{logged}");
 
     assert_eq!(call(&home, "notify.mark_read", json!({"ids": [id]}))["marked"], 1);
     assert_eq!(call(&home, "notify.count", json!({"unread": true}))["count"], 0);
@@ -102,7 +108,8 @@ fn the_notify_commands() {
     assert!(quiet.contains("every day  22:00-08:00") && quiet.contains("weekends   00:00-10:00"), "{quiet}");
     assert!(common::ok(&home, &["notify", "builtin-alerts", "off", "workspace-dirty"]).contains("workspace-dirty"));
     assert!(common::ok(&home, &["notify", "cap", "500"]).starts_with("✓ the inbox keeps at most 500"));
-    assert!(common::ok(&home, &["notify", "test"]).starts_with("Shimmer has no way to show messages yet"));
+    let test = common::ok(&home, &["notify", "test"]);
+    assert!(test.starts_with("Sent \"Shimmer can reach you\" to:\n  desktop ✓"), "{test}");
     assert!(common::fails(&home, &["notify", "cap", "5"]).contains("at least 100"));
 }
 

@@ -7,7 +7,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use shimmer_core::testing::TestEnv;
-use shimmer_core::{Ctx, Error, ErrorCode, Event, Module, ModuleId, Result};
+use shimmer_core::{Ctx, Error, ErrorCode, Event, Module, ModuleId, Result, Urgency};
 use shimmer_notify::{Message, Notify, Sink};
 
 /// A sink that records what it was given, and fails when told to.
@@ -127,8 +127,8 @@ async fn nothing_is_dropped_when_every_sink_fails() {
     assert_eq!((phone.got().len(), backup.got().len()), (1, 1), "the fallback tried once, never on its own");
     assert_eq!(t.topics(), ["notify.message.received", "notify.message.exhausted"]);
 
-    // No sink at all (before the desktop one): kept as failed too.
-    let m = Notify::default().handle("notify.send", json!({"title": "y"}), &t.env.ctx).await.unwrap();
+    // No sink at all: kept as failed too.
+    let m = Notify::with_sinks(Vec::new()).handle("notify.send", json!({"title": "y"}), &t.env.ctx).await.unwrap();
     assert_eq!(m["state"], "failed");
 }
 
@@ -396,12 +396,38 @@ async fn status_says_it_all() {
 }
 
 #[tokio::test]
+async fn by_default_messages_reach_the_desktop() {
+    let env = TestEnv::new("notify");
+    let notify = Notify::default();
+    let m = notify
+        .handle("notify.send", json!({"title": "Deploy done", "body": "v1.4", "priority": "high"}), &env.ctx)
+        .await
+        .unwrap();
+    assert_eq!((m["state"].as_str(), m["delivery"][0]["medium"].as_str()), (Some("delivered"), Some("desktop")));
+    let shown = env.desktop.shown.lock().unwrap().clone();
+    assert_eq!(
+        (shown[0].title.as_str(), shown[0].body.as_str(), shown[0].urgency),
+        ("Deploy done", "v1.4", Urgency::Critical)
+    );
+
+    *env.desktop.fail.lock().unwrap() = Some("no desktop session".into());
+    let m = notify.handle("notify.send", json!({"title": "x", "priority": "low"}), &env.ctx).await.unwrap();
+    assert_eq!(m["state"], "failed");
+    assert_eq!(m["delivery"][0]["error"], "no desktop session", "why is on the message");
+    assert_eq!(env.desktop.shown.lock().unwrap()[1].urgency, Urgency::Low);
+    let t = notify.handle("notify.test", json!({}), &env.ctx).await.unwrap();
+    assert_eq!(t["sinks"], json!(["desktop"]));
+    assert_eq!(t["deliveries"][0]["ok"], false);
+}
+
+#[tokio::test]
 async fn the_manifest_declares_its_lane_trigger_and_ops() {
     let notify = Notify::default();
     assert_eq!(notify.lanes()[0].max_concurrent, 2);
     let t = &notify.triggers()[0];
     assert_eq!((t.id.as_str(), t.op.as_str()), ("notify.flush", "notify.flush"));
     assert_eq!(notify.commands().len(), 16);
+    assert_eq!(notify.manifest().capabilities, ["desktop"], "the real ctx.desktop, nothing more");
     for topic in notify.manifest().topics {
         assert!(topic.starts_with("notify."), "{topic}");
     }
