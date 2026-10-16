@@ -287,11 +287,11 @@ Clients should offer: run cleanup, force relaunch, or open the log. Never auto-f
   ]}}
 ```
 
-Illustrative excerpt — `records` actually registers twenty-one ops (`records.collections`,
+Illustrative excerpt — `records` actually registers twenty-three ops (`records.collections`,
 `.templates`, `.create_collection`,
 `.add`, `.get`, `.list`, `.update`, `.complete`, `.reopen`, `.rename`, `.remove`, `.restore`,
 `.trash`, `.purge`, `.check`, `.rename_field`, `.rename_collection`, `.copy_collection`,
-`.remove_collection`, `.restore_collection`, `.import`) and fourteen topics; see "Records
+`.remove_collection`, `.restore_collection`, `.purge_collection`, `.import`, `.health`) and fifteen topics; see "Records
 ops" below and `docs/decisions/0008-records-collections-and-storage.md` for the full list.
 This example only shows two commands to keep the shape readable.
 
@@ -328,11 +328,19 @@ Always present, independent of which modules are registered.
 |---|---|---|---|
 | `queue.list` | inline | `{"lane"?}` | Lanes, each with `running` and `queued` task arrays and `queue_version`. |
 | `queue.task` | inline | `{"task_id"}` | One task with status, progress, attempts, origin. |
-| `queue.reorder` | inline | `{"lane","task_id","before":TaskId\|null,"queue_version"}` | New `queue_version`. |
-| `queue.cancel` | inline | `{"task_id"}` | `{"cancelled":true,"was":"queued"\|"running"}`, or `not_cancellable`. A queued task is gone; a running one has been asked to stop and ends at its next cancellation check. |
+| `queue.reorder` | inline | `{"lane","task_id","before":TaskId\|null,"queue_version"}` | `{"queue_version","task_id"}`: the new `queue_version`, and the moved task's full id. |
+| `queue.cancel` | inline | `{"task_id"}` | `{"cancelled":true,"was":"queued"\|"running","task_id"}`, or `not_cancellable`. A queued task is gone; a running one has been asked to stop and ends at its next cancellation check. |
 
 Reordering is within a lane only. The running task cannot be reordered or displaced; it can
 be cancelled. A stale `queue_version` returns `conflict`.
+
+**Short ids (ADR 0031 §4).** Every `task_id` the queue ops take (and `before`) may be the full
+id or a unique ending of one, case insensitive: a ULID's start is its creation time, its end is
+random. A whole id matches at any length; an ending needs at least 4 characters (shorter is
+`invalid_params`), so a stray keystroke can't remove or cancel something. Several matches return
+`conflict` naming them; none returns `not_found`. The same holds for every `trigger_id` the
+scheduler ops take. Replies that act on one carry its full id (`task_id` / `trigger_id`), so a
+client can say which one it hit.
 
 ## Scheduler ops
 
@@ -341,12 +349,17 @@ be cancelled. A stale `queue_version` returns `conflict`.
 | `scheduler.list` | inline | `{}` | `{"triggers":[…]}`, each `{"id","op","params","schedule","catch_up","lane","fallback","next_due","last_run","paused","done","source"}`. `done` is a `once` trigger that has fired; `source` is `{"type":"user"}` or `{"type":"module","id"}`. |
 | `scheduler.get` | inline | `{"trigger_id"}` | One trigger, same shape as a `scheduler.list` entry, or `not_found`. |
 | `scheduler.add` | inline | `{"schedule","op","params","catch_up","lane"?,"fallback"?}` | `{"trigger_id"}` |
-| `scheduler.remove` | inline | `{"trigger_id"}` | `{"removed":true}` |
-| `scheduler.pause` | inline | `{"trigger_id"}` | `{"paused":true}` |
-| `scheduler.resume` | inline | `{"trigger_id"}` | `{"paused":false}` |
+| `scheduler.remove` | inline | `{"trigger_id"}` | `{"removed":true,"trigger_id"}` (the full id) |
+| `scheduler.pause` | inline | `{"trigger_id"}` | `{"paused":true,"trigger_id"}` |
+| `scheduler.resume` | inline | `{"trigger_id"}` | `{"paused":false,"trigger_id"}` |
+
+`trigger_id` may be a unique ending of the id (see "Short ids" above).
 
 Schedules are `{"cron": "0 9 * * 1"}` (5 fields, Sunday = 0 or 7, Monday = 1, UTC),
-`{"every": 172800}` (seconds) or `{"once": "2026-10-04T09:00:00Z"}`. A fired task's params
+`{"cron_local": "0 9 * * 1"}` (the same, read in config.toml's `[general] local_timezone`, so 9am
+stays 9am across a clock change; ADR 0031 §2), `{"every": 172800}` (seconds) or
+`{"once": "2026-10-04T09:00:00Z"}`. A client should show a schedule shape it doesn't know rather
+than fail on it: more may be added without a version bump. A fired task's params
 gain a `scheduled_for` timestamp when they are an object. See
 `docs/decisions/0004-scheduler-semantics.md`.
 
@@ -405,7 +418,7 @@ after a step has run leaves it `dirty`.
 
 | Op | Execution | Params | Returns |
 |---|---|---|---|
-| `records.collections` | inline | `{}` | `{"collections":[...]}`, each collection definition as JSON (+ `"skipped"` naming each malformed collection file). A collection made from a built-in template also has `"template"`: its id, read from the "Created from Shimmer's X template" line its file starts with (absent for one made by hand, or once that line is edited away). ADR 0030 §4. |
+| `records.collections` | inline | `{"removed"?}` | `{"collections":[...]}`, each collection definition as JSON (+ `"skipped"` naming each malformed collection file). A collection made from a built-in template also has `"template"`: its id, read from the "Created from Shimmer's X template" line its file starts with (absent for one made by hand, or once that line is edited away). ADR 0030 §4. With `"removed": true`, the removed collections instead, by id: `{"collections":[{"id","label"?,"records","trash"}]}` (no `label` when its file doesn't parse). ADR 0021 §5a. |
 | `records.add` | inline | `{"collection","id"?,"fields"?}` | The new item, which carries its `id`. Without an `id`, one is made from the collection's `title` (`"Two Sum"` → `two-sum`, then `two-sum-2`, …), or from today's date (`2026-10-05-1`) when there's no title to use. An explicit `id` that exists is `conflict`. ADR 0018. |
 | `records.get` | inline | `{"collection","id"}` | The item. |
 | `records.list` | inline | `{"collection","filter"?,"search"?,"sort"?,"limit"?,"offset"?}` | `{"items","total","titles"}` (+ `"skipped"` if a hand-edited file was unreadable). `titles` is `{id: title}` for the listed items (ADR 0024 §5). Ordered by `sort`, then by id. See below. |
@@ -426,6 +439,7 @@ after a step has run leaves it `dirty`.
 | `records.copy_collection` | inline | `{"id","to","label"?,"with_records"?}` | The new collection, plus `"records":N`. Copies the collection file with only `id` (and `label`) changed, comments kept, and `ref` fields pointing at the collection itself pointed at the copy. With `with_records`, every live record file too, as written (not the trash). One transaction; emits `records.collection.copied {"collection","from","records"}`, then one `records.item.created` per copied record. `conflict` if `to` exists, `not_found` for an unknown `id`. ADR 0030 §3. |
 | `records.remove_collection` | inline | `{"id","confirm"?}` | `{"removed":true,"records":N}`. Without a matching `confirm`, `confirmation_required` with `detail: {"records":N}`; re-send with `"confirm": {"records":N}`. Moves everything to `data/records/removed-collections/<id>/`; emits `records.collection.removed`. |
 | `records.restore_collection` | inline | `{"id"}` | The collection, back with its records and trash; emits `records.collection.restored`. |
+| `records.purge_collection` | inline | `{"id","confirm"?}` | `{"purged":true,"records":N}`. Permanently deletes a removed collection: its file, its records and its trash, `N` counting both. Without a matching `confirm`, `confirmation_required` with `detail: {"records":N}`; re-send with `"confirm": {"records":N}`. `not_found` when there's no removed collection by that id; a live collection with the same id is never touched. Emits `records.collection.purged`. ADR 0021 §5a. |
 | `records.health` | inline | `{}` | `{"checks":[…]}` in the shape ADR 0033 sets: a `fail` for each collection file that won't load, a `warn` for each collection with records `records.check` finds problems in (fix: `records.check` on it), or one `ok` line. Writes nothing. |
 
 All inline — nothing here is slow enough to queue. Items on the wire are flat:
@@ -510,7 +524,7 @@ tolerate unknown topics.
 | `records.collection.created` | `records.create_collection` made a collection from a template. Payload `{collection, template}`. Nothing is created on first start (ADR 0023). |
 | `records.collection.copied` | `records.copy_collection` made a collection from another. Payload `{collection, from, records}`. ADR 0030 §3. |
 | `records.field.renamed` | `{collection, from, to}`. |
-| `records.collection.renamed` / `.removed` / `.restored` | `{collection, new_id}` / `{collection, records}` / `{collection}`. |
+| `records.collection.renamed` / `.removed` / `.restored` / `.purged` | `{collection, new_id}` / `{collection, records}` / `{collection}` / `{collection, records}`. `.purged`: a removed collection was deleted for good (ADR 0021 §5a). |
 | `records.trash.purged` | `records.purge` deleted trashed records for good. `{collection, records}`, plus `id` when one record was purged. ADR 0024 §5. |
 | `fetchers.item.found` | A source returned a new, deduplicated item. Planned (M6): not emitted by any module yet. |
 | `fetchers.fetch.finished` / `.failed` | A fetch run ended. Planned (M6): not emitted by any module yet. |
