@@ -297,6 +297,10 @@ pub struct Ctx {
     /// declares the `"process"` capability; every other module gets a stub that fails
     /// `unavailable`. Modules must never call `std::process::Command` directly (§12 rule 4).
     pub launcher: Launcher,
+    /// Show a desktop notification (ADR 0032 §1). Populated only for a module whose manifest
+    /// declares the `"desktop"` capability; every other module gets a stub that fails
+    /// `unavailable`. A note is plain text; no program or path reaches the module.
+    pub desktop: Desktop,
     /// Cooperative cancellation. Long tasks must poll this.
     pub cancel: CancellationToken,
     pub config: ModuleConfig,
