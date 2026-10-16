@@ -71,8 +71,10 @@ after = "60d"
     call(&home, "automations.create", json!({"id": "redo", "text": rule}));
     call(&home, "records.complete", json!({"collection": "leetcode", "id": "two-sum"}));
 
-    let listed = until(&home, "scheduler.list", json!({}), |l| !l["triggers"].as_array().unwrap().is_empty());
-    let t = &listed["triggers"][0];
+    // Other schedules may be there too (notify declares its own): find the one the rule added.
+    let added = |l: &Value| l["triggers"].as_array().unwrap().iter().find(|t| t["source"]["type"] == "added").cloned();
+    let listed = until(&home, "scheduler.list", json!({}), |l| added(l).is_some());
+    let t = &added(&listed).unwrap();
     assert_eq!(t["source"], json!({"type": "added", "id": "automations", "label": "rule redo: Redo it later"}));
     assert_eq!(
         (t["op"].clone(), t["params"].clone()),
