@@ -161,9 +161,11 @@ impl StateDir {
     fn of(home: &Home, workspace: &str) -> Self {
         let shimmer_home = home.dir.path().join("home");
         let tag = shimmer_home.to_string_lossy().bytes().fold(0u64, |h, b| (h * 31 + u64::from(b)) % 2_147_483_647);
-        let uid = std::fs::read_to_string("/proc/self/status")
-            .ok()
-            .and_then(|s| s.lines().find(|l| l.starts_with("Uid:"))?.split_whitespace().nth(1).map(String::from))
+        // `id -u`, as the script does: macOS has no `/proc`.
+        let uid = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
             .unwrap_or_default();
         let tmp = std::env::var_os("TMPDIR").map_or_else(|| "/tmp".into(), std::path::PathBuf::from);
         Self(tmp.join(format!("shimmer-{uid}-{tag:08x}-{workspace}")))
