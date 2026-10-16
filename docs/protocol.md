@@ -498,7 +498,7 @@ tolerate unknown topics.
 | `queue.task.started` | Task began executing. |
 | `queue.task.progress` | Module called `ctx.progress`. Payload `{fraction, note}`. |
 | `queue.task.finished` | Task succeeded. |
-| `queue.task.failed` | Task failed. Payload includes `error`, `attempts`, `lane`, `origin`. |
+| `queue.task.failed` | Task failed. Payload includes `error`, `attempts`, `lane`, `origin`, and `fallback`: `true` only when a fallback is being sent for this failure (ADR 0005, 0032 §4). |
 | `queue.task.cancelled` | Task cancelled before or during execution. |
 | `queue.task.promoted` | A task jumped the lane. Payload lists displaced task ids. |
 | `queue.task.reordered` | A waiting task moved within its lane. Payload `{task_id, lane, before, queue_version}`. |
