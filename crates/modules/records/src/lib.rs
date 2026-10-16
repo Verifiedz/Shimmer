@@ -35,6 +35,25 @@ pub struct Records {
     write: WriteLock,
 }
 
+/// Every topic records emits, with a line on it for `automations events` (ADR 0035 §5.5).
+const TOPICS: [(&str, &str); 15] = [
+    ("records.item.created", "a record was added"),
+    ("records.item.updated", "a record's fields were changed"),
+    ("records.item.completed", "a record was marked done"),
+    ("records.item.reopened", "a done record was marked to do again"),
+    ("records.item.renamed", "a record was given a new id"),
+    ("records.item.restored", "a removed record came back from the trash"),
+    ("records.field.renamed", "a collection's field was renamed"),
+    ("records.collection.renamed", "a collection was given a new id"),
+    ("records.collection.removed", "a collection was removed (it can be restored)"),
+    ("records.collection.restored", "a removed collection came back"),
+    ("records.item.removed", "a record was moved to the trash"),
+    ("records.collection.created", "a collection was made from a template"),
+    ("records.collection.copied", "a collection was made from another"),
+    ("records.trash.purged", "trashed records were deleted for good"),
+    ("records.collection.purged", "a removed collection was deleted for good"),
+];
+
 #[async_trait]
 impl Module for Records {
     fn manifest(&self) -> Manifest {
@@ -42,25 +61,8 @@ impl Module for Records {
             id: "records".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             namespace: "records".into(),
-            topics: [
-                "records.item.created",
-                "records.item.updated",
-                "records.item.completed",
-                "records.item.reopened",
-                "records.item.renamed",
-                "records.item.restored",
-                "records.field.renamed",
-                "records.collection.renamed",
-                "records.collection.removed",
-                "records.collection.restored",
-                "records.item.removed",
-                "records.collection.created",
-                "records.collection.copied",
-                "records.trash.purged",
-                "records.collection.purged",
-            ]
-            .map(String::from)
-            .to_vec(),
+            topics: TOPICS.iter().map(|(t, _)| t.to_string()).collect(),
+            topic_descriptions: TOPICS.iter().map(|(t, d)| (t.to_string(), d.to_string())).collect(),
             capabilities: vec![],
         }
     }

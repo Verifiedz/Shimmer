@@ -4,10 +4,12 @@
 //! user is (§1.5): no identity, session or token types belong here.
 
 pub mod bus;
+pub mod catalog;
 pub mod clock;
 pub mod ctx;
 pub mod error;
 pub mod event;
+pub mod filter;
 pub mod http;
 pub mod ids;
 pub mod launcher;
@@ -16,10 +18,13 @@ pub mod module;
 pub mod params;
 pub mod queue;
 pub mod retry;
+pub mod schedules;
 pub mod store;
 pub mod sync;
 pub mod task;
+pub mod text;
 pub mod time;
+pub mod topic;
 pub mod trigger;
 
 #[cfg(any(test, feature = "testing"))]
@@ -28,6 +33,7 @@ pub mod testing;
 pub use serde_json::Value;
 
 pub use bus::{Emitter, EventSink};
+pub use catalog::Catalog;
 pub use clock::Clock;
 pub use ctx::{Ctx, ModuleConfig, ProgressFn};
 pub use error::{Error, ErrorCode, Result};
@@ -39,6 +45,7 @@ pub use manifest::{CommandSpec, Execution, LaneConfig, Manifest};
 pub use module::Module;
 pub use queue::{EnqueueRequest, QueueHandle, TaskHandle, TaskSubmitter};
 pub use retry::RetryPolicy;
+pub use schedules::{OneTime, ScheduleBackend, Schedules};
 pub use store::{NamespacedStore, StoreBackend, Tx, TxPlan, Write};
 pub use sync::WriteLock;
 pub use task::{Fallback, NotifyPriority, Origin, Priority, Task, TaskOutcome};

@@ -20,8 +20,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use shimmer_core::{
-    CatchUp, Clock, Emitter, EnqueueRequest, Error, Fallback, LaneId, LocalTimezone, ModuleId, NamespacedStore, Origin,
-    Priority, Result, Schedule, TaskId, TriggerId, TriggerSpec,
+    CatchUp, Clock, Emitter, EnqueueRequest, Error, Fallback, LaneId, LocalTimezone, ModuleId, NamespacedStore,
+    OneTime, Origin, Priority, Result, Schedule, ScheduleBackend, TaskId, TriggerId, TriggerSpec,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -31,13 +31,21 @@ use plan::Parsed;
 const DIR: &str = "triggers";
 
 /// Who owns a trigger. Module-declared ones are re-derived from `Module::triggers()` on
-/// every start, so users may pause them but not remove them.
+/// every start, so users may pause them but not remove them. `Added` ones are one-time schedules
+/// a module added while running (ADR 0035 §5.6): kept across restarts, removed by that module or
+/// once they've run.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Source {
     User,
     Module { id: ModuleId },
+    Added { id: ModuleId, label: String },
 }
+
+/// At most this many one-time schedules waiting per module: a runaway rule fills this, not the disk.
+const MAX_ADDED: usize = 1000;
+/// A label is one line for `scheduler list`.
+const MAX_LABEL: usize = 200;
 
 /// What is written to disk.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -256,7 +264,8 @@ impl Scheduler {
     /// Fire everything that is due at the clock's current time.
     pub fn tick(&self) {
         let now = self.clock.now();
-        for entry in self.lock().values_mut() {
+        let mut st = self.lock();
+        for entry in st.values_mut() {
             if entry.stored.paused || entry.stored.done {
                 continue;
             }
@@ -264,6 +273,8 @@ impl Scheduler {
                 self.fire_due(entry, now);
             }
         }
+        // A module's one-time schedule is gone once it has run: its file was deleted in `fire_due`.
+        st.retain(|_, e| !(e.stored.done && matches!(e.stored.source, Source::Added { .. })));
     }
 
     fn task_pending(&self, id: TaskId) -> bool {
@@ -283,7 +294,16 @@ impl Scheduler {
             next.last_run = Some(now);
         }
         // Persist first (at-most-once). If that fails nothing has happened and the next tick retries.
-        if let Err(err) = self.write(&next, None) {
+        // A module's finished one-time schedule is deleted instead of kept as `done`: nothing
+        // re-declares it, so there's nothing to remember (ADR 0035 §5.6).
+        let persisted = match &next.source {
+            Source::Added { .. } if next.done => self.delete(
+                next.spec.id.as_str(),
+                ("scheduler.trigger.removed", json!({"trigger_id": next.spec.id, "reason": "ran"})),
+            ),
+            _ => self.write(&next, None),
+        };
+        if let Err(err) = persisted {
             tracing::error!(trigger = %e.stored.spec.id, error = %err, "could not persist trigger state; will retry");
             return;
         }
@@ -428,8 +448,16 @@ impl Scheduler {
     fn remove(&self, id: &str) -> Result<Value> {
         let mut st = self.lock();
         let e = st.get(id).ok_or_else(|| Error::not_found(format!("no trigger '{id}'")))?;
-        if let Source::Module { id: owner } = &e.stored.source {
-            return Err(Error::conflict(format!("trigger '{id}' is declared by module '{owner}'; pause it instead")));
+        match &e.stored.source {
+            Source::Module { id: owner } => {
+                return Err(Error::conflict(format!(
+                    "trigger '{id}' is declared by module '{owner}'; pause it instead"
+                )));
+            }
+            Source::Added { id: owner, .. } => {
+                return Err(Error::conflict(format!("trigger '{id}' was added by module '{owner}'; pause it instead")));
+            }
+            Source::User => {}
         }
         self.delete(id, ("scheduler.trigger.removed", json!({"trigger_id": id, "reason": "removed by user"})))?;
         st.remove(id);
@@ -452,6 +480,60 @@ impl Scheduler {
         self.write(&next, Some((topic, json!({"trigger_id": id}))))?;
         e.stored = next;
         Ok(json!({ "paused": paused, "trigger_id": id }))
+    }
+}
+
+/// `ctx.schedules` (ADR 0035 §5.6): one-time schedules a module adds and removes while running.
+impl ScheduleBackend for Scheduler {
+    fn add_once(&self, module: &ModuleId, once: OneTime) -> Result<TriggerId> {
+        let label = once.label.trim();
+        if label.is_empty() || label.len() > MAX_LABEL || label.contains('\n') {
+            return Err(Error::invalid_params(format!("a schedule's label is one line of 1-{MAX_LABEL} characters")));
+        }
+        let mine = |e: &Entry| matches!(&e.stored.source, Source::Added { id, .. } if id == module);
+        if self.lock().values().filter(|e| mine(e)).count() >= MAX_ADDED {
+            return Err(Error::conflict(format!("module '{module}' already has {MAX_ADDED} schedules waiting")));
+        }
+        let spec = TriggerSpec {
+            id: TriggerId::new(format!("{module}-{}", ulid::Ulid::new().to_string().to_lowercase())),
+            schedule: Schedule::Once(once.at),
+            // Still wanted if the machine was off then: run on wake, once.
+            catch_up: CatchUp::RunOnce,
+            op: once.op,
+            params: once.params,
+            lane: None,
+            fallback: None,
+        };
+        self.check_target(&spec)?;
+        let parsed = Parsed::parse(&spec.schedule, self.local_tz)?;
+        let stored = Stored {
+            next_due: parsed.first_due(self.clock.now()),
+            spec,
+            source: Source::Added { id: module.clone(), label: label.to_owned() },
+            paused: false,
+            last_run: None,
+            done: false,
+            zone: None,
+        };
+        self.write(&stored, Some(("scheduler.trigger.added", added_payload(&stored))))?;
+        let id = stored.spec.id.clone();
+        self.lock().insert(id.to_string(), Entry { stored, parsed, pending: Vec::new() });
+        Ok(id)
+    }
+
+    fn remove(&self, module: &ModuleId, id: &TriggerId) -> Result<bool> {
+        let mut st = self.lock();
+        // Another module's, or a person's, is "not there" as far as this module can tell.
+        let Some(e) = st.get(id.as_str()) else { return Ok(false) };
+        if !matches!(&e.stored.source, Source::Added { id: owner, .. } if owner == module) {
+            return Ok(false);
+        }
+        self.delete(
+            id.as_str(),
+            ("scheduler.trigger.removed", json!({"trigger_id": id, "reason": "removed by module"})),
+        )?;
+        st.remove(id.as_str());
+        Ok(true)
     }
 }
 

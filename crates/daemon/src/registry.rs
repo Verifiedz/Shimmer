@@ -57,6 +57,11 @@ impl Registry {
             if let Some(t) = manifest.topics.iter().find(|t| !t.starts_with(&prefix)) {
                 return Err(Error::invalid_params(format!("module '{id}' declares foreign topic '{t}'")));
             }
+            if let Some(t) = manifest.topic_descriptions.keys().find(|t| !manifest.topics.contains(t)) {
+                return Err(Error::invalid_params(format!(
+                    "module '{id}' describes topic '{t}', which it doesn't declare"
+                )));
+            }
             let commands = module.commands();
             let idx = reg.entries.len();
             for (ci, c) in commands.iter().enumerate() {

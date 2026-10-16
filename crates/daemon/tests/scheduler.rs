@@ -649,3 +649,85 @@ async fn a_local_trigger_gets_its_zone_saved_and_a_failed_save_never_stops_the_d
     assert_eq!((hours(&moved) - hours(&before)).num_hours(), 3, "moved in memory: {before} → {moved}");
     assert_eq!(read()["zone"], "America/New_York", "the file couldn't be written, so it's unchanged");
 }
+
+// ------------------------------------------------------------------ one-time module schedules
+
+async fn later(c: &mut Client, at: String, op: &str, label: &str) -> std::result::Result<String, shimmer_core::Error> {
+    let r = c.call("demo.later", json!({"at": at, "op": op, "label": label})).await?;
+    Ok(r["trigger_id"].as_str().unwrap().to_owned())
+}
+
+/// ADR 0035 §5.6: what automations' `after = "3d"` stands on.
+#[tokio::test]
+async fn a_module_one_time_schedule_is_listed_survives_a_restart_runs_once_and_is_gone() {
+    let env = Env::fake_clock();
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    let id = later(&mut c, iso(3 * DAY), "demo.echo", "follow up on acme").await.unwrap();
+    assert!(id.starts_with("demo-"), "ids carry the module's name: {id}");
+    let t = trigger(&mut c, &id).await.unwrap();
+    assert_eq!(t["source"], json!({"type": "added", "id": "demo", "label": "follow up on acme"}));
+    assert_eq!((t["catch_up"].clone(), t["lane"].clone()), (json!("run_once"), Value::Null));
+    drop(c);
+    stop(d).await;
+
+    // Kept across a restart: start-up drops module triggers no longer declared, not these.
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    c.subscribe(&["scheduler.trigger.*", "queue.task.finished"]).await;
+    assert!(trigger(&mut c, &id).await.is_some(), "lost on restart");
+
+    advance(&env, 3 * DAY + 10);
+    let fired = c.event("scheduler.trigger.fired").await;
+    assert_eq!(fired.payload["trigger_id"], id);
+    let done = c.event("queue.task.finished").await;
+    assert_eq!(done.payload["task_id"], fired.payload["task_id"]);
+    settle(&mut c).await;
+    assert!(trigger(&mut c, &id).await.is_none(), "a finished one is removed, not kept as done");
+    assert!(!env.home.path().join(format!("data/scheduler/triggers/{id}.json")).exists());
+    assert_eq!(count(&c, "scheduler.trigger.removed", &id), 1);
+    stop(d).await;
+    assert_eq!(logged(&env, "scheduler.trigger.fired").len(), 1);
+}
+
+#[tokio::test]
+async fn a_module_removes_only_its_own_one_time_schedules_and_people_pause_them() {
+    let env = Env::fake_clock();
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    let mine = later(&mut c, iso(DAY), "demo.echo", "mine").await.unwrap();
+    let persons = add(&mut c, json!({"once": iso(DAY)}), "demo.echo", "skip").await;
+
+    let cancel = |id: &str| json!({"trigger_id": id});
+    assert_eq!(c.call("demo.cancel", cancel(&persons)).await.unwrap()["removed"], false, "not its own");
+    assert!(trigger(&mut c, &persons).await.is_some());
+    let err = c.call("scheduler.remove", cancel(&mine)).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Conflict, "{}", err.message);
+    assert_eq!(c.call("scheduler.pause", cancel(&mine)).await.unwrap()["paused"], true);
+
+    assert_eq!(c.call("demo.cancel", cancel(&mine)).await.unwrap()["removed"], true);
+    assert!(trigger(&mut c, &mine).await.is_none());
+    assert_eq!(c.call("demo.cancel", cancel(&mine)).await.unwrap()["removed"], false, "gone already");
+
+    // Checked like a person's: the op must exist, and the label is one line.
+    assert_eq!(later(&mut c, iso(DAY), "demo.nope", "x").await.unwrap_err().code, ErrorCode::UnknownOp);
+    for label in ["", "  ", "two\nlines"] {
+        assert_eq!(later(&mut c, iso(DAY), "demo.echo", label).await.unwrap_err().code, ErrorCode::InvalidParams);
+    }
+    stop(d).await;
+}
+
+/// ADR 0035 §5.7: a module reads every op and topic, the daemon's own topics included.
+#[tokio::test]
+async fn a_modules_catalog_lists_every_op_and_topic() {
+    let env = Env::new();
+    let d = env.start_with_notify().await;
+    let mut c = Client::connect(&env.sock).await;
+    let got = c.call("demo.catalog", json!({})).await.unwrap();
+    let ops: Vec<&str> = got["ops"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    assert!(ops.contains(&"demo.echo") && ops.contains(&"notify.send"), "{ops:?}");
+    assert_eq!(got["topics"]["queue.task.failed"], "a task failed");
+    assert_eq!(got["topics"]["demo.item.saved"], "", "a topic with no description");
+    assert!(got["topics"].get("queue.task.progress").is_none(), "streamed only");
+    stop(d).await;
+}

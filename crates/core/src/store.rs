@@ -15,7 +15,7 @@ use crate::bus::validate_topic;
 use crate::clock::Clock;
 use crate::error::{Error, Result};
 use crate::event::Event;
-use crate::ids::ModuleId;
+use crate::ids::{ModuleId, TaskId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Write {
@@ -69,11 +69,18 @@ pub struct NamespacedStore {
     source: ModuleId,
     backend: Arc<dyn StoreBackend>,
     clock: Clock,
+    /// Stamped on every event a transaction emits: the task this handle runs in (ADR 0035 §5.1).
+    cause: Option<TaskId>,
 }
 
 impl NamespacedStore {
     pub fn new(namespace: impl Into<String>, source: ModuleId, backend: Arc<dyn StoreBackend>, clock: Clock) -> Self {
-        Self { namespace: namespace.into(), source, backend, clock }
+        Self { namespace: namespace.into(), source, backend, clock, cause: None }
+    }
+
+    /// A copy whose transactions' events say they came from `task`.
+    pub fn for_task(&self, task: TaskId) -> Self {
+        Self { cause: Some(task), ..self.clone() }
     }
 
     pub fn read(&self, path: &str) -> Result<Option<Vec<u8>>> {
@@ -156,7 +163,9 @@ impl Tx<'_> {
     /// Queue an event to be logged and published atomically with the writes.
     pub fn emit(&mut self, topic: &str, payload: Value) -> Result<()> {
         validate_topic(&self.store.source, topic)?;
-        self.events.push(Event::new(self.store.source.clone(), topic, payload, self.store.clock.now()));
+        self.events.push(
+            Event::new(self.store.source.clone(), topic, payload, self.store.clock.now()).caused_by(self.store.cause),
+        );
         Ok(())
     }
 }
