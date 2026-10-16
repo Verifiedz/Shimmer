@@ -257,10 +257,12 @@ Stable strings. Clients may branch on `code`, never on `message`.
  "message":"workspace 'deep-work' failed setup and was not cleaned up",
  "detail":{"workspace":"deep-work","failed_step":"3/7 tmux-session",
    "failed_at":"2026-09-16T09:12:44Z","log":"logs/deep-work-01JD2T.log",
-   "has_cleanup_script":true}}
+   "has_cleanup_script":true,"fix":"shimmer workspaces cleanup deep-work"}}
 ```
 
-Clients should offer: run cleanup, force relaunch, or open the log. Never auto-force.
+Clients should offer: run cleanup, force relaunch, or open the log. Never auto-force. `fix` is the
+command that clears it: `cleanup` when there's a cleanup script, `reset` when there isn't (ADR 0035
+§10).
 
 ---
 
@@ -519,6 +521,13 @@ saved and loaded: its `on` pattern, its `when` filter, every op exists and none 
 | `automations.status` | inline | `{}` | `{"rules","enabled","depth","stopped":[…],"problems":[…]}`. |
 | `automations.depth` | inline | `{}` or `{"depth":N}` (1–10) | `{"depth"}`: how many rules may follow each other in a chain (default 3). |
 | `automations.health` | inline | `{}` | `{"checks":[…]}` in ADR 0033's shape: a `fail` per unusable file, a `warn` for a recently stopped loop, or one `ok` line. |
+
+**Built-in rules** (ADR 0035 §10): `workspace-dirty`, `workspace-half-launched`,
+`scheduled-task-failed` and `loop-stopped` are always listed (`"builtin": true`) once the ops they run
+are installed (they send with `notify.send`). `get` shows their text; `enable`/`disable` switch them
+in `settings.toml`'s `[builtin]` (and their event carries `"builtin": true`); `remove`, `save`, and
+`create` or `restore` with their ids are `conflict`. A rule file of yours with a built-in's id is
+reported in `problems`, not run.
 
 **The loop guard:** an event whose `cause` is a task automations queued continues that task's
 chain of rules. A rule already in the chain doesn't fire again, and a chain stops at the depth

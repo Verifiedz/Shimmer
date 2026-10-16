@@ -3,6 +3,7 @@
 //! scheduling one for later (`after`). One TOML file per rule; a loop guard follows chains of rules
 //! through `Event.cause`. Depends on `core` only (CLAUDE.md §3).
 
+pub mod builtin;
 pub mod chain;
 pub mod rule;
 pub mod template;
@@ -81,13 +82,24 @@ impl Automations {
                 Err(e) => problems.push((path.clone(), e)),
             }
         }
-        let depth = match settings(ctx) {
-            Ok(d) => d,
+        let (depth, off) = match settings(ctx) {
+            Ok(s) => s,
             Err(e) => {
                 problems.push((SETTINGS.to_owned(), e));
-                DEPTH
+                (DEPTH, Vec::new())
             }
         };
+        for (id, key, text) in builtin::RULES {
+            // A file of yours with a built-in rule's id is reported, not run: the built-in wins.
+            if rules.remove(id).is_some() {
+                problems.push((path(id), format!("'{id}' is a built-in rule's id: rename your file")));
+            }
+            // Not loaded when its op isn't installed (notify's, before notify is there).
+            if let Ok(mut rule) = Rule::parse(id, text, &ctx.catalog, true) {
+                rule.enabled = !off.iter().any(|k| k == key);
+                rules.insert(id.to_owned(), rule);
+            }
+        }
         let mut st = self.state();
         st.rules = rules;
         st.problems = problems;
@@ -189,7 +201,11 @@ impl Automations {
     fn get(&self, ctx: &Ctx, id: &str) -> Result<Value> {
         let rule = self.rule(id)?;
         let mut v = view(&rule, &history(ctx));
-        v["text"] = json!(ctx.store.read_string(&path(id))?.unwrap_or_default());
+        let text = match builtin::find(id).filter(|_| rule.builtin) {
+            Some((_, text)) => text.to_owned(),
+            None => ctx.store.read_string(&path(id))?.unwrap_or_default(),
+        };
+        v["text"] = json!(text);
         Ok(v)
     }
 
@@ -250,7 +266,7 @@ impl Automations {
         let taken: Vec<&str> = rules
             .iter()
             .map(|(rule_id, _)| rule_id.as_str())
-            .filter(|rule_id| matches!(ctx.store.read(&path(rule_id)), Ok(Some(_))))
+            .filter(|rule_id| builtin::find(rule_id).is_some() || matches!(ctx.store.read(&path(rule_id)), Ok(Some(_))))
             .collect();
         if !taken.is_empty() {
             return Err(Error::conflict(format!("already a rule: {}; choose another id", taken.join(", "))));
@@ -295,13 +311,18 @@ impl Automations {
     /// one kept (§8).
     fn save(&self, ctx: &Ctx, p: Save) -> Result<Value> {
         let _g = self.write.lock();
-        if ctx.store.read(&path(&p.id))?.is_none() {
+        if builtin::find(&p.id).is_none() && ctx.store.read(&path(&p.id))?.is_none() {
             return Err(Error::not_found(format!("no rule '{}'", p.id)));
         }
         self.write_rule(ctx, &p.id, &p.text, "automations.rule.edited")
     }
 
     fn write_rule(&self, ctx: &Ctx, id: &str, text: &str, topic: &str) -> Result<Value> {
+        if builtin::find(id).is_some() {
+            return Err(Error::conflict(format!(
+                "'{id}' is a built-in rule: it can't be edited. Switch it off and make your own instead"
+            )));
+        }
         let rule = Rule::parse(id, text, &ctx.catalog, false).map_err(Error::invalid_params)?;
         ctx.store.transaction(|tx| {
             tx.put(&path(id), text)?;
@@ -345,6 +366,11 @@ impl Automations {
         let Some(text) = ctx.store.read_string(&removed_path(id))? else {
             return Err(Error::not_found(format!("no removed rule '{id}'")));
         };
+        if builtin::find(id).is_some() {
+            return Err(Error::conflict(format!(
+                "'{id}' is a built-in rule's id: rename the file in removed/ to restore it"
+            )));
+        }
         if ctx.store.read(&path(id))?.is_some() {
             return Err(Error::conflict(format!("a rule '{id}' exists: remove or rename it first")));
         }
@@ -371,13 +397,30 @@ impl Automations {
     /// Switch a rule on or off, keeping the rest of its file as written.
     fn set_enabled(&self, ctx: &Ctx, id: &str, on: bool) -> Result<Value> {
         let _g = self.write.lock();
-        self.rule(id)?;
+        let current = self.rule(id)?;
+        let topic = if on { "automations.rule.enabled" } else { "automations.rule.disabled" };
+        if let Some((key, _)) = builtin::find(id).filter(|_| current.builtin) {
+            // A built-in rule is switched in the settings (§7): its text isn't yours to change.
+            let text = ctx.store.read_string(SETTINGS)?.unwrap_or_default();
+            let mut doc = text.parse::<toml_edit::DocumentMut>().unwrap_or_default();
+            if doc.get("builtin").is_none() {
+                doc["builtin"] = toml_edit::table();
+            }
+            doc["builtin"][key] = toml_edit::value(on);
+            ctx.store.transaction(|tx| {
+                tx.put(SETTINGS, doc.to_string())?;
+                tx.emit(topic, json!({"rule": id, "builtin": true}))
+            })?;
+            let mut rule = current;
+            rule.enabled = on;
+            self.state().rules.insert(id.to_owned(), rule.clone());
+            return Ok(view(&rule, &history(ctx)));
+        }
         let text = ctx.store.read_string(&path(id))?.unwrap_or_default();
         let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|e| Error::internal(e.to_string()))?;
         doc["rule"]["enabled"] = toml_edit::value(on);
         let text = doc.to_string();
         let rule = Rule::parse(id, &text, &ctx.catalog, false).map_err(Error::invalid_params)?;
-        let topic = if on { "automations.rule.enabled" } else { "automations.rule.disabled" };
         ctx.store.transaction(|tx| {
             tx.put(&path(id), text.as_str())?;
             tx.emit(topic, json!({"rule": id}))
@@ -677,17 +720,27 @@ fn removed(ctx: &Ctx) -> Vec<String> {
         .collect()
 }
 
-/// `settings.toml`'s depth limit: the default when there's no file or no `depth`.
-fn settings(ctx: &Ctx) -> std::result::Result<usize, String> {
-    let Some(text) = ctx.store.read_string(SETTINGS).map_err(|e| e.message)? else { return Ok(DEPTH) };
+/// `settings.toml`: the depth limit (the default when there's no file or no `depth`), and the
+/// `[builtin]` keys switched off (§7).
+fn settings(ctx: &Ctx) -> std::result::Result<(usize, Vec<String>), String> {
+    let Some(text) = ctx.store.read_string(SETTINGS).map_err(|e| e.message)? else { return Ok((DEPTH, Vec::new())) };
     let table: toml::Table = toml::from_str(&text).map_err(|e| format!("not a settings file: {}", e.message()))?;
-    match table.get("depth") {
-        None => Ok(DEPTH),
+    let off: Vec<String> = table
+        .get("builtin")
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flatten()
+        .filter(|(_, on)| on.as_bool() == Some(false))
+        .map(|(k, _)| k.clone())
+        .collect();
+    let depth = match table.get("depth") {
+        None => DEPTH,
         Some(v) => match v.as_integer().and_then(|n| usize::try_from(n).ok()) {
-            Some(n) if DEPTH_RANGE.contains(&n) => Ok(n),
-            _ => Err(format!("depth is {} to {}, using {DEPTH}", DEPTH_RANGE.start(), DEPTH_RANGE.end())),
+            Some(n) if DEPTH_RANGE.contains(&n) => n,
+            _ => return Err(format!("depth is {} to {}, using {DEPTH}", DEPTH_RANGE.start(), DEPTH_RANGE.end())),
         },
-    }
+    };
+    Ok((depth, off))
 }
 
 /// The history, oldest first. A broken file reads as empty: it's a convenience, the event log
