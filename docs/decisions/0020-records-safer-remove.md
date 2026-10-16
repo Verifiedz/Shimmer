@@ -101,9 +101,9 @@ $ shimmer records restore jobs/amazon-sde-intern
 
 - **Emptying the trash** (`records.purge`, or removing trashed records after N days). Deleting
   the files by hand works; an op can come when someone wants it, with a confirmation that names
-  how many records go for good.
+  how many records go for good. **Done since:** `records.purge` (ADR 0024 §5).
 - **Keeping every removed version** of an id (timestamped trash). The latest is what people
   undo; the event log still records every change.
-- **Removing whole collections** (roadmap item 10).
+- **Removing whole collections** (roadmap item 10). **Done since:** ADR 0021.
 - **Restoring from the event log.** Needs log access in `Ctx`, a `core` change; not worth it while
   the trash covers the need.

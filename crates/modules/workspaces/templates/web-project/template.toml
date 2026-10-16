@@ -13,6 +13,7 @@ good_to_know = [
     "With a terminal inside the editor (IDE_TERMINAL_COMMAND), it writes .vscode/tasks.json in your project, hidden from git through .git/info/exclude",
     "A separate browser window (BROWSER_WINDOW) uses its own browser profile under ~/.local/state/shimmer/browser-profiles/, so it's not logged in to your usual sites",
     "Everything is set by your answers; the scripts stay the template's own and you can edit them in the workspace's folder",
+    "On macOS, the first time it opens a Terminal or iTerm window, macOS asks whether the program that started Shimmer (Terminal, iTerm, or sshd-keygen-wrapper over SSH) may control it: allow it, or no window can open. You can change it later in System Settings › Privacy & Security › Automation",
 ]
 on_stop = "Stops the dev server (freeing its port) and the services it started, closes the terminals and browser window it opened where it can, and lists what it left open. Your editor always stays open."
 

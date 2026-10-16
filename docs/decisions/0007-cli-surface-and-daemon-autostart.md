@@ -4,6 +4,11 @@ Status: accepted (M0, #2) · Raised by Dev B · Signed off: Dev A (touches `crat
 
 > **Renamed since:** `swe`, `swe-*` and `SWE_*` in this ADR are now `shimmer`, `shimmer-*` and
 > `SHIMMER_*` (ADR 0011). The text below is kept as written.
+>
+> **Changed since:** `records` has many more commands (ADRs 0016–0024, 0030); `list`'s table
+> shows only the columns some listed record has filled, plus a `TITLE` (ADR 0024 §5); and the
+> daemon writes its own logs to `logs/` (CLAUDE.md §7), so an auto-started daemon's logs are no
+> longer lost.
 
 ## Context
 

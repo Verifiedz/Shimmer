@@ -8,6 +8,7 @@ use shimmer_core::{Error, Result};
 use crate::client::Client;
 use crate::flags::Flags;
 use crate::render::{self, table};
+use crate::style::{paint, Role};
 use crate::when;
 
 pub const USAGE: &str = "usage: shimmer queue <command>
@@ -21,7 +22,8 @@ commands:
 
 Every unit of work runs through the queue: workspace launches, scheduled tasks, anything a module
 starts. Each lane runs a set number of tasks at a time; reordering is within a lane only, and a
-running task can be cancelled but not moved. Add --json to any command for raw output.";
+running task can be cancelled but not moved. TASK is the id as 'shimmer queue' shows it: its
+ending is enough (at least 4 characters). Add --json to any command for raw output.";
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum QueueCmd {
@@ -88,25 +90,37 @@ pub async fn run(client: &mut Client, cmd: &QueueCmd, json: bool) -> Result<Stri
             Ok(if json { render::json(&data) } else { task(&data, now) })
         }
         QueueCmd::Cancel { id } => {
-            let data = client.call("queue.cancel", json!({ "task_id": id })).await?;
-            Ok(if json { render::json(&data) } else { cancelled(id, &data) })
+            // Find it first, then act on its full id, and say which one it was (#183's review).
+            let t = client.call("queue.task", json!({ "task_id": id })).await?;
+            let full = render::cell(&t["task_id"]);
+            let data = client.call("queue.cancel", json!({ "task_id": full })).await?;
+            Ok(if json { render::json(&data) } else { cancelled(&named(&t), &data) })
         }
         QueueCmd::Move { id, before } => {
             // The lane comes from the task itself; `queue.reorder` needs it, and the lane's current
             // `queue_version`, so a move based on a stale view is refused rather than misplaced.
             let t = client.call("queue.task", json!({ "task_id": id })).await?;
             let lane = t["lane"].as_str().ok_or_else(|| Error::internal("task has no lane"))?.to_string();
+            let full = render::cell(&t["task_id"]);
+            let other = match before {
+                Some(b) => Some(client.call("queue.task", json!({ "task_id": b })).await?),
+                None => None,
+            };
             let lanes = client.call("queue.list", json!({ "lane": lane })).await?;
             let version = lanes["lanes"][0]["queue_version"].clone();
+            let before_id = other.as_ref().map(|o| render::cell(&o["task_id"]));
             let data = client
-                .call("queue.reorder", json!({"lane": lane, "task_id": id, "before": before, "queue_version": version}))
+                .call(
+                    "queue.reorder",
+                    json!({"lane": lane, "task_id": full, "before": before_id, "queue_version": version}),
+                )
                 .await?;
             Ok(if json {
                 render::json(&data)
             } else {
-                match before {
-                    Some(other) => format!("✓ moved {id} ahead of {other} in lane {lane}"),
-                    None => format!("✓ moved {id} to the back of lane {lane}"),
+                match &other {
+                    Some(o) => format!("✓ moved {} ahead of {} in lane {lane}", named(&t), named(o)),
+                    None => format!("✓ moved {} to the back of lane {lane}", named(&t)),
                 }
             })
         }
@@ -117,6 +131,12 @@ pub async fn run(client: &mut Client, cmd: &QueueCmd, json: bool) -> Result<Stri
 fn list(data: &Value, now: DateTime<Utc>) -> String {
     let lanes = data["lanes"].as_array().cloned().unwrap_or_default();
     let mut rows = Vec::new();
+    let all: Vec<String> = lanes
+        .iter()
+        .flat_map(|l| l["running"].as_array().into_iter().flatten().chain(l["queued"].as_array().into_iter().flatten()))
+        .map(|t| render::cell(&t["task_id"]))
+        .collect();
+    let mut short = render::short_ids(&all).into_iter();
     for lane in &lanes {
         let id = lane["id"].as_str().unwrap_or("?");
         for t in lane["running"].as_array().into_iter().flatten().chain(lane["queued"].as_array().into_iter().flatten())
@@ -124,7 +144,7 @@ fn list(data: &Value, now: DateTime<Utc>) -> String {
             let since = when::timestamp(&t["started_at"]).or_else(|| when::timestamp(&t["enqueued_at"]));
             rows.push(vec![
                 id.to_string(),
-                render::cell(&t["task_id"]),
+                short.next().unwrap_or_default(),
                 render::cell(&t["status"]),
                 render::cell(&t["op"]),
                 origin(&t["origin"]),
@@ -150,8 +170,9 @@ fn task(t: &Value, now: DateTime<Utc>) -> String {
     let time = |v: &Value| {
         when::timestamp(v).map_or("-".into(), |at| format!("{} ({})", when::local(at), when::relative(at, now)))
     };
-    let mut out = format!("{}  ({})\n", render::cell(&t["task_id"]), render::cell(&t["status"]));
-    let mut line = |label: &str, value: String| out.push_str(&format!("  {label:<10}{value}\n"));
+    let id = paint(Role::Name, &render::cell(&t["task_id"]));
+    let mut out = format!("{id}  ({})\n", crate::style::state(&render::cell(&t["status"])));
+    let mut line = |label: &str, value: String| out.push_str(&format!("  {}{value}\n", crate::style::label(label, 10)));
     line("op", render::cell(&t["op"]));
     line("lane", render::cell(&t["lane"]));
     line("from", origin(&t["origin"]));
@@ -164,6 +185,11 @@ fn task(t: &Value, now: DateTime<Utc>) -> String {
         line("error", render::cell(&t["error"]));
     }
     out.trim_end().to_string()
+}
+
+/// A task as a reply names it: the ending lists show, and what it runs, e.g. `kfxbpp (workspaces.activate)`.
+fn named(t: &Value) -> String {
+    format!("{} ({})", render::short_id(&render::cell(&t["task_id"])), render::cell(&t["op"]))
 }
 
 fn cancelled(id: &str, data: &Value) -> String {
