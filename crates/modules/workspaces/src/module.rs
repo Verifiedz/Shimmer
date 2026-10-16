@@ -72,7 +72,11 @@ impl Module for Workspaces {
             ctx.store.transaction(|tx| {
                 let next = Saved::new(dirty.clone()).with_last_session(saved.last_session.clone());
                 tx.put(&state_path(&id), persist::encode(&next))?;
-                tx.emit("workspaces.session.dirty", dirty_payload(&id, &dirty))
+                // `recovered`: no task failed to report this one, so notify alerts on it
+                // (ADR 0032 §4); a launch that fails as it runs is reported by its task.
+                let mut payload = dirty_payload(&id, &dirty);
+                payload["recovered"] = json!(true);
+                tx.emit("workspaces.session.dirty", payload)
             })?;
         }
         Ok(())
