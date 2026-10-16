@@ -300,7 +300,7 @@ tested end to end, and one asking consequential questions shows the rule before 
 | `follow-up-reminder` | N days after a record is done, reminds you (a delayed action, §4) |
 | `spaced-review` | N days after a record is done, reminds you to redo it (§4) |
 | `stage-opens-workspace` | opens a fixed workspace when a field reaches a value |
-| `stage-creates-workspace` | makes a workspace **for that record** from a workspace template, with answers filled from the record, opens it, and removes it when the record closes |
+| `stage-creates-workspace` | makes a workspace **for that record** from a workspace template, with answers filled from the record, opens it, and stops it when the record closes |
 | `posting-to-application` | saves a fetched posting as a record (ships with fetchers) |
 
 `stage-creates-workspace` makes **three rules** from one set of answers, because creating and
@@ -320,16 +320,22 @@ on = "workspaces.workspace.created"
 when = { template = "interview-prep" }
 [[do]]
 op = "workspaces.activate"
-params = { id = "{id}" }
+params = { id = "{workspace}" }
 ```
 ```toml
-# 3: the record closes → the workspace goes (to the workspaces trash, restorable)
+# 3: the record closes → the workspace stops (its cleanup runs; it stays in your list)
 on = "records.item.updated"
 when = { collection = "jobs", "item.stage" = { in = ["offer", "rejected", "withdrawn"] } }
 [[do]]
-op = "workspaces.remove"
+op = "workspaces.stop"
 params = { id = "{id}-prep" }
 ```
+
+Rule 3 **stops** the workspace rather than removing it: `workspaces.remove` refuses a workspace
+that's active (ADR 0026), and rule 2 has opened it, so a remove would fail every time. A rule's
+actions start together, so "stop, then remove" can't be one rule; a fourth rule removing any
+stopped `*-prep` workspace was considered and rejected, since it would also remove one you stop by
+hand. Removing it stays yours (`shimmer workspaces remove`), from a list where it's `ready`.
 
 **Two walkthroughs** go in the README as "try this", built from these templates: the job hunt and
 LeetCode flows of the Context (the LeetCode one's "weekdays at 09:00" is a schedule, `scheduler add
