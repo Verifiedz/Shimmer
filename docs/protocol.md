@@ -500,7 +500,7 @@ day), a local `2026-10-01 14:00`, or RFC 3339; `text` matches the title or body,
 | `notify.test` | queued (`notify`) | `{}` | `{"deliveries":[{"medium","at","ok","error"?}],"sinks":[…]}`: a test to every sink, past quiet hours and pause; not kept |
 | `notify.resend` | queued (`notify`) | `{"ids":[…]}` or filters | `{"items":[…]}`: each tried again, the new deliveries added to it |
 | `notify.flush` | queued (`notify`) | `{}` | `{"delivered":N}`: what quiet hours or a pause held, as one summary. Run hourly by notify's own trigger `notify.flush`. |
-| `notify.list` | inline | filters, `"limit"`? (default 50) | `{"items":[…],"counts":{"total","unread","high","held","failed"},"removed_unread"?}`, newest first |
+| `notify.list` | inline | filters, `"limit"`? (default 50) | `{"items":[…],"counts":{"total","unread","high","held","failed"},"removed_unread"?}`, newest first; each item also has `short`, the ending to show for it |
 | `notify.count` | inline | filters | `{"count", "total","unread","high","held","failed"}` |
 | `notify.get` | inline | `{"id"}` | the message |
 | `notify.mark_read` / `notify.mark_unread` | inline | `{"ids":[…]}`, `{"all":true}` or filters | `{"marked":N}` |
@@ -515,6 +515,11 @@ day), a local `2026-10-01 14:00`, or RFC 3339; `text` matches the title or body,
 A message: `{"id","at","priority","title","body"?,"source","state","read","delivery":[{"medium","at","ok","error"?}]}`.
 `source` is `send`, `schedule`, `fallback`, `alert:<name>` or `automation:<rule>`. Messages are files
 in `data/notify/inbox/`; settings are `data/notify/settings.toml`.
+
+Every `id` and `ids` entry may be a unique ending of a message id, as for tasks (see "Short ids"
+above): at least 4 characters, `conflict` when several match, `not_found` when none does. A list
+item's `short` is its last 6 characters, or more where another message in the inbox ends the same
+way: unique across the whole inbox, not only the page returned, so it always works given back.
 
 ## Topic catalogue
 
