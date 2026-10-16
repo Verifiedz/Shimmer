@@ -87,7 +87,9 @@ pub enum Os {
 /// Everything the commands read from outside, spelled out so tests can point it at temp folders.
 pub struct Env {
     pub os: Os,
-    /// `$XDG_CONFIG_HOME`, else `~/.config`: where the systemd unit goes.
+    /// `~/.config`: where systemd's user manager reads units, unless its own environment names
+    /// another `XDG_CONFIG_HOME` ([`unit_file`]). Never the shell's `XDG_CONFIG_HOME`: systemd
+    /// doesn't see it, and a unit written there "does not exist" for systemd.
     pub config_dir: Option<PathBuf>,
     /// `$HOME`: where the LaunchAgent goes (`~/Library/LaunchAgents`).
     pub home_dir: Option<PathBuf>,
@@ -118,9 +120,7 @@ impl Env {
         };
         Self {
             os,
-            config_dir: var("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .or_else(|| home_dir.as_ref().map(|h| h.join(".config"))),
+            config_dir: home_dir.as_ref().map(|h| h.join(".config")),
             home_dir,
             cli_toml: settings::path(),
             exe: std::env::current_exe().and_then(|p| p.canonicalize()),
@@ -194,7 +194,13 @@ pub fn run(cmd: &StartupCmd, env: &Env, services: &mut impl Services) -> Result<
 // ---------------------------------------------------------------- on
 
 fn on(env: &Env, services: &mut impl Services) -> Result<String> {
-    let file = env.service_file()?;
+    // On Linux, systemd is asked once: whether it's there, which login to start with, and where
+    // it reads units.
+    let linux = if env.os == Os::Linux { Some(linux_when(env, services)?) } else { None };
+    let file = match &linux {
+        Some((_, manager)) => unit_file_in(env, manager)?,
+        None => env.service_file()?,
+    };
     let exe =
         env.exe.as_ref().map_err(|e| Error::unavailable(format!("can't tell where shimmer is installed: {e}")))?;
     let (cli_toml, mut saved) = env.settings()?;
@@ -205,13 +211,10 @@ fn on(env: &Env, services: &mut impl Services) -> Result<String> {
         )));
     }
     let mut out = Vec::new();
-    let (text, target) = match env.os {
-        Os::Linux => {
-            let when = linux_when(env, services)?;
-            (systemd_unit(exe, &env.pinned, when == When::WithDesktop)?, when)
-        }
-        Os::Mac => (launchd_plist(exe, &env.pinned)?, When::WithDesktop),
-        Os::Other => unreachable!("service_file refuses other systems"),
+    let (text, target) = match (&linux, env.os) {
+        (Some((when, _)), _) => (systemd_unit(exe, &env.pinned, *when == When::WithDesktop)?, *when),
+        (None, Os::Mac) => (launchd_plist(exe, &env.pinned)?, When::WithDesktop),
+        (None, _) => unreachable!("service_file refuses other systems"),
     };
     write_atomic(&file, &text).map_err(|e| Error::internal(format!("can't write {}: {e}", file.display())))?;
     // Recorded before the service manager runs, so 'off' can always remove it if a step fails.
@@ -274,9 +277,29 @@ fn on(env: &Env, services: &mut impl Services) -> Result<String> {
     Ok(out.join("\n"))
 }
 
+/// Where the service file goes. On Linux, where systemd's user manager reads it: its own
+/// `XDG_CONFIG_HOME` if its environment has one, else `~/.config` (found testing on GNOME: a
+/// shell's `XDG_CONFIG_HOME` put the unit where systemd never looked).
+fn unit_file(env: &Env, services: &mut impl Services) -> Result<PathBuf> {
+    if env.os != Os::Linux {
+        return env.service_file();
+    }
+    let manager = services.run("systemctl", &["--user", "show-environment"]).map(|(_, said)| said).unwrap_or_default();
+    unit_file_in(env, &manager)
+}
+
+/// [`unit_file`], given what `systemctl --user show-environment` printed.
+fn unit_file_in(env: &Env, manager_env: &str) -> Result<PathBuf> {
+    match manager_env.lines().find_map(|l| l.strip_prefix("XDG_CONFIG_HOME=")).map(PathBuf::from) {
+        Some(dir) if dir.is_absolute() => Ok(dir.join("systemd/user").join(UNIT)),
+        _ => env.service_file(),
+    }
+}
+
 /// Which login the Linux service starts with, from where `on` runs (ADR 0034 §4).
-fn linux_when(env: &Env, services: &mut impl Services) -> Result<When> {
-    match services.run("systemctl", &["--user", "show-environment"]) {
+/// Also returns what `systemctl --user show-environment` printed, for [`unit_file_in`].
+fn linux_when(env: &Env, services: &mut impl Services) -> Result<(When, String)> {
+    let manager = match services.run("systemctl", &["--user", "show-environment"]) {
         Err(_) => {
             return Err(Error::unavailable(
                 "systemd isn't installed here, so there's no user service to start Shimmer at login",
@@ -287,13 +310,14 @@ fn linux_when(env: &Env, services: &mut impl Services) -> Result<When> {
                 "systemd's user services aren't running for you here ({said}), so nothing can start Shimmer at login"
             )))
         }
-        Ok((true, _)) => {}
-    }
+        Ok((true, said)) => said,
+    };
     if !env.display {
-        return Ok(When::AnyLogin);
+        return Ok((When::AnyLogin, manager));
     }
     let desktop_target = services.run("systemctl", &["--user", "is-active", "graphical-session.target"]);
-    Ok(if desktop_target.is_ok_and(|(ok, _)| ok) { When::WithDesktop } else { When::DesktopWithoutTarget })
+    let when = if desktop_target.is_ok_and(|(ok, _)| ok) { When::WithDesktop } else { When::DesktopWithoutTarget };
+    Ok((when, manager))
 }
 
 /// The line that hands the desktop's display to the service, for a desktop that never reaches
@@ -323,7 +347,10 @@ fn off(env: &Env, services: &mut impl Services) -> Result<String> {
     let expected = env.service_file()?;
     let (cli_toml, mut saved) = env.settings()?;
     // The recorded file, or one at the usual place that says it's ours (cli.toml was lost).
-    let file = saved.startup.as_ref().map(|s| s.file.clone()).unwrap_or_else(|| expected.clone());
+    let file = match saved.startup.as_ref() {
+        Some(s) => s.file.clone(),
+        None => unit_file(env, services)?,
+    };
     let text = match std::fs::read_to_string(&file) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -343,7 +370,16 @@ fn off(env: &Env, services: &mut impl Services) -> Result<String> {
         )));
     }
     if env.os == Os::Linux {
-        ok(services, "systemctl", &["--user", "disable", UNIT])?;
+        // A unit systemd has never loaded (written where it doesn't look) is as good as
+        // disabled: say so and carry on removing the file, rather than stopping half way.
+        match services.run("systemctl", &["--user", "disable", UNIT]) {
+            Ok((true, _)) => {}
+            Ok((false, said)) if said.contains("does not exist") || said.contains("not found") => {}
+            Ok((false, said)) => {
+                return Err(Error::unavailable(format!("'systemctl --user disable {UNIT}' failed: {said}")))
+            }
+            Err(e) => return Err(Error::unavailable(format!("can't run systemctl: {e}"))),
+        }
     }
     std::fs::remove_file(&file).map_err(|e| Error::internal(format!("can't remove {}: {e}", file.display())))?;
     if env.os == Os::Linux {
@@ -361,9 +397,12 @@ fn off(env: &Env, services: &mut impl Services) -> Result<String> {
 // ---------------------------------------------------------------- status
 
 fn status(env: &Env, services: &mut impl Services) -> Result<String> {
-    let expected = env.service_file()?;
+    env.service_file()?;
     let saved = env.settings().map(|(_, s)| s).unwrap_or_default();
-    let file = saved.startup.as_ref().map(|s| s.file.clone()).unwrap_or(expected);
+    let file = match saved.startup.as_ref() {
+        Some(s) => s.file.clone(),
+        None => unit_file(env, services)?,
+    };
     let Some(text) = std::fs::read_to_string(&file).ok() else {
         return Ok("off: Shimmer's daemon starts when a command needs it.\n'shimmer startup on' starts it every time you log in, so schedules run after a restart.".into());
     };
@@ -581,6 +620,8 @@ mod tests {
         failing: Vec<&'static str>,
         /// What `systemctl --user show-environment` prints.
         manager_env: &'static str,
+        /// What a failing command prints.
+        failure_says: &'static str,
         missing: bool,
     }
 
@@ -591,12 +632,14 @@ mod tests {
             if self.missing {
                 return Err(std::io::ErrorKind::NotFound.into());
             }
+            let failed = self.failing.contains(&line.as_str());
             let said = match line.as_str() {
+                _ if failed => self.failure_says.to_owned(),
                 "id -u" => "501".to_owned(),
                 "systemctl --user show-environment" => self.manager_env.to_owned(),
                 _ => String::new(),
             };
-            Ok((!self.failing.contains(&line.as_str()), said))
+            Ok((!failed, said))
         }
     }
 
@@ -733,7 +776,7 @@ mod tests {
         let e = on(&t.env, &mut fake).unwrap_err();
         assert!(e.message.contains("Shimmer didn't write it"), "{e}");
         assert_eq!(std::fs::read_to_string(unit_file(&t)).unwrap(), "[Service]\nExecStart=/usr/bin/mine\n");
-        assert!(fake.calls.is_empty());
+        assert_eq!(fake.calls, ["systemctl --user show-environment"], "only asked where systemd reads units");
         let e = off(&t.env, &mut fake).unwrap_err();
         assert!(e.message.contains("wasn't written by"), "{e}");
         assert!(unit_file(&t).exists());
@@ -782,6 +825,48 @@ mod tests {
         settings::save(t.env.cli_toml.as_ref().unwrap(), &s).unwrap();
         assert!(off(&t.env, &mut Fake::default()).is_err());
         assert!(other.exists());
+    }
+
+    #[test]
+    fn the_unit_goes_where_systemd_reads_units() {
+        // Found testing on GNOME: a shell's XDG_CONFIG_HOME is never used (Env::from_process
+        // takes ~/.config); systemd's own XDG_CONFIG_HOME is.
+        let t = env(Os::Linux);
+        let sysd = t._tmp.path().join("systemd-config");
+        let manager: &'static str =
+            Box::leak(format!("HOME=/home/me\nXDG_CONFIG_HOME={}\n", sysd.display()).into_boxed_str());
+        let mut fake = Fake { manager_env: manager, ..Fake::default() };
+        let out = on(&t.env, &mut fake).unwrap();
+        let written = sysd.join("systemd/user/shimmer.service");
+        assert!(written.exists() && out.contains(&written.display().to_string()), "{out}");
+        assert_eq!(saved(&t).startup.unwrap().file, written);
+        assert!(!unit_file(&t).exists(), "not in ~/.config when systemd reads elsewhere");
+        assert_eq!(fake.calls.iter().filter(|c| c.contains("show-environment")).count(), 1, "asked once");
+        off(&t.env, &mut Fake { manager_env: manager, ..Fake::default() }).unwrap();
+        assert!(!written.exists());
+    }
+
+    #[test]
+    fn off_finishes_when_systemd_never_loaded_the_unit() {
+        let t = env(Os::Linux);
+        on(&t.env, &mut Fake::default()).unwrap();
+        let mut fake = Fake {
+            failing: vec!["systemctl --user disable shimmer.service"],
+            failure_says: "Failed to disable unit: Unit file shimmer.service does not exist.",
+            ..Fake::default()
+        };
+        assert!(off(&t.env, &mut fake).unwrap().starts_with("off:"));
+        assert!(!unit_file(&t).exists());
+        assert_eq!(saved(&t).startup, None);
+        // Any other failure still stops it, with systemd's words.
+        on(&t.env, &mut Fake::default()).unwrap();
+        let mut broken = Fake {
+            failing: vec!["systemctl --user disable shimmer.service"],
+            failure_says: "Access denied",
+            ..Fake::default()
+        };
+        assert!(off(&t.env, &mut broken).unwrap_err().message.contains("Access denied"));
+        assert!(unit_file(&t).exists());
     }
 
     #[test]
