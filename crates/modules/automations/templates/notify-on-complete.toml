@@ -1,0 +1,30 @@
+[template]
+label = "Tell me when a record is done"
+description = "A message whenever a record in a collection is marked done"
+category = "messages"
+good_to_know = ["It only sends a message: nothing else changes"]
+
+[[question]]
+name = "COLLECTION"
+prompt = "Which collection (its id, as 'shimmer records collections' shows it)"
+kind = "name"
+required = true
+
+[[question]]
+name = "PRIORITY"
+prompt = "How loud"
+kind = "choice"
+choices = ["low", "normal", "high"]
+default = "low"
+
+[[rule]]
+text = '''
+[rule]
+label = "Tell me when something in ${COLLECTION} is done"
+on = "records.item.completed"
+when = { collection = "${COLLECTION}" }
+
+[[do]]
+op = "notify.send"
+params = { title = "Done: {title}", priority = "${PRIORITY}" }
+'''

@@ -105,6 +105,8 @@ belongs to this machine, so copying your Shimmer folder elsewhere doesn't bring 
 | automations status | `genki` | `status-page` | `status-report` | `ast` |
 | automations depth | `fukasa` | `blast-radius` | `chain-of-command` | `adepth` |
 | automations reload | `saikidou` | `hot-reload` | `power-cycle` | `areload` |
+| automations templates | `jutsu` | `playbooks` | `battle-plans` | `atpl` |
+| automations peek | `chira` | `read-playbook` | `review-plan` | `apeek` |
 
 ## Writing your own
 

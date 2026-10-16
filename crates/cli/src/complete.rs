@@ -650,8 +650,8 @@ impl Groups {
                     self.add("fields", "fields", f["name"].as_str().unwrap_or_default(), field_type(&f));
                 }
             }
-            ("records" | "workspaces", "TEMPLATE") => self.templates(module, source).await,
-            ("records" | "workspaces", "CATEGORY") => self.categories(module, source).await,
+            ("records" | "workspaces" | "automations", "TEMPLATE") => self.templates(module, source).await,
+            ("records" | "workspaces" | "automations", "CATEGORY") => self.categories(module, source).await,
             ("workspaces", "NAME") if command != "new" => self.workspaces(source).await,
             ("packs", "NAME") | ("", "NAME") => self.packs(cx),
             ("packs", "NAME|FOLDER") => {
@@ -962,6 +962,11 @@ mod tests {
             ("scheduler.list", json!({"triggers": [{"id": "usr-01JABCDEFGHJKMNPQRSTVWXYZ0", "op": "records.list"}]})),
             ("automations.list", json!({"rules": [{"id": "solved", "label": "Solved"}], "removed": ["old"]})),
             (
+                "automations.templates",
+                json!({"categories": [{"id": "messages", "label": "Tell me"}],
+                       "templates": [{"id": "notify-on-add", "description": "A message"}]}),
+            ),
+            (
                 "core.manifest",
                 json!({"lanes": [{"id": "default", "max_concurrent": 4}],
                        "modules": [{"commands": [{"op": "core.ping", "summary": "Ping"}]}]}),
@@ -1142,6 +1147,9 @@ mod tests {
         assert_eq!(words("call ").await, ["core.ping"]);
         assert_eq!(words("automations disable ").await, ["solved"]);
         assert_eq!(words("automations restore ").await, ["old"], "only removed rules come back");
+        assert_eq!(words("automations new x --from ").await, ["notify-on-add"]);
+        assert_eq!(words("automations peek ").await, ["notify-on-add"]);
+        assert_eq!(words("automations templates ").await, ["messages"]);
         assert!(words("automations ").await.contains(&"history".to_owned()));
         assert!(words("automations test solved --").await.contains(&"--event".to_owned()));
         assert!(words("packs use ").await.contains(&"none".to_owned()));

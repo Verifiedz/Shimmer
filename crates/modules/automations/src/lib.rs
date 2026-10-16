@@ -5,6 +5,7 @@
 
 pub mod chain;
 pub mod rule;
+pub mod template;
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -194,6 +195,15 @@ impl Automations {
 
     /// A new rule from `text`, or a starter rule, switched off, to edit (§8).
     fn create(&self, ctx: &Ctx, p: Create) -> Result<Value> {
+        if let Some(template) = &p.template {
+            if p.text.is_some() || p.label.is_some() {
+                return Err(Error::invalid_params("a rule comes from a template or from its text, not both"));
+            }
+            return self.create_from_template(ctx, &p.id, template, &p.values, p.preview);
+        }
+        if p.preview || !p.values.is_empty() {
+            return Err(Error::invalid_params("values and preview go with a template"));
+        }
         let _g = self.write.lock();
         if ctx.store.read(&path(&p.id))?.is_some() {
             return Err(Error::conflict(format!("rule '{}' already exists", p.id)));
@@ -203,6 +213,82 @@ impl Automations {
             None => starter(ctx, p.label.as_deref().unwrap_or("")),
         };
         self.write_rule(ctx, &p.id, &text, "automations.rule.created")
+    }
+
+    /// The rules `template` makes with these answers (§9), checked like any rule, made together or
+    /// not at all; with `preview`, only shown.
+    fn create_from_template(
+        &self,
+        ctx: &Ctx,
+        id: &str,
+        template: &str,
+        values: &serde_json::Map<String, Value>,
+        preview: bool,
+    ) -> Result<Value> {
+        let t = template::builtin()
+            .into_iter()
+            .find(|t| t.id == template)
+            .ok_or_else(|| Error::not_found(format!("no template '{template}' (shimmer automations templates)")))?;
+        let missing: Vec<String> = t.ops().into_iter().filter(|op| ctx.catalog.op(op).is_none()).collect();
+        if !missing.is_empty() {
+            let modules: Vec<&str> = missing.iter().filter_map(|op| op.split('.').next()).collect();
+            return Err(Error::unavailable(format!(
+                "the {template} template needs {} from the {} module, which isn't installed",
+                missing.join(", "),
+                modules.join(", ")
+            )));
+        }
+        let answers = t.answers(values).map_err(Error::invalid_params)?;
+        let rules = t.fill(id, &answers);
+        let mut checked = Vec::new();
+        for (rule_id, text) in &rules {
+            let rule = Rule::parse(rule_id, text, &ctx.catalog, false)
+                .map_err(|m| Error::invalid_params(format!("{rule_id}: {m}")))?;
+            checked.push(rule);
+        }
+        let _g = self.write.lock();
+        let taken: Vec<&str> = rules
+            .iter()
+            .map(|(rule_id, _)| rule_id.as_str())
+            .filter(|rule_id| matches!(ctx.store.read(&path(rule_id)), Ok(Some(_))))
+            .collect();
+        if !taken.is_empty() {
+            return Err(Error::conflict(format!("already a rule: {}; choose another id", taken.join(", "))));
+        }
+        if preview {
+            let shown: Vec<Value> = rules.iter().map(|(rule_id, text)| json!({"id": rule_id, "text": text})).collect();
+            return Ok(json!({"preview": true, "template": template, "rules": shown}));
+        }
+        ctx.store.transaction(|tx| {
+            for (rule_id, text) in &rules {
+                tx.put(&path(rule_id), text.as_str())?;
+                tx.emit("automations.rule.created", json!({"rule": rule_id, "template": template}))?;
+            }
+            Ok(())
+        })?;
+        let history = history(ctx);
+        let mut st = self.state();
+        let views: Vec<Value> = checked.iter().map(|r| view(r, &history)).collect();
+        for rule in checked {
+            st.problems.retain(|(file, _)| *file != path(&rule.id));
+            st.rules.insert(rule.id.clone(), rule);
+        }
+        Ok(json!({"template": template, "rules": views}))
+    }
+
+    fn templates(&self, p: TemplatesParams) -> Result<Value> {
+        let all = template::builtin();
+        let templates: Vec<Value> = match &p.id {
+            None => all.iter().map(template::Template::to_wire).collect(),
+            Some(id) => vec![all
+                .iter()
+                .find(|t| &t.id == id)
+                .ok_or_else(|| Error::not_found(format!("no template '{id}'")))?
+                .to_wire()],
+        };
+        let categories: Vec<Value> =
+            template::CATEGORIES.iter().map(|(id, label)| json!({"id": id, "label": label})).collect();
+        Ok(json!({"categories": categories, "templates": templates}))
     }
 
     /// Replace a rule's file with `text`, after checking it: a broken rule is refused and the old
@@ -418,9 +504,15 @@ impl Module for Automations {
             ("automations.get", "One rule, and its file's text", id()),
             (
                 "automations.create",
-                "Make a rule from its text, or a starter rule (switched off) to edit",
+                "Make a rule from its text, from a template's answers, or a starter rule (switched off) to edit",
                 json!({"type": "object", "required": ["id"], "properties": {
-                    "id": {"type": "string"}, "text": {"type": "string"}, "label": {"type": "string"}}}),
+                    "id": {"type": "string"}, "text": {"type": "string"}, "label": {"type": "string"},
+                    "template": {"type": "string"}, "values": {"type": "object"}, "preview": {"type": "boolean"}}}),
+            ),
+            (
+                "automations.templates",
+                "Ready-made rules to make from a few answers, by category",
+                json!({"type": "object", "properties": {"id": {"type": "string"}}}),
             ),
             (
                 "automations.save",
@@ -487,6 +579,7 @@ impl Module for Automations {
             }
             "automations.test" => self.test(ctx, decode(params)?),
             "automations.events" => Ok(self.events(ctx)),
+            "automations.templates" => self.templates(decode(params)?),
             "automations.history" => Ok(self.history(ctx, decode(params)?)),
             "automations.status" => Ok(self.status(ctx)),
             "automations.depth" => self.depth(ctx, decode(params)?),
@@ -514,6 +607,18 @@ struct Create {
     id: String,
     text: Option<String>,
     label: Option<String>,
+    template: Option<String>,
+    #[serde(default)]
+    values: serde_json::Map<String, Value>,
+    /// With a template: the rules it would make, without making them.
+    #[serde(default)]
+    preview: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TemplatesParams {
+    id: Option<String>,
 }
 
 #[derive(Deserialize)]
