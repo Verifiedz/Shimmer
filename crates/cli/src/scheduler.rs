@@ -288,6 +288,17 @@ fn candidates(op: &str, params: &Value) -> Vec<Vec<String>> {
     let Some(target) = crate::packs::pack::TARGETS.iter().find(|t| t.op == op) else { return Vec::new() };
     let Some(p) = params.as_object() else { return Vec::new() };
     let base: Vec<String> = target.words.iter().map(|w| w.to_string()).collect();
+    if op == "notify.send" {
+        let mut words = base;
+        let Some(title) = p.get("title").and_then(Value::as_str) else { return Vec::new() };
+        words.push(title.to_owned());
+        for key in ["body", "priority"] {
+            if let Some(v) = p.get(key).and_then(Value::as_str) {
+                words.extend([format!("--{key}"), v.to_owned()]);
+            }
+        }
+        return vec![words];
+    }
     if op.starts_with("workspaces.") {
         let mut words = base;
         words.extend(p.get("id").and_then(Value::as_str).map(String::from));
@@ -426,6 +437,7 @@ fn parses_back_to(words: &[String], op: &str, params: &Value, schemas: &Schemas)
         "workspaces" => {
             crate::workspaces::parse(rest.to_vec()).ok().and_then(|cmd| crate::schedule::workspaces_op(&cmd))
         }
+        "notify" => crate::notify::parse(rest.to_vec()).ok().as_ref().and_then(crate::notify::scheduled_send),
         _ => None,
     };
     got.is_some_and(|(got_op, got_params)| got_op == op && &got_params == params)
@@ -685,6 +697,7 @@ mod tests {
                 let schema = cmd.collection().and_then(|c| schemas().get(c).cloned()).unwrap_or(Value::Null);
                 crate::records::request(&cmd, &schema).unwrap()
             }
+            "notify" => crate::notify::scheduled_send(&crate::notify::parse(words[1..].to_vec()).unwrap()).unwrap(),
             _ => crate::schedule::workspaces_op(&crate::workspaces::parse(words[1..].to_vec()).unwrap()).unwrap(),
         };
         (op, params)
@@ -710,6 +723,8 @@ mod tests {
             "workspaces activate site",
             "workspaces stop site",
             "workspaces cleanup site",
+            "notify send 'Standup in 15'",
+            "notify send Stretch --body 'stand up, walk' --priority low",
             // Through `scheduler add`: list filters, options, and a field named like an option.
             "records list jobs --stage offer",
             "records list jobs --filter limit=5",

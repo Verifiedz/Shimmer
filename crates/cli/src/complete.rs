@@ -27,13 +27,14 @@ use crate::style::{Palette, Role};
 const DAEMON_WAIT: Duration = Duration::from_millis(500);
 
 /// The modules with their own help page, by the command word that opens it.
-fn modules() -> [(&'static str, &'static str); 5] {
+fn modules() -> [(&'static str, &'static str); 6] {
     [
         ("records", crate::records::USAGE),
         ("workspaces", crate::workspaces::USAGE),
         ("queue", crate::queue::USAGE),
         ("scheduler", crate::scheduler::USAGE),
         ("packs", crate::packs::cmd::USAGE),
+        ("notify", crate::notify::USAGE),
     ]
 }
 
@@ -661,6 +662,7 @@ impl Groups {
             ("queue", "TASK" | "OTHER") => self.tasks(source).await,
             ("queue" | "scheduler", "LANE") => self.lanes(source).await,
             ("scheduler", "TRIGGER") => self.triggers(source).await,
+            ("notify", "ID") => self.messages(source).await,
             ("scheduler" | "", "OP") => self.ops(source).await,
             ("scheduler", "WHAT") => {
                 for v in crate::scheduler::CATCH_UP {
@@ -748,6 +750,16 @@ impl Groups {
         let Some(data) = source.call("core.manifest", json!({})).await else { return };
         for l in data["lanes"].as_array().into_iter().flatten() {
             self.add("lanes", "lanes", text(&l["id"]), format!("{} at a time", text(&l["max_concurrent"])));
+        }
+    }
+
+    /// Inbox messages by the short ending `notify list` shows, newest first.
+    async fn messages(&mut self, source: &mut impl Source) {
+        let Some(data) = source.call("notify.list", json!({"limit": 200})).await else { return };
+        let all = data["items"].as_array().cloned().unwrap_or_default();
+        let ids: Vec<String> = all.iter().map(|m| text(&m["id"])).collect();
+        for (m, short) in all.iter().zip(crate::render::short_ids(&ids)) {
+            self.add("messages", "messages", short, text(&m["title"]));
         }
     }
 
@@ -1080,7 +1092,11 @@ mod tests {
         assert_eq!(words("schedule w").await, ["weekdays", "weekends"]);
         assert!(words("schedule daily ").await.is_empty(), "a time is typed, not picked");
         assert!(words("schedule once 2026-10-20 ").await.is_empty(), "the time still to come");
-        assert_eq!(words("schedule daily 09:00 ").await, ["records", "workspaces"], "only what can be scheduled");
+        assert_eq!(
+            words("schedule daily 09:00 ").await,
+            ["records", "workspaces", "notify"],
+            "only what can be scheduled"
+        );
         assert_eq!(words("schedule daily 09:00 --").await, ["--catch-up", "--lane"]);
         assert_eq!(words("schedule every 1d --catch-up ").await, ["skip", "run-once", "backfill"]);
         assert_eq!(words("schedule every 1d --lane ").await, ["default"]);
