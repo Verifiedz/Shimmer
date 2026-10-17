@@ -660,7 +660,7 @@ impl Groups {
             ("records", "FILE") | ("", "PATH") => self.files(),
             ("queue", "TASK" | "OTHER") => self.tasks(source).await,
             ("queue" | "scheduler", "LANE") => self.lanes(source).await,
-            ("scheduler", "TRIGGER") => self.triggers(source).await,
+            ("scheduler", "TRIGGER") => self.triggers(command, source).await,
             ("scheduler" | "", "OP") => self.ops(source).await,
             ("scheduler", "WHAT") => {
                 for v in crate::scheduler::CATCH_UP {
@@ -751,15 +751,17 @@ impl Groups {
         }
     }
 
-    async fn triggers(&mut self, source: &mut impl Source) {
+    async fn triggers(&mut self, command: &str, source: &mut impl Source) {
         let Some(data) = source.call("scheduler.list", json!({})).await else { return };
         let all: Vec<Value> = data["triggers"]
             .as_array()
             .or_else(|| data.as_array())
             .into_iter()
             .flatten()
-            // The ones you added, as `scheduler list` shows (#244); a module's own is typed whole.
-            .filter(|t| t["source"]["type"] == "user")
+            // The ones you added, as `scheduler list` shows (#244), for anything you can only do to
+            // your own. Pausing is the one thing you can do to a module's schedule, so pause and
+            // resume offer every one (#249's review).
+            .filter(|t| matches!(command, "pause" | "resume") || t["source"]["type"] == "user")
             .cloned()
             .collect();
         // The same short endings `scheduler list` shows, which every scheduler command accepts.
@@ -1140,7 +1142,9 @@ mod tests {
         assert_eq!(words("records complete lc/").await, ["lc/two-sum"]);
         assert_eq!(words("records new jobs --from ").await, ["leetcode"]);
         assert_eq!(words("records templates ").await, ["practice"]);
-        assert_eq!(words("scheduler pause ").await, ["VWXYZ0"], "the short ending lists show, not the whole id");
+        assert_eq!(words("scheduler remove ").await, ["VWXYZ0"], "the short ending lists show, not the whole id");
+        let pause = words("scheduler pause ").await;
+        assert!(pause.contains(&"VWXYZ0".to_owned()) && pause.contains(&"notify.flush".to_owned()), "{pause:?}");
         assert_eq!(words("call ").await, ["core.ping"]);
         assert!(words("packs use ").await.contains(&"none".to_owned()));
         assert!(words("packs use ").await.contains(&"short".to_owned()));

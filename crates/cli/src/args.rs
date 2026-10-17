@@ -103,6 +103,8 @@ impl Args {
             (true, Some("workspaces")) => Command::Workspaces(WorkspacesCmd::Help),
             (true, Some("queue")) => Command::Queue(QueueCmd::Help),
             (true, Some("scheduler")) => Command::Scheduler(SchedulerCmd::Help),
+            // `schedule --help` is what muscle memory types: the same pointer as `schedule …`.
+            (true, Some("schedule")) => command(words.clone())?,
             (true, Some("packs")) => Command::Packs(PacksCmd::Help),
             (true, Some("doctor")) => Command::DoctorHelp,
             (true, _) => Command::Help,

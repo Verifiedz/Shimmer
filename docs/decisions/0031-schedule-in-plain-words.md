@@ -185,7 +185,7 @@ shell is easy to get wrong, and it bypasses §1's own rule by scheduling ops tha
   relative values kept relative, and the same reply.
 
       shimmer scheduler add weekdays 09:00 --catch-up skip workspaces activate site
-      shimmer scheduler add mon,wed,fri 18:00 --catch-up skip notify send "Gym"
+      shimmer scheduler add mon,wed,fri 18:00 --catch-up skip records add habits --title Gym
       shimmer scheduler add cron-local "*/15 9-17 * * 1-5" --catch-up skip records add habits --title Stretch
 
 - **`shimmer schedule` goes.** For a while, typing it is an error that says what to type instead
@@ -198,14 +198,15 @@ shell is easy to get wrong, and it bypasses §1's own rule by scheduling ops tha
   unchanged for the daemon, the TUI, scripts and any other client. Triggers made the raw way keep
   working; `scheduler list` already shows each as the command it would be, or as op and params
   when no command reads back to it.
-- **No fallback flag.** A scheduled task that fails is already reported, with no link between
-  scheduler and notify: the queue emits `queue.task.failed` (`origin: scheduler`), and notify's
-  built-in alerts react to it (ADR 0032 §4). A custom message for one schedule is an automation
-  on that event (ADR 0035). ADR 0005's `fallback` field stays, reachable with `shimmer call
+- **No fallback flag.** A scheduled task that fails is reported without one: the queue emits
+  `queue.task.failed` (`origin: scheduler`), in the event log and on the stream. Once notify (ADR
+  0032, #276) and automations (ADR 0035, #238) are in, a built-in rule turns that into a message,
+  and a custom message for one schedule is an automation on that event; until then the event is
+  the report. ADR 0005's `fallback` field stays, reachable with `shimmer call
   scheduler.add`, but the CLI doesn't expose it.
 - **Kept as they are:** Tab completion (the `WHEN` words, then the schedule's options, then only
-  commands that can be scheduled), and the one-time "starts at login" note on the first schedule
-  made (ADR 0034 §7), now on `scheduler add`. `scheduler list|show|pause|resume|remove` are
+  commands that can be scheduled). The one-time "starts at login" note on the first schedule made
+  (ADR 0034 §7) comes with `shimmer startup` (#242) and goes on `scheduler add` when that lands. `scheduler list|show|pause|resume|remove` are
   unchanged.
 
 ## Consequences

@@ -162,11 +162,17 @@ fn scheduler_mistakes_are_caught_before_or_by_the_daemon() {
     let o = home.shimmer(&["scheduler", "add", "records.list", "--every", "1d", "--catch-up", "skip"]);
     assert_eq!(o.status.code(), Some(2));
     assert!(
-        stderr(&o).contains("looks like an op") && stderr(&o).contains("shimmer call scheduler.add"),
+        stderr(&o).contains("the old way of scheduling") && stderr(&o).contains("shimmer call scheduler.add"),
         "{}",
         stderr(&o)
     );
     let o = home.shimmer(&["schedule", "daily", "09:00", "--catch-up", "skip", "records", "complete", "leetcode/x"]);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(stderr(&o).contains("'shimmer schedule' is now 'shimmer scheduler add'"), "{}", stderr(&o));
+    // The old flags first, and `schedule --help`, say the same (#249's review).
+    let o = home.shimmer(&["scheduler", "add", "--every", "1d", "--catch-up", "skip", "records.list"]);
+    assert!(stderr(&o).contains("the old way of scheduling"), "{}", stderr(&o));
+    let o = home.shimmer(&["schedule", "--help"]);
     assert_eq!(o.status.code(), Some(2));
     assert!(stderr(&o).contains("'shimmer schedule' is now 'shimmer scheduler add'"), "{}", stderr(&o));
 

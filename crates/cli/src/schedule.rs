@@ -96,9 +96,11 @@ pub fn parse(words: Vec<String>) -> std::result::Result<ScheduleCmd, String> {
     }
     // The raw `OP [PARAMS] --every …` form went (ADR 0031 §6): an op name where the time goes
     // says what to type instead.
-    if words[0].contains('.') && parse_when(&words).is_err() {
+    let raw_form =
+        words[0].contains('.') || matches!(words[0].as_str(), "--every" | "--cron" | "--cron-local" | "--once");
+    if raw_form && parse_when(&words).is_err() {
         return Err(format!(
-            "'{}' looks like an op: say when first, then the command as you'd type it, e.g. scheduler add \
+            "'{}' is the old way of scheduling: say when first, then the command as you'd type it, e.g. scheduler add \
              weekdays 09:00 --catch-up skip workspaces activate site. For any other op: shimmer call \
              scheduler.add '{{\"schedule\":…,\"op\":…,\"params\":…,\"catch_up\":…}}'",
             words[0]
