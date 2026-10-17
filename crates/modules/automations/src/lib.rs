@@ -113,17 +113,26 @@ impl Automations {
                 .collect();
             (matched, st.chains.of(ev.cause, &ev.id.to_string()), st.depth)
         };
+        // One rule failing (e.g. its history couldn't be written) never stops the others: each is
+        // tried, and the failures come back together for the daemon to log (#252's review).
+        let mut failures = Vec::new();
         for rule in matched {
-            match chain.next(&rule.id, depth) {
-                Ok(next) => self.fire(&rule, ev, next, ctx).await?,
+            let done = match chain.next(&rule.id, depth) {
+                Ok(next) => self.fire(&rule, ev, next, ctx).await,
                 Err(stop) => {
                     let payload = json!({"chain": chain.id, "rules": chain.rules, "rule": rule.id,
                         "reason": stop.as_str(), "event": {"id": ev.id, "topic": ev.topic}});
-                    self.record(ctx, "automations.chain.stopped", payload)?;
+                    self.record(ctx, "automations.chain.stopped", payload)
                 }
+            };
+            if let Err(e) = done {
+                failures.push(format!("rule '{}': {}", rule.id, e.message));
             }
         }
-        Ok(())
+        match failures.is_empty() {
+            true => Ok(()),
+            false => Err(Error::internal(failures.join("; "))),
+        }
     }
 
     /// Queue or schedule each of `rule`'s actions. One failing doesn't stop the others (§1).
@@ -135,8 +144,13 @@ impl Automations {
             let params = rule::fill(&action.params, &ev.payload);
             match action.after {
                 Some(wait) => {
+                    // Scheduled as `automations.deferred`, carrying the chain, rather than the op
+                    // itself: when it fires, automations queues the op and remembers the chain, so a
+                    // delay never starts a fresh chain the loop guard can't see, even across a
+                    // restart (ADR 0035 §3, #238's review).
                     let at = ctx.clock.now() + wait;
-                    match ctx.schedules.add_once(&action.op, params, at, &label(rule)) {
+                    let deferred = json!({"rule": rule.id, "op": action.op, "params": params, "chain": chain});
+                    match ctx.schedules.add_once(DEFERRED, deferred, at, &label(rule)) {
                         Ok(id) => scheduled.push(json!({"op": action.op, "trigger_id": id, "at": at})),
                         Err(e) => failed.push(json!({"op": action.op, "error": e.message})),
                     }
@@ -153,6 +167,18 @@ impl Automations {
         let payload = json!({"rule": rule.id, "event": {"id": ev.id, "topic": ev.topic}, "chain": chain.id,
             "depth": chain.rules.len(), "queued": queued, "scheduled": scheduled, "failed": failed});
         self.record(ctx, "automations.rule.fired", payload)
+    }
+
+    /// A delayed action's time has come: queue its op, continuing the chain that scheduled it. A
+    /// rule removed or switched off meanwhile has nothing left to do.
+    async fn deferred(&self, ctx: &Ctx, d: Deferred) -> Result<Value> {
+        let on = self.state().rules.get(&d.rule).is_some_and(|r| r.enabled);
+        if !on {
+            return Ok(json!({"skipped": format!("rule '{}' was removed or switched off", d.rule)}));
+        }
+        let h = ctx.queue.enqueue(&d.op, d.params).await?;
+        self.state().chains.remember(h.task_id, d.chain);
+        Ok(json!({"task_id": h.task_id, "op": d.op}))
     }
 
     /// Emit `topic` and add it to the history, together (§7.1).
@@ -234,13 +260,11 @@ impl Automations {
         if known == Some(true) {
             return Err(Error::conflict(format!("'{id}' is built in: switch it off instead")));
         }
-        // A broken rule file can be removed too: that's one way to fix it.
-        if ctx.store.read(&path(id))?.is_none() {
+        // A broken rule file can be removed too: that's one way to fix it. Moved, not deleted, so
+        // `restore` can bring it back. An older removed rule with the same id is replaced.
+        let Some(text) = ctx.store.read(&path(id))? else {
             return Err(Error::not_found(format!("no rule '{id}'")));
-        }
-        // Moved, not deleted, so `restore` can bring it back. An older removed rule with the same
-        // id is replaced.
-        let text = ctx.store.read(&path(id))?.unwrap_or_default();
+        };
         ctx.store.transaction(|tx| {
             tx.put(&removed_path(id), text)?;
             tx.delete(&path(id))?;
@@ -443,6 +467,11 @@ impl Module for Automations {
             ),
             ("automations.events", "Everything a rule can react to, with what it means", json!({"type": "object"})),
             (
+                DEFERRED,
+                "Internal: run a rule's delayed action when its time comes (rules can't call it)",
+                json!({"type": "object", "required": ["rule", "op", "chain"]}),
+            ),
+            (
                 "automations.history",
                 "What rules did recently, newest first",
                 json!({"type": "object", "properties": {
@@ -491,6 +520,7 @@ impl Module for Automations {
             "automations.status" => Ok(self.status(ctx)),
             "automations.depth" => self.depth(ctx, decode(params)?),
             "automations.health" => Ok(self.health(ctx)),
+            DEFERRED => self.deferred(ctx, decode(params)?).await,
             _ => Err(Error::unknown_op(op)),
         }
     }
@@ -501,6 +531,19 @@ impl Module for Automations {
 }
 
 // ---------------------------------------------------------------------- params
+
+/// Rules can't name `automations.*` ops, so only automations itself schedules this one.
+const DEFERRED: &str = "automations.deferred";
+
+/// What a delayed action carries until it runs. `scheduled_for` is the scheduler's stamp.
+#[derive(Deserialize)]
+struct Deferred {
+    rule: String,
+    op: String,
+    #[serde(default)]
+    params: Value,
+    chain: Chain,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
