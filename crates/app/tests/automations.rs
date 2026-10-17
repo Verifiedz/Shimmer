@@ -74,8 +74,11 @@ after = "60d"
     let listed = until(&home, "scheduler.list", json!({}), |l| !l["triggers"].as_array().unwrap().is_empty());
     let t = &listed["triggers"][0];
     assert_eq!(t["source"], json!({"type": "added", "id": "automations", "label": "rule redo: Redo it later"}));
+    // It waits as automations' own op, carrying the action and its chain (ADR 0035 §4).
+    assert_eq!(t["op"], "automations.deferred");
     assert_eq!(
-        (t["op"].clone(), t["params"].clone()),
-        (json!("records.reopen"), json!({"collection": "leetcode", "id": "two-sum"}))
+        (t["params"]["rule"].clone(), t["params"]["op"].clone(), t["params"]["params"].clone()),
+        (json!("redo"), json!("records.reopen"), json!({"collection": "leetcode", "id": "two-sum"}))
     );
+    assert_eq!(t["params"]["chain"]["rules"], json!(["redo"]));
 }
