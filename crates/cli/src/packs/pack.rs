@@ -12,7 +12,7 @@ use toml::{Table, Value};
 /// `pack.toml` larger than this is rejected unread.
 pub const MAX_PACK_TOML: u64 = 64 * 1024;
 /// Most aliases one pack may define.
-pub const MAX_ALIASES: usize = 64;
+pub const MAX_ALIASES: usize = 256;
 /// Longest pack id or alias.
 pub const MAX_NAME: usize = 32;
 /// Longest pack label, in characters.
@@ -119,6 +119,21 @@ pub const TARGETS: &[Target] = &[
     Target { op: "scheduler.pause", words: &["scheduler", "pause"] },
     Target { op: "scheduler.resume", words: &["scheduler", "resume"] },
     Target { op: "scheduler.remove", words: &["scheduler", "remove"] },
+    Target { op: "notify.list", words: &["notify", "list"] },
+    Target { op: "notify.get", words: &["notify", "show"] },
+    Target { op: "notify.count", words: &["notify", "count"] },
+    Target { op: "notify.mark_read", words: &["notify", "mark-read"] },
+    Target { op: "notify.mark_unread", words: &["notify", "mark-unread"] },
+    Target { op: "notify.remove", words: &["notify", "remove"] },
+    Target { op: "notify.send", words: &["notify", "send"] },
+    Target { op: "notify.test", words: &["notify", "test"] },
+    Target { op: "notify.resend", words: &["notify", "resend"] },
+    Target { op: "notify.pause", words: &["notify", "pause"] },
+    Target { op: "notify.resume", words: &["notify", "resume"] },
+    Target { op: "notify.quiet", words: &["notify", "quiet"] },
+    Target { op: "notify.status", words: &["notify", "status"] },
+    Target { op: "notify.builtin_alerts", words: &["notify", "builtin-alerts"] },
+    Target { op: "notify.cap", words: &["notify", "cap"] },
 ];
 
 /// The command `op` names, if a pack may alias it.
@@ -428,7 +443,7 @@ label = "My Pack"
 
     #[test]
     fn every_target_is_an_op_with_its_command_words() {
-        assert_eq!(TARGETS.len(), 54);
+        assert_eq!(TARGETS.len(), 69);
         // Where the CLI's word differs from the op's verb (ADR 0015 §1).
         let renamed = [
             ("queue.task", "show"),
@@ -436,6 +451,7 @@ label = "My Pack"
             ("records.create_collection", "new"),
             ("workspaces.create", "new"),
             ("scheduler.get", "show"),
+            ("notify.get", "show"),
         ];
         for t in TARGETS {
             let (module, verb) = t.op.split_once('.').unwrap();
@@ -540,7 +556,7 @@ colour = "red"
     #[test]
     fn too_many_aliases_or_too_big_a_file_is_rejected() {
         let many: String = (0..=MAX_ALIASES).map(|i| format!("\"a{i}\" = \"core.ping\"\n")).collect();
-        has(&problems(&with_alias(&many)), "the most a pack may have is 64");
+        has(&problems(&with_alias(&many)), &format!("the most a pack may have is {MAX_ALIASES}"));
         let huge = format!("{GOOD}# {}\n", "x".repeat(MAX_PACK_TOML as usize));
         has(&problems(&huge), "larger than 64 KiB");
     }

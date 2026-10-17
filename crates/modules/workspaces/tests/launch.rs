@@ -210,6 +210,7 @@ async fn a_failed_step_stops_the_launch_and_leaves_it_dirty() {
     assert_eq!(ev.topic, "workspaces.session.dirty");
     assert_eq!(ev.payload["reason"], "exit code 1");
     assert_eq!(ev.payload["session_id"], "01SESSION");
+    assert!(ev.payload.get("recovered").is_none(), "its failed task reports it, not this event");
 
     // Dirty blocks activation outright (§10.3): nothing runs.
     let e = call(&w, &env, "workspaces.activate").await.unwrap_err();
