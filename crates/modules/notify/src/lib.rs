@@ -53,6 +53,9 @@ pub struct Notify {
     write: WriteLock,
     /// A `notify.flush` is already queued: one is enough.
     flush_queued: AtomicBool,
+    /// Held while a flush runs: flushes go one at a time, so two never send the same summary
+    /// (#276's review).
+    flushing: tokio::sync::Mutex<()>,
     /// Ids in the order messages were sent, even several in one millisecond: the inbox and the
     /// summary read them in that order.
     ids: Mutex<ulid::Generator>,
@@ -72,6 +75,7 @@ impl Notify {
             sinks,
             write: WriteLock::default(),
             flush_queued: AtomicBool::new(false),
+            flushing: tokio::sync::Mutex::new(()),
             ids: Mutex::new(ulid::Generator::new()),
         }
     }
@@ -428,6 +432,9 @@ impl Notify {
     /// `notify.flush`: once quiet hours or a pause are over, what they held goes out as one
     /// summary. A pause that reached its end is cleared here.
     async fn flush(&self, ctx: &Ctx) -> Result<Value> {
+        // One at a time: a second flush (another `on_event`, or the hourly trigger) waits for the
+        // first to finish and clear its held markers, then finds only what's left (#276's review).
+        let _one = self.flushing.lock().await;
         self.flush_queued.store(false, Ordering::Release);
         self.clear_ended_pause(ctx)?;
         let (s, _) = settings(ctx)?;
@@ -536,8 +543,12 @@ fn cap_inbox(tx: &mut Tx<'_>, older: Vec<String>, new: Option<&str>, max: usize)
     }
     let mut entries = Vec::with_capacity(total);
     for id in older {
-        let read = tx_message(tx, &id)?.is_some_and(|m| m.read);
-        entries.push((id, read));
+        // A message that can't be read (a damaged file, or an I/O error reading it) is left alone
+        // and not counted, as `list` skips it: one bad file must never make every later send fail
+        // (#276's review).
+        if let Ok(m) = tx_message(tx, &id) {
+            entries.push((id, m.is_some_and(|m| m.read)));
+        }
     }
     if let Some(new) = new {
         entries.push((new.to_owned(), false));
@@ -682,11 +693,21 @@ impl Notify {
         ctx: &Ctx,
         f: impl FnOnce(&mut settings::File) -> Result<Vec<(&'static str, Value)>>,
     ) -> Result<settings::File> {
+        self.write_settings_with(ctx, |file, _| f(file))
+    }
+
+    /// [`write_settings`](Self::write_settings), where `f` can also stage other changes in the
+    /// same transaction, so a setting and what it does land together or not at all (§7.1).
+    fn write_settings_with(
+        &self,
+        ctx: &Ctx,
+        f: impl FnOnce(&mut settings::File, &mut Tx<'_>) -> Result<Vec<(&'static str, Value)>>,
+    ) -> Result<settings::File> {
         let _g = self.write.lock();
         let text = ctx.store.read_string(settings::FILE)?;
         let mut file = settings::editable(text.as_deref()).map_err(Error::invalid_params)?;
-        let events = f(&mut file)?;
         ctx.store.transaction(|tx| {
+            let events = f(&mut file, tx)?;
             tx.put(settings::FILE, settings::encode(&file))?;
             for (topic, payload) in events {
                 tx.emit(topic, payload)?;
@@ -727,9 +748,12 @@ impl Notify {
 
     /// `notify.resume`: stop holding, and send what waited (one flush).
     async fn resume(&self, ctx: &Ctx) -> Result<Value> {
-        let held = held_ids(ctx)?.len();
+        let mut held = 0;
         let mut was_paused = false;
         self.write_settings(ctx, |file| {
+            // Counted under the write lock that holds and releases messages, so the number is
+            // exact (#276's review).
+            held = held_ids(ctx)?.len();
             was_paused = file.pause.take().is_some();
             Ok(if was_paused { vec![("notify.pause.ended", json!({"held": held}))] } else { Vec::new() })
         })?;
@@ -824,15 +848,13 @@ impl Notify {
             .map(|n| n as usize)
             .filter(|n| *n >= settings::MIN_CAP)
             .ok_or_else(|| Error::invalid_params(format!("max is a number, at least {}", settings::MIN_CAP)))?;
-        self.write_settings(ctx, |file| {
+        // The new cap and the trimming it causes are one transaction (§7.1, #276's review).
+        let mut removed_unread = 0;
+        self.write_settings_with(ctx, |file, tx| {
             file.cap = Some(max);
+            removed_unread = cap_inbox(tx, inbox_ids(ctx)?, None, max)?;
             Ok(vec![("notify.settings.changed", json!({"cap": max}))])
         })?;
-        let removed_unread = {
-            let _g = self.write.lock();
-            let ids = inbox_ids(ctx)?;
-            ctx.store.transaction(|tx| cap_inbox(tx, ids, None, max))?
-        };
         Ok(json!({"max": max, "messages": inbox_ids(ctx)?.len(), "removed_unread": removed_unread}))
     }
 

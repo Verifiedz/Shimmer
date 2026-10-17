@@ -730,14 +730,22 @@ fn cap(d: &Value, changed: bool) -> String {
 }
 
 /// The next time `t` comes round on this machine's clock: today, or tomorrow if it's passed.
-fn next_local(t: NaiveTime, now: DateTime<Local>) -> DateTime<Utc> {
-    let today = now.date_naive().and_time(t);
-    let at = Local.from_local_datetime(&today).earliest().filter(|at| *at > now);
-    let at = at.unwrap_or_else(|| {
-        let tomorrow = today + chrono::Duration::days(1);
-        Local.from_local_datetime(&tomorrow).earliest().unwrap_or(now + chrono::Duration::days(1))
-    });
-    at.with_timezone(&Utc)
+fn next_local<Tz: TimeZone>(t: NaiveTime, now: DateTime<Tz>) -> DateTime<Utc> {
+    let tz = now.timezone();
+    // `t` on `day`. A time the clocks skip that day (spring forward) is the first minute after the
+    // gap that exists, as the scheduler does (ADR 0031 §2), never silently tomorrow (#276's review).
+    let on = |day: chrono::NaiveDate| {
+        let wall = day.and_time(t);
+        tz.from_local_datetime(&wall).earliest().or_else(|| {
+            (1..=180).find_map(|m| tz.from_local_datetime(&(wall + chrono::Duration::minutes(m))).earliest())
+        })
+    };
+    let today = now.date_naive();
+    on(today)
+        .filter(|at| *at > now)
+        .or_else(|| on(today + chrono::Duration::days(1)))
+        .unwrap_or_else(|| now.clone() + chrono::Duration::days(1))
+        .with_timezone(&Utc)
 }
 
 fn local_time(t: DateTime<Utc>) -> String {
@@ -926,5 +934,18 @@ mod tests {
         assert_eq!(later.with_timezone(&Local).format("%d %H:%M").to_string(), "16 16:00");
         let tomorrow = next_local(NaiveTime::from_hms_opt(9, 0, 0).unwrap(), now);
         assert_eq!(tomorrow.with_timezone(&Local).format("%d %H:%M").to_string(), "17 09:00");
+    }
+
+    /// New York skips 02:00-03:00 on 2026-03-08. "Until 02:30" that morning is 03:00, the first
+    /// minute that exists, never 02:30 the next day (#276's review).
+    #[test]
+    fn until_a_time_the_clocks_skip_is_the_first_minute_after_the_gap() {
+        let ny = chrono_tz::America::New_York;
+        let now = ny.with_ymd_and_hms(2026, 3, 8, 1, 0, 0).unwrap();
+        let at = next_local(NaiveTime::from_hms_opt(2, 30, 0).unwrap(), now).with_timezone(&ny);
+        assert_eq!(at.format("%Y-%m-%d %H:%M").to_string(), "2026-03-08 03:00");
+        // An ordinary time that day is unchanged.
+        let at = next_local(NaiveTime::from_hms_opt(9, 0, 0).unwrap(), now).with_timezone(&ny);
+        assert_eq!(at.format("%Y-%m-%d %H:%M").to_string(), "2026-03-08 09:00");
     }
 }
