@@ -113,17 +113,26 @@ impl Automations {
                 .collect();
             (matched, st.chains.of(ev.cause, &ev.id.to_string()), st.depth)
         };
+        // One rule failing (e.g. its history couldn't be written) never stops the others: each is
+        // tried, and the failures come back together for the daemon to log (#252's review).
+        let mut failures = Vec::new();
         for rule in matched {
-            match chain.next(&rule.id, depth) {
-                Ok(next) => self.fire(&rule, ev, next, ctx).await?,
+            let done = match chain.next(&rule.id, depth) {
+                Ok(next) => self.fire(&rule, ev, next, ctx).await,
                 Err(stop) => {
                     let payload = json!({"chain": chain.id, "rules": chain.rules, "rule": rule.id,
                         "reason": stop.as_str(), "event": {"id": ev.id, "topic": ev.topic}});
-                    self.record(ctx, "automations.chain.stopped", payload)?;
+                    self.record(ctx, "automations.chain.stopped", payload)
                 }
+            };
+            if let Err(e) = done {
+                failures.push(format!("rule '{}': {}", rule.id, e.message));
             }
         }
-        Ok(())
+        match failures.is_empty() {
+            true => Ok(()),
+            false => Err(Error::internal(failures.join("; "))),
+        }
     }
 
     /// Queue or schedule each of `rule`'s actions. One failing doesn't stop the others (§1).
@@ -234,13 +243,11 @@ impl Automations {
         if known == Some(true) {
             return Err(Error::conflict(format!("'{id}' is built in: switch it off instead")));
         }
-        // A broken rule file can be removed too: that's one way to fix it.
-        if ctx.store.read(&path(id))?.is_none() {
+        // A broken rule file can be removed too: that's one way to fix it. Moved, not deleted, so
+        // `restore` can bring it back. An older removed rule with the same id is replaced.
+        let Some(text) = ctx.store.read(&path(id))? else {
             return Err(Error::not_found(format!("no rule '{id}'")));
-        }
-        // Moved, not deleted, so `restore` can bring it back. An older removed rule with the same
-        // id is replaced.
-        let text = ctx.store.read(&path(id))?.unwrap_or_default();
+        };
         ctx.store.transaction(|tx| {
             tx.put(&removed_path(id), text)?;
             tx.delete(&path(id))?;

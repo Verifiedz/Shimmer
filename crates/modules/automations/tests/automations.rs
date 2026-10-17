@@ -281,3 +281,58 @@ async fn test_shows_what_a_rule_would_do_and_events_lists_what_it_can_react_to()
         .unwrap()
         .contains(&json!({"topic": "queue.task.failed", "description": "a task failed"})));
 }
+
+/// Fails the first transaction that writes the history file, then behaves.
+struct FailFirstHistory {
+    inner: Arc<shimmer_core::testing::MemBackend>,
+    failed: std::sync::atomic::AtomicBool,
+}
+
+impl StoreBackend for FailFirstHistory {
+    fn read(&self, ns: &str, path: &str) -> shimmer_core::Result<Option<Vec<u8>>> {
+        self.inner.read(ns, path)
+    }
+
+    fn list(&self, ns: &str, prefix: &str) -> shimmer_core::Result<Vec<String>> {
+        self.inner.list(ns, prefix)
+    }
+
+    fn commit(&self, ns: &str, plan: shimmer_core::TxPlan) -> shimmer_core::Result<()> {
+        let history =
+            plan.writes.iter().any(|w| matches!(w, shimmer_core::Write::Put { path, .. } if path == "history.json"));
+        if history && !self.failed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Err(shimmer_core::Error::internal("disk full"));
+        }
+        self.inner.commit(ns, plan)
+    }
+}
+
+/// "Every matching rule fires": one rule failing never stops the next (#252's review).
+#[tokio::test]
+async fn one_rule_failing_never_stops_the_others() {
+    let mut env = env();
+    let rule = |label: &str| {
+        format!("[rule]\nlabel = \"{label}\"\non = \"records.item.completed\"\n\n[[do]]\nop = \"notify.send\"\nparams = {{ title = \"{label}\" }}\n")
+    };
+    let m = started(&env).await;
+    for id in ["a-first", "b-second"] {
+        call(&m, &env.ctx, "automations.create", json!({"id": id, "text": rule(id)})).await.unwrap();
+    }
+    let failing = FailFirstHistory { inner: env.backend.clone(), failed: Default::default() };
+    env.ctx.store = shimmer_core::NamespacedStore::new(
+        "automations",
+        ModuleId::new("automations"),
+        Arc::new(failing),
+        env.clock.clone(),
+    );
+    let err = m.on_event(&event("records.item.completed", json!({}), None), &env.ctx).await.unwrap_err();
+    assert!(err.message.contains("a-first") && err.message.contains("disk full"), "{}", err.message);
+    let fired: Vec<Value> = env
+        .backend
+        .events()
+        .into_iter()
+        .filter(|e| e.topic == "automations.rule.fired")
+        .map(|e| e.payload["rule"].clone())
+        .collect();
+    assert_eq!(fired, [json!("b-second")], "the second rule still fired");
+}
