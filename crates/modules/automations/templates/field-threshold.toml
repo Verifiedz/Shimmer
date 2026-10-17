@@ -34,5 +34,5 @@ when = { collection = "${COLLECTION}", "item.${FIELD}" = { gt = ${OVER} }, chang
 
 [[do]]
 op = "notify.send"
-params = { title = "{title}: ${FIELD} is {item.${FIELD}}", body = "That's more than ${OVER}." }
+params = { title = "{title}: ${FIELD} is {item.${FIELD}}", body = "That's more than ${OVER}.", from = "automation:${RULE}" }
 '''

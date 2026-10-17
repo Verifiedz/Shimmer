@@ -2,7 +2,7 @@
 //! `[[question]]`s, and one or more `[[rule]]`s whose text takes the answers as `${NAME}` (a
 //! rule's own `{field}` is filled from the event later, so the two never mix). A line ending in
 //! `# if NAME` is left out when NAME's answer is empty, and one ending in `# unless NAME` when it
-//! isn't. Pure: no `Ctx` (§12 rule 10).
+//! isn't. `${RULE}` is the id of the rule being made. Pure: no `Ctx` (§12 rule 10).
 
 use std::collections::BTreeMap;
 
@@ -139,7 +139,7 @@ impl Template {
             while let Some(at) = rest.find("${") {
                 let end = rest[at..].find('}').ok_or_else(|| bad("an unclosed ${".into()))?;
                 let name = &rest[at + 2..at + end];
-                if !f.question.iter().any(|q| q.name == name) {
+                if name != "RULE" && !f.question.iter().any(|q| q.name == name) {
                     return Err(bad(format!("${{{name}}} isn't one of its questions")));
                 }
                 rest = &rest[at + end..];
@@ -232,7 +232,7 @@ impl Template {
                         _ => (line, true),
                     };
                     if keep {
-                        text.push_str(&substitute(line, answers));
+                        text.push_str(&substitute(line, answers).replace("${RULE}", &rule_id));
                         text.push('\n');
                     }
                 }

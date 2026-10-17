@@ -29,6 +29,6 @@ when = { collection = "${COLLECTION}" }
 
 [[do]]
 op = "notify.send"
-params = { title = "Follow up: {title}", body = "It's been ${DAYS} days." }
+params = { title = "Follow up: {title}", body = "It's been ${DAYS} days.", from = "automation:${RULE}" }
 after = "${DAYS}d"
 '''

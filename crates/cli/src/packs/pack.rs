@@ -149,7 +149,6 @@ pub const TARGETS: &[Target] = &[
     Target { op: "notify.resume", words: &["notify", "resume"] },
     Target { op: "notify.quiet", words: &["notify", "quiet"] },
     Target { op: "notify.status", words: &["notify", "status"] },
-    Target { op: "notify.builtin_alerts", words: &["notify", "builtin-alerts"] },
     Target { op: "notify.cap", words: &["notify", "cap"] },
 ];
 
@@ -460,7 +459,7 @@ label = "My Pack"
 
     #[test]
     fn every_target_is_an_op_with_its_command_words() {
-        assert_eq!(TARGETS.len(), 85);
+        assert_eq!(TARGETS.len(), 84);
         // Where the CLI's word differs from the op's verb (ADR 0015 §1).
         let renamed = [
             ("queue.task", "show"),

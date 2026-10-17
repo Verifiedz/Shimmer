@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::alerts::Alerts;
 use crate::quiet::Quiet;
 
 pub const FILE: &str = "settings.toml";
@@ -44,8 +43,6 @@ pub struct File {
     pub quiet: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause: Option<Pause>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub builtin_alerts: Option<Alerts>,
 }
 
 /// The settings in force.
@@ -54,12 +51,11 @@ pub struct Settings {
     pub cap: usize,
     pub quiet: Quiet,
     pub pause: Option<Pause>,
-    pub alerts: Alerts,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { cap: DEFAULT_CAP, quiet: Quiet::default(), pause: None, alerts: Alerts::default() }
+        Self { cap: DEFAULT_CAP, quiet: Quiet::default(), pause: None }
     }
 }
 
@@ -84,7 +80,7 @@ pub fn read(text: Option<&str>) -> (Settings, Option<String>) {
         Some(n) => n,
         None => DEFAULT_CAP,
     };
-    (Settings { cap, quiet, pause: file.pause, alerts: file.builtin_alerts.unwrap_or_default() }, problem)
+    (Settings { cap, quiet, pause: file.pause }, problem)
 }
 
 /// The file to rewrite, or why it can't be: a command never overwrites a file it can't read,
@@ -114,14 +110,12 @@ mod tests {
     #[test]
     fn a_full_file_reads() {
         let text =
-            "cap = 500\n[quiet]\nevery_day = \"22:00-08:00\"\n[pause]\nsince = \"2026-10-16T14:00:00Z\"\nall = true\n\
-                    [builtin_alerts]\nworkspace_dirty = false\n";
+            "cap = 500\n[quiet]\nevery_day = \"22:00-08:00\"\n[pause]\nsince = \"2026-10-16T14:00:00Z\"\nall = true\n";
         let (s, problem) = read(Some(text));
         assert_eq!(problem, None);
         assert_eq!(s.cap, 500);
         assert_ne!(s.quiet, Quiet::default());
         assert!(s.pause.as_ref().is_some_and(|p| p.all && p.until.is_none()));
-        assert!(!s.alerts.workspace_dirty && s.alerts.scheduled_task_failed);
     }
 
     #[test]
@@ -129,8 +123,8 @@ mod tests {
         let (s, problem) = read(Some("cap = 5\n"));
         assert_eq!(s.cap, MIN_CAP);
         assert!(problem.unwrap().contains("under 100"));
-        let (s, problem) = read(Some("[quiet]\nevery_day = \"late\"\n[builtin_alerts]\nworkspace_dirty = false\n"));
-        assert!(s.quiet == Quiet::default() && !s.alerts.workspace_dirty, "the readable part still counts");
+        let (s, problem) = read(Some("cap = 500\n[quiet]\nevery_day = \"late\"\n"));
+        assert!(s.quiet == Quiet::default() && s.cap == 500, "the readable part still counts");
         assert!(problem.unwrap().contains("quiet.every_day"));
         let (s, problem) = read(Some("cap = [\n"));
         assert_eq!(s, Settings::default());

@@ -41,5 +41,5 @@ when = { collection = "${COLLECTION}", "item.${FIELD}" = "${VALUE}", changed = "
 
 [[do]]
 op = "notify.send"
-params = { title = "{title}: ${FIELD} is now ${VALUE}", priority = "${PRIORITY}" }
+params = { title = "{title}: ${FIELD} is now ${VALUE}", priority = "${PRIORITY}", from = "automation:${RULE}" }
 '''

@@ -13,7 +13,6 @@ pub enum From {
     Send,
     Schedules,
     Fallbacks,
-    Alerts,
     Automations,
 }
 
@@ -23,7 +22,6 @@ impl From {
             "send" => Self::Send,
             "schedules" => Self::Schedules,
             "fallbacks" => Self::Fallbacks,
-            "alerts" => Self::Alerts,
             "automations" => Self::Automations,
             _ => return None,
         })
@@ -34,7 +32,6 @@ impl From {
             Self::Send => source == "send",
             Self::Schedules => source == "schedule",
             Self::Fallbacks => source == "fallback",
-            Self::Alerts => source.starts_with("alert:"),
             Self::Automations => source.starts_with("automation:"),
         }
     }
@@ -79,9 +76,8 @@ impl Filter {
                 .transpose()?,
             from: text("from")?
                 .map(|s| {
-                    From::parse(&s).ok_or_else(|| {
-                        bad(format!("from is send, schedules, fallbacks, alerts or automations, not '{s}'"))
-                    })
+                    From::parse(&s)
+                        .ok_or_else(|| bad(format!("from is send, schedules, fallbacks or automations, not '{s}'")))
                 })
                 .transpose()?,
             priority: text("priority")?
@@ -158,11 +154,14 @@ mod tests {
 
     #[test]
     fn each_filter_matches_its_own() {
-        let alert = msg("site couldn't launch", "Step 2/5", "alert:workspace_dirty", false, "2026-10-10T09:00:00Z");
+        let alert =
+            msg("site couldn't launch", "Step 2/5", "automation:workspace-dirty", false, "2026-10-10T09:00:00Z");
         let sched = msg("Standup", "in 15", "schedule", true, "2026-10-12T09:00:00Z");
         assert!(f(json!({"unread": true})).matches(&alert) && !f(json!({"unread": true})).matches(&sched));
         assert!(f(json!({"read": true})).matches(&sched));
-        assert!(f(json!({"from": "alerts"})).matches(&alert) && !f(json!({"from": "alerts"})).matches(&sched));
+        assert!(
+            f(json!({"from": "automations"})).matches(&alert) && !f(json!({"from": "automations"})).matches(&sched)
+        );
         assert!(f(json!({"from": "schedules"})).matches(&sched));
         assert!(
             f(json!({"since": "2026-10-11"})).matches(&sched) && !f(json!({"since": "2026-10-11"})).matches(&alert)

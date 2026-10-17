@@ -33,6 +33,7 @@ Everything a user sees is a specialisation of one of these.
 | `fetchers` | Reaching outward: scheduling, dedup, backoff (rate limits and caching live in `ctx.http`, ADR 0027) | Job boards, tech news, docs sites, transcript APIs |
 | `notify` | Delivering messages: batching, retry, quiet hours, fallback sinks | Email, phone push, desktop, webhook |
 | `calendar` | Shared dated entries other mechanisms read and write | Deadlines, career fairs, scheduled sessions |
+| `automations` | Reacting: rules that queue ops when events happen, the loop guard (ADR 0035) | "Message me when…", follow-up reminders, a workspace per job, the built-in alerts |
 
 `queue`, `scheduler` and the event bus are **core services** living in the daemon, reached
 through `Ctx`. The rest are **modules**, registered at startup, each owning a data
@@ -161,6 +162,7 @@ crates/
     workspaces/  Workspace manifests, state machine, script execution.
     notify/      Sink trait + delivery, batching, fallback sinks.
     calendar/    Shared dated entries; registers triggers with the scheduler.
+    automations/ Rules: an event queues ops; templates, built-in rules, the loop guard.
   cli/           Thin client (lib). Command parsing, alias table, output rendering.
   tui/           Thin client (lib). ratatui. Owned by Dev C.
   mockd/         Mock daemon (lib): fixtures + scripted events over the real protocol,
@@ -466,6 +468,7 @@ $SHIMMER_HOME/
   data/workspaces/<name>/  workspace.toml + steps/ + cleanup script + state.toml (ADRs 0010, 0012).
   data/workspaces/.removed/<name>/  Removed workspaces, until restored (ADR 0026).
   data/scheduler/triggers/<id>.json  One per trigger, JSON because params are JSON (ADR 0004).
+  data/automations/rules/<id>.toml  One per rule; settings.toml, history.json, removed/ (ADR 0035).
   data/notify/             Notify's inbox (inbox/<id>.toml, one file per message), settings.toml,
                            and held/ markers (ADR 0032). A message no sink could deliver stays in
                            the inbox as failed (§11.3).
