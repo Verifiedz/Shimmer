@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use serde::{Deserialize, Serialize};
 use shimmer_core::TaskId;
 
 /// How many queued tasks are remembered. A task's chain only matters while it runs, and the
@@ -12,7 +13,7 @@ use shimmer_core::TaskId;
 const REMEMBERED: usize = 10_000;
 
 /// The rules that led here. `id` is the id of the event that started it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Chain {
     pub id: String,
     pub rules: Vec<String>,
