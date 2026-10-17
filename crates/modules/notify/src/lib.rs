@@ -543,8 +543,9 @@ fn cap_inbox(tx: &mut Tx<'_>, older: Vec<String>, new: Option<&str>, max: usize)
     }
     let mut entries = Vec::with_capacity(total);
     for id in older {
-        // An unreadable message is left alone and not counted, as `list` skips it: one damaged
-        // file must never make every later send fail (#276's review).
+        // A message that can't be read (a damaged file, or an I/O error reading it) is left alone
+        // and not counted, as `list` skips it: one bad file must never make every later send fail
+        // (#276's review).
         if let Ok(m) = tx_message(tx, &id) {
             entries.push((id, m.is_some_and(|m| m.read)));
         }

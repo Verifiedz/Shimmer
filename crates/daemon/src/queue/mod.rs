@@ -156,12 +156,23 @@ impl QueueInner {
         self.submit(req, Some(promotion))
     }
 
-    fn submit(self: &Arc<Self>, req: EnqueueRequest, promotion: Option<Promotion>) -> Result<TaskHandle> {
+    /// The lane `req` would join, or why it can't be enqueued. Changes nothing: `finish` asks it
+    /// before reporting a failure, so `queue.task.failed`'s `fallback` is decided before the
+    /// fallback is enqueued, and its events come after the failure that caused it (#281's review).
+    fn admits(&self, req: &EnqueueRequest) -> Result<LaneId> {
         // Whatever the caller, an invalid fallback never reaches a lane (ADR 0005).
         fallback::validate(&req.op, req.fallback.as_ref())?;
         let declared =
             self.ops.get(&req.op).ok_or_else(|| Error::unknown_op(format!("no module registered op '{}'", req.op)))?;
-        let lane = req.lane.or_else(|| declared.clone()).unwrap_or_else(LaneId::default_lane);
+        let lane = req.lane.clone().or_else(|| declared.clone()).unwrap_or_else(LaneId::default_lane);
+        if !self.lock().lanes.contains_key(&lane) {
+            return Err(Error::lane_unknown(format!("no lane '{lane}'")));
+        }
+        Ok(lane)
+    }
+
+    fn submit(self: &Arc<Self>, req: EnqueueRequest, promotion: Option<Promotion>) -> Result<TaskHandle> {
+        let lane = self.admits(&req)?;
         let now = self.clock.now();
         // Identity is out of `core` (§1.5), so the promoter is recorded as the role, not a person.
         let priority = match promotion {
@@ -310,37 +321,37 @@ impl QueueInner {
             }
             record_finished(&mut st, task.id, status, self.clock.now());
         }
-        // The fallback is enqueued before the failure is reported, so `queue.task.failed`'s
-        // `fallback` says whether one really is being sent (ADR 0032 §4): notify's alerts stay
-        // quiet only when it is, and a fallback that couldn't be enqueued leaves them to report
-        // the failure (#276's review).
-        let sent = fallback.map(|request| (request.op.clone(), self.enqueue_fallback(request)));
+        // `fallback` says whether one is really being sent (ADR 0032 §4): notify's alerts stay
+        // quiet only when it is (#276's review). Decided by asking the queue first, and the
+        // fallback is enqueued only after the failure is reported, so the log reads cause, then
+        // effect (#281's review). Shutting down sends none: nothing would start it.
+        let fallback = fallback.filter(|_| !self.shutdown.is_cancelled());
+        let admitted = fallback.as_ref().map(|request| self.admits(request));
         if topic == "queue.task.failed" {
-            payload["fallback"] = json!(matches!(sent, Some((_, Some(Ok(_))))));
+            payload["fallback"] = json!(matches!(admitted, Some(Ok(_))));
         }
         self.emit(topic, payload);
-        match sent {
-            Some((op, Some(Ok(h)))) => self.emit(
-                "queue.fallback.enqueued",
-                json!({"task_id": task.id, "fallback_task_id": h.task_id, "op": op, "lane": h.lane}),
-            ),
-            Some((op, Some(Err(e)))) => self.emit(
-                "queue.fallback.failed",
-                json!({"task_id": task.id, "op": op, "error": e.message, "code": e.code}),
-            ),
-            _ => {}
+        if let (Some(request), Some(admitted)) = (fallback, admitted) {
+            self.enqueue_fallback(&task, request, admitted);
         }
         self.pump(&task.lane);
     }
 
-    /// Degrade, don't drop (§11.3). The slot is already free, so nothing here can hold the lane:
-    /// a fallback that cannot be enqueued is reported, never a stall and never a retry. `None`
-    /// when shutting down: pump refuses to start anything, so the notice would only sit there.
-    fn enqueue_fallback(self: &Arc<Self>, request: EnqueueRequest) -> Option<Result<TaskHandle>> {
-        if self.shutdown.is_cancelled() {
-            return None;
+    /// Degrade, don't drop (§11.3). The slot is already free and the failure already reported,
+    /// so nothing here can hold the lane: a fallback that cannot be enqueued is one more event,
+    /// never a stall and never a retry.
+    fn enqueue_fallback(self: &Arc<Self>, failed: &Task, request: EnqueueRequest, admitted: Result<LaneId>) {
+        let op = request.op.clone();
+        match admitted.and_then(|_| self.submit(request, None)) {
+            Ok(h) => self.emit(
+                "queue.fallback.enqueued",
+                json!({"task_id": failed.id, "fallback_task_id": h.task_id, "op": op, "lane": h.lane}),
+            ),
+            Err(e) => self.emit(
+                "queue.fallback.failed",
+                json!({"task_id": failed.id, "op": op, "error": e.message, "code": e.code}),
+            ),
         }
-        Some(self.submit(request, None))
     }
 
     pub fn cancel(self: &Arc<Self>, id: TaskId) -> Result<Value> {

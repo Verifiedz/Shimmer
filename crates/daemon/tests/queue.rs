@@ -450,7 +450,17 @@ async fn a_structural_failure_enqueues_the_fallback_in_the_notify_lane() {
         index_of(&seen, "queue.task.failed", &primary) < seen.len() - 1,
         "the failure is reported before the fallback is enqueued"
     );
-    let failed = &seen[index_of(&seen, "queue.task.failed", &primary)];
+    // Cause, then effect: the failure is logged before the fallback task even joins its lane
+    // (#281's review).
+    let fallback_events: Vec<&str> =
+        seen.iter().filter(|e| e.payload["task_id"] == fallback.as_str()).map(|e| e.topic.as_str()).collect();
+    let failed_at = index_of(&seen, "queue.task.failed", &primary);
+    let first_fallback_event = seen.iter().position(|e| e.payload["task_id"] == fallback.as_str());
+    assert!(
+        first_fallback_event.is_none_or(|i| i > failed_at),
+        "the fallback's {fallback_events:?} came before the failure that caused it"
+    );
+    let failed = &seen[failed_at];
     assert_eq!(failed.payload["code"], "unavailable");
     assert_eq!(failed.payload["lane"], "slow", "the primary ran in its own lane");
     assert_eq!(failed.payload["fallback"], true, "a fallback is being sent for this failure (ADR 0032 §4)");
