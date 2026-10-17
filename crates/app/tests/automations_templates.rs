@@ -152,6 +152,8 @@ fn stage_creates_workspace_makes_opens_and_stops_one_per_record() {
     until("it was opened by the second rule", || state() == "active");
     let history = ok(&home, &["automations", "history", "prep-open"]);
     assert!(history.contains("prep-open on workspaces.workspace.created: queued workspaces.activate"), "{history}");
+    // A detached step is started, not waited on: `active` can come before it has written its pid.
+    until("smoke-test's background step saved its pid", || background_pid().is_some());
     let (pid, dir) = background_pid().expect("smoke-test's background step saved its pid");
     let _cleanup = Cleanup { pid, dir };
     assert!(alive(pid), "the background step runs while it's open");
