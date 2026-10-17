@@ -91,15 +91,20 @@ impl TaskSubmitter for StubQueue {
     }
 }
 
-/// Serves canned bodies by exact URL; anything else is `unavailable`.
+/// Serves canned bodies by exact URL; anything else is `unavailable`. Records each call's
+/// `credential` (ADR 0036) so a test can assert a `Source` asked for the right named
+/// credential, without this stub resolving or caring what the credential actually maps to —
+/// that resolution lives entirely in `RealHttpBackend`, never in a module.
 #[derive(Default)]
 pub struct StubHttp {
     pub responses: Mutex<BTreeMap<String, HttpResponse>>,
+    pub calls: Mutex<Vec<(String, Option<String>)>>,
 }
 
 #[async_trait]
 impl HttpBackend for StubHttp {
-    async fn get(&self, _module: &ModuleId, url: &str) -> Result<HttpResponse> {
+    async fn get(&self, _module: &ModuleId, url: &str, credential: Option<&str>) -> Result<HttpResponse> {
+        self.calls.lock().unwrap().push((url.to_owned(), credential.map(str::to_owned)));
         self.responses.lock().unwrap().get(url).cloned().ok_or_else(|| Error::unavailable(format!("no stub for {url}")))
     }
 }

@@ -27,8 +27,11 @@ pub struct HttpResponse {
 
 #[async_trait]
 pub trait HttpBackend: Send + Sync {
-    /// `module` lets the gateway attribute and rate-limit per caller.
-    async fn get(&self, module: &ModuleId, url: &str) -> Result<HttpResponse>;
+    /// `module` lets the gateway attribute and rate-limit per caller. `credential`, when
+    /// given, names a `[credentials.<name>]` entry the backend resolves and attaches as a
+    /// header (ADR 0036) — the caller never says which header or which host, and never sees
+    /// the secret value; both are fixed by that entry's own configuration.
+    async fn get(&self, module: &ModuleId, url: &str, credential: Option<&str>) -> Result<HttpResponse>;
 }
 
 #[derive(Clone)]
@@ -43,6 +46,13 @@ impl HttpGateway {
     }
 
     pub async fn get(&self, url: &str) -> Result<HttpResponse> {
-        self.backend.get(&self.module, url).await
+        self.backend.get(&self.module, url, None).await
+    }
+
+    /// Like [`Self::get`], but attaches the named credential (ADR 0036). `credential` must
+    /// name a `[credentials.<name>]` entry bound to this module; anything else is
+    /// `invalid_params`.
+    pub async fn get_with_credential(&self, url: &str, credential: &str) -> Result<HttpResponse> {
+        self.backend.get(&self.module, url, Some(credential)).await
     }
 }
