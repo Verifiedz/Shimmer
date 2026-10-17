@@ -191,8 +191,10 @@ fn conditions(filter: &Map<String, Value>, top: bool) -> Result<Vec<Cond>, Strin
                 }
                 for (name, arg) in ops {
                     let op = Op::parse(name, arg).map_err(|m| bad(key, &m))?;
-                    // Checked now so a broken `today+x` is refused when the filter is written.
-                    op.clone().try_map(|v| resolve(v, NaiveDate::MIN)).map_err(|m| bad(key, &m))?;
+                    // Checked now so a broken `today+x` is refused when the filter is written. Against
+                    // an ordinary date, not `NaiveDate::MIN`, which any `today-N` would run past
+                    // (#251's review).
+                    op.clone().try_map(|v| resolve(v, check_day())).map_err(|m| bad(key, &m))?;
                     out.push(Cond::One(key.clone(), op));
                 }
             }
@@ -223,6 +225,12 @@ fn meets(conditions: &[Cond], data: &Value, today: NaiveDate, tz: Tz) -> bool {
 }
 
 /// `today+N` as a date; any other value as it is.
+/// The "today" a filter's relative dates are checked against when it's written: any ordinary
+/// date works, since only the form is being checked.
+fn check_day() -> NaiveDate {
+    NaiveDate::from_ymd_opt(2000, 1, 1).expect("a valid date")
+}
+
 fn resolve(v: &Value, today: NaiveDate) -> Result<Value, String> {
     match v.as_str().map(|s| relative_date(s, today)).transpose()?.flatten() {
         Some(day) => Ok(Value::String(day.format("%Y-%m-%d").to_string())),
@@ -294,6 +302,17 @@ mod tests {
         // 20:00 UTC on the 20th is the 21st in Karachi (UTC+5).
         assert!(passes(json!({"at": {"gt": "2026-10-20"}}), ev.clone()), "a datetime's day is local");
         assert!(!passes(json!({"pay": {"gt": "80"}}), ev), "different kinds don't compare");
+    }
+
+    /// `today-N` used to be refused when the filter was written: it was checked against
+    /// `NaiveDate::MIN`, which any subtraction runs past (#251's review).
+    #[test]
+    fn today_minus_n_is_accepted_and_looks_back() {
+        assert!(filter(json!({"applied_on": {"lte": "today-7"}})).is_ok());
+        assert!(filter(json!({"applied_on": "today-1"})).is_ok());
+        let ev = json!({"applied_on": "2026-10-05"});
+        assert!(passes(json!({"applied_on": {"lte": "today-7"}}), ev.clone()), "11 days ago is at least a week ago");
+        assert!(!passes(json!({"applied_on": {"gte": "today-7"}}), ev));
     }
 
     #[test]
