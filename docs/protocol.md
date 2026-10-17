@@ -321,6 +321,7 @@ Always present, independent of which modules are registered.
 | `core.ping` | inline | `{}` | `{"pong":true,"uptime_s":N}` |
 | `core.manifest` | inline | `{}` | See above. |
 | `core.shutdown` | inline | `{}` | `{"ok":true}`, then a clean exit. |
+| `core.events.list` | inline | `{"topic"?,"limit"?}` | `{"events":[Event…]}`, oldest-first, capped to the `limit` most recent matches (default 100, max 1000). `topic` is a subscription-style pattern (`a.b.c`, `a.*`, `*`; default `*`) — `invalid_params` if it doesn't parse as one. Backed by the derived index (`crates/store/src/index.rs`'s `events_matching_recent`), not a log scan, so it stays fast regardless of history size. Module-agnostic: any event any module ever emitted, not just one module's own. |
 
 ## Queue ops
 
