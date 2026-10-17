@@ -731,3 +731,43 @@ async fn a_modules_catalog_lists_every_op_and_topic() {
     assert!(got["topics"].get("queue.task.progress").is_none(), "streamed only");
     stop(d).await;
 }
+
+/// The 1,000-per-module cap is checked and the schedule added under one lock: calls racing at
+/// 990 waiting can't push past it (#251's review).
+#[tokio::test(flavor = "multi_thread")]
+async fn racing_one_time_schedules_never_pass_the_cap() {
+    let env = Env::fake_clock();
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    for i in 0..990 {
+        later(&mut c, iso(DAY), "demo.echo", &format!("fill {i}")).await.unwrap();
+    }
+    let racers: Vec<_> = (0..8)
+        .map(|n| {
+            let sock = env.sock.clone();
+            tokio::spawn(async move {
+                let mut c = Client::connect(&sock).await;
+                let mut ok = 0;
+                for i in 0..5 {
+                    if later(&mut c, iso(DAY), "demo.echo", &format!("race {n} {i}")).await.is_ok() {
+                        ok += 1;
+                    }
+                }
+                ok
+            })
+        })
+        .collect();
+    let mut added = 0;
+    for r in racers {
+        added += r.await.unwrap();
+    }
+    let waiting = c.call("scheduler.list", json!({})).await.unwrap()["triggers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t["source"]["type"] == "added")
+        .count();
+    stop(d).await;
+    assert_eq!(added, 10, "40 racing calls, room for 10");
+    assert_eq!(waiting, 1000);
+}
