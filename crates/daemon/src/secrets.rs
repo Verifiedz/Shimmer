@@ -109,18 +109,29 @@ pub fn default_secrets_path() -> Option<PathBuf> {
 }
 
 /// The daemon's full chain (§3): the file store (if `secrets.toml` exists and loads cleanly)
-/// first, then the environment, always available. A `secrets.toml` that exists but fails to
-/// load (bad permissions, malformed TOML) fails this outright -- the daemon must not start up
-/// silently ignoring a secrets file the user clearly meant to use.
-pub fn load_chain() -> Result<Arc<dyn SecretStore>> {
+/// first, then the environment, always available.
+///
+/// A `secrets.toml` that exists but fails to load (bad permissions, malformed TOML) is
+/// reported as the returned `problem` and skipped, never fatal (#257's review -- a 0644
+/// secrets file stopping `records`, `workspaces` and `notify` over an optional network
+/// feature is wildly disproportionate). `RealHttpBackend` quotes the problem on any
+/// credentialed request that then finds no value, so the failure is loud exactly where it
+/// matters and silent everywhere it doesn't.
+pub fn load_chain() -> (Arc<dyn SecretStore>, Option<String>) {
     let mut stores: Vec<Box<dyn SecretStore>> = Vec::new();
+    let mut problem = None;
     if let Some(path) = default_secrets_path() {
-        if let Some(file_store) = FileSecretStore::load_if_present(&path) {
-            stores.push(Box::new(file_store?));
+        match FileSecretStore::load_if_present(&path) {
+            Some(Ok(file_store)) => stores.push(Box::new(file_store)),
+            Some(Err(e)) => {
+                tracing::warn!(error = %e, "secrets file could not be loaded; credentialed requests will fail");
+                problem = Some(e.message);
+            }
+            None => {}
         }
     }
     stores.push(Box::new(EnvSecretStore));
-    Ok(Arc::new(ChainedSecretStore(stores)))
+    (Arc::new(ChainedSecretStore(stores)), problem)
 }
 
 #[cfg(test)]

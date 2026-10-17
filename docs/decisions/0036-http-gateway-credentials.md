@@ -78,13 +78,30 @@ config.toml with no core change"):
 
 ```toml
 [credentials.my-api-key]
-module = "fetchers"               # the only module allowed to use this credential
-host = "api.example.com"          # the only host it is ever attached to, including a
+module = "fetchers"                # the only module allowed to use this credential
+host = "api.example.com:443"       # the only host it is ever attached to, including a
                                    # redirect target (§4) -- host:port, same bucketing
                                    # RealHttpBackend already uses for rate limits (ADR 0027 §3)
-header = "Authorization"          # the header name this credential fills in
+header = "Authorization"           # the header name this credential fills in
 # the secret VALUE is never here -- resolved by name through the SecretStore (§3)
 ```
+
+**`host` is normalised at load, and a mismatch is loud.** It is matched against
+`RealHttpBackend`'s own `host:port` bucketing, so a bare `api.example.com` would have matched
+nothing and the credential would have silently never attached — the request going out
+unauthenticated and coming back with an API's own `401`, indistinguishable from a bad token
+(#257's review; this cost real debugging time before it was caught). Two things close that:
+
+- A `host` with no port is normalised to `:443` at config load. An explicit port is kept as
+  written, so `:80` or `:8443` still work when spelled out. A `host` that is really a URL, or
+  carries a non-numeric port, is an `invalid_params` error at load.
+- A credentialed request whose **first** hop's host doesn't match the binding is
+  `invalid_params`, naming both hosts, rather than a request sent without the header. Only
+  *subsequent* redirect hops fall back to silently dropping the header, which is the whole
+  point of §4 — a cross-host redirect must degrade, not error.
+
+`header` is checked against RFC 7230's `token` charset at load for the same reason: a typo
+should be a clear startup error, not a request that fails deep inside a fetch.
 
 `RealHttpBackend::get` rejects a `credential` name with no matching `[credentials.*]` entry, or
 one whose `module` doesn't match the actual caller, as `invalid_params` — a config/call-site
@@ -125,9 +142,35 @@ Two tier-1 backends, tried in order (first `Some` wins), matching Verifiedz's ow
 Chained: `FileSecretStore` first (explicit, user-managed, the one a future `shimmer secrets
 set` would write to), falling back to `EnvSecretStore`. Neither backend is required to exist —
 a daemon with no `secrets.toml` and no matching env var simply has no value for that name, which
-`RealHttpBackend::get` reports as `unavailable` (retryable — a value could show up after the
-user fixes their setup, without a daemon restart serving as the actual fix path; retrying
-doesn't cost anything the caller wasn't already going to pay).
+`RealHttpBackend::get` reports as `unavailable`.
+
+**The secret is the *full header value*, not the bare token.** Whatever string the store
+resolves is sent verbatim as the header's value, so an `Authorization` credential's value is
+`"Bearer ya29...."`, including the scheme word. This is deliberate — it is what lets the same
+mechanism serve `X-Api-Key: abc123` with no special-casing — but it is also the single easiest
+thing to get wrong (writing the bare token gives an opaque `401`), so it belongs in the
+`secrets.toml` example and in any `shimmer secrets set` help text:
+
+```toml
+# ~/.config/shimmer/secrets.toml, mode 0600
+my-api-key = "Bearer ya29...."     # the whole header value, scheme word included
+```
+
+**Both stores are read once, at daemon startup.** Editing `secrets.toml` or exporting a
+`SHIMMER_SECRET_*` variable therefore needs the daemon restarted (`shimmer shutdown`, then any
+command) before it takes effect — the file is parsed into memory at start, and a process's
+environment is fixed at spawn. Worth stating plainly because it is surprising in exactly the
+moment it bites: rotating an expired token and retrying without a restart keeps using the old
+one. Two consequences: a future `shimmer secrets set` should restart or signal the daemon
+itself, and once `shimmer startup` (#242) launches the daemon at login, a `SHIMMER_SECRET_*`
+exported in an interactive shell will not reach it at all — that path needs the file store.
+
+**A `secrets.toml` that exists but cannot be loaded is never fatal.** It is logged, remembered,
+and quoted on any credentialed request that then finds no value (`credential 'x' is
+unavailable: ...: must be mode 0600 (found 644)`). Failing the daemon's whole startup over it —
+taking `records`, `workspaces` and `notify` down for an optional network feature — is wildly
+disproportionate (#257's review); failing loudly at the one request that actually needed the
+secret puts the error where the person can act on it.
 
 ### 4. Attached per-hop, never cross-host — collapses two rules into one
 
@@ -179,7 +222,16 @@ and is bound to that module is `config.toml`'s decision (§2), checked per-call.
 - **Tier 2 (pasted session cookies)** — out of scope, per the issue's own scoping. Nothing here
   blocks it; a cookie is just a different header name on the same `credential` mechanism, should
   it ever be wanted.
-- **Tier 3 (automated login)** — explicitly out of scope, per the issue.
+- **Tier 3 (automated login)** — explicitly out of scope, per the issue. **This is a real limit
+  on the first consumer, not a theoretical one:** the Gmail API (the source this mechanism was
+  built and live-tested against) issues OAuth2 access tokens that expire in about an hour, and
+  refreshing one is squarely the "automated login" tier ruled out here. So a Gmail source on
+  this mechanism is a *manual-use* source — fine for `fetchers test gmail` and for a run you
+  are sitting in front of, useless as an unattended daily trigger, since the token will be dead
+  long before the next firing. Any mail source that wants to be unattended needs a refresh-token
+  flow, which needs its own ADR and probably its own `SecretStore` backend (one that can
+  *write* a rotated token back). Static, non-expiring keys — an ATS board's API key, a
+  retailer's developer key — are the shapes this tier actually serves well.
 - **A distinct "credential expired" failure** (e.g. a `401`/`403` on a credentialed request
   reported differently from an ordinary `http_error`) — this is a *caller's* interpretation of an
   ordinary in-band status code, exactly like every other 4xx `RealHttpBackend` already passes

@@ -304,6 +304,10 @@ pub struct RealHttpBackend {
     cache: ResponseCache,
     credentials: HashMap<String, CredentialBinding>,
     secrets: Arc<dyn SecretStore>,
+    /// Why `secrets.toml` could not be loaded, if it existed and failed (ADR 0036 §3). Quoted
+    /// on a credentialed request that finds no value, so "your secrets file is mode 0644"
+    /// reaches the caller instead of a bare "no secret value available".
+    secrets_problem: Option<String>,
 }
 
 impl RealHttpBackend {
@@ -313,6 +317,7 @@ impl RealHttpBackend {
         clock: Clock,
         credentials: HashMap<String, CredentialBinding>,
         secrets: Arc<dyn SecretStore>,
+        secrets_problem: Option<String>,
     ) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(config.timeout)
@@ -327,6 +332,7 @@ impl RealHttpBackend {
             cache: ResponseCache { home },
             credentials,
             secrets,
+            secrets_problem,
         })
     }
 
@@ -341,10 +347,11 @@ impl RealHttpBackend {
         if &binding.module != module {
             return Err(Error::invalid_params(format!("credential '{name}' is not configured for module '{module}'")));
         }
-        let value = self.secrets.resolve(name).ok_or_else(|| {
-            Error::unavailable(format!(
+        let value = self.secrets.resolve(name).ok_or_else(|| match &self.secrets_problem {
+            Some(why) => Error::unavailable(format!("credential '{name}' is unavailable: {why}")),
+            None => Error::unavailable(format!(
                 "credential '{name}' has no secret value available (set it in secrets.toml or SHIMMER_SECRET_*)"
-            ))
+            )),
         })?;
         Ok(ResolvedAuth { header: binding.header.clone(), value, host: binding.host.clone() })
     }
@@ -551,6 +558,20 @@ impl HttpBackend for RealHttpBackend {
     async fn get(&self, module: &ModuleId, url: &str, credential: Option<&str>) -> Result<HttpResponse> {
         let parsed = parse_checked_url(url)?;
         let auth = credential.map(|name| self.resolve_credential(module, name)).transpose()?;
+        // The per-hop host check (§4) exists so a *redirect* to another host silently drops the
+        // header. For the URL the caller actually asked for, silence is the wrong answer: it
+        // sends an unauthenticated request and hands back an opaque 401 the caller can't tell
+        // apart from a bad token (#257's review). Mismatch on the first hop is an error that
+        // names both hosts.
+        if let (Some(a), Some(name)) = (&auth, credential) {
+            let asked = host_key(&parsed)?;
+            if a.host != asked {
+                return Err(Error::invalid_params(format!(
+                    "credential '{name}' is bound to host '{}', but this request is for '{asked}'",
+                    a.host
+                )));
+            }
+        }
         // A credentialed response is never cached (ADR 0036 §5): a credential can be rotated
         // or revoked at any time, and a cached body from before that must never outlive it.
         let cacheable = auth.is_none();
@@ -753,9 +774,15 @@ mod tests {
         secrets: HashMap<String, String>,
     ) -> (RealHttpBackend, TempDir) {
         let home = TempDir::new().unwrap();
-        let b =
-            RealHttpBackend::new(home.path().to_path_buf(), config, clock, credentials, Arc::new(TestSecrets(secrets)))
-                .unwrap();
+        let b = RealHttpBackend::new(
+            home.path().to_path_buf(),
+            config,
+            clock,
+            credentials,
+            Arc::new(TestSecrets(secrets)),
+            None,
+        )
+        .unwrap();
         (b, home)
     }
 
@@ -1127,6 +1154,46 @@ mod tests {
         let (b, _home) = backend_with_credentials(generous_config(), Clock::system(), credentials, HashMap::new());
         let err = b.get(&ModuleId::new("test"), "http://example.test/a", Some("my-cred")).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn a_request_to_a_host_the_credential_is_not_bound_to_fails_loudly_not_silently_unauthenticated() {
+        // The old behaviour sent the request with no header and handed back whatever the API
+        // said -- indistinguishable from a bad token, which is exactly how a mis-typed host
+        // (or one written without its port) wasted an afternoon (#257's review). Nothing is
+        // stubbed here: if this ever sends a request again, it fails with "no stub for", not
+        // the clear binding error.
+        let credentials =
+            HashMap::from([("my-cred".to_owned(), credential("test", "api.example.com:443", "Authorization"))]);
+        let secrets = HashMap::from([("my-cred".to_owned(), "Bearer s3cr3t".to_owned())]);
+        let (b, _home) = backend_with_credentials(generous_config(), Clock::system(), credentials, secrets);
+
+        let err = b.get(&ModuleId::new("test"), "https://other.example.com/a", Some("my-cred")).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+        assert!(err.message.contains("api.example.com:443"), "names the bound host: {}", err.message);
+        assert!(err.message.contains("other.example.com:443"), "names the asked-for host: {}", err.message);
+    }
+
+    #[tokio::test]
+    async fn an_unloadable_secrets_file_is_quoted_on_the_credentialed_request_it_breaks() {
+        // A broken secrets.toml no longer stops the daemon (ADR 0036 §3); the reason travels
+        // to the one place it matters instead.
+        let credentials =
+            HashMap::from([("my-cred".to_owned(), credential("test", "api.example.com:443", "Authorization"))]);
+        let home = TempDir::new().unwrap();
+        let b = RealHttpBackend::new(
+            home.path().to_path_buf(),
+            generous_config(),
+            Clock::system(),
+            credentials,
+            Arc::new(TestSecrets(HashMap::new())),
+            Some("/home/me/.config/shimmer/secrets.toml: must be mode 0600 (found 644)".to_owned()),
+        )
+        .unwrap();
+
+        let err = b.get(&ModuleId::new("test"), "https://api.example.com/a", Some("my-cred")).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert!(err.message.contains("mode 0600"), "quotes the real reason: {}", err.message);
     }
 
     #[tokio::test]

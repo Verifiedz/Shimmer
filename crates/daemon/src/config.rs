@@ -116,11 +116,45 @@ fn parse_credential(name: &str, entry: &toml::Value) -> Result<CredentialBinding
                 Error::invalid_params(format!("config.toml: credentials.{name} needs a non-empty {key}"))
             })
         };
+    let header = field("header")?;
+    if !is_header_name(header) {
+        return Err(Error::invalid_params(format!(
+            "config.toml: credentials.{name}: header '{header}' is not a valid header name"
+        )));
+    }
     Ok(CredentialBinding {
         module: ModuleId::new(field("module")?),
-        host: field("host")?.to_owned(),
-        header: field("header")?.to_owned(),
+        host: normalized_host(name, field("host")?)?,
+        header: header.to_owned(),
     })
+}
+
+/// A binding's `host` is matched against `RealHttpBackend`'s own `host:port` bucketing, so a
+/// bare `api.example.com` would never match anything and the credential would silently never
+/// attach (#257's review). Normalise it here instead: a missing port becomes `:443`, since a
+/// credentialed API over plain `http` is not a thing we want to make convenient by default.
+/// An explicit port is kept as written, so `:80` or `:8443` still work when spelled out.
+fn normalized_host(name: &str, host: &str) -> Result<String> {
+    let bad = |why: &str| Error::invalid_params(format!("config.toml: credentials.{name}: host '{host}' {why}"));
+    if host.contains('/') {
+        return Err(bad("must be a host, optionally with a port -- not a url"));
+    }
+    match host.rsplit_once(':') {
+        Some((h, port)) => {
+            if h.is_empty() {
+                return Err(bad("has no host before its port"));
+            }
+            port.parse::<u16>().map(|_| host.to_owned()).map_err(|_| bad("has a port that is not a number"))
+        }
+        None => Ok(format!("{host}:443")),
+    }
+}
+
+/// RFC 7230's `token` charset, which is what `reqwest` will accept as a header name anyway --
+/// checked here so a typo is a clear config error at startup rather than a request that fails
+/// deep inside a fetch.
+fn is_header_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c))
 }
 
 fn number(v: &toml::Value) -> Option<f64> {
@@ -338,6 +372,51 @@ mod tests {
         assert_eq!(cred.module, ModuleId::new("fetchers"));
         assert_eq!(cred.host, "api.example.com:443");
         assert_eq!(cred.header, "Authorization");
+    }
+
+    #[test]
+    fn a_credential_host_without_a_port_is_normalised_rather_than_silently_never_matching() {
+        // `host` is matched against RealHttpBackend's own `host:port` bucketing, so a bare host
+        // used to match nothing at all and the credential silently never attached (#257 review).
+        let text = "[credentials.k]\nmodule = \"fetchers\"\nhost = \"api.example.com\"\nheader = \"Authorization\"\n";
+        assert_eq!(Config::parse(text).unwrap().credentials["k"].host, "api.example.com:443");
+    }
+
+    #[test]
+    fn an_explicit_credential_port_is_kept_as_written() {
+        for (written, expected) in
+            [("api.example.com:80", "api.example.com:80"), ("api.example.com:8443", "api.example.com:8443")]
+        {
+            let text = format!("[credentials.k]\nmodule = \"f\"\nhost = \"{written}\"\nheader = \"Authorization\"\n");
+            assert_eq!(Config::parse(&text).unwrap().credentials["k"].host, expected);
+        }
+    }
+
+    #[test]
+    fn a_credential_host_that_is_a_url_or_has_a_bad_port_is_rejected() {
+        for host in ["https://api.example.com", "api.example.com/v1", "api.example.com:https", "api.example.com:"] {
+            let text = format!("[credentials.k]\nmodule = \"f\"\nhost = \"{host}\"\nheader = \"Authorization\"\n");
+            let e = Config::parse(&text).unwrap_err();
+            assert_eq!(e.code, shimmer_core::ErrorCode::InvalidParams, "host: {host}");
+            assert!(e.message.contains("host"), "host {host}: {}", e.message);
+        }
+    }
+
+    #[test]
+    fn a_credential_header_that_is_not_a_header_name_is_rejected_at_load() {
+        for header in ["Authorization: Bearer", "X Api Key", "has\nnewline"] {
+            let text = format!(
+                "[credentials.k]\nmodule = \"f\"\nhost = \"a.test:443\"\nheader = \"{}\"\n",
+                header.escape_default()
+            );
+            let e = Config::parse(&text).unwrap_err();
+            assert_eq!(e.code, shimmer_core::ErrorCode::InvalidParams, "header: {header}");
+        }
+        // The shapes a real API actually uses all pass.
+        for header in ["Authorization", "X-Api-Key", "x-goog-api-key"] {
+            let text = format!("[credentials.k]\nmodule = \"f\"\nhost = \"a.test:443\"\nheader = \"{header}\"\n");
+            Config::parse(&text).unwrap_or_else(|e| panic!("header {header} should be valid: {}", e.message));
+        }
     }
 
     #[test]
