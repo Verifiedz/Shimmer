@@ -573,6 +573,10 @@ async fn a_fallback_that_cannot_be_enqueued_is_reported_and_never_stalls_the_lan
     let ev = seen.last().unwrap();
     assert_eq!(ev.payload["op"], "notify.ghost");
     assert_eq!(ev.payload["code"], "unknown_op");
+    // No fallback is being sent, so the failure must say so: notify's alerts stay quiet only
+    // when one is (#276's review). Reported before the fallback's own failure.
+    let failed = seen.iter().find(|e| e.topic == "queue.task.failed").expect("the failure is reported first");
+    assert_eq!(failed.payload["fallback"], false, "the fallback couldn't be enqueued");
 
     let next = quick(&mut c).await;
     assert_eq!(until(&mut c, "queue.task.finished", &next).await.last().unwrap().payload["task_id"], next.as_str());

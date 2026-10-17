@@ -282,7 +282,7 @@ impl QueueInner {
     fn finish(self: &Arc<Self>, task: Task, token: &CancellationToken, result: Result<Value>) {
         // Only a task that ran and failed structurally can owe a fallback (§11.3).
         let mut fallback = None;
-        let (status, topic, payload) = if token.is_cancelled() {
+        let (status, topic, mut payload) = if token.is_cancelled() {
             (Status::Cancelled, "queue.task.cancelled", json!({"task_id": task.id, "lane": task.lane, "op": task.op}))
         } else {
             match result {
@@ -296,11 +296,9 @@ impl QueueInner {
                     (
                         Status::Failed(e.to_string()),
                         "queue.task.failed",
-                        // `fallback`: whether a fallback is being sent for this failure (ADR
-                        // 0032 §4), so notify's alerts never repeat its message.
                         json!({"task_id": task.id, "lane": task.lane, "op": task.op, "origin": task.origin,
                                "error": e.message, "code": e.code, "detail": e.detail,
-                               "retryable": e.is_retryable(), "attempts": 1, "fallback": fallback.is_some()}),
+                               "retryable": e.is_retryable(), "attempts": 1}),
                     )
                 }
             }
@@ -312,32 +310,37 @@ impl QueueInner {
             }
             record_finished(&mut st, task.id, status, self.clock.now());
         }
+        // The fallback is enqueued before the failure is reported, so `queue.task.failed`'s
+        // `fallback` says whether one really is being sent (ADR 0032 §4): notify's alerts stay
+        // quiet only when it is, and a fallback that couldn't be enqueued leaves them to report
+        // the failure (#276's review).
+        let sent = fallback.map(|request| (request.op.clone(), self.enqueue_fallback(request)));
+        if topic == "queue.task.failed" {
+            payload["fallback"] = json!(matches!(sent, Some((_, Some(Ok(_))))));
+        }
         self.emit(topic, payload);
-        if let Some(request) = fallback {
-            self.enqueue_fallback(&task, request);
+        match sent {
+            Some((op, Some(Ok(h)))) => self.emit(
+                "queue.fallback.enqueued",
+                json!({"task_id": task.id, "fallback_task_id": h.task_id, "op": op, "lane": h.lane}),
+            ),
+            Some((op, Some(Err(e)))) => self.emit(
+                "queue.fallback.failed",
+                json!({"task_id": task.id, "op": op, "error": e.message, "code": e.code}),
+            ),
+            _ => {}
         }
         self.pump(&task.lane);
     }
 
-    /// Degrade, don't drop (§11.3). The slot is already free and the failure already reported,
-    /// so nothing here can hold the lane: a fallback that cannot be enqueued is one more event,
-    /// never a stall and never a retry.
-    fn enqueue_fallback(self: &Arc<Self>, failed: &Task, request: EnqueueRequest) {
-        // Shutting down: pump refuses to start anything, so the notice would only sit there.
+    /// Degrade, don't drop (§11.3). The slot is already free, so nothing here can hold the lane:
+    /// a fallback that cannot be enqueued is reported, never a stall and never a retry. `None`
+    /// when shutting down: pump refuses to start anything, so the notice would only sit there.
+    fn enqueue_fallback(self: &Arc<Self>, request: EnqueueRequest) -> Option<Result<TaskHandle>> {
         if self.shutdown.is_cancelled() {
-            return;
+            return None;
         }
-        let op = request.op.clone();
-        match self.submit(request, None) {
-            Ok(h) => self.emit(
-                "queue.fallback.enqueued",
-                json!({"task_id": failed.id, "fallback_task_id": h.task_id, "op": op, "lane": h.lane}),
-            ),
-            Err(e) => self.emit(
-                "queue.fallback.failed",
-                json!({"task_id": failed.id, "op": op, "error": e.message, "code": e.code}),
-            ),
-        }
+        Some(self.submit(request, None))
     }
 
     pub fn cancel(self: &Arc<Self>, id: TaskId) -> Result<Value> {
