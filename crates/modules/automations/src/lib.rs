@@ -144,8 +144,13 @@ impl Automations {
             let params = rule::fill(&action.params, &ev.payload);
             match action.after {
                 Some(wait) => {
+                    // Scheduled as `automations.deferred`, carrying the chain, rather than the op
+                    // itself: when it fires, automations queues the op and remembers the chain, so a
+                    // delay never starts a fresh chain the loop guard can't see, even across a
+                    // restart (ADR 0035 §3, #238's review).
                     let at = ctx.clock.now() + wait;
-                    match ctx.schedules.add_once(&action.op, params, at, &label(rule)) {
+                    let deferred = json!({"rule": rule.id, "op": action.op, "params": params, "chain": chain});
+                    match ctx.schedules.add_once(DEFERRED, deferred, at, &label(rule)) {
                         Ok(id) => scheduled.push(json!({"op": action.op, "trigger_id": id, "at": at})),
                         Err(e) => failed.push(json!({"op": action.op, "error": e.message})),
                     }
@@ -162,6 +167,18 @@ impl Automations {
         let payload = json!({"rule": rule.id, "event": {"id": ev.id, "topic": ev.topic}, "chain": chain.id,
             "depth": chain.rules.len(), "queued": queued, "scheduled": scheduled, "failed": failed});
         self.record(ctx, "automations.rule.fired", payload)
+    }
+
+    /// A delayed action's time has come: queue its op, continuing the chain that scheduled it. A
+    /// rule removed or switched off meanwhile has nothing left to do.
+    async fn deferred(&self, ctx: &Ctx, d: Deferred) -> Result<Value> {
+        let on = self.state().rules.get(&d.rule).is_some_and(|r| r.enabled);
+        if !on {
+            return Ok(json!({"skipped": format!("rule '{}' was removed or switched off", d.rule)}));
+        }
+        let h = ctx.queue.enqueue(&d.op, d.params).await?;
+        self.state().chains.remember(h.task_id, d.chain);
+        Ok(json!({"task_id": h.task_id, "op": d.op}))
     }
 
     /// Emit `topic` and add it to the history, together (§7.1).
@@ -450,6 +467,11 @@ impl Module for Automations {
             ),
             ("automations.events", "Everything a rule can react to, with what it means", json!({"type": "object"})),
             (
+                DEFERRED,
+                "Internal: run a rule's delayed action when its time comes (rules can't call it)",
+                json!({"type": "object", "required": ["rule", "op", "chain"]}),
+            ),
+            (
                 "automations.history",
                 "What rules did recently, newest first",
                 json!({"type": "object", "properties": {
@@ -498,6 +520,7 @@ impl Module for Automations {
             "automations.status" => Ok(self.status(ctx)),
             "automations.depth" => self.depth(ctx, decode(params)?),
             "automations.health" => Ok(self.health(ctx)),
+            DEFERRED => self.deferred(ctx, decode(params)?).await,
             _ => Err(Error::unknown_op(op)),
         }
     }
@@ -508,6 +531,19 @@ impl Module for Automations {
 }
 
 // ---------------------------------------------------------------------- params
+
+/// Rules can't name `automations.*` ops, so only automations itself schedules this one.
+const DEFERRED: &str = "automations.deferred";
+
+/// What a delayed action carries until it runs. `scheduled_for` is the scheduler's stamp.
+#[derive(Deserialize)]
+struct Deferred {
+    rule: String,
+    op: String,
+    #[serde(default)]
+    params: Value,
+    chain: Chain,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
