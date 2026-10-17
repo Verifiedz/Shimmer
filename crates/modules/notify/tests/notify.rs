@@ -464,3 +464,57 @@ async fn the_manifest_declares_its_lane_trigger_and_ops() {
         assert!(topic.starts_with("notify."), "{topic}");
     }
 }
+
+/// A sink that yields before delivering, so two deliveries can overlap.
+struct Slow(Arc<Fake>);
+
+#[async_trait]
+impl Sink for Slow {
+    fn id(&self) -> &str {
+        self.0.id
+    }
+
+    async fn deliver(&self, message: &Message, ctx: &Ctx) -> Result<()> {
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        self.0.deliver(message, ctx).await
+    }
+}
+
+#[tokio::test]
+async fn two_flushes_at_once_send_one_summary() {
+    let got = Fake::new("desktop");
+    let t = T {
+        env: TestEnv::new("notify"),
+        notify: Notify::with_sinks(vec![Arc::new(Slow(got.clone()))]),
+        desktop: got.clone(),
+    };
+    t.call("notify.pause", json!({})).await;
+    for title in ["a", "b", "c"] {
+        t.send(title).await;
+    }
+    t.call("notify.resume", json!({})).await;
+    // Another event's flush and the hourly trigger's flush, at the same moment (#276's review).
+    let (x, y) = tokio::join!(
+        t.notify.handle("notify.flush", json!({}), &t.env.ctx),
+        t.notify.handle("notify.flush", json!({}), &t.env.ctx)
+    );
+    x.unwrap();
+    y.unwrap();
+    assert_eq!(got.got().len(), 1, "the 'while you were away' summary went out more than once: {:?}", got.got());
+}
+
+#[tokio::test]
+async fn a_damaged_inbox_file_never_stops_a_send() {
+    let t = setup();
+    t.call("notify.cap", json!({"max": 100})).await;
+    let first = t.send("m0").await;
+    for i in 1..100 {
+        t.send(&format!("m{i}")).await;
+    }
+    let damaged = format!("inbox/{first}.toml");
+    t.env.ctx.store.write(&damaged, "title = [").unwrap();
+    // Over the cap, so capping reads every older message, the damaged one included (#276's review).
+    t.send("one more").await;
+    assert!(t.files("inbox").contains(&damaged), "the damaged file is left alone, not removed");
+}
