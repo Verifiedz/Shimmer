@@ -111,18 +111,39 @@ impl Source for JsonApi {
             let Some(source_id) = field_as_string(item, &self.id_field) else { continue };
             let Some(title) = field_as_string(item, &self.title_field) else { continue };
             let Some(raw_url) = field_as_string(item, &self.url_field) else { continue };
-            let url = match &self.url_base {
-                Some(base) => format!("{base}{raw_url}"),
-                None => raw_url,
-            };
+            let Some(url) = join_url(self.url_base.as_deref(), &raw_url) else { continue };
             items.push(RawItem { source_id, title, url, raw_data: item.clone() });
         }
 
         // Fewer than a full page means this was the last one -- the same "ask again only if
         // the last answer was full" signal a page-number scheme would use, just expressed as
         // a running offset instead.
-        let next_cursor = page_size.filter(|&n| items.len() as u32 >= n).map(|n| (offset + n).to_string());
-        Ok(Page { items, next_cursor })
+        //
+        // Measured on the **raw array**, not on `items` (#126's review, B4): items get dropped
+        // for being inactive or missing a mapped field, so one closed posting on an otherwise
+        // full page used to read as "short page, we're done" and silently abandon the rest of
+        // a board.
+        let next_cursor = page_size.filter(|&n| array.len() as u32 >= n).map(|n| (offset + n).to_string());
+        Ok(Page { items, next_cursor, ..Page::default() })
+    }
+}
+
+/// Joins a `url_base` to an item's own url field. String concatenation turned
+/// `"https://www.amazon.jobs"` plus `"en/jobs/1"` into `"https://www.amazon.jobsen/jobs/1"`
+/// (#126's review, B13), so this goes through a real URL join, which handles the missing or
+/// doubled separator either way. `None` means the result isn't a usable url and the item is
+/// skipped rather than emitted with a broken link. With no `url_base`, the field must already
+/// be an absolute url.
+fn join_url(base: Option<&str>, raw: &str) -> Option<String> {
+    match base {
+        None => Some(raw.to_owned()),
+        Some(base) => {
+            // A base without a trailing slash would otherwise have its last segment replaced
+            // by `join`, turning `https://x.test/jobs` + `1` into `https://x.test/1`.
+            let base = if base.ends_with('/') { base.to_owned() } else { format!("{base}/") };
+            let joined = url::Url::parse(&base).ok()?.join(raw.trim_start_matches('/')).ok()?;
+            Some(joined.to_string())
+        }
     }
 }
 
@@ -152,6 +173,7 @@ fn field_as_string(item: &Value, field: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
     use shimmer_core::testing::TestEnv;
     use shimmer_core::{ErrorCode, HttpResponse};
 
@@ -189,6 +211,57 @@ mod tests {
         {"id": 111, "title": "Backend Engineer", "absolute_url": "https://boards.greenhouse.io/acme/jobs/111", "location": {"name": "Remote"}},
         {"id": 222, "title": "Full Stack Engineer", "absolute_url": "https://boards.greenhouse.io/acme/jobs/222", "location": {"name": "NYC"}}
     ]}"#;
+
+    #[tokio::test]
+    async fn one_dropped_item_on_a_full_page_does_not_end_pagination() {
+        // #126's review, B4: "last page" was decided from the items left *after* dropping
+        // inactive/thin ones, so one closed posting on an otherwise full page read as a short
+        // page and silently abandoned the rest of the board.
+        let env = TestEnv::new("fetchers");
+        let source = JsonApi::new(
+            "acme".into(),
+            "https://acme.test/jobs?offset={offset}".into(),
+            String::new(),
+            "id".into(),
+            "title".into(),
+            "url".into(),
+            None,
+            Pagination::Offset { page_size: 2 },
+            Some("active".into()),
+        );
+        // A full page (2 items, page_size 2) where one is inactive: one item survives, but the
+        // *page* was full, so there must be a next cursor.
+        env.http.responses.lock().unwrap().insert(
+            "https://acme.test/jobs?offset=0".into(),
+            ok(&json!([
+                {"id": "1", "title": "Closed role", "url": "https://acme.test/1", "active": false},
+                {"id": "2", "title": "Open role", "url": "https://acme.test/2", "active": true},
+            ])
+            .to_string()),
+        );
+
+        let page = source.fetch_page(&env.ctx, None).await.unwrap();
+        assert_eq!(page.items.len(), 1, "the closed posting is still dropped");
+        assert_eq!(page.next_cursor.as_deref(), Some("2"), "but the full raw page must keep paging");
+    }
+
+    #[test]
+    fn url_base_without_a_trailing_slash_still_makes_a_valid_url() {
+        // #126's review, B13: string concatenation gave "https://www.amazon.jobsen/jobs/1".
+        assert_eq!(
+            join_url(Some("https://www.amazon.jobs"), "en/jobs/1").unwrap(),
+            "https://www.amazon.jobs/en/jobs/1"
+        );
+        // A trailing slash on the base, a leading slash on the path, and both, all agree.
+        assert_eq!(join_url(Some("https://x.test/"), "a/1").unwrap(), "https://x.test/a/1");
+        assert_eq!(join_url(Some("https://x.test"), "/a/1").unwrap(), "https://x.test/a/1");
+        assert_eq!(join_url(Some("https://x.test/"), "/a/1").unwrap(), "https://x.test/a/1");
+        // A base that keeps its own path doesn't lose its last segment.
+        assert_eq!(join_url(Some("https://x.test/jobs"), "1").unwrap(), "https://x.test/jobs/1");
+        // No base means the field must already be absolute; a junk base is no url at all.
+        assert_eq!(join_url(None, "https://x.test/a").unwrap(), "https://x.test/a");
+        assert!(join_url(Some("not a url"), "a").is_none());
+    }
 
     #[test]
     fn id_is_whatever_it_was_constructed_with_and_method_is_api() {

@@ -53,6 +53,14 @@ pub fn trigger() -> TriggerSpec {
 #[serde(default, deny_unknown_fields)]
 pub struct FetchersConfig {
     pub sources: BTreeMap<String, SourceConfig>,
+    /// Sources whose own entry could not be read, by id, with why. They are kept out of
+    /// [`FetchersConfig::sources`] entirely -- never fetched, never scheduled -- but they are
+    /// *not* an error for everything else (#126's review, B1): one typo in one source used to
+    /// fail every `fetchers.tick`, `fetchers.list` and `fetchers.status`, which with the
+    /// built-in `scheduled-task-failed` alert meant a high-priority popup every five minutes.
+    /// `fetchers.list`/`status` report these so a broken source is visible rather than silent.
+    #[serde(skip)]
+    pub problems: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -171,8 +179,12 @@ impl IntervalSpec {
 
 impl FetchersConfig {
     /// Pure parse, no `Ctx` -- [`load`] is the thin wrapper that supplies `ctx.config.raw()`.
-    /// Every source's `interval` is resolved (and so validated) up front, not lazily on the
-    /// first tick that happens to look at it.
+    ///
+    /// Each source is read and validated **on its own** (#126's review, B1). One entry with a
+    /// bad `url`, an unknown `kind`, a misspelled id or the wrong type for a field is recorded
+    /// in `problems` and left out of `sources`; every other source still loads and still runs.
+    /// Only a `[modules.fetchers]` section that isn't a table at all, or an unknown key at the
+    /// top level, is fatal -- at that point there is no per-source structure to salvage.
     pub fn from_value(raw: &Value) -> Result<Self> {
         // `ModuleConfig::default()` (no `[modules.fetchers]` section attached at all, e.g.
         // `shimmer_core::testing::TestEnv`) wraps `Value::Null`, not `{}` -- both mean "no
@@ -180,128 +192,173 @@ impl FetchersConfig {
         if raw.is_null() {
             return Ok(Self::default());
         }
-        let cfg: Self = serde_json::from_value(raw.clone())
+        // Deserialized in two steps on purpose: `sources` as raw JSON first, so one entry whose
+        // *type* is wrong (`interval = {}`) fails only itself, where deserializing the whole
+        // `FetchersConfig` in one go would fail the lot.
+        #[derive(Default, Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        struct Outer {
+            sources: BTreeMap<String, Value>,
+        }
+        let outer: Outer = serde_json::from_value(raw.clone())
             .map_err(|e| Error::invalid_params(format!("[modules.fetchers]: {e}")))?;
-        for (id, source) in &cfg.sources {
-            // Each `Method` gets its own floor (ADR 0028 §5/§7) -- a scraped page must not be
-            // pollable at an API source's much lower cadence (PR #126 review). For a `kind`
-            // entry there is no fixed `Source` to ask yet (it is only ever built by
-            // `crate::source::resolve`, lazily, per `Ctx`) -- but `sources::rss::Rss::method`
-            // always answers `Method::Api` (a feed url is a known endpoint, not a crawled
-            // page), so the `"rss"` floor can be hardcoded here rather than instantiating one
-            // just to ask.
-            let floor = match source.kind.as_deref() {
-                None => {
-                    let Some(found) = crate::source::find(id) else {
-                        let known_sources = crate::source::registry();
-                        let known: Vec<&str> = known_sources.iter().map(|s| s.id()).collect();
-                        return Err(Error::invalid_params(format!(
-                            "sources.{id}: unknown source id (known: {})",
-                            known.join(", ")
-                        )));
-                    };
-                    match found.method() {
-                        crate::source::Method::Api => MIN_INTERVAL_API_S,
-                        crate::source::Method::Scrape => MIN_INTERVAL_SCRAPE_S,
-                    }
+
+        let mut cfg = Self::default();
+        for (id, entry) in outer.sources {
+            match serde_json::from_value::<SourceConfig>(entry)
+                .map_err(|e| Error::invalid_params(format!("sources.{id}: {e}")))
+                .and_then(|source| validate_source(&id, &source).map(|()| source))
+            {
+                Ok(source) => {
+                    cfg.sources.insert(id, source);
                 }
-                Some(kind) => {
-                    // A `kind` entry builds a brand-new instance (`crate::source::resolve`)
-                    // rather than adjusting a fixed, compiled-in one -- so an id that
-                    // already belongs to the fixed registry would either sit alongside it
-                    // as a silent duplicate (`crate::source::known`) or shadow it outright
-                    // (`crate::source::resolve` always prefers the `kind` branch). Neither
-                    // is a real "this source is both configured and reconfigured" case we
-                    // want to allow; reject it at load time rather than let one silently
-                    // win.
-                    if crate::source::find(id).is_some() {
-                        return Err(Error::invalid_params(format!(
-                            "sources.{id}: kind \"{kind}\" collides with a fixed, compiled-in source of the same id"
-                        )));
-                    }
-                    match kind {
-                        "rss" => {
-                            let url = source.url.as_deref().unwrap_or_default().trim();
-                            if url.is_empty() {
-                                return Err(Error::invalid_params(format!(
-                                    "sources.{id}: kind \"rss\" needs a non-empty url"
-                                )));
-                            }
-                            if !is_http_url(url) {
-                                return Err(Error::invalid_params(format!(
-                                    "sources.{id}: kind \"rss\" url must be a well-formed http:// or https:// url, got '{url}'"
-                                )));
-                            }
-                            MIN_INTERVAL_API_S
-                        }
-                        "json-api" => {
-                            let url = source.url.as_deref().unwrap_or_default().trim();
-                            if url.is_empty() {
-                                return Err(Error::invalid_params(format!(
-                                    "sources.{id}: kind \"json-api\" needs a non-empty url"
-                                )));
-                            }
-                            if !is_http_url(url) {
-                                return Err(Error::invalid_params(format!(
-                                    "sources.{id}: kind \"json-api\" url must be a well-formed http:// or https:// url, got '{url}'"
-                                )));
-                            }
-                            for (field_name, value) in [
-                                ("id_field", &source.id_field),
-                                ("title_field", &source.title_field),
-                                ("url_field", &source.url_field),
-                            ] {
-                                if value.as_deref().unwrap_or_default().trim().is_empty() {
-                                    return Err(Error::invalid_params(format!(
-                                        "sources.{id}: kind \"json-api\" needs a non-empty {field_name}"
-                                    )));
-                                }
-                            }
-                            if let Some(field) = &source.active_field {
-                                if field.trim().is_empty() {
-                                    return Err(Error::invalid_params(format!(
-                                        "sources.{id}: kind \"json-api\" active_field must be non-empty when given"
-                                    )));
-                                }
-                            }
-                            match source.pagination.as_deref().unwrap_or("none") {
-                                "none" => {}
-                                "offset" => {
-                                    if source.page_size.unwrap_or(0) == 0 {
-                                        return Err(Error::invalid_params(format!(
-                                            "sources.{id}: kind \"json-api\" pagination \"offset\" needs page_size > 0"
-                                        )));
-                                    }
-                                    if !url.contains("{offset}") {
-                                        return Err(Error::invalid_params(format!(
-                                            "sources.{id}: kind \"json-api\" pagination \"offset\" needs a literal '{{offset}}' placeholder in url"
-                                        )));
-                                    }
-                                }
-                                other => {
-                                    return Err(Error::invalid_params(format!(
-                                        "sources.{id}: kind \"json-api\" has unknown pagination \"{other}\" (known: none, offset)"
-                                    )));
-                                }
-                            }
-                            MIN_INTERVAL_API_S
-                        }
-                        other => {
-                            return Err(Error::invalid_params(format!(
-                                "sources.{id}: unknown kind \"{other}\" (known: rss, json-api)"
-                            )));
-                        }
-                    }
+                Err(e) => {
+                    cfg.problems.insert(id, e.message);
                 }
-            };
-            source.interval.resolve(floor).map_err(|e| Error::invalid_params(format!("sources.{id}.interval: {e}")))?;
+            }
         }
         Ok(cfg)
     }
-
     pub fn load(ctx: &Ctx) -> Result<Self> {
         Self::from_value(ctx.config.raw())
     }
+}
+
+/// Everything that must be true of one source's own entry, checked at load rather than on the
+/// first tick that happens to look at it. Returns the reason as an error for the caller to
+/// record against that one source (#126's review, B1) -- it never decides the fate of any
+/// other source.
+fn validate_source(id: &str, source: &SourceConfig) -> Result<()> {
+    // An id becomes a folder name under the module's own store namespace
+    // (`dedup::path`), so it is checked here with the same charset rule every other
+    // user-named thing uses, rather than only failing at the first fetch when the store
+    // rejects the path (#126's review, B14).
+    if !shimmer_core::ids::is_valid_id(id) {
+        return Err(Error::invalid_params(format!(
+            "sources.{id}: not a usable source id -- lowercase letters, digits, '-' and '_' only"
+        )));
+    }
+    for (what, terms) in [("title_contains", &source.title_contains), ("title_excludes", &source.title_excludes)] {
+        // An empty or whitespace term is a substring of every title, so one stray comma in
+        // `title_excludes = ["senior", ""]` excludes everything, and in `title_contains`
+        // matches everything (#126's review, B3). Neither can be what anyone meant.
+        if terms.iter().any(|t| t.trim().is_empty()) {
+            return Err(Error::invalid_params(format!(
+                "sources.{id}.{what}: an empty term matches every title -- remove it (a trailing comma?)"
+            )));
+        }
+    }
+    // Each `Method` gets its own floor (ADR 0028 §5/§7) -- a scraped page must not be
+    // pollable at an API source's much lower cadence (PR #126 review). For a `kind`
+    // entry there is no fixed `Source` to ask yet (it is only ever built by
+    // `crate::source::resolve`, lazily, per `Ctx`) -- but `sources::rss::Rss::method`
+    // always answers `Method::Api` (a feed url is a known endpoint, not a crawled
+    // page), so the `"rss"` floor can be hardcoded here rather than instantiating one
+    // just to ask.
+    let floor = match source.kind.as_deref() {
+        None => {
+            let Some(found) = crate::source::find(id) else {
+                let known_sources = crate::source::registry();
+                let known: Vec<&str> = known_sources.iter().map(|s| s.id()).collect();
+                return Err(Error::invalid_params(format!(
+                    "sources.{id}: unknown source id (known: {})",
+                    known.join(", ")
+                )));
+            };
+            match found.method() {
+                crate::source::Method::Api => MIN_INTERVAL_API_S,
+                crate::source::Method::Scrape => MIN_INTERVAL_SCRAPE_S,
+            }
+        }
+        Some(kind) => {
+            // A `kind` entry builds a brand-new instance (`crate::source::resolve`)
+            // rather than adjusting a fixed, compiled-in one -- so an id that
+            // already belongs to the fixed registry would either sit alongside it
+            // as a silent duplicate (`crate::source::known`) or shadow it outright
+            // (`crate::source::resolve` always prefers the `kind` branch). Neither
+            // is a real "this source is both configured and reconfigured" case we
+            // want to allow; reject it at load time rather than let one silently
+            // win.
+            if crate::source::find(id).is_some() {
+                return Err(Error::invalid_params(format!(
+                    "sources.{id}: kind \"{kind}\" collides with a fixed, compiled-in source of the same id"
+                )));
+            }
+            match kind {
+                "rss" => {
+                    let url = source.url.as_deref().unwrap_or_default().trim();
+                    if url.is_empty() {
+                        return Err(Error::invalid_params(format!("sources.{id}: kind \"rss\" needs a non-empty url")));
+                    }
+                    if !is_http_url(url) {
+                        return Err(Error::invalid_params(format!(
+                            "sources.{id}: kind \"rss\" url must be a well-formed http:// or https:// url, got '{url}'"
+                        )));
+                    }
+                    MIN_INTERVAL_API_S
+                }
+                "json-api" => {
+                    let url = source.url.as_deref().unwrap_or_default().trim();
+                    if url.is_empty() {
+                        return Err(Error::invalid_params(format!(
+                            "sources.{id}: kind \"json-api\" needs a non-empty url"
+                        )));
+                    }
+                    if !is_http_url(url) {
+                        return Err(Error::invalid_params(format!(
+                                "sources.{id}: kind \"json-api\" url must be a well-formed http:// or https:// url, got '{url}'"
+                            )));
+                    }
+                    for (field_name, value) in [
+                        ("id_field", &source.id_field),
+                        ("title_field", &source.title_field),
+                        ("url_field", &source.url_field),
+                    ] {
+                        if value.as_deref().unwrap_or_default().trim().is_empty() {
+                            return Err(Error::invalid_params(format!(
+                                "sources.{id}: kind \"json-api\" needs a non-empty {field_name}"
+                            )));
+                        }
+                    }
+                    if let Some(field) = &source.active_field {
+                        if field.trim().is_empty() {
+                            return Err(Error::invalid_params(format!(
+                                "sources.{id}: kind \"json-api\" active_field must be non-empty when given"
+                            )));
+                        }
+                    }
+                    match source.pagination.as_deref().unwrap_or("none") {
+                        "none" => {}
+                        "offset" => {
+                            if source.page_size.unwrap_or(0) == 0 {
+                                return Err(Error::invalid_params(format!(
+                                    "sources.{id}: kind \"json-api\" pagination \"offset\" needs page_size > 0"
+                                )));
+                            }
+                            if !url.contains("{offset}") {
+                                return Err(Error::invalid_params(format!(
+                                        "sources.{id}: kind \"json-api\" pagination \"offset\" needs a literal '{{offset}}' placeholder in url"
+                                    )));
+                            }
+                        }
+                        other => {
+                            return Err(Error::invalid_params(format!(
+                                    "sources.{id}: kind \"json-api\" has unknown pagination \"{other}\" (known: none, offset)"
+                                )));
+                        }
+                    }
+                    MIN_INTERVAL_API_S
+                }
+                other => {
+                    return Err(Error::invalid_params(format!(
+                        "sources.{id}: unknown kind \"{other}\" (known: rss, json-api)"
+                    )));
+                }
+            }
+        }
+    };
+    source.interval.resolve(floor).map_err(|e| Error::invalid_params(format!("sources.{id}.interval: {e}")))?;
+    Ok(())
 }
 
 /// `url` is deliberately not a free-text field: an `rss` source feeds straight into
@@ -329,6 +386,11 @@ pub fn due_sources(
             let interval = c.interval.resolve(0).ok()?;
             let due = match last_run.get(id) {
                 None => true,
+                // A `last_run` in the future (a clock correction, or a `$SHIMMER_HOME` copied
+                // from a machine whose clock was ahead) used to park a source until that time
+                // actually arrived -- up to a silent month-long stall (#126's review, B10).
+                // Ahead of `now` means the record can't be trusted, so the source is due.
+                Some(last) if *last > now => true,
                 Some(last) => now.signed_duration_since(*last).num_seconds() >= interval as i64,
             };
             due.then(|| id.clone())
@@ -341,17 +403,36 @@ pub fn due_sources(
 /// whole.
 const LAST_RUN_PATH: &str = "last_run.toml";
 
+/// A corrupt or unparseable `last_run.toml` is logged and treated as empty, never an error
+/// (#126's review, B1): failing here failed every `fetchers.tick`, so a single bad line in a
+/// bookkeeping file stopped all fetching. Empty means every source reads as due, so the worst
+/// case is one extra round of fetches -- which `seen.toml` then dedupes to zero new items --
+/// rather than no fetching at all. The next successful run rewrites the file cleanly.
+/// Individual unparseable *entries* are dropped the same way, keeping the good ones.
 pub fn load_last_run(ctx: &Ctx) -> Result<BTreeMap<String, DateTime<Utc>>> {
     let Some(text) = ctx.store.read_string(LAST_RUN_PATH)? else { return Ok(BTreeMap::new()) };
-    let raw: BTreeMap<String, String> =
-        toml::from_str(&text).map_err(|e| Error::internal(format!("fetchers last_run.toml: {e}")))?;
-    raw.into_iter()
-        .map(|(id, at)| {
-            DateTime::parse_from_rfc3339(&at)
-                .map(|at| (id.clone(), at.with_timezone(&Utc)))
-                .map_err(|e| Error::internal(format!("fetchers last_run.toml: '{id}': {e}")))
-        })
-        .collect()
+    let Ok(raw) = toml::from_str::<BTreeMap<String, String>>(&text) else { return Ok(BTreeMap::new()) };
+    // An entry whose timestamp doesn't parse is dropped, keeping the good ones -- that source
+    // reads as due, which is the safe direction.
+    Ok(raw
+        .into_iter()
+        .filter_map(|(id, at)| DateTime::parse_from_rfc3339(&at).ok().map(|at| (id, at.with_timezone(&Utc))))
+        .collect())
+}
+
+/// Why `last_run.toml` could not be read, if it exists and is unreadable -- reported by
+/// `fetchers.status` so a corrupt bookkeeping file is visible (#126's review, B1) instead of
+/// silently making every source look due forever. Read on the status path only; the fetch path
+/// deliberately doesn't care, because "treat everything as due" is already the safe answer.
+pub fn last_run_problem(ctx: &Ctx) -> Option<String> {
+    let text = ctx.store.read_string(LAST_RUN_PATH).ok()??;
+    match toml::from_str::<BTreeMap<String, String>>(&text) {
+        Ok(raw) => raw
+            .iter()
+            .find(|(_, at)| DateTime::parse_from_rfc3339(at).is_err())
+            .map(|(id, _)| format!("last_run.toml: '{id}' has an unreadable timestamp; that source reads as due")),
+        Err(e) => Some(format!("last_run.toml is unreadable ({e}); every source reads as due")),
+    }
 }
 
 /// Records that `source` ran at `now`; every other source's record is left untouched.
@@ -371,6 +452,15 @@ mod tests {
 
     fn at(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    /// A bad source entry no longer fails the whole load (#126's review, B1): it is dropped
+    /// from `sources` and its reason recorded in `problems`. Returns that reason, asserting
+    /// the source really was kept out of the live set.
+    fn problem_for(raw: Value, id: &str) -> String {
+        let cfg = FetchersConfig::from_value(&raw).expect("one bad source must not fail the load");
+        assert!(!cfg.sources.contains_key(id), "a source that failed validation must not be live");
+        cfg.problems.get(id).cloned().unwrap_or_else(|| panic!("no problem recorded for {id}: {:?}", cfg.problems))
     }
 
     #[test]
@@ -395,12 +485,9 @@ mod tests {
 
     #[test]
     fn a_scrape_source_below_its_own_higher_floor_is_rejected_even_at_an_interval_an_api_source_would_accept() {
-        let err = FetchersConfig::from_value(&json!({
-            "sources": {"weworkremotely": {"enabled": true, "interval": 3600}}
-        }))
-        .unwrap_err();
-        assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams);
-        assert!(err.message.contains(&MIN_INTERVAL_SCRAPE_S.to_string()), "{}", err.message);
+        let why =
+            problem_for(json!({"sources": {"weworkremotely": {"enabled": true, "interval": 3600}}}), "weworkremotely");
+        assert!(why.contains(&MIN_INTERVAL_SCRAPE_S.to_string()), "{why}");
 
         // The identical interval is fine for an API source -- the floor is per-`Method`, not
         // one uniform number.
@@ -482,12 +569,11 @@ mod tests {
 
     #[test]
     fn a_bad_interval_fails_at_load_time_not_on_the_first_tick() {
-        let err = FetchersConfig::from_value(&json!({
-            "sources": {"hn-whoishiring": {"enabled": true, "interval": "fortnightly"}}
-        }))
-        .unwrap_err();
-        assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams);
-        assert!(err.message.contains("sources.hn-whoishiring"), "{}", err.message);
+        let why = problem_for(
+            json!({"sources": {"hn-whoishiring": {"enabled": true, "interval": "fortnightly"}}}),
+            "hn-whoishiring",
+        );
+        assert!(why.contains("interval"), "{why}");
     }
 
     #[test]
@@ -498,13 +584,11 @@ mod tests {
 
     #[test]
     fn a_misspelled_source_id_fails_at_load_time_not_on_the_first_tick() {
-        let err = FetchersConfig::from_value(&json!({
-            "sources": {"hn-whoishirign": {"enabled": true, "interval": "daily"}}
-        }))
-        .unwrap_err();
-        assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams);
-        assert!(err.message.contains("hn-whoishirign"), "{}", err.message);
-        assert!(err.message.contains("hn-whoishiring"), "{}", err.message);
+        let why = problem_for(
+            json!({"sources": {"hn-whoishirign": {"enabled": true, "interval": "daily"}}}),
+            "hn-whoishirign",
+        );
+        assert!(why.contains("hn-whoishiring"), "the reason should name the real ids: {why}");
     }
 
     #[test]
@@ -520,33 +604,29 @@ mod tests {
 
     #[test]
     fn an_rss_kind_with_no_url_fails_at_load_time() {
-        let err = FetchersConfig::from_value(&json!({
-            "sources": {"my-team-blog": {"enabled": true, "interval": "hourly", "kind": "rss"}}
-        }))
-        .unwrap_err();
-        assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams);
-        assert!(err.message.contains("my-team-blog"), "{}", err.message);
-        assert!(err.message.contains("url"), "{}", err.message);
+        let why = problem_for(
+            json!({"sources": {"my-team-blog": {"enabled": true, "interval": "hourly", "kind": "rss"}}}),
+            "my-team-blog",
+        );
+        assert!(why.contains("url"), "{why}");
     }
 
     #[test]
     fn an_rss_kind_with_a_non_http_url_fails_at_load_time() {
-        let err = FetchersConfig::from_value(&json!({
-            "sources": {"my-team-blog": {"enabled": true, "interval": "hourly", "kind": "rss", "url": "not-a-url"}}
-        }))
-        .unwrap_err();
-        assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams);
-        assert!(err.message.contains("my-team-blog"), "{}", err.message);
+        let why = problem_for(
+            json!({"sources": {"my-team-blog": {"enabled": true, "interval": "hourly", "kind": "rss", "url": "not-a-url"}}}),
+            "my-team-blog",
+        );
+        assert!(why.contains("url"), "{why}");
     }
 
     #[test]
     fn an_rss_kind_with_a_non_http_scheme_url_fails_at_load_time() {
-        let err = FetchersConfig::from_value(&json!({
-            "sources": {"my-team-blog": {"enabled": true, "interval": "hourly", "kind": "rss", "url": "ftp://example.test/feed.xml"}}
-        }))
-        .unwrap_err();
-        assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams);
-        assert!(err.message.contains("my-team-blog"), "{}", err.message);
+        let why = problem_for(
+            json!({"sources": {"my-team-blog": {"enabled": true, "interval": "hourly", "kind": "rss", "url": "ftp://example.test/feed.xml"}}}),
+            "my-team-blog",
+        );
+        assert!(why.contains("url"), "{why}");
     }
 
     #[test]
@@ -561,23 +641,21 @@ mod tests {
     #[test]
     fn a_kind_entry_whose_id_collides_with_a_fixed_source_fails_at_load_time() {
         for id in ["hn-whoishiring", "weworkremotely"] {
-            let err = FetchersConfig::from_value(&json!({
-                "sources": {id: {"enabled": true, "interval": "hourly", "kind": "rss", "url": "https://example.test/feed.xml"}}
-            }))
-            .unwrap_err();
-            assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams, "id: {id}");
-            assert!(err.message.contains(id), "{}", err.message);
+            let why = problem_for(
+                json!({"sources": {id: {"enabled": true, "interval": "hourly", "kind": "rss", "url": "https://example.test/feed.xml"}}}),
+                id,
+            );
+            assert!(why.contains("collides"), "id {id}: {why}");
         }
     }
 
     #[test]
     fn an_unknown_kind_is_rejected() {
-        let err = FetchersConfig::from_value(&json!({
-            "sources": {"my-team-blog": {"enabled": true, "interval": "hourly", "kind": "carrier-pigeon"}}
-        }))
-        .unwrap_err();
-        assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams);
-        assert!(err.message.contains("carrier-pigeon"), "{}", err.message);
+        let why = problem_for(
+            json!({"sources": {"my-team-blog": {"enabled": true, "interval": "hourly", "kind": "carrier-pigeon"}}}),
+            "my-team-blog",
+        );
+        assert!(why.contains("carrier-pigeon"), "{why}");
     }
 
     #[test]
@@ -604,15 +682,14 @@ mod tests {
                 "items_path": "jobs", "id_field": "id", "title_field": "title", "url_field": "url",
             });
             fields.as_object_mut().unwrap().remove(missing);
-            let err = FetchersConfig::from_value(&json!({"sources": {"acme-jobs": fields}})).unwrap_err();
-            assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams, "missing {missing}");
-            assert!(err.message.contains(missing), "{missing}: {}", err.message);
+            let why = problem_for(json!({"sources": {"acme-jobs": fields}}), "acme-jobs");
+            assert!(why.contains(missing), "missing {missing}: {why}");
         }
     }
 
     #[test]
     fn a_json_api_kind_with_offset_pagination_needs_page_size_and_a_placeholder() {
-        let base = |extra: Value| {
+        let raw = |extra: Value| {
             let mut fields = json!({
                 "enabled": true, "interval": "daily", "kind": "json-api",
                 "url": "https://example.test/jobs", "id_field": "id", "title_field": "title", "url_field": "url",
@@ -621,31 +698,33 @@ mod tests {
             for (k, v) in extra.as_object().unwrap() {
                 fields.as_object_mut().unwrap().insert(k.clone(), v.clone());
             }
-            FetchersConfig::from_value(&json!({"sources": {"acme-jobs": fields}}))
+            json!({"sources": {"acme-jobs": fields}})
         };
 
-        let err = base(json!({"page_size": 0})).unwrap_err();
-        assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams);
-        assert!(err.message.contains("page_size"), "{}", err.message);
+        let why = problem_for(raw(json!({"page_size": 0})), "acme-jobs");
+        assert!(why.contains("page_size"), "{why}");
 
-        let err = base(json!({"page_size": 50, "url": "https://example.test/jobs"})).unwrap_err();
-        assert!(err.message.contains("{offset}"), "{}", err.message);
+        let why = problem_for(raw(json!({"page_size": 50, "url": "https://example.test/jobs"})), "acme-jobs");
+        assert!(why.contains("{offset}"), "{why}");
 
-        base(json!({"page_size": 50, "url": "https://example.test/jobs?offset={offset}"})).unwrap();
+        let good = FetchersConfig::from_value(&raw(
+            json!({"page_size": 50, "url": "https://example.test/jobs?offset={offset}"}),
+        ))
+        .unwrap();
+        assert!(good.sources.contains_key("acme-jobs") && good.problems.is_empty());
     }
 
     #[test]
     fn a_json_api_kind_with_an_unknown_pagination_is_rejected() {
-        let err = FetchersConfig::from_value(&json!({
-            "sources": {"acme-jobs": {
+        let why = problem_for(
+            json!({"sources": {"acme-jobs": {
                 "enabled": true, "interval": "daily", "kind": "json-api",
                 "url": "https://example.test/jobs", "id_field": "id", "title_field": "title", "url_field": "url",
                 "pagination": "cursor",
-            }}
-        }))
-        .unwrap_err();
-        assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams);
-        assert!(err.message.contains("cursor"), "{}", err.message);
+            }}}),
+            "acme-jobs",
+        );
+        assert!(why.contains("cursor"), "{why}");
     }
 
     #[test]
@@ -663,16 +742,15 @@ mod tests {
 
     #[test]
     fn a_json_api_kind_rejects_a_blank_active_field() {
-        let err = FetchersConfig::from_value(&json!({
-            "sources": {"acme-jobs": {
+        let why = problem_for(
+            json!({"sources": {"acme-jobs": {
                 "enabled": true, "interval": "daily", "kind": "json-api",
                 "url": "https://example.test/jobs", "id_field": "id", "title_field": "title", "url_field": "url",
                 "active_field": "  ",
-            }}
-        }))
-        .unwrap_err();
-        assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams);
-        assert!(err.message.contains("active_field"), "{}", err.message);
+            }}}),
+            "acme-jobs",
+        );
+        assert!(why.contains("active_field"), "{why}");
     }
 
     fn source(enabled: bool, interval_s: u64) -> SourceConfig {
@@ -728,6 +806,90 @@ mod tests {
         last.insert("hn-whoishiring".to_string(), at("2026-01-01T00:00:00Z"));
         let due = due_sources(&cfg, &last, at("2026-01-01T01:00:01Z"));
         assert_eq!(due, vec!["hn-whoishiring".to_string()]);
+    }
+
+    #[test]
+    fn one_bad_source_does_not_stop_the_good_ones() {
+        // #126's review, B1: this used to make `from_value` -- and so every `fetchers.tick`,
+        // `list` and `status` -- fail outright, so one typo stopped all fetching and (with the
+        // built-in scheduled-task-failed alert) popped a high-priority notification every five
+        // minutes.
+        let cfg = FetchersConfig::from_value(&json!({
+            "sources": {
+                "good": {"enabled": true, "interval": "daily", "kind": "rss", "url": "https://example.test/f.xml"},
+                "bad": {"enabled": true, "interval": "daily", "kind": "rss", "url": "not-a-url"},
+                "also-bad": {"enabled": true, "interval": "daily", "kind": "carrier-pigeon"},
+                "wrong-type": {"enabled": true, "interval": {}},
+            }
+        }))
+        .unwrap();
+        assert_eq!(cfg.sources.keys().collect::<Vec<_>>(), vec!["good"], "the good source still loads");
+        assert_eq!(cfg.problems.len(), 3, "each bad source is reported on its own: {:?}", cfg.problems);
+        for id in ["bad", "also-bad", "wrong-type"] {
+            assert!(cfg.problems.contains_key(id), "{id} should be reported: {:?}", cfg.problems);
+        }
+
+        // And the good one is still schedulable.
+        let due = due_sources(&cfg, &BTreeMap::new(), at("2026-01-01T00:00:00Z"));
+        assert_eq!(due, vec!["good".to_string()]);
+    }
+
+    #[test]
+    fn an_empty_filter_term_is_rejected_rather_than_matching_every_title() {
+        // #126's review, B3: `--excludes senior,` becomes ["senior", ""], and "" is a substring
+        // of every title, so everything got excluded. Same the other way for `title_contains`.
+        for field in ["title_excludes", "title_contains"] {
+            let why = problem_for(
+                json!({"sources": {"hn-whoishiring": {"enabled": true, "interval": "daily", field: ["senior", ""]}}}),
+                "hn-whoishiring",
+            );
+            assert!(why.contains(field), "{field}: {why}");
+        }
+        // Whitespace-only counts as empty.
+        problem_for(
+            json!({"sources": {"hn-whoishiring": {"enabled": true, "interval": "daily", "title_contains": ["  "]}}}),
+            "hn-whoishiring",
+        );
+    }
+
+    #[test]
+    fn a_source_id_that_cannot_be_a_folder_name_is_rejected_at_load() {
+        // #126's review, B14: the store's own path check caught this at the first fetch, but an
+        // id should be checked where every other user-named thing is -- at load.
+        for id in ["../records", "has space", "UPPER", "has/slash"] {
+            let why = problem_for(
+                json!({"sources": {id: {"enabled": true, "interval": "daily", "kind": "rss", "url": "https://e.test/f"}}}),
+                id,
+            );
+            assert!(why.contains("source id"), "id {id}: {why}");
+        }
+    }
+
+    #[test]
+    fn a_last_run_in_the_future_reads_as_due_rather_than_stalling_the_source() {
+        // #126's review, B10: a clock correction, or a $SHIMMER_HOME copied from a machine
+        // running ahead, parked a source until that future time actually arrived.
+        let mut cfg = FetchersConfig::default();
+        cfg.sources.insert("hn-whoishiring".into(), source(true, 3600));
+        let mut last = BTreeMap::new();
+        last.insert("hn-whoishiring".to_string(), at("2026-02-01T00:00:00Z"));
+        let due = due_sources(&cfg, &last, at("2026-01-01T00:00:00Z"));
+        assert_eq!(due, vec!["hn-whoishiring".to_string()], "a future last_run must not stall the source");
+    }
+
+    #[test]
+    fn a_corrupt_last_run_file_does_not_stop_every_source() {
+        // #126's review, B1's other half: this returned `Err`, failing the whole tick.
+        let env = TestEnv::new("fetchers");
+        env.ctx.store.write(LAST_RUN_PATH, "this is not: valid toml [[[").unwrap();
+        assert!(load_last_run(&env.ctx).unwrap().is_empty(), "unreadable means every source is due, not an error");
+        assert!(last_run_problem(&env.ctx).is_some(), "but it is reported, not silent");
+
+        // A single unreadable entry keeps the good ones.
+        env.ctx.store.write(LAST_RUN_PATH, "good = \"2026-01-01T00:00:00Z\"\nbad = \"not a date\"\n").unwrap();
+        let runs = load_last_run(&env.ctx).unwrap();
+        assert_eq!(runs.keys().collect::<Vec<_>>(), vec!["good"]);
+        assert!(last_run_problem(&env.ctx).is_some_and(|p| p.contains("bad")));
     }
 
     #[test]

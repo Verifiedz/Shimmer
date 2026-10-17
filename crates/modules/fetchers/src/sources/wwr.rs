@@ -44,7 +44,7 @@ impl Source for WeWorkRemotely {
             None => 0,
         };
         let Some(&category) = CATEGORIES.get(index) else {
-            return Ok(Page { items: Vec::new(), next_cursor: None });
+            return Ok(Page::default());
         };
         let url = format!("{BASE}/categories/{category}");
 
@@ -77,7 +77,7 @@ impl Source for WeWorkRemotely {
         }
 
         let next_cursor = (index + 1 < CATEGORIES.len()).then(|| (index + 1).to_string());
-        Ok(Page { items, next_cursor })
+        Ok(Page { items, next_cursor, ..Page::default() })
     }
 }
 
