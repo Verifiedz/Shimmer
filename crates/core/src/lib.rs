@@ -6,6 +6,7 @@
 pub mod bus;
 pub mod clock;
 pub mod ctx;
+pub mod desktop;
 pub mod error;
 pub mod event;
 pub mod http;
@@ -31,6 +32,7 @@ pub use serde_json::Value;
 pub use bus::{Emitter, EventSink};
 pub use clock::Clock;
 pub use ctx::{Ctx, ModuleConfig, ProgressFn};
+pub use desktop::{Desktop, DesktopBackend, DesktopNote, Urgency};
 pub use error::{Error, ErrorCode, Result};
 pub use event::Event;
 pub use http::{HttpBackend, HttpGateway, HttpResponse};

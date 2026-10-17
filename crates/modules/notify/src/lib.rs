@@ -37,7 +37,7 @@ use shimmer_core::{
 
 pub use alerts::Alerts;
 pub use message::{Delivery, Message, Priority, State};
-pub use sink::Sink;
+pub use sink::{DesktopSink, Sink};
 
 use filter::Filter;
 use message::{held_path, path, HELD, INBOX, REMOVED};
@@ -59,10 +59,10 @@ pub struct Notify {
 }
 
 impl Default for Notify {
-    /// No sinks yet: the desktop one comes with `Ctx.desktop` (ADR 0032 §1). Until then every
-    /// message stays in the inbox, as `failed`.
+    /// The MVP's one way of reaching you: desktop notifications (ADR 0032 §3). Phone, email and
+    /// webhooks are one more sink each, later.
     fn default() -> Self {
-        Self::with_sinks(Vec::new())
+        Self::with_sinks(vec![Arc::new(DesktopSink)])
     }
 }
 
@@ -231,8 +231,8 @@ impl Module for Notify {
             ]
             .map(String::from)
             .to_vec(),
-            // `"desktop"` comes with `Ctx.desktop` (ADR 0032 §1).
-            capabilities: Vec::new(),
+            // The real `ctx.desktop` (ADR 0032 §1); every other module's fails closed.
+            capabilities: vec!["desktop".into()],
         }
     }
 

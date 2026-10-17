@@ -75,6 +75,8 @@ impl Sandbox {
         for d in ["bin", "home", "tmp", "shimmer", "config", "state"] {
             std::fs::create_dir_all(sb.path(d)).unwrap();
         }
+        // Notify's popups are logged, never shown (ADR 0032 §2).
+        std::fs::write(sb.path("shimmer/config.toml"), "[desktop]\nshow = false\n").unwrap();
         for tool in SYSTEM_TOOLS {
             if let Some(real) = which(tool) {
                 symlink(real, sb.path("bin").join(tool)).unwrap();

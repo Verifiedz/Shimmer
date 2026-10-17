@@ -1,6 +1,7 @@
 //! Notify end to end (ADR 0032), through the real binary and a real daemon: a message sent as a
-//! queued task lands in the inbox file, and the inbox ops work over the socket. There's no sink
-//! yet (the desktop one comes with `Ctx.desktop`), so a message is kept as `failed`.
+//! queued task lands in the inbox file, goes to the desktop, and the inbox ops work over the
+//! socket. Every test home has `[desktop] show = false`, so the real backend logs each note
+//! instead of popping it up.
 
 mod common;
 
@@ -41,11 +42,16 @@ fn a_message_sent_through_the_queue_lands_in_the_inbox() {
     let m = &list["items"][0];
     assert_eq!(
         (m["title"].as_str(), m["priority"].as_str(), m["state"].as_str()),
-        (Some("Build finished"), Some("high"), Some("failed"))
+        (Some("Build finished"), Some("high"), Some("delivered"))
     );
     let id = m["id"].as_str().unwrap();
     let file = std::fs::read_to_string(home.dir.path().join(format!("home/data/notify/inbox/{id}.toml"))).unwrap();
     assert!(file.contains("title = \"Build finished\""), "files are the truth: {file}");
+
+    // The real desktop backend took it and, with `show = false`, logged it instead of showing it.
+    let logs = std::fs::read_dir(home.dir.path().join("home/logs")).unwrap();
+    let logged: String = logs.filter_map(|e| std::fs::read_to_string(e.unwrap().path()).ok()).collect();
+    assert!(logged.contains("desktop note") && logged.contains("Build finished"), "{logged}");
 
     assert_eq!(call(&home, "notify.mark_read", json!({"ids": [id]}))["marked"], 1);
     assert_eq!(call(&home, "notify.count", json!({"unread": true}))["count"], 0);
@@ -69,4 +75,57 @@ fn settings_change_at_once_with_no_restart() {
 
     call(&home, "notify.resume", json!({}));
     assert!(call(&home, "notify.status", json!({}))["paused"].is_null());
+}
+
+/// `shimmer notify …` as a person types it (ADR 0032 §7).
+#[test]
+fn the_notify_commands() {
+    let home = Home::new();
+    let sent = common::ok(&home, &["notify", "send", "Build finished", "--body", "v1.4 is live", "--priority", "high"]);
+    assert!(sent.starts_with("✓ sent \"Build finished\""), "{sent}");
+    inbox(&home, 1);
+
+    let list = common::ok(&home, &["notify", "list"]);
+    assert!(list.contains("Build finished — v1.4 is live") && list.contains("1 unread"), "{list}");
+    assert_eq!(common::ok(&home, &["notify", "count"]).trim(), "1");
+    let id = inbox(&home, 1)["items"][0]["id"].as_str().unwrap().to_owned();
+    let short = &id[id.len() - 6..];
+    let shown = common::ok(&home, &["notify", "show", short]);
+    assert!(shown.starts_with("Build finished\nv1.4 is live") && shown.contains("priority  high"), "{shown}");
+    assert_eq!(common::ok(&home, &["notify", "count"]).trim(), "0", "show marks it read");
+    assert!(common::ok(&home, &["notify", "mark-unread", "--all"]).starts_with("✓ marked 1 message unread"));
+
+    // One character never picks a message, even the only one it ends (#246's review).
+    let typo = common::fails(&home, &["notify", "remove", &id[id.len() - 1..]]);
+    assert!(typo.contains("at least 4"), "{typo}");
+    assert_eq!(common::ok(&home, &["notify", "count"]).trim(), "1", "nothing removed");
+
+    // A bulk remove asks first; with no one to ask, it says to add --yes.
+    let refused = common::fails(&home, &["notify", "remove", "--all"]);
+    assert!(refused.contains("this removes 1 message (1 unread); add --yes"), "{refused}");
+    assert!(common::ok(&home, &["notify", "remove", "--all", "--yes"]).starts_with("✓ removed 1 message"));
+    assert!(common::ok(&home, &["notify", "list"]).starts_with("no messages yet"));
+
+    assert!(common::ok(&home, &["notify", "pause", "2h"]).starts_with("✓ paused until"));
+    assert!(common::ok(&home, &["notify", "status"]).contains("paused     yes, until"));
+    assert!(common::ok(&home, &["notify", "resume"]).starts_with("✓ resumed"));
+    let quiet = common::ok(&home, &["notify", "quiet", "22:00-08:00", "--weekends", "00:00-10:00"]);
+    assert!(quiet.contains("every day  22:00-08:00") && quiet.contains("weekends   00:00-10:00"), "{quiet}");
+    assert!(common::ok(&home, &["notify", "builtin-alerts", "off", "workspace-dirty"]).contains("workspace-dirty"));
+    assert!(common::ok(&home, &["notify", "cap", "500"]).starts_with("✓ the inbox keeps at most 500"));
+    let test = common::ok(&home, &["notify", "test"]);
+    assert!(test.starts_with("Sent \"Shimmer can reach you\" to:\n  desktop ✓"), "{test}");
+    assert!(common::fails(&home, &["notify", "cap", "5"]).contains("at least 100"));
+}
+
+/// `notify send` can be scheduled (ADR 0032 §7), and reads back as typed.
+#[test]
+fn a_reminder_can_be_scheduled() {
+    let home = Home::new();
+    let out = common::ok(&home, &["schedule", "every", "1h", "--catch-up", "skip", "notify", "send", "Stretch break"]);
+    assert!(out.starts_with("✓ scheduled notify send 'Stretch break'"), "{out}");
+    let list = common::ok(&home, &["scheduler", "list"]);
+    assert!(list.contains("notify send 'Stretch break'"), "{list}");
+    let refused = common::fails(&home, &["schedule", "every", "1h", "--catch-up", "skip", "notify", "list"]);
+    assert!(refused.contains("only notify send can"), "{refused}");
 }
