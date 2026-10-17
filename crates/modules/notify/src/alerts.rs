@@ -42,9 +42,6 @@ impl Alerts {
     }
 }
 
-/// Every topic [`alert`] can react to, so `on_event` reads settings only for these.
-pub const TOPICS: [&str; 2] = ["queue.task.failed", "workspaces.session.dirty"];
-
 /// The message `ev` calls for, as `notify.send` params, if any.
 pub fn alert(ev: &Event, alerts: &Alerts) -> Option<Value> {
     let p = &ev.payload;
@@ -172,18 +169,5 @@ mod tests {
         let off = Alerts { scheduled_task_failed: false, ..Alerts::default() };
         assert_eq!(alert(&failed("records.complete", sched), &off), None);
         assert_eq!(alert(&ev("records.item.completed", json!({})), &Alerts::default()), None);
-    }
-
-    /// `on_event` reads settings only for `TOPICS`, so no other topic may ever make an alert.
-    #[test]
-    fn only_its_topics_ever_make_an_alert() {
-        let p = json!({"origin": {"type": "scheduler"}, "code": "workspace_dirty", "recovered": true,
-                       "fallback": false, "op": "demo.op", "error": "boom", "workspace": "site"});
-        for topic in
-            ["queue.task.finished", "queue.task.cancelled", "workspaces.session.launched", "records.item.created"]
-        {
-            assert!(!TOPICS.contains(&topic));
-            assert_eq!(alert(&ev(topic, p.clone()), &Alerts::default()), None, "{topic}");
-        }
     }
 }

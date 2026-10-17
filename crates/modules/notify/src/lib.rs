@@ -328,21 +328,17 @@ impl Module for Notify {
         if ev.topic.starts_with("notify.") {
             return Ok(());
         }
-        // Settings are read only when this event could matter: one an alert reacts to, or any
-        // event while messages are held and none is queued to flush them. Every other event in
-        // the daemon costs one flag check (#276's review).
-        let alerting = alerts::TOPICS.contains(&ev.topic.as_str());
-        let may_flush = !self.flush_queued.load(Ordering::Acquire) && !held_ids(ctx)?.is_empty();
-        if !alerting && !may_flush {
-            return Ok(());
-        }
         let (s, _) = settings(ctx)?;
         // Enqueued, never sent inline: a slow popup must not hold up the bus, and every send
         // shows in the queue (ADR 0032 §4).
         if let Some(params) = alerts::alert(ev, &s.alerts) {
             ctx.queue.enqueue("notify.send", params).await?;
         }
-        if may_flush && !holds(&s, ctx, Priority::Normal) && !self.flush_queued.swap(true, Ordering::AcqRel) {
+        if !holds(&s, ctx, Priority::Normal)
+            && !self.flush_queued.load(Ordering::Acquire)
+            && !held_ids(ctx)?.is_empty()
+            && !self.flush_queued.swap(true, Ordering::AcqRel)
+        {
             ctx.queue.enqueue("notify.flush", json!({})).await?;
         }
         Ok(())

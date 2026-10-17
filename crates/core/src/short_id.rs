@@ -46,26 +46,15 @@ pub fn resolve(written: &str, ids: &[String], kind: &str) -> Result<String> {
 /// How many characters of its end a list shows for an id, at the least.
 pub const SHOWN: usize = 6;
 
-/// The last `n` bytes of `s`, if that's on a character boundary.
-fn tail(s: &str, n: usize) -> Option<&str> {
-    s.len().checked_sub(n).and_then(|start| s.get(start..))
-}
-
 /// The ending of `id` a list shows: its last [`SHOWN`] characters, or more where another id in
 /// `ids` ends the same way (ignoring case), so [`resolve`] given it back finds `id`. `ids` should
 /// be every id `resolve` will look through, not only the ones on screen.
 pub fn ending(id: &str, ids: &[String]) -> String {
-    // Compared in place, ignoring ASCII case, without a lowercased copy of every id at every
-    // width: `notify.list` calls this for each message it shows, against the whole inbox
-    // (#276's review). `get` keeps a slice that isn't on a character boundary from panicking.
-    let clashes = |n: usize| {
-        let mine = tail(id, n);
-        ids.iter().any(|other| {
-            !other.eq_ignore_ascii_case(id) && tail(other, n).zip(mine).is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
-        })
-    };
-    let mut n = SHOWN.min(id.len());
-    while n < id.len() && clashes(n) {
+    let me = id.to_lowercase();
+    let mut n = SHOWN.min(me.len());
+    while n < me.len()
+        && ids.iter().any(|other| other.to_lowercase() != me && other.to_lowercase().ends_with(&me[me.len() - n..]))
+    {
         n += 1;
     }
     id[id.len() - n..].to_owned()
