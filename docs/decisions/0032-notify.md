@@ -1,7 +1,9 @@
 # 0032. Notify: an inbox and desktop notifications, built for more ways to reach you
 
 Status: proposed · Raised by Dev B · Needs sign-off: Dev A (§1 adds a `Ctx` capability to
-`crates/core`; §2 is daemon code; §1 and §7 change CLAUDE.md and `docs/protocol.md`, CLAUDE.md §4) ·
+`crates/core`; §2 is daemon code; §6's ids move short-id matching into `crates/core`
+(`core::short_id`, with ADR 0031 §4's amendment); §1 and §7 change CLAUDE.md and `docs/protocol.md`,
+CLAUDE.md §4) ·
 Dev C notified (new ops and topics, §6) · Amends ADR 0005 (where an exhausted delivery goes) ·
 "Message me when X" rules are automations' (ADR 0035, #238), not notify's: §5
 
@@ -71,8 +73,10 @@ impl Desktop {
 - **Linux:** `notify-send --app-name=Shimmer --urgency=<low|normal|critical> -- <title> <body>`
   (the `libnotify-bin` package; most desktops have it).
 - **macOS:** `osascript -e 'on run argv' -e 'display notification (item 2 of argv) with title (item
-  1 of argv)' -e 'end run' <title> <body>`. The text is passed as arguments, never put into the
+  1 of argv)' -e 'end run' -- <title> <body>`. The text is passed as arguments, never put into the
   script, so nothing in a message can run as AppleScript.
+- **Every backend ends its own options with `--` before the title and body**, so a message whose
+  title starts with a dash (`-e`, `--help`) is text, never read as another option.
 - `std::process::Command` with arguments, no shell; a 5-second timeout.
 - A missing tool, or no desktop session, is `unavailable`, with a message that says which. On Linux,
   `notify-send` needs `DBUS_SESSION_BUS_ADDRESS` in the daemon's environment: a daemon the CLI
