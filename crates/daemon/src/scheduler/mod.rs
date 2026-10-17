@@ -296,10 +296,12 @@ impl Scheduler {
         // Persist first (at-most-once). If that fails nothing has happened and the next tick retries.
         // A module's finished one-time schedule is deleted instead of kept as `done`: nothing
         // re-declares it, so there's nothing to remember (ADR 0035 §5.6).
+        // "ran" only when a task was enqueued this tick; an overlap drops the firing (#251's review).
+        let reason = if overlap || decision.fire.is_empty() { "skipped" } else { "ran" };
         let persisted = match &next.source {
             Source::Added { .. } if next.done => self.delete(
                 next.spec.id.as_str(),
-                ("scheduler.trigger.removed", json!({"trigger_id": next.spec.id, "reason": "ran"})),
+                ("scheduler.trigger.removed", json!({"trigger_id": next.spec.id, "reason": reason})),
             ),
             _ => self.write(&next, None),
         };
@@ -490,10 +492,6 @@ impl ScheduleBackend for Scheduler {
         if label.is_empty() || label.len() > MAX_LABEL || label.contains('\n') {
             return Err(Error::invalid_params(format!("a schedule's label is one line of 1-{MAX_LABEL} characters")));
         }
-        let mine = |e: &Entry| matches!(&e.stored.source, Source::Added { id, .. } if id == module);
-        if self.lock().values().filter(|e| mine(e)).count() >= MAX_ADDED {
-            return Err(Error::conflict(format!("module '{module}' already has {MAX_ADDED} schedules waiting")));
-        }
         let spec = TriggerSpec {
             id: TriggerId::new(format!("{module}-{}", ulid::Ulid::new().to_string().to_lowercase())),
             schedule: Schedule::Once(once.at),
@@ -515,9 +513,16 @@ impl ScheduleBackend for Scheduler {
             done: false,
             zone: None,
         };
+        // The cap is checked and the schedule added under one lock, so two calls at once can't
+        // both pass it (#251's review).
+        let mut st = self.lock();
+        let mine = st.values().filter(|e| matches!(&e.stored.source, Source::Added { id, .. } if id == module)).count();
+        if mine >= MAX_ADDED {
+            return Err(Error::conflict(format!("module '{module}' already has {MAX_ADDED} schedules waiting")));
+        }
         self.write(&stored, Some(("scheduler.trigger.added", added_payload(&stored))))?;
         let id = stored.spec.id.clone();
-        self.lock().insert(id.to_string(), Entry { stored, parsed, pending: Vec::new() });
+        st.insert(id.to_string(), Entry { stored, parsed, pending: Vec::new() });
         Ok(id)
     }
 
