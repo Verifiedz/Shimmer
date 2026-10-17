@@ -152,7 +152,13 @@ async fn a_matching_event_queues_its_actions_and_schedules_the_delayed_one() {
     let added = env.schedules.added.lock().unwrap().clone();
     assert_eq!(added.len(), 1);
     let (_, _, once) = &added[0];
-    assert_eq!((once.op.as_str(), once.params.clone()), ("notify.send", json!({"title": "Redo Two Sum"})));
+    // Scheduled through automations, carrying the chain (ADR 0035 §3).
+    assert_eq!(once.op, "automations.deferred");
+    assert_eq!(
+        (once.params["rule"].clone(), once.params["op"].clone(), once.params["params"].clone()),
+        (json!("solved"), json!("notify.send"), json!({"title": "Redo Two Sum"}))
+    );
+    assert_eq!(once.params["chain"]["rules"], json!(["solved"]));
     assert_eq!(once.at, env.clock.now() + chrono::Duration::days(60));
     assert_eq!(once.label, "rule solved: Tell me when it's done");
 
@@ -280,4 +286,91 @@ async fn test_shows_what_a_rule_would_do_and_events_lists_what_it_can_react_to()
         .as_array()
         .unwrap()
         .contains(&json!({"topic": "queue.task.failed", "description": "a task failed"})));
+}
+
+/// Fails the first transaction that writes the history file, then behaves.
+struct FailFirstHistory {
+    inner: Arc<shimmer_core::testing::MemBackend>,
+    failed: std::sync::atomic::AtomicBool,
+}
+
+impl StoreBackend for FailFirstHistory {
+    fn read(&self, ns: &str, path: &str) -> shimmer_core::Result<Option<Vec<u8>>> {
+        self.inner.read(ns, path)
+    }
+
+    fn list(&self, ns: &str, prefix: &str) -> shimmer_core::Result<Vec<String>> {
+        self.inner.list(ns, prefix)
+    }
+
+    fn commit(&self, ns: &str, plan: shimmer_core::TxPlan) -> shimmer_core::Result<()> {
+        let history =
+            plan.writes.iter().any(|w| matches!(w, shimmer_core::Write::Put { path, .. } if path == "history.json"));
+        if history && !self.failed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Err(shimmer_core::Error::internal("disk full"));
+        }
+        self.inner.commit(ns, plan)
+    }
+}
+
+/// "Every matching rule fires": one rule failing never stops the next (#252's review).
+#[tokio::test]
+async fn one_rule_failing_never_stops_the_others() {
+    let mut env = env();
+    let rule = |label: &str| {
+        format!("[rule]\nlabel = \"{label}\"\non = \"records.item.completed\"\n\n[[do]]\nop = \"notify.send\"\nparams = {{ title = \"{label}\" }}\n")
+    };
+    let m = started(&env).await;
+    for id in ["a-first", "b-second"] {
+        call(&m, &env.ctx, "automations.create", json!({"id": id, "text": rule(id)})).await.unwrap();
+    }
+    let failing = FailFirstHistory { inner: env.backend.clone(), failed: Default::default() };
+    env.ctx.store = shimmer_core::NamespacedStore::new(
+        "automations",
+        ModuleId::new("automations"),
+        Arc::new(failing),
+        env.clock.clone(),
+    );
+    let err = m.on_event(&event("records.item.completed", json!({}), None), &env.ctx).await.unwrap_err();
+    assert!(err.message.contains("a-first") && err.message.contains("disk full"), "{}", err.message);
+    let fired: Vec<Value> = env
+        .backend
+        .events()
+        .into_iter()
+        .filter(|e| e.topic == "automations.rule.fired")
+        .map(|e| e.payload["rule"].clone())
+        .collect();
+    assert_eq!(fired, [json!("b-second")], "the second rule still fired");
+}
+
+/// A delayed action that causes the rule's own event is still a cycle: the chain travels with
+/// the delay, so "re-set the stage in 3 days" can't loop every 3 days (#238's review).
+#[tokio::test]
+async fn a_delayed_action_continues_its_chain() {
+    let env = env();
+    let m = started(&env).await;
+    let ctx = &env.ctx;
+    let text = "[rule]\non = \"records.item.updated\"\n[[do]]\nop = \"records.update\"\nafter = \"3d\"\n";
+    call(&m, ctx, "automations.create", json!({"id": "waiting", "text": text})).await.unwrap();
+
+    m.on_event(&event("records.item.updated", json!({}), None), ctx).await.unwrap();
+    let (_, _, once) = env.schedules.added.lock().unwrap()[0].clone();
+    // Three days later the scheduler runs it, stamping `scheduled_for` as it does.
+    let mut params = once.params.clone();
+    params["scheduled_for"] = json!("2026-10-20T09:00:00Z");
+    let ran = m.handle(&once.op, params.clone(), ctx).await.unwrap();
+    let task: TaskId = serde_json::from_value(ran["task_id"].clone()).unwrap();
+    assert_eq!(env.queue.requests.lock().unwrap().last().unwrap().op, "records.update");
+
+    // The update it made comes back caused by that task: the rule is already in the chain.
+    m.on_event(&event("records.item.updated", json!({}), Some(task)), ctx).await.unwrap();
+    assert_eq!(env.schedules.added.lock().unwrap().len(), 1, "no second delayed action");
+    assert_eq!(last(&env, "automations.chain.stopped")["reason"], "cycle");
+
+    // Switched off meanwhile: the delayed action does nothing.
+    call(&m, ctx, "automations.disable", json!({"id": "waiting"})).await.unwrap();
+    let before = env.queue.requests.lock().unwrap().len();
+    let skipped = m.handle(&once.op, params, ctx).await.unwrap();
+    assert!(skipped["skipped"].is_string(), "{skipped}");
+    assert_eq!(env.queue.requests.lock().unwrap().len(), before);
 }
