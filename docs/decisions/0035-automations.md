@@ -1,7 +1,8 @@
 # 0035. Automations: "when this happens, do that", written by users
 
 Status: proposed · Raised by Dev B (#228) · Needs sign-off: Dev A (§5's `core` changes: `Event.cause`,
-three helpers moved into `core`, `Manifest.topic_descriptions`, one-time module schedules; CLAUDE.md
+three helpers moved into `core`, `Manifest.topic_descriptions`, one-time module schedules,
+`Ctx.catalog`; CLAUDE.md
 §1.1 gains a row, CLAUDE.md §4) · Dev C notified (new ops and topics, §8) · Amends ADR 0032 §4–§5
 (notify's alerts and rules), ADR 0033 (a `fix` in workspaces' dirty detail, §10)
 
@@ -123,9 +124,15 @@ a popup) each time; or A triggers B triggers A.
   - **a chain stops at the depth limit: 3 by default**, adjustable from 1 to 10 in automations'
     settings (`shimmer automations depth N`, §8).
 - Events with no automations cause start a **new chain**: anything a person does, and anything a
-  schedule fires, including a delayed action coming due (§4). Real flows stay shallow because of
-  this: in the job-hunt flow the deepest point is 2 (a posting found → saved → told and opened),
-  since applying, marking done, and the follow-up firing three days later each start fresh.
+  schedule fires. Real flows stay shallow because of this: in the job-hunt flow the deepest point is
+  2 (a posting found → saved → told and opened), since applying and marking done each start fresh.
+- **A delayed action continues its chain** (§4): it carries the chain while it waits, so a rule
+  whose delayed action re-causes its own event ("re-set the stage in 3 days") is stopped as a
+  cycle, not run once per delay forever.
+- **Where chains are kept:** the `task id → chain` map is in memory, bounded to the 10,000 newest
+  tasks (a chain only matters while its task is queued or running, and the queue itself is in
+  memory, #236). A delayed action's chain is stored with its schedule instead, so it survives a
+  restart.
 - A stopped chain emits `automations.chain.stopped {chain, rule, event}`, and the built-in rule
   `loop-stopped` (§10) turns that into a high-priority message. It's also marked where you'd look:
   `⚠ stopped a loop` in `automations list`, a line in `automations status`, a warning in doctor.
@@ -152,9 +159,13 @@ after = "3d"                      # 30m, 2h, 3d, 1w, 60d…
 - **It always fires** after the wait. Cancelling it when what it was about has changed (you already
   followed up, the record was removed) is a later refinement, its own issue.
 - **Pending ones are yours to see and remove:** they show **by default** in `shimmer scheduler list`
-  (not only under `--all`, ADR 0031 §6 / #244), marked `from: automation <rule>`, and `scheduler
-  remove` removes one.
-- When one fires, its task's events start a new chain (§3).
+  (not only under `--all`, #244), marked `from: automation <rule>`, and `scheduler remove` removes
+  one.
+- **It's scheduled as automations' own `automations.deferred` op**, carrying the rule, the action's
+  op and params, and the chain (§3). When it comes due, automations queues the action and
+  remembers its task with that chain, so the loop guard sees through the wait. A rule removed or
+  switched off meanwhile does nothing. Rules can't name `automations.*` ops, so only automations
+  schedules it.
 
 ### 5. What `core` gains (Dev A)
 
@@ -199,6 +210,11 @@ after = "3d"                      # 30m, 2h, 3d, 1w, 60d…
      `"desktop"`). Revisit if non-Shimmer code ever runs inside the daemon: persistence is a
      different power from "now", and a capability would make it visible in a manifest.
    - It's also what a calendar or reminders feature would use.
+   - **Not chosen: calling `scheduler.add`.** A module can't: `ctx.queue` takes module ops, and
+     `scheduler.*` are the daemon's own ops, reached only over the socket. And a `scheduler.add`
+     trigger is a person's (`usr-…`), removable by anyone and not tied to the module, with no
+     per-module cap. These need the module's name in the id, removal by that module only, and a
+     limit of 1,000 waiting per module, so a runaway rule fills its own quota, not the disk.
 7. **A read-only catalog of ops and topics.** A module can't see `core.manifest`, yet automations
    checks that a rule's ops exist (§1) and lists what a rule can react to (`automations events`).
    `Ctx` gains `catalog`: every module op (its `CommandSpec`) and every topic with its description,
@@ -285,8 +301,9 @@ shimmer automations reload                         after editing rule files by h
 
 ### 9. Templates
 
-In the records/workspaces template format (ADR 0025 §3, #202 later): a header with notes and "How it
-works" examples, a category, and `[[question]]`s whose answers fill the rule. Every template is
+In the records/workspaces template format (ADR 0025 §1, ADR 0030 §1, #202 later): a header with
+notes and examples (the lines under `How it works:`), a category, and `[[question]]`s whose answers
+fill the rule. Every template is
 tested end to end, and one asking consequential questions shows the rule before creating it (ADR
 0025 §6a).
 
@@ -304,12 +321,17 @@ tested end to end, and one asking consequential questions shows the rule before 
 | `posting-to-application` | saves a fetched posting as a record (ships with fetchers) |
 
 `stage-creates-workspace` makes **three rules** from one set of answers, because creating and
-opening must happen in order and a rule's actions start together (§1):
+opening must happen in order and a rule's actions start together (§1). `when` is a condition on the
+record as it is now, so each rule also needs `changed = "<field>"` (records' update event names the
+fields that changed): without it, any edit to a record already at that stage would fire again. If a
+record comes back to the stage later, `workspaces.create` meets the workspace it made before and
+refuses (`conflict`, recorded as a failed action in the rule's history); the existing workspace is
+left as it is.
 
 ```toml
 # 1: the record reaches the stage → its own workspace, from a workspace template
 on = "records.item.updated"
-when = { collection = "jobs", "item.stage" = "interviewing" }
+when = { collection = "jobs", "item.stage" = "interviewing", changed = "stage" }
 [[do]]
 op = "workspaces.create"
 params = { id = "{id}-prep", template = "interview-prep", answers = { COMPANY = "{title}", JOB_URL = "{item.url}" } }
@@ -356,6 +378,9 @@ optional starting points; built-in rules are always there.
 | `scheduled-task-failed` | `queue.task.failed`, origin scheduler, not `workspace_dirty`, `fallback` false | "Scheduled records.complete failed: …" |
 | `loop-stopped` | `automations.chain.stopped` | "Automation X was stopped: it would have triggered itself" |
 
+- **The fields they match exist on the event:** `queue.task.failed` carries `code` (protocol.md's
+  error codes) and `fallback` (ADR 0032 §4) besides CLAUDE.md §11.1's summary of task id, lane,
+  origin, error and attempts.
 - **Notify's own work is never alerted on:** notify's tasks run in the `notify` lane, so the first
   three add `lane ≠ notify`, as notify's alert code did (ADR 0032 §4).
 - **The exact fix in the message:** workspaces' `workspace_dirty` detail gains `fix`, the command
@@ -379,7 +404,7 @@ optional starting points; built-in rules are always there.
 | §1.6 Extensible | A new reaction is a file, not code. |
 | §2 Clients hold no logic | Matching, filling, enqueuing and checking rules are in the module; the CLI shows, opens the editor and sends. |
 | §3 rules 1–2 | Depends on `core` only; what it needs moves into `core` (§5). |
-| §5 `Ctx` is a security decision | One new handle (§5.6), same power as `ctx.queue`, later, for Shimmer's own modules only; `Event.cause` is data, not a power. |
+| §5 `Ctx` is a security decision | Two new fields: one-time schedules (§5.6), same power as `ctx.queue`, later, for Shimmer's own modules only; and `catalog` (§5.7), read-only, what `core.manifest` already tells any client. `Event.cause` is data, not a power. |
 | §6.2 Ordering | Enqueued like any task, in the op's lane; no `Overridden`. |
 | §11.1–11.2 Failure, no retry | A failed action is an ordinary `queue.task.failed`; automations never retries. |
 | §12 rule 4 | No `std::fs`, no network, no `Utc::now()`: store, queue, schedules and clock through `Ctx`. |
@@ -392,8 +417,8 @@ optional starting points; built-in rules are always there.
 - People connect modules without code: developers write mechanisms, people write workflows. The job
   hunt and LeetCode flows are configuration.
 - One rules system: notify keeps delivery only; its alerts become built-in rules.
-- `core` gains `Event.cause`, three moved helpers, `Manifest.topic_descriptions`, and one-time module
-  schedules; the daemon stamps causes and keeps those schedules; workspaces adds `fix` to its dirty
+- `core` gains `Event.cause`, three moved helpers, `Manifest.topic_descriptions`, one-time module
+  schedules and `Ctx.catalog`; the daemon stamps causes and keeps those schedules; workspaces adds `fix` to its dirty
   detail; CLAUDE.md §1.1 gains a row: `automations` · owns: reactions between events and ops,
   written as data · specialised by: rule templates.
 - Built after sign-off, in small PRs into an `integration/automations` umbrella, one at a time: the
