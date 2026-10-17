@@ -199,9 +199,17 @@ fn schedules(home: &Home) -> Vec<Value> {
         .collect()
 }
 
+/// A trigger for `op` (read-only ops included, which `scheduler add` refuses), made the way ADR
+/// 0031 §6 leaves for that: `shimmer call scheduler.add`. Its id.
 fn schedule(home: &Home, op: &str, params: &str, every: &str) -> String {
-    let out = ok(home, &["scheduler", "add", op, params, "--every", every, "--catch-up", "skip"]);
-    out["✓ added trigger ".len()..].split(':').next().unwrap().to_owned()
+    let secs: u64 = match every {
+        "1d" => 86_400,
+        "2d" => 172_800,
+        other => panic!("add {other} to schedule()"),
+    };
+    let add = format!(r#"{{"schedule":{{"every":{secs}}},"op":"{op}","params":{params},"catch_up":"skip"}}"#);
+    let out: Value = serde_json::from_str(&ok(home, &["call", "scheduler.add", &add, "--json"])).unwrap();
+    out["trigger_id"].as_str().unwrap().to_owned()
 }
 
 #[test]
