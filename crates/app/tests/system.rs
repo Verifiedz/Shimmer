@@ -55,8 +55,11 @@ fn wait_until(home: &Home, what: &str, mut cond: impl FnMut() -> bool) {
 }
 
 /// The trigger id in `scheduler add`'s reply: "✓ added trigger usr-…: …".
-fn added_trigger(out: &str) -> String {
-    out.trim_start_matches("✓ added trigger ").split(':').next().unwrap().trim().to_owned()
+/// A trigger made with `shimmer call scheduler.add` (ADR 0031 §6: the raw form went from
+/// `scheduler add`): its id.
+fn raw_trigger(home: &Home, add: &str) -> String {
+    let out: serde_json::Value = serde_json::from_str(&ok(home, &["call", "scheduler.add", add, "--json"])).unwrap();
+    out["trigger_id"].as_str().unwrap().to_owned()
 }
 
 /// `secs` from now as UTC RFC 3339, for `scheduler add --once`.
@@ -118,11 +121,10 @@ fn a_shimmer_folder_copied_elsewhere_keeps_working() {
     ok(&old, &["workspaces", "new", "smoke", "--from", "smoke-test", "--set", "FAIL_AT=none"]);
     ok(&old, &["workspaces", "activate", "smoke", "--wait"]);
     ok(&old, &["workspaces", "stop", "smoke", "--wait"]);
-    let trigger = ok(
+    let trigger = raw_trigger(
         &old,
-        &["scheduler", "add", "records.list", r#"{"collection":"jobs"}"#, "--every", "1d", "--catch-up", "skip"],
+        r#"{"schedule":{"every":86400},"op":"records.list","params":{"collection":"jobs"},"catch_up":"skip"}"#,
     );
-    let trigger = added_trigger(&trigger);
     ok(&old, &["shutdown"]);
     wait_gone(&old.socket());
 
@@ -163,12 +165,7 @@ fn a_schedule_launches_a_workspace_and_a_dirty_one_never_blocks_the_lane() {
 
     // A one-shot schedule a few seconds from now launches it (with room for a slow machine).
     let add = |id: &str| {
-        let params = format!(r#"{{"id":"{id}"}}"#);
-        let out = ok(
-            &home,
-            &["scheduler", "add", "workspaces.activate", &params, "--once", &utc_in(5), "--catch-up", "run-once"],
-        );
-        added_trigger(&out)
+        ok(&home, &["scheduler", "add", "once", &utc_in(5), "--catch-up", "run-once", "workspaces", "activate", id]);
     };
     add("smoke");
     wait_until(&home, "the scheduled launch of smoke", || state(&home, "smoke") == "active");

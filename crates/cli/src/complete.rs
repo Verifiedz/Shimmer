@@ -294,7 +294,7 @@ fn alternatives(usage: &str, placeholder: &str) -> Vec<Opt> {
     out
 }
 
-/// The first words of `WHEN` as `shimmer schedule --help` lists them (`WHEN is one of:`), each
+/// The first words of `WHEN` as `shimmer scheduler add --help` lists them (`WHEN is one of:`), each
 /// with what follows it: `daily` → `HH:MM`, `every` → `DURATION`, `cron` → `"EXPR"`. An example
 /// list of days (`mon,wed,fri`) isn't a word to type, so it's left out.
 fn when_words(usage: &str) -> Vec<(String, String)> {
@@ -426,8 +426,8 @@ impl Groups {
             rest.splice(0..1, target.words.iter().map(|w| w.to_string()));
         }
         let first = rest[0].clone();
-        if first == "schedule" {
-            return self.schedule(&rest[1..], current, cx, source).await;
+        if first == "scheduler" && rest.get(1).map(String::as_str) == Some("add") {
+            return self.schedule(&rest[2..], current, cx, source).await;
         }
         let (cmd, usage, after) = match modules().into_iter().find(|(m, _)| *m == first) {
             Some((module, usage)) => {
@@ -456,7 +456,7 @@ impl Groups {
         self.arguments(module, &cmd, usage, &after, current, cx, source).await;
     }
 
-    /// `shimmer schedule WHEN [--catch-up WHAT] [--lane LANE] COMMAND…` (#230): the ways to say
+    /// `shimmer scheduler add WHEN [--catch-up WHAT] [--lane LANE] COMMAND…` (#230, ADR 0031 §6): the ways to say
     /// when, then the schedule's options, then a command that can be scheduled, completed as it is
     /// on its own. Where the command starts is read as running it reads it (`parse_when`).
     async fn schedule(&mut self, after: &[String], current: &str, cx: &Context<'_>, source: &mut impl Source) {
@@ -661,7 +661,7 @@ impl Groups {
             ("records", "FILE") | ("", "PATH") => self.files(),
             ("queue", "TASK" | "OTHER") => self.tasks(source).await,
             ("queue" | "scheduler", "LANE") => self.lanes(source).await,
-            ("scheduler", "TRIGGER") => self.triggers(source).await,
+            ("scheduler", "TRIGGER") => self.triggers(command, source).await,
             ("scheduler" | "", "OP") => self.ops(source).await,
             ("scheduler", "WHAT") => {
                 for v in crate::scheduler::CATCH_UP {
@@ -752,9 +752,19 @@ impl Groups {
         }
     }
 
-    async fn triggers(&mut self, source: &mut impl Source) {
+    async fn triggers(&mut self, command: &str, source: &mut impl Source) {
         let Some(data) = source.call("scheduler.list", json!({})).await else { return };
-        let all = data["triggers"].as_array().or_else(|| data.as_array()).cloned().unwrap_or_default();
+        let all: Vec<Value> = data["triggers"]
+            .as_array()
+            .or_else(|| data.as_array())
+            .into_iter()
+            .flatten()
+            // The ones you added, as `scheduler list` shows (#244), for anything you can only do to
+            // your own. Pausing is the one thing you can do to a module's schedule, so pause and
+            // resume offer every one (#249's review).
+            .filter(|t| matches!(command, "pause" | "resume") || t["source"]["type"] == "user")
+            .cloned()
+            .collect();
         // The same short endings `scheduler list` shows, which every scheduler command accepts.
         let ids: Vec<String> = all.iter().map(|t| text(&t["id"])).collect();
         for (t, short) in all.iter().zip(crate::render::short_ids(&ids)) {
@@ -945,7 +955,12 @@ mod tests {
                        "templates": [{"id": "leetcode", "description": "Problems"}]}),
             ),
             ("workspaces.list", json!({"workspaces": [{"id": "site", "label": "Site", "state": "ready"}]})),
-            ("scheduler.list", json!({"triggers": [{"id": "usr-01JABCDEFGHJKMNPQRSTVWXYZ0", "op": "records.list"}]})),
+            (
+                "scheduler.list",
+                json!({"triggers": [
+                    {"id": "usr-01JABCDEFGHJKMNPQRSTVWXYZ0", "op": "records.list", "source": {"type": "user"}},
+                    {"id": "notify.flush", "op": "notify.flush", "source": {"type": "module", "id": "notify"}}]}),
+            ),
             (
                 "core.manifest",
                 json!({"lanes": [{"id": "default", "max_concurrent": 4}],
@@ -971,10 +986,10 @@ mod tests {
 
     #[tokio::test]
     async fn every_command_with_more_to_type_completes_after_its_name() {
-        // A command written with `…` in `shimmer --help` (`records …`, `schedule WHEN … COMMAND`)
+        // A command written with `…` in `shimmer --help` (`records …`, `scheduler …`)
         // takes more words, so Tab after it should offer some. A new group (fetchers, notify,
         // calendar) only does once modules() reads its help page; this says so instead of it
-        // being forgotten, whatever shape its help line has (#230: `schedule` slipped past a
+        // being forgotten, whatever shape its help line has (#230: `shimmer schedule` slipped past a
         // check that only knew `NAME …`).
         let groups: Vec<&str> = crate::args::USAGE
             .lines()
@@ -982,13 +997,13 @@ mod tests {
             .filter(|l| l.split("  ").find(|p| !p.is_empty()).is_some_and(|synopsis| synopsis.contains('…')))
             .filter_map(|l| l.split_whitespace().next())
             .collect();
-        assert!(groups.contains(&"records") && groups.contains(&"schedule"), "groups not found: {groups:?}");
+        assert!(groups.contains(&"records") && groups.contains(&"scheduler"), "groups not found: {groups:?}");
         for group in groups {
             assert!(
                 !words(&format!("{group} ")).await.is_empty(),
                 "`shimmer {group} <Tab>` offers nothing. If it's a group of subcommands, add \
                  (\"{group}\", <its help's USAGE constant>) to complete.rs's modules(), as the others are; \
-                 if it reads its words its own way, as `schedule` does, give it its own case in complete()."
+                 if it reads its words its own way, as `scheduler add` does, give it its own case in complete()."
             );
         }
     }
@@ -1042,9 +1057,11 @@ mod tests {
         assert!(moves.options.iter().any(|o| o.name == "--before") && moves.options.iter().any(|o| o.name == "--last"));
         let uses = commands(crate::packs::cmd::USAGE).into_iter().find(|c| c.word == "use").unwrap();
         assert_eq!(uses.positionals, [vec!["NAME".to_owned(), "none".to_owned()]]);
-        let when: Vec<String> = alternatives(crate::scheduler::USAGE, "WHEN").into_iter().map(|o| o.name).collect();
-        // `--cron-local`'s summary runs onto a second line; `--once` after it is still read.
-        assert_eq!(when, ["--every", "--cron", "--cron-local", "--once"]);
+        // A placeholder's alternatives, as a help page lists them; one whose summary runs onto a
+        // second line doesn't end the list.
+        let usage = "usage: x\n\nWHEN is exactly one of:\n  --every DURATION   e.g. 2h\n  --cron-local \"EXPR\" local time:\n                     9am stays 9am\n  --once TIME        a time\n";
+        let when: Vec<String> = alternatives(usage, "WHEN").into_iter().map(|o| o.name).collect();
+        assert_eq!(when, ["--every", "--cron-local", "--once"]);
     }
 
     #[tokio::test]
@@ -1078,26 +1095,29 @@ mod tests {
 
     #[tokio::test]
     async fn a_schedule_completes_when_then_its_options_then_the_command() {
-        assert_eq!(words("schedule ").await, ["daily", "weekdays", "weekends", "every", "once", "cron", "cron-local"]);
-        assert_eq!(words("schedule w").await, ["weekdays", "weekends"]);
-        assert!(words("schedule daily ").await.is_empty(), "a time is typed, not picked");
-        assert!(words("schedule once 2026-10-20 ").await.is_empty(), "the time still to come");
-        assert_eq!(words("schedule daily 09:00 ").await, ["records", "workspaces"], "only what can be scheduled");
-        assert_eq!(words("schedule daily 09:00 --").await, ["--catch-up", "--lane"]);
-        assert_eq!(words("schedule every 1d --catch-up ").await, ["skip", "run-once", "backfill"]);
-        assert_eq!(words("schedule every 1d --lane ").await, ["default"]);
         assert_eq!(
-            words("schedule every 1d --catch-up skip --lane default wor").await,
+            words("scheduler add ").await,
+            ["daily", "weekdays", "weekends", "every", "once", "cron", "cron-local"]
+        );
+        assert_eq!(words("scheduler add w").await, ["weekdays", "weekends"]);
+        assert!(words("scheduler add daily ").await.is_empty(), "a time is typed, not picked");
+        assert!(words("scheduler add once 2026-10-20 ").await.is_empty(), "the time still to come");
+        assert_eq!(words("scheduler add daily 09:00 ").await, ["records", "workspaces"], "only what can be scheduled");
+        assert_eq!(words("scheduler add daily 09:00 --").await, ["--catch-up", "--lane"]);
+        assert_eq!(words("scheduler add every 1d --catch-up ").await, ["skip", "run-once", "backfill"]);
+        assert_eq!(words("scheduler add every 1d --lane ").await, ["default"]);
+        assert_eq!(
+            words("scheduler add every 1d --catch-up skip --lane default wor").await,
             ["workspaces"],
             "the options' values aren't taken for the command"
         );
-        assert_eq!(words("schedule daily 09:00 workspaces ").await, ["activate", "cleanup", "stop"]);
-        assert_eq!(words("schedule daily 09:00 records re").await, ["reopen", "remove", "restore"]);
-        assert_eq!(words("schedule daily 09:00 workspaces activate ").await, ["site"]);
-        assert_eq!(words("schedule daily 09:00 records complete lc/").await, ["lc/two-sum"]);
-        let options = words("schedule daily 09:00 workspaces activate site --").await;
+        assert_eq!(words("scheduler add daily 09:00 workspaces ").await, ["activate", "cleanup", "stop"]);
+        assert_eq!(words("scheduler add daily 09:00 records re").await, ["reopen", "remove", "restore"]);
+        assert_eq!(words("scheduler add daily 09:00 workspaces activate ").await, ["site"]);
+        assert_eq!(words("scheduler add daily 09:00 records complete lc/").await, ["lc/two-sum"]);
+        let options = words("scheduler add daily 09:00 workspaces activate site --").await;
         assert!(!options.contains(&"--wait".to_owned()) && !options.contains(&"--first".to_owned()), "{options:?}");
-        assert!(words("schedule daily 09:00 records list ").await.is_empty(), "list can't be scheduled");
+        assert!(words("scheduler add daily 09:00 records list ").await.is_empty(), "list can't be scheduled");
     }
 
     #[tokio::test]
@@ -1110,10 +1130,10 @@ mod tests {
         let got = |groups: Vec<Group>| -> Vec<String> {
             groups.into_iter().flat_map(|g| g.candidates).map(|c| c.word).collect()
         };
-        let offered = got(complete(&at("schedule daily 09:00 "), &cx, &mut daemon()).await);
+        let offered = got(complete(&at("scheduler add daily 09:00 "), &cx, &mut daemon()).await);
         assert!(offered.contains(&"wgo".to_owned()), "workspaces activate's alias: {offered:?}");
         assert!(!offered.contains(&"wst".to_owned()), "workspaces status can't be scheduled");
-        assert_eq!(got(complete(&at("schedule daily 09:00 wgo "), &cx, &mut daemon()).await), ["site"]);
+        assert_eq!(got(complete(&at("scheduler add daily 09:00 wgo "), &cx, &mut daemon()).await), ["site"]);
     }
 
     #[tokio::test]
@@ -1124,7 +1144,9 @@ mod tests {
         assert_eq!(words("records complete lc/").await, ["lc/two-sum"]);
         assert_eq!(words("records new jobs --from ").await, ["leetcode"]);
         assert_eq!(words("records templates ").await, ["practice"]);
-        assert_eq!(words("scheduler pause ").await, ["VWXYZ0"], "the short ending lists show, not the whole id");
+        assert_eq!(words("scheduler remove ").await, ["VWXYZ0"], "the short ending lists show, not the whole id");
+        let pause = words("scheduler pause ").await;
+        assert!(pause.contains(&"VWXYZ0".to_owned()) && pause.contains(&"notify.flush".to_owned()), "{pause:?}");
         assert_eq!(words("call ").await, ["core.ping"]);
         assert!(words("packs use ").await.contains(&"none".to_owned()));
         assert!(words("packs use ").await.contains(&"short".to_owned()));
@@ -1141,8 +1163,8 @@ mod tests {
         assert_eq!(words("records list lc --sort ").await, ["title", "difficulty", "time_min"]);
         assert_eq!(words("records export lc --format ").await, ["csv", "json"]);
         assert!(words("records export lc --").await.contains(&"--status".to_owned()), "list's options too");
-        assert_eq!(words("scheduler add core.ping --every 1d --catch-up ").await, ["skip", "run-once", "backfill"]);
-        assert!(words("scheduler add core.ping --").await.contains(&"--every".to_owned()));
+        assert_eq!(words("scheduler add every 1d --catch-up ").await, ["skip", "run-once", "backfill"]);
+        assert!(words("scheduler add every 1d --").await.contains(&"--catch-up".to_owned()));
         assert_eq!(words("workspaces activate site --w").await, ["--wait"]);
         assert_eq!(words("queue list --lane ").await, ["default"]);
     }
