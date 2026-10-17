@@ -40,7 +40,7 @@ impl Source for Rss {
         // (it never follows a `next_cursor` this impl never returns), but guard it anyway
         // rather than silently re-fetching if that assumption ever changes elsewhere.
         if cursor.is_some() {
-            return Ok(Page { items: Vec::new(), next_cursor: None });
+            return Ok(Page::default());
         }
 
         let resp = http::require_ok(http::get(ctx, &self.url).await?, &self.url)?;
@@ -95,7 +95,7 @@ impl Source for Rss {
             })
             .collect();
 
-        Ok(Page { items, next_cursor: None })
+        Ok(Page { items, ..Page::default() })
     }
 }
 

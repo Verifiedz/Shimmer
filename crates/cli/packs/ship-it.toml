@@ -68,6 +68,6 @@ label = "Ship It"
 # fetchers (ADR 0028, ADR 0029)
 "sources"        = "fetchers.list"
 "crawler-status" = "fetchers.status"
-"dry-run"        = "fetchers.test"
+"smoke-test"     = "fetchers.test"
 "poll"           = "fetchers.fetch"
-"inbox"          = "fetchers.items"
+"feed"           = "fetchers.items"

@@ -97,6 +97,7 @@ impl Source for HnWhoIsHiring {
         let seen = crate::dedup::load(ctx, self.id())?;
 
         let mut items = Vec::new();
+        let mut examined_only = Vec::new();
         let mut idx = offset.min(kids.len());
         let mut examined = 0usize;
         while idx < kids.len() && examined < PAGE_SIZE {
@@ -109,11 +110,22 @@ impl Source for HnWhoIsHiring {
                 continue; // already seen -- no HTTP call, and doesn't use up this page's budget
             }
             examined += 1;
-            let Some(comment) = item(ctx, kid).await? else { continue }; // purged, same as deleted
+            // A kid that is examined and yields nothing (purged, deleted, dead, or text-less)
+            // is reported as `examined` so the orchestration marks it seen (#126's review,
+            // B6). Without that it was re-downloaded on every single run, forever, and ate
+            // into this page's budget each time as the thread aged.
+            let Some(comment) = item(ctx, kid).await? else {
+                examined_only.push(kid.to_string());
+                continue;
+            };
             if comment.deleted || comment.dead {
+                examined_only.push(comment.id.to_string());
                 continue;
             }
-            let Some(text) = comment.text else { continue };
+            let Some(text) = comment.text else {
+                examined_only.push(comment.id.to_string());
+                continue;
+            };
             items.push(RawItem {
                 source_id: comment.id.to_string(),
                 title: summarize(&text),
@@ -122,7 +134,7 @@ impl Source for HnWhoIsHiring {
             });
         }
         let next_cursor = (idx < kids.len()).then(|| format!("{thread_id}:{idx}"));
-        Ok(Page { items, next_cursor })
+        Ok(Page { items, next_cursor, examined_only })
     }
 }
 
@@ -177,8 +189,15 @@ fn parse_cursor(c: &str) -> Result<(u64, usize)> {
 /// of the `<p>` paragraph breaks the API's text field uses in place of real markup,
 /// truncated to a sane length.
 fn summarize(text: &str) -> String {
-    let unescaped = text.replace("<p>", "\n").replace("&amp;", "&").replace("&gt;", ">").replace("&lt;", "<");
-    let first_line = unescaped.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    // HN's `text` is HTML: `<p>` for paragraph breaks, real tags like `<a href=...>`, and every
+    // entity form (`&amp;`, `&#x27;`, `&quot;`, `&#x2F;`). Hand-decoding four of them left
+    // `&#x27;Remote&#x27;` in titles, which is both ugly and defeats the title filter, since
+    // `--contains remote` no longer matches the stored text (#126's review, B15). `scraper` is
+    // already a dependency, so parse it as the HTML it is and take the text.
+    let with_breaks = text.replace("<p>", "\n");
+    let fragment = scraper::Html::parse_fragment(&with_breaks);
+    let decoded: String = fragment.root_element().text().collect();
+    let first_line = decoded.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
     let truncated: String = first_line.chars().take(120).collect();
     if truncated.is_empty() {
         "(untitled)".to_owned()
@@ -296,6 +315,35 @@ mod tests {
         let err = HnWhoIsHiring.fetch_page(&env.ctx, None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::ModuleError);
         assert!(err.message.starts_with("parse_empty:"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn a_comment_fetched_and_found_empty_is_reported_so_it_is_never_fetched_again() {
+        // #126's review, B6: a deleted/dead/text-less comment was downloaded, dropped, and
+        // never marked seen -- so it was downloaded again on every single run, forever, eating
+        // into the page's budget each time as the thread aged.
+        let env = TestEnv::new("fetchers");
+        stub_full_thread(&env);
+
+        let page = HnWhoIsHiring.fetch_page(&env.ctx, None).await.unwrap();
+        assert!(
+            page.examined_only.contains(&"45000011".to_string()),
+            "the deleted comment must be reported as examined: {:?}",
+            page.examined_only
+        );
+        // And it is not smuggled in as an item.
+        assert!(page.items.iter().all(|i| i.source_id != "45000011"));
+    }
+
+    #[test]
+    fn summarize_decodes_every_entity_form_and_drops_tags() {
+        // #126's review, B15: only &amp; &gt; &lt; and <p> were handled, so HN titles kept
+        // `&#x27;`, `&quot;`, `&#x2F;` and raw <a href=...> markup -- ugly, and it broke the
+        // title filter, since `--contains remote` no longer matched `&#x27;Remote&#x27;`.
+        assert_eq!(summarize("<p>&#x27;Remote&#x27; Rust role"), "'Remote' Rust role");
+        assert_eq!(summarize("<p>Acme &amp; Co &quot;hiring&quot;"), "Acme & Co \"hiring\"");
+        assert_eq!(summarize("<p>Backend&#x2F;Infra"), "Backend/Infra");
+        assert_eq!(summarize("<p>See <a href=\"https://x.test\">our site</a> now"), "See our site now");
     }
 
     #[test]

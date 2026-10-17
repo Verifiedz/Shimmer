@@ -35,16 +35,6 @@ pub fn select_one<'a>(scope: ElementRef<'a>, selector: &str) -> Result<Option<El
     Ok(scope.select(&parsed).next())
 }
 
-/// Every element matching `selector` within `scope`, empty if none matched -- for a listing
-/// container that legitimately has nothing in it (the page past the last one of a paginated
-/// site), where zero results is the end of pagination, not a structure change. Pair with
-/// [`select_or_fail`] on the container itself first, so a genuinely broken page still fails.
-pub fn select_all<'a>(scope: ElementRef<'a>, selector: &str) -> Result<Vec<ElementRef<'a>>> {
-    let parsed =
-        Selector::parse(selector).map_err(|e| Error::internal(format!("invalid selector '{selector}': {e:?}")))?;
-    Ok(scope.select(&parsed).collect())
-}
-
 /// [`select_one`]'s matched element's text, trimmed; `None` if nothing matched or its text
 /// was empty (never a distinction a caller needs to make between the two).
 pub fn text_of(scope: ElementRef<'_>, selector: &str) -> Result<Option<String>> {
@@ -87,21 +77,6 @@ mod tests {
         let doc = parse(PAGE.as_bytes());
         let job = select_or_fail(&doc, "div.job", "jobs").unwrap()[0];
         assert_eq!(text_of(job, "span.salary-that-does-not-exist").unwrap(), None);
-    }
-
-    #[test]
-    fn select_all_returns_every_match_within_a_scope() {
-        let doc = parse(PAGE.as_bytes());
-        let list = select_or_fail(&doc, "body", "body").unwrap()[0];
-        let jobs = select_all(list, "div.job").unwrap();
-        assert_eq!(jobs.len(), 2);
-    }
-
-    #[test]
-    fn select_all_is_empty_rather_than_erroring_when_nothing_matches() {
-        let doc = parse(PAGE.as_bytes());
-        let list = select_or_fail(&doc, "body", "body").unwrap()[0];
-        assert_eq!(select_all(list, "div.no-such-listing").unwrap(), Vec::new());
     }
 
     #[test]

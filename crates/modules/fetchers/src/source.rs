@@ -38,11 +38,79 @@ pub struct RawItem {
     pub raw_data: Value,
 }
 
-#[derive(Debug)]
+/// Longest title and url kept. A title is already a short summary everywhere it is built; a
+/// url past ~2 KiB is past what servers and browsers accept anyway.
+const MAX_TITLE_CHARS: usize = 500;
+const MAX_URL_CHARS: usize = 2048;
+
+impl RawItem {
+    /// Everything a `Source` returns is **untrusted remote input** on its way into the event
+    /// log, and from there into automations, `notify` and `records` (#126's review, §4 and
+    /// B7/B8). One gate, here, so it covers every source that exists and every one added
+    /// later, rather than each `Source` impl having to remember:
+    ///
+    /// - A `url` that isn't `http`/`https` drops the whole item. `javascript:alert(...)` as an
+    ///   item url was reaching events, and whatever eventually opens a url (a browser step, a
+    ///   rule) trusts it.
+    /// - Control characters are stripped from the title, the url, and every string inside
+    ///   `raw_data`. A title carrying `ESC]0;pwned BEL ESC[2J` reached events raw, and while
+    ///   `fetchers`' own CLI strips them, `render::cell` and `notify`'s own line rendering do
+    ///   not -- so a rule doing `notify.send` with `{title}` put remote escape sequences on
+    ///   the user's terminal.
+    /// - Title and url are length-capped, so one pathological page can't push a single item
+    ///   past anything downstream expects.
+    pub fn sanitized(mut self) -> Option<Self> {
+        let url = strip_control(&self.url);
+        if !matches!(url::Url::parse(&url), Ok(u) if u.scheme() == "http" || u.scheme() == "https") {
+            return None;
+        }
+        self.url = truncate(&url, MAX_URL_CHARS);
+        self.title = truncate(&strip_control(&self.title), MAX_TITLE_CHARS);
+        self.raw_data = strip_control_in(&self.raw_data);
+        Some(self)
+    }
+}
+
+/// Drops control characters (C0, DEL and C1) while keeping every printable character,
+/// including non-ASCII ones -- a title in Japanese or with an em dash must survive untouched.
+/// Tab and newline go too: these are single-line fields in a table, an event payload and a
+/// notification body.
+fn strip_control(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control() && !matches!(c, '\u{7f}'..='\u{9f}')).collect()
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_owned()
+    } else {
+        s.chars().take(max).collect()
+    }
+}
+
+/// [`strip_control`] applied to every string anywhere inside a `raw_data` value, keys included
+/// -- a key is as able to carry an escape sequence as a value, and both end up rendered.
+fn strip_control_in(v: &Value) -> Value {
+    match v {
+        Value::String(s) => Value::String(strip_control(s)),
+        Value::Array(items) => Value::Array(items.iter().map(strip_control_in).collect()),
+        Value::Object(fields) => {
+            Value::Object(fields.iter().map(|(k, v)| (strip_control(k), strip_control_in(v))).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+#[derive(Debug, Default)]
 pub struct Page {
     pub items: Vec<RawItem>,
     /// `None` means there is nothing more to page through.
     pub next_cursor: Option<String>,
+    /// Ids this page actually fetched and then had nothing to show for -- a deleted, dead or
+    /// text-less HN comment, say. The orchestration marks them seen exactly like a kept item
+    /// (#126's review, B6), so they are never re-fetched; without this they were downloaded
+    /// again on every run, forever, each time eating into the page's own budget. A `Source`
+    /// with nothing to report here just leaves it empty.
+    pub examined_only: Vec<String>,
 }
 
 #[async_trait]
@@ -157,10 +225,65 @@ pub fn known(ctx: &Ctx) -> Result<Vec<std::sync::Arc<dyn Source>>> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
     use shimmer_core::testing::TestEnv;
     use shimmer_core::ModuleConfig;
 
     use super::*;
+
+    fn item(title: &str, url: &str, raw: Value) -> RawItem {
+        RawItem { source_id: "1".into(), title: title.into(), url: url.into(), raw_data: raw }
+    }
+
+    #[test]
+    fn a_non_http_url_drops_the_whole_item() {
+        // #126's review, B7: `javascript:alert(document.cookie)` reached events as an item url,
+        // and whatever eventually opens a url trusts it.
+        for url in [
+            "javascript:alert(document.cookie)",
+            "data:text/html,<script>x</script>",
+            "file:///etc/passwd",
+            "",
+            "not a url",
+        ] {
+            assert!(item("Job", url, json!({})).sanitized().is_none(), "should be dropped: {url}");
+        }
+        for url in ["http://example.test/a", "https://example.test/a?b=c#d"] {
+            assert!(item("Job", url, json!({})).sanitized().is_some(), "should be kept: {url}");
+        }
+    }
+
+    #[test]
+    fn control_characters_never_reach_an_event_from_a_title_or_raw_data() {
+        // #126's review, B8: a title of "\x1b]0;pwned\x07\x1b[2JJob" reached events raw, and
+        // `render::cell` and notify's own rendering print it as-is -- so a rule doing
+        // notify.send with {title} put escape sequences on the user's terminal.
+        let hostile = "\u{1b}]0;pwned\u{7}\u{1b}[2JJob";
+        let clean = item(hostile, "https://example.test/a", json!({"snippet": hostile, "nested": {"x": [hostile]}}))
+            .sanitized()
+            .unwrap();
+        assert_eq!(clean.title, "]0;pwned[2JJob", "printable text stays, control bytes go");
+        assert!(!clean.title.contains('\u{1b}') && !clean.title.contains('\u{7}'));
+        assert!(!clean.raw_data.to_string().contains('\u{1b}'), "raw_data too: {}", clean.raw_data);
+        assert!(!clean.raw_data["nested"]["x"][0].as_str().unwrap().contains('\u{1b}'), "at any depth");
+    }
+
+    #[test]
+    fn ordinary_non_ascii_text_survives_sanitising_untouched() {
+        let kept = item("Rust エンジニア — Remote", "https://example.test/a", json!({})).sanitized().unwrap();
+        assert_eq!(kept.title, "Rust エンジニア — Remote");
+    }
+
+    #[test]
+    fn a_pathological_title_or_url_is_length_capped() {
+        let long_title = "x".repeat(MAX_TITLE_CHARS + 500);
+        let capped = item(&long_title, "https://example.test/a", json!({})).sanitized().unwrap();
+        assert_eq!(capped.title.chars().count(), MAX_TITLE_CHARS);
+
+        let long_url = format!("https://example.test/{}", "a".repeat(MAX_URL_CHARS + 500));
+        let capped = item("Job", &long_url, json!({})).sanitized().unwrap();
+        assert_eq!(capped.url.chars().count(), MAX_URL_CHARS);
+    }
 
     #[test]
     fn the_registry_has_every_reference_source_and_only_known_ids_resolve() {
