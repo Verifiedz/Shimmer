@@ -104,7 +104,7 @@ async fn run_daemon() -> ExitCode {
         Ok(d) => d,
         // Refused because one already runs. A lock held by a daemon that doesn't answer is still a
         // real failure (below), so a login service retries it.
-        Err(e) if e.code == ErrorCode::Conflict && std::os::unix::net::UnixStream::connect(&socket).is_ok() => {
+        Err(e) if e.code == ErrorCode::Conflict && answers_soon(&socket).await => {
             eprintln!("shimmer: already running: a daemon answers on {} ({e})", socket.display());
             return already_running();
         }
@@ -123,15 +123,39 @@ async fn run_daemon() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// How long a daemon that holds the lock may take to start answering. It takes the lock first,
+/// then recovers transactions, opens the index and starts modules, and only then binds the
+/// socket: one starting up at login while a command starts another must not look dead (#241's
+/// review), or the login service restarts it in a loop.
+const STARTING_UP: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether a daemon answers on `socket` within [`STARTING_UP`].
+async fn answers_soon(socket: &Path) -> bool {
+    let deadline = tokio::time::Instant::now() + STARTING_UP;
+    loop {
+        if tokio::net::UnixStream::connect(socket).await.is_ok() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 /// [`ALREADY_RUNNING`], or success when launchd started this daemon: launchd can't be told that
 /// an exit status means success, so any other would be restarted (ADR 0034 §3, §5). launchd names
-/// the job in `XPC_SERVICE_NAME`; a terminal on macOS sets it to `0`.
+/// the job in `XPC_SERVICE_NAME`; only our own LaunchAgent's label counts, since terminals set it
+/// too (Terminal.app to `0`, iTerm2 and VS Code to their own, #241's review).
 fn already_running() -> ExitCode {
     match std::env::var("XPC_SERVICE_NAME") {
-        Ok(job) if !job.is_empty() && job != "0" => ExitCode::SUCCESS,
+        Ok(job) if job == LAUNCH_AGENT => ExitCode::SUCCESS,
         _ => ExitCode::from(ALREADY_RUNNING),
     }
 }
+
+/// The LaunchAgent's label, as `shimmer startup on` writes it (ADR 0034 §3).
+const LAUNCH_AGENT: &str = "io.github.verifiedz.shimmer";
 
 async fn run_mockd(args: Vec<String>) -> ExitCode {
     let options = match shimmer_mockd::Command::parse(args) {

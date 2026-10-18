@@ -44,8 +44,11 @@ fn a_second_daemon_exits_already_running() {
     // launchd can't be told 3 means success, so under it that's 0; a macOS terminal's `0` isn't it.
     let o = daemon(&home, &[("XPC_SERVICE_NAME", "io.github.verifiedz.shimmer")]);
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
-    let o = daemon(&home, &[("XPC_SERVICE_NAME", "0")]);
-    assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
+    // Terminals set it too: Terminal.app to `0`, iTerm2 and VS Code to their own (#241's review).
+    for terminal in ["0", "application.com.googlecode.iterm2.12345.67890"] {
+        let o = daemon(&home, &[("XPC_SERVICE_NAME", terminal)]);
+        assert_eq!(o.status.code(), Some(3), "{terminal}: {}", stderr(&o));
+    }
 
     // The first daemon is untouched.
     ok(&home, &["ping"]);
@@ -63,4 +66,28 @@ fn a_lock_nobody_answers_for_is_still_a_failure() {
     let o = daemon(&home, &[]);
     assert_eq!(o.status.code(), Some(1), "retried by a login service: {}", stderr(&o));
     assert!(stderr(&o).contains("another daemon already owns"), "{}", stderr(&o));
+}
+
+/// A daemon holds the lock before it answers (it recovers and opens its index first): one still
+/// starting up is waited for, not taken for dead (#241's review).
+#[test]
+fn a_daemon_still_starting_up_counts_as_running() {
+    let home = Home::new();
+    let dir = home.dir.path().join("home");
+    std::fs::create_dir_all(&dir).unwrap();
+    let lock = std::fs::File::create(dir.join(".daemon.lock")).unwrap();
+    lock.try_lock().unwrap();
+    // It starts answering a second later, as a daemon finishing its start-up would.
+    let socket = home.socket();
+    let listener = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(1));
+        let l = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::thread::sleep(Duration::from_secs(8));
+        drop(l);
+    });
+
+    let o = daemon(&home, &[]);
+    assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
+    drop(lock);
+    let _ = listener;
 }
