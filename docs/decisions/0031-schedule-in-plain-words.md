@@ -157,6 +157,19 @@ prefix can rarely tell them apart. Its last sixteen characters are random.
 - **The CLI shows the same short ending** (the last six characters, more if needed to be unique
   among what it lists), so what you see is what you type.
 
+**Amendment (ADR 0032, from #246's review): the rule lives in `core`, and notify uses it too.**
+Notify's message ids are ULIDs as well, and `shimmer notify` first resolved endings in the CLI,
+with no minimum length (`notify remove 5` removed a message). Notify is a module, and modules can't
+use daemon code, so the matching moves unchanged from `crates/daemon/src/short_id.rs` to
+`crates/core/src/short_id.rs` (`core::short_id`). The queue, the scheduler and notify all call it,
+so there is one rule: a whole id at any length; an ending of at least 4 characters (shorter is
+`invalid_params`, so a stray keystroke can't remove or cancel anything); several matches are
+`conflict`, none `not_found`. It adds `ending()`, the shortest ending a list should show (the last
+six characters, more where another id ends the same way), worked out against every id that will
+be resolved, not only the page shown. Resolution still happens in the daemon or a module, never in
+a client, as this section intended. A purely additive `core` change: needs Dev A's and Dev B's
+sign-off (CLAUDE.md §4).
+
 ### 5. `--catch-up`, in plain words (CLI)
 
 It stays required: a guessed default is how duplicate runs happen (§6.3). At a terminal, leaving it

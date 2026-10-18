@@ -20,6 +20,9 @@ pub struct Config {
     pub local_timezone: LocalTimezone,
     /// `[http]` (ADR 0027): the real gateway's rate limits, cache and timeout.
     pub http: HttpConfig,
+    /// `[desktop] show = false` (ADR 0032 §2): log desktop notes instead of showing them, for
+    /// machines with no screen and for tests.
+    pub hide_desktop: bool,
 }
 
 impl Config {
@@ -89,6 +92,23 @@ impl Config {
         }
         if let Some(http) = root.get("http") {
             cfg.http = parse_http(http)?;
+        }
+        if let Some(desktop) = root.get("desktop") {
+            let table =
+                desktop.as_table().ok_or_else(|| Error::invalid_params("config.toml: [desktop] must be a table"))?;
+            for (key, v) in table {
+                match (key.as_str(), v.as_bool()) {
+                    ("show", Some(show)) => cfg.hide_desktop = !show,
+                    ("show", None) => {
+                        return Err(Error::invalid_params("config.toml: desktop.show must be true or false"))
+                    }
+                    (other, _) => {
+                        return Err(Error::invalid_params(format!(
+                            "config.toml: desktop.{other} isn't a setting (only show)"
+                        )))
+                    }
+                }
+            }
         }
         Ok(cfg)
     }
@@ -239,6 +259,14 @@ fn general_table_header_end(existing: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_notes_can_be_logged_instead_of_shown() {
+        assert!(!Config::parse("").unwrap().hide_desktop, "shown by default");
+        assert!(Config::parse("[desktop]\nshow = false\n").unwrap().hide_desktop);
+        assert!(Config::parse("[desktop]\nshow = \"no\"\n").unwrap_err().message.contains("true or false"));
+        assert!(Config::parse("[desktop]\nsound = true\n").unwrap_err().message.contains("only show"));
+    }
 
     #[test]
     fn parses_lanes_and_module_sections() {

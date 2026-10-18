@@ -8,8 +8,8 @@ pub mod paths;
 pub mod topic;
 
 pub use frame::{
-    decode_client, decode_server, encode, ClientFrame, ManifestData, ModuleInfo, PingData, QueueControl, QueuePriority,
-    QueuedHandle, ServerFrame,
+    decode_client, decode_server, encode, ClientFrame, EventsListData, ManifestData, ModuleInfo, PingData,
+    QueueControl, QueuePriority, QueuedHandle, ServerFrame,
 };
 pub use topic::{is_valid_pattern, topic_matches};
 
@@ -31,6 +31,7 @@ pub mod ops {
     pub const QUEUE_TASK: &str = "queue.task";
     pub const QUEUE_CANCEL: &str = "queue.cancel";
     pub const QUEUE_REORDER: &str = "queue.reorder";
+    pub const EVENTS_LIST: &str = "core.events.list";
 }
 
 /// Topics the daemon itself defines.

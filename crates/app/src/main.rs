@@ -91,8 +91,11 @@ fn init_daemon_logging(home: &Path) -> Option<WorkerGuard> {
 
 async fn run_daemon() -> ExitCode {
     // Every module the daemon runs. A new module is one more line here.
-    let modules: Vec<Arc<dyn Module>> =
-        vec![Arc::new(shimmer_records::Records::default()), Arc::new(shimmer_workspaces::Workspaces::default())];
+    let modules: Vec<Arc<dyn Module>> = vec![
+        Arc::new(shimmer_records::Records::default()),
+        Arc::new(shimmer_workspaces::Workspaces::default()),
+        Arc::new(shimmer_notify::Notify::default()),
+    ];
     let daemon = match Daemon::start(DaemonConfig::from_env(), modules).await {
         Ok(d) => d,
         Err(e) => {
