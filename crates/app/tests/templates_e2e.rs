@@ -853,17 +853,8 @@ fn triggers(sb: &Sandbox) -> Vec<serde_json::Value> {
 fn rename_moves_the_workspace_and_only_with_a_yes_its_schedules() {
     let sb = Sandbox::new();
     sb.create("smoke", "smoke-test", &[]);
-    sb.ok(&[
-        "scheduler",
-        "add",
-        "workspaces.activate",
-        r#"{"id":"smoke"}"#,
-        "--cron",
-        "0 9 * * 1-5",
-        "--catch-up",
-        "skip",
-    ]);
-    sb.ok(&["scheduler", "add", "workspaces.stop", r#"{"id":"smoke"}"#, "--every", "1d", "--catch-up", "skip"]);
+    sb.ok(&["scheduler", "add", "cron", "0 9 * * 1-5", "--catch-up", "skip", "workspaces", "activate", "smoke"]);
+    sb.ok(&["scheduler", "add", "every", "1d", "--catch-up", "skip", "workspaces", "stop", "smoke"]);
     let paused = triggers(&sb).into_iter().find(|t| t["op"] == "workspaces.stop").unwrap();
     sb.ok(&["scheduler", "pause", paused["id"].as_str().unwrap()]);
 

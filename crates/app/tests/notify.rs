@@ -122,10 +122,13 @@ fn the_notify_commands() {
 #[test]
 fn a_reminder_can_be_scheduled() {
     let home = Home::new();
-    let out = common::ok(&home, &["schedule", "every", "1h", "--catch-up", "skip", "notify", "send", "Stretch break"]);
+    let out = common::ok(
+        &home,
+        &["scheduler", "add", "every", "1h", "--catch-up", "skip", "notify", "send", "Stretch break"],
+    );
     assert!(out.starts_with("✓ scheduled notify send 'Stretch break'"), "{out}");
     let list = common::ok(&home, &["scheduler", "list"]);
     assert!(list.contains("notify send 'Stretch break'"), "{list}");
-    let refused = common::fails(&home, &["schedule", "every", "1h", "--catch-up", "skip", "notify", "list"]);
+    let refused = common::fails(&home, &["scheduler", "add", "every", "1h", "--catch-up", "skip", "notify", "list"]);
     assert!(refused.contains("only notify send can"), "{refused}");
 }
