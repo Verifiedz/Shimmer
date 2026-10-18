@@ -177,3 +177,21 @@ impl Drop for StateDir {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+
+/// A launch the daemon never finished (it was killed mid-step): on the next start workspaces marks
+/// it dirty with `recovered` (ADR 0032 §4), and the built-in rule says so, from a real event, not a
+/// hand-made one (#238's and #255's reviews).
+#[test]
+fn a_workspace_left_half_launched_by_a_crash_is_reported() {
+    let home = home();
+    let _state = StateDir::of(&home, "site");
+    ok(&home, &["workspaces", "new", "site", "--from", "smoke-test"]);
+    ok(&home, &["shutdown"]);
+    // What a daemon killed during step 1 of 3 leaves behind.
+    let state = home.dir.path().join("home/data/workspaces/site/state.toml");
+    std::fs::write(&state, "state = \"launching\"\nstep = { index = 1, count = 3, name = \"check\" }\n").unwrap();
+
+    ok(&home, &["ping"]); // the next command starts the daemon, which finds it
+    let m = message(&home, "site was left half-launched");
+    assert_eq!(m["source"], "automation:workspace-half-launched");
+}

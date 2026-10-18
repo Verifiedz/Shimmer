@@ -458,7 +458,6 @@ fn plural<'a>(n: u64, one: &'a str, many: &'a str) -> &'a str {
 
 fn from(source: &str) -> &str {
     match source.split(':').next().unwrap_or(source) {
-        "alert" => "alert",
         "automation" => "automation",
         "schedule" => "schedule",
         "fallback" => "fallback",
@@ -805,7 +804,7 @@ mod tests {
         let now: DateTime<Utc> = "2026-10-16T14:02:00Z".parse().unwrap();
         let data = json!({
             "items": [
-                msg("01JD2T00000000000000000A3F", "site couldn't launch", "Step 2/5 install failed. Log: logs/site-01JD2T.log and some more words to cut", false, "high", "alert:workspace_dirty", "failed"),
+                msg("01JD2T00000000000000000A3F", "site couldn't launch", "Step 2/5 install failed. Log: logs/site-01JD2T.log and some more words to cut", false, "high", "automation:workspace-dirty", "failed"),
                 msg("01JD2T00000000000000000B81", "Standup", "", true, "normal", "schedule", "delivered"),
             ],
             "counts": {"total": 2, "unread": 1, "held": 0, "failed": 1},
@@ -813,7 +812,7 @@ mod tests {
         let out = list(&data, false, now);
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines[0].contains("ID") && lines[0].contains("MESSAGE"), "{out}");
-        assert!(lines[1].starts_with("●!") && lines[1].contains("2m ago") && lines[1].contains("alert"), "{out}");
+        assert!(lines[1].starts_with("●!") && lines[1].contains("2m ago") && lines[1].contains("automation"), "{out}");
         assert!(
             lines[1].contains("site couldn't launch — Step 2/5")
                 && lines[1].contains('…')

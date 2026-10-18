@@ -6,7 +6,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{ok, Home};
+use common::{fails, ok, Home};
 use serde_json::Value;
 
 const JOBS: &str = r#"

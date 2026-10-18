@@ -43,6 +43,12 @@ pub struct File {
     pub quiet: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause: Option<Pause>,
+    /// Notify's own `[builtin_alerts]`, from before they became automations' built-in rules (ADR
+    /// 0035 §10). Read and ignored, dropped on the next write: a file that has it still gives its
+    /// cap, quiet hours and pause, rather than failing to read and falling back to defaults
+    /// (#256's review). Switch the rules with `shimmer automations disable` now.
+    #[serde(default, rename = "builtin_alerts", skip_serializing)]
+    pub _retired_builtin_alerts: Option<toml::Value>,
 }
 
 /// The settings in force.
@@ -138,5 +144,17 @@ mod tests {
         assert!(editable(Some("[quiet]\nfri = \"x\"\n")).unwrap_err().contains("quiet.fri"));
         let file = editable(Some("cap = 300\n")).unwrap();
         assert_eq!(encode(&file), "cap = 300\n");
+    }
+
+    /// A settings file from before the built-in alerts moved to automations still reads: its
+    /// `[builtin_alerts]` is ignored, its cap kept, and it's dropped when the file is next written
+    /// (#256's review).
+    #[test]
+    fn an_old_builtin_alerts_table_never_resets_the_settings() {
+        let old = "cap = 500\n\n[builtin_alerts]\nworkspace_dirty = false\n";
+        let (s, problem) = read(Some(old));
+        assert_eq!((s.cap, problem), (500, None));
+        let file: File = toml::from_str(old).unwrap();
+        assert!(!encode(&file).contains("builtin_alerts"), "{}", encode(&file));
     }
 }
