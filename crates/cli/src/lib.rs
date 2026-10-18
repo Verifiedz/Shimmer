@@ -21,6 +21,7 @@ mod render;
 mod schedule;
 mod scheduler;
 mod schedules;
+mod startup;
 mod style;
 mod when;
 mod workspaces;
@@ -204,6 +205,7 @@ fn usage_for(args: &[String]) -> &'static str {
             "scheduler" => return scheduler::USAGE,
             "packs" => return packs::cmd::USAGE,
             "doctor" => return doctor::USAGE,
+            "startup" => return startup::USAGE,
             _ => return USAGE,
         }
     }
@@ -232,6 +234,19 @@ fn prints_data(cmd: &Command) -> bool {
     )
 }
 
+/// Once, the first time something that only runs while the daemon runs is made (ADR 0034 §7). Only
+/// to a person at a terminal: never with `--json`, and never into a script's output.
+fn nudge_startup(json: bool, what: &str) {
+    use std::io::IsTerminal as _;
+    if json || !std::io::stderr().is_terminal() {
+        return;
+    }
+    let os = startup::Env::from_process().os;
+    if let Some(note) = startup::nudge(packs::settings::path().as_deref(), os, what) {
+        eprintln!("{}", style::paint_err(style::Role::Hint, &note));
+    }
+}
+
 /// `help` is the top-level help: [`USAGE`], plus the active pack's aliases unless `--canonical`.
 async fn execute(args: &Args, help: String) -> Result<Option<String>> {
     match &args.command {
@@ -243,6 +258,8 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
         Command::DoctorHelp => return Ok(Some(doctor::USAGE.into())),
         // Packs live entirely in the client: no daemon needed.
         Command::Packs(cmd) => return packs::cmd::run(cmd, &packs::cmd::Env::from_process()).map(Some),
+        // The login service is the operating system's, not the daemon's (ADR 0034).
+        Command::Startup(cmd) => return startup::run(cmd, &startup::Env::from_process(), &mut startup::Real).map(Some),
         _ => {}
     }
     let Some(mut client) = connect(args).await? else { return Ok(None) };
@@ -254,7 +271,11 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
         return queue::run(&mut client, cmd, args.json).await.map(Some);
     }
     if let Command::Scheduler(cmd) = &args.command {
-        return scheduler::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
+        let out = scheduler::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await?;
+        if matches!(cmd, SchedulerCmd::Add(_)) {
+            nudge_startup(args.json, "schedules");
+        }
+        return Ok(Some(out));
     }
     if let Command::Workspaces(cmd) = &args.command {
         return workspaces::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
@@ -274,7 +295,8 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
         | Command::Workspaces(_)
         | Command::Queue(_)
         | Command::Scheduler(_)
-        | Command::Packs(_) => {
+        | Command::Packs(_)
+        | Command::Startup(_) => {
             unreachable!("handled above")
         }
     };
@@ -342,7 +364,8 @@ fn output(args: &Args, data: &Value) -> String {
         | Command::Workspaces(_)
         | Command::Queue(_)
         | Command::Scheduler(_)
-        | Command::Packs(_) => render::json(data),
+        | Command::Packs(_)
+        | Command::Startup(_) => render::json(data),
     }
 }
 
