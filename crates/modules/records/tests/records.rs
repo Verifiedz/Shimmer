@@ -206,7 +206,7 @@ async fn complete_marks_done_and_stamps_today_each_time() {
     let completed = topics(&env).iter().filter(|t| *t == "records.item.completed").count();
     assert_eq!(completed, 2);
 
-    let got = call(&r, &env, "records.get", target).await.unwrap();
+    let got = call(&r, &env, "records.show", target).await.unwrap();
     assert_eq!(got, item);
 }
 
@@ -235,7 +235,7 @@ async fn remove_deletes_the_file() {
     assert_eq!(call(&r, &env, "records.remove", target.clone()).await.unwrap(), json!({"removed": true}));
     assert!(file(&env, "items/leetcode/two-sum.toml").is_none());
     assert_eq!(topics(&env).last().unwrap(), "records.item.removed");
-    assert_eq!(call(&r, &env, "records.get", target).await.unwrap_err().code, ErrorCode::NotFound);
+    assert_eq!(call(&r, &env, "records.show", target).await.unwrap_err().code, ErrorCode::NotFound);
 }
 
 #[tokio::test]
@@ -297,7 +297,7 @@ async fn a_new_module_instance_sees_everything() {
 
     let restarted = Records::default();
     restarted.init(&env.ctx).await.unwrap();
-    let got = call(&restarted, &env, "records.get", json!({"collection": "leetcode", "id": "two-sum"})).await.unwrap();
+    let got = call(&restarted, &env, "records.show", json!({"collection": "leetcode", "id": "two-sum"})).await.unwrap();
     assert_eq!(got["status"], "done");
 }
 
@@ -811,8 +811,11 @@ async fn remove_moves_the_record_to_the_trash_and_says_what_went() {
 
     let list = call(&r, &env, "records.list", json!({"collection": "leetcode"})).await.unwrap();
     assert_eq!(list["total"], 0, "the trash isn't part of the collection");
-    let trash = call(&r, &env, "records.trash", json!({"collection": "leetcode"})).await.unwrap();
+    let trash = call(&r, &env, "records.list", json!({"collection": "leetcode", "removed": true})).await.unwrap();
     assert_eq!(trash["items"][0]["id"], "two-sum");
+    // `removed` is the whole trash (ADR 0038 §6); narrowing it is refused, not ignored.
+    let narrowed = json!({"collection": "leetcode", "removed": true, "filter": {"difficulty": "easy"}});
+    assert_eq!(call(&r, &env, "records.list", narrowed).await.unwrap_err().code, ErrorCode::InvalidParams);
 }
 
 #[tokio::test]
@@ -821,7 +824,7 @@ async fn restore_brings_it_back_exactly() {
     add_two_sum(&r, &env).await;
     call(&r, &env, "records.complete", json!({"collection": "leetcode", "id": "two-sum"})).await.unwrap();
     let target = json!({"collection": "leetcode", "id": "two-sum"});
-    let original = call(&r, &env, "records.get", target.clone()).await.unwrap();
+    let original = call(&r, &env, "records.show", target.clone()).await.unwrap();
     call(&r, &env, "records.remove", target.clone()).await.unwrap();
 
     let restored = call(&r, &env, "records.restore", target.clone()).await.unwrap();
@@ -976,7 +979,7 @@ async fn rename_field_moves_values_everywhere_in_one_step() {
         collection.contains("name = \"level\"") && collection.contains("# Test fixture"),
         "comments kept: {collection}"
     );
-    let item = call(&r, &env, "records.get", json!({"collection": "leetcode", "id": "two-sum"})).await.unwrap();
+    let item = call(&r, &env, "records.show", json!({"collection": "leetcode", "id": "two-sum"})).await.unwrap();
     assert_eq!((item["level"].clone(), item.get("difficulty").cloned()), (json!("easy"), None));
     assert!(file(&env, "trash/leetcode/lru.toml").unwrap().contains("level = \"medium\""));
     assert_eq!(env.backend.events().pop().unwrap().topic, "records.field.renamed");
@@ -1001,7 +1004,7 @@ async fn rename_collection_moves_everything() {
     assert_eq!(out["id"], "problems");
     assert!(file(&env, "collections/leetcode.toml").is_none());
     assert!(file(&env, "collections/problems.toml").unwrap().contains("id = \"problems\""));
-    let item = call(&r, &env, "records.get", json!({"collection": "problems", "id": "two-sum"})).await.unwrap();
+    let item = call(&r, &env, "records.show", json!({"collection": "problems", "id": "two-sum"})).await.unwrap();
     assert_eq!(item["title"], "Two Sum");
     assert_eq!(env.backend.events().pop().unwrap().topic, "records.collection.renamed");
     add_education_collection(&env);
@@ -1071,7 +1074,7 @@ async fn copy_collection_copies_the_file_and_only_with_records_its_records() {
         );
     }
     assert!(file(&env, "items/plan-c/gone.toml").is_none() && file(&env, "trash/plan-c/gone.toml").is_none());
-    let week1 = call(&r, &env, "records.get", json!({"collection": "plan-c", "id": "week-1"})).await.unwrap();
+    let week1 = call(&r, &env, "records.show", json!({"collection": "plan-c", "id": "week-1"})).await.unwrap();
     assert_eq!((week1["status"].as_str(), week1["problem"].as_str()), (Some("done"), Some("two-sum")));
     // The copy's refs resolve inside the copy: it all fits.
     let check = call(&r, &env, "records.check", json!({"collection": "plan-c"})).await.unwrap();
@@ -1123,7 +1126,7 @@ async fn remove_collection_asks_first_then_restore_brings_it_all_back() {
     assert_eq!(env.backend.events().pop().unwrap().topic, "records.collection.removed");
 
     call(&r, &env, "records.restore_collection", json!({"id": "leetcode"})).await.unwrap();
-    let item = call(&r, &env, "records.get", json!({"collection": "leetcode", "id": "two-sum"})).await.unwrap();
+    let item = call(&r, &env, "records.show", json!({"collection": "leetcode", "id": "two-sum"})).await.unwrap();
     assert_eq!(item["title"], "Two Sum");
     assert_eq!(env.backend.events().pop().unwrap().topic, "records.collection.restored");
     let e = call(&r, &env, "records.restore_collection", json!({"id": "leetcode"})).await.unwrap_err();
@@ -1186,7 +1189,7 @@ async fn purge_collection_never_touches_a_live_collection_of_the_same_name() {
     add_two_sum(&r, &env).await;
 
     call(&r, &env, "records.purge_collection", json!({"id": "leetcode", "confirm": {"records": 1}})).await.unwrap();
-    let item = call(&r, &env, "records.get", json!({"collection": "leetcode", "id": "two-sum"})).await.unwrap();
+    let item = call(&r, &env, "records.show", json!({"collection": "leetcode", "id": "two-sum"})).await.unwrap();
     assert_eq!(item["title"], "Two Sum", "the live collection and its record are untouched");
 }
 
@@ -1237,7 +1240,7 @@ async fn every_template_is_listed_and_creates_a_valid_collection() {
 
     for template in &ids {
         let id = format!("my-{template}");
-        let c = call(&r, &env, "records.create_collection", json!({"id": id, "template": template})).await.unwrap();
+        let c = call(&r, &env, "records.new", json!({"id": id, "template": template})).await.unwrap();
         assert_eq!(c["id"], id.as_str(), "{template}");
         let text = file(&env, &format!("collections/{id}.toml")).unwrap();
         assert!(text.contains(&format!("id = \"{id}\"")), "{template}");
@@ -1266,7 +1269,7 @@ async fn templates_gives_one_in_full_with_its_notes_and_file() {
     assert!(notes.iter().any(|n| n.as_str().unwrap().starts_with("Private information: this file")), "{notes:?}");
     assert!(!notes.iter().any(|n| n.as_str().unwrap().contains("Created from")), "{notes:?}");
     assert!(t["examples"][0].as_str().unwrap().starts_with("shimmer records add <collection> --street"), "{t}");
-    // The file is the template exactly: what `records.create_collection` copies.
+    // The file is the template exactly: what `records.new` copies.
     assert_eq!(t["file"].as_str().unwrap(), include_str!("../templates/addresses.toml"));
     assert_eq!(data["categories"].as_array().unwrap().len(), 5, "the headings come along");
 
@@ -1280,7 +1283,7 @@ async fn templates_gives_one_in_full_with_its_notes_and_file() {
 #[tokio::test]
 async fn collections_say_which_template_they_came_from() {
     let (r, env) = setup().await;
-    call(&r, &env, "records.create_collection", json!({"id": "jobs", "template": "job-applications"})).await.unwrap();
+    call(&r, &env, "records.new", json!({"id": "jobs", "template": "job-applications"})).await.unwrap();
     call(&r, &env, "records.copy_collection", json!({"id": "jobs", "to": "jobs-2"})).await.unwrap();
     // One whose header was edited away, and one that names a template that isn't built in.
     let text = file(&env, "collections/jobs.toml").unwrap();
@@ -1320,7 +1323,7 @@ async fn create_collection_never_overwrites_and_says_what_exists() {
         (json!({"id": "Jobs!", "template": "job-applications"}), ErrorCode::InvalidParams, "not a valid collection id"),
         (json!({"id": "jobs", "template": "job-applications", "label": " "}), ErrorCode::InvalidParams, "label"),
     ] {
-        let e = call(&r, &env, "records.create_collection", params.clone()).await.unwrap_err();
+        let e = call(&r, &env, "records.new", params.clone()).await.unwrap_err();
         assert_eq!(e.code, code, "{params}");
         assert!(e.message.contains(says), "{params}: {}", e.message);
     }
@@ -1330,7 +1333,7 @@ async fn create_collection_never_overwrites_and_says_what_exists() {
     let c = call(
         &r,
         &env,
-        "records.create_collection",
+        "records.new",
         json!({"id": "jobs", "template": "job-applications", "label": "Internships 2027"}),
     )
     .await
@@ -1342,7 +1345,7 @@ async fn create_collection_never_overwrites_and_says_what_exists() {
 async fn a_job_hunt_with_the_templates() {
     let (r, env) = setup().await;
     for (id, template) in [("jobs", "job-applications"), ("rounds", "interviews")] {
-        call(&r, &env, "records.create_collection", json!({"id": id, "template": template})).await.unwrap();
+        call(&r, &env, "records.new", json!({"id": id, "template": template})).await.unwrap();
     }
     // Saved, with a generated id, a unique URL and a deadline the calendar will see.
     let job = call(
@@ -1409,9 +1412,7 @@ async fn a_job_hunt_with_the_templates() {
 #[tokio::test]
 async fn practising_a_question_counts_every_time() {
     let (r, env) = setup().await;
-    call(&r, &env, "records.create_collection", json!({"id": "questions", "template": "interview-questions"}))
-        .await
-        .unwrap();
+    call(&r, &env, "records.new", json!({"id": "questions", "template": "interview-questions"})).await.unwrap();
     let q = call(
         &r,
         &env,
@@ -1438,7 +1439,7 @@ async fn practising_a_question_counts_every_time() {
 #[tokio::test]
 async fn background_history_is_a_reference_list() {
     let (r, env) = setup().await;
-    call(&r, &env, "records.create_collection", json!({"id": "jobs-held", "template": "employment"})).await.unwrap();
+    call(&r, &env, "records.new", json!({"id": "jobs-held", "template": "employment"})).await.unwrap();
     let job = call(&r, &env, "records.add", json!({"collection": "jobs-held", "fields": {
         "company": "Acme", "job_title": "SWE Intern", "start_on": "2025-05-12", "end_on": "2025-08-15", "may_contact": true}}))
         .await
@@ -1462,7 +1463,7 @@ async fn background_history_is_a_reference_list() {
 #[tokio::test]
 async fn a_planned_gift_is_given_once() {
     let (r, env) = setup().await;
-    call(&r, &env, "records.create_collection", json!({"id": "charity", "template": "charity"})).await.unwrap();
+    call(&r, &env, "records.new", json!({"id": "charity", "template": "charity"})).await.unwrap();
     let gift = call(
         &r,
         &env,
@@ -1494,7 +1495,7 @@ async fn a_planned_gift_is_given_once() {
 async fn a_question_points_at_the_story_that_answers_it() {
     let (r, env) = setup().await;
     for (id, template) in [("stories", "stories"), ("questions", "interview-questions")] {
-        call(&r, &env, "records.create_collection", json!({"id": id, "template": template})).await.unwrap();
+        call(&r, &env, "records.new", json!({"id": id, "template": template})).await.unwrap();
     }
     let story = call(
         &r,
@@ -1536,7 +1537,7 @@ async fn a_question_points_at_the_story_that_answers_it() {
 #[tokio::test]
 async fn a_project_is_shipped_once_and_sorts_by_stars() {
     let (r, env) = setup().await;
-    call(&r, &env, "records.create_collection", json!({"id": "projects", "template": "projects"})).await.unwrap();
+    call(&r, &env, "records.new", json!({"id": "projects", "template": "projects"})).await.unwrap();
     for (name, stars, url) in
         [("Shimmer", 40, "https://github.com/x/shimmer"), ("Todo app", 3, "https://github.com/x/todo")]
     {
@@ -1578,7 +1579,7 @@ async fn a_project_is_shipped_once_and_sorts_by_stars() {
 #[tokio::test]
 async fn offers_compare_by_total_comp_and_are_decided_once() {
     let (r, env) = setup().await;
-    call(&r, &env, "records.create_collection", json!({"id": "offers", "template": "offers"})).await.unwrap();
+    call(&r, &env, "records.new", json!({"id": "offers", "template": "offers"})).await.unwrap();
     for (company, total, deadline) in [("Amazon", 95_000, "2026-11-01"), ("Google", 110_000, "2026-10-20")] {
         call(
             &r,
@@ -1613,7 +1614,7 @@ async fn offers_compare_by_total_comp_and_are_decided_once() {
 #[tokio::test]
 async fn a_certification_is_earned_then_renewed() {
     let (r, env) = setup().await;
-    call(&r, &env, "records.create_collection", json!({"id": "certs", "template": "certifications"})).await.unwrap();
+    call(&r, &env, "records.new", json!({"id": "certs", "template": "certifications"})).await.unwrap();
     call(&r, &env, "records.add", json!({"collection": "certs", "fields": {
         "name": "AWS Solutions Architect - Associate", "provider": "AWS", "stage": "studying", "exam_at": "2026-12-10 09:00"}}))
         .await
@@ -1639,9 +1640,7 @@ async fn a_certification_is_earned_then_renewed() {
 #[tokio::test]
 async fn an_event_is_attended_then_followed_up() {
     let (r, env) = setup().await;
-    call(&r, &env, "records.create_collection", json!({"id": "events", "template": "networking-events"}))
-        .await
-        .unwrap();
+    call(&r, &env, "records.new", json!({"id": "events", "template": "networking-events"})).await.unwrap();
     call(
         &r,
         &env,
@@ -1677,7 +1676,7 @@ async fn an_event_is_attended_then_followed_up() {
 #[tokio::test]
 async fn every_follow_up_counts_and_people_link_to_the_event() {
     let (r, env) = setup().await;
-    call(&r, &env, "records.create_collection", json!({"id": "outreach", "template": "outreach"})).await.unwrap();
+    call(&r, &env, "records.new", json!({"id": "outreach", "template": "outreach"})).await.unwrap();
     for name in ["Priya Shah", "Ben Lee"] {
         call(
             &r,
@@ -1705,7 +1704,7 @@ async fn every_follow_up_counts_and_people_link_to_the_event() {
 #[tokio::test]
 async fn subscriptions_are_on_or_off_and_warn_before_charges() {
     let (r, env) = setup().await;
-    call(&r, &env, "records.create_collection", json!({"id": "subs", "template": "subscriptions"})).await.unwrap();
+    call(&r, &env, "records.new", json!({"id": "subs", "template": "subscriptions"})).await.unwrap();
     let sub = call(&r, &env, "records.add", json!({"collection": "subs", "fields": {
         "name": "Cloud storage", "state": "trial", "cost": 13, "trial_ends_on": "2026-10-12", "renews_on": "2026-11-12"}}))
         .await
@@ -1726,7 +1725,7 @@ async fn subscriptions_are_on_or_off_and_warn_before_charges() {
 #[tokio::test]
 async fn documents_warn_before_they_expire() {
     let (r, env) = setup().await;
-    call(&r, &env, "records.create_collection", json!({"id": "documents", "template": "documents"})).await.unwrap();
+    call(&r, &env, "records.new", json!({"id": "documents", "template": "documents"})).await.unwrap();
     for (name, expires) in [("Passport", "2031-03-01"), ("Study permit", "2027-01-15")] {
         call(
             &r,
@@ -1935,7 +1934,7 @@ async fn references_are_checked_followed_on_rename_and_guard_removal() {
     let rename = json!({"collection": "jobs", "id": "acme", "new_id": "acme-corp"});
     call(&r, &env, "records.rename", rename).await.unwrap();
     assert_eq!(env.backend.events().pop().unwrap().payload["references"], 2);
-    let round = call(&r, &env, "records.get", json!({"collection": "rounds", "id": "r1"})).await.unwrap();
+    let round = call(&r, &env, "records.show", json!({"collection": "rounds", "id": "r1"})).await.unwrap();
     assert_eq!(round["application"], "acme-corp");
     assert_eq!(round["also_for"], json!(["globex", "acme-corp"]));
 
@@ -1990,7 +1989,7 @@ async fn import_checks_every_row_and_writes_all_or_nothing() {
     let out = call(&r, &env, "records.import", import(json!({"skip_invalid": true}))).await.unwrap();
     assert_eq!(out["written"], true);
     assert_eq!(topics(&env)[before..], ["records.item.created"; 3]);
-    let globex = call(&r, &env, "records.get", json!({"collection": "postings", "id": "globex"})).await.unwrap();
+    let globex = call(&r, &env, "records.show", json!({"collection": "postings", "id": "globex"})).await.unwrap();
     assert_eq!((globex["status"].clone(), globex["applied_on"].clone()), (json!("done"), json!("2026-10-01")));
 
     // Importing the same rows again adds nothing new by id.
@@ -2023,7 +2022,7 @@ async fn purge_deletes_trashed_records_only_after_confirmation() {
     let ev = env.backend.events().pop().unwrap();
     assert_eq!(
         (ev.topic.as_str(), ev.payload),
-        ("records.trash.purged", json!({"collection": "leetcode", "records": 1, "id": "a"}))
+        ("records.item.purged", json!({"collection": "leetcode", "records": 1, "id": "a"}))
     );
     assert_eq!(call(&r, &env, "records.purge", one).await.unwrap_err().code, ErrorCode::NotFound);
 
@@ -2032,7 +2031,7 @@ async fn purge_deletes_trashed_records_only_after_confirmation() {
     assert_eq!(call(&r, &env, "records.purge", all).await.unwrap_err().code, ErrorCode::ConfirmationRequired);
     let all = json!({"collection": "leetcode", "confirm": {"records": 2}});
     assert_eq!(call(&r, &env, "records.purge", all).await.unwrap(), json!({"purged": 2}));
-    let trash = call(&r, &env, "records.trash", json!({"collection": "leetcode"})).await.unwrap();
+    let trash = call(&r, &env, "records.list", json!({"collection": "leetcode", "removed": true})).await.unwrap();
     assert_eq!(trash["items"], json!([]));
     assert_eq!(call(&r, &env, "records.purge", json!({"collection": "leetcode"})).await.unwrap(), json!({"purged": 0}));
 }
@@ -2083,7 +2082,7 @@ async fn one_unreadable_record_never_blocks_writes_renames_imports_or_the_trash(
 
     // Reference checks: renaming a still repoints b.
     call(&r, &env, "records.rename", json!({"collection": "plan", "id": "a", "new_id": "a2"})).await.unwrap();
-    let b = call(&r, &env, "records.get", json!({"collection": "plan", "id": "b"})).await.unwrap();
+    let b = call(&r, &env, "records.show", json!({"collection": "plan", "id": "b"})).await.unwrap();
     assert_eq!(b["follows"], "a2");
 
     // Import.
@@ -2091,7 +2090,7 @@ async fn one_unreadable_record_never_blocks_writes_renames_imports_or_the_trash(
     assert_eq!(call(&r, &env, "records.import", rows).await.unwrap()["added"], json!(["e"]));
 
     // The trash lists what it can read, and says what it couldn't.
-    let trash = call(&r, &env, "records.trash", json!({"collection": "plan"})).await.unwrap();
+    let trash = call(&r, &env, "records.list", json!({"collection": "plan", "removed": true})).await.unwrap();
     assert_eq!(trash["items"].as_array().unwrap().len(), 1, "{trash}");
     assert_eq!(trash["items"][0]["id"], "gone");
     assert!(trash["skipped"][0].as_str().unwrap().contains("garbled-too.toml"), "{trash}");
@@ -2109,6 +2108,6 @@ async fn one_unreadable_record_never_blocks_writes_renames_imports_or_the_trash(
         assert!(skipped.iter().any(|s| s.contains(name)), "{name} not in {skipped:?}");
     }
     // Nothing unreadable: no `skipped` key at all, as in records.list.
-    let clean = call(&r, &env, "records.trash", json!({"collection": "leetcode"})).await.unwrap();
+    let clean = call(&r, &env, "records.list", json!({"collection": "leetcode", "removed": true})).await.unwrap();
     assert!(clean.get("skipped").is_none(), "{clean}");
 }

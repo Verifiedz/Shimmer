@@ -12,20 +12,29 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use shimmer_core::params::decode;
 use shimmer_core::{
-    Clock, Ctx, Emitter, Error, Execution, HttpBackend, HttpGateway, LaneConfig, LaneId, ModuleConfig, ModuleId,
-    NamespacedStore, Origin, Priority, ProgressFn, QueueHandle, Result,
+    Clock, Ctx, Desktop, DesktopBackend, Emitter, Error, Execution, HttpBackend, HttpGateway, LaneConfig, LaneId,
+    ModuleConfig, ModuleId, NamespacedStore, Origin, Priority, ProgressFn, QueueHandle, Result,
 };
 use shimmer_core::{EnqueueRequest, TaskSubmitter};
 #[cfg(unix)]
 use shimmer_core::{LaunchBackend, Launcher};
-use shimmer_proto::{ops, ManifestData, ModuleInfo, PingData, QueueControl, QueuePriority, QueuedHandle};
+use shimmer_proto::{
+    ops, EventsListData, ManifestData, ModuleInfo, PingData, QueueControl, QueuePriority, QueuedHandle,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::Backend;
 use crate::config::Config;
+use crate::indexer::SharedIndex;
 use crate::queue::{OpRunner, Promotion, QueueFront, QueueInner};
 use crate::registry::Registry;
 use crate::scheduler::Scheduler;
+
+/// `core.events.list`'s own default and hard cap on `limit` -- generous enough for "what did
+/// the last run find," small enough that a client can't make one query hold the index's
+/// single connection (`Index`'s `Mutex`, `crate::indexer::SharedIndex`) for very long.
+const DEFAULT_EVENTS_LIMIT: usize = 100;
+const MAX_EVENTS_LIMIT: usize = 1000;
 
 pub struct Core {
     pub registry: Registry,
@@ -37,11 +46,14 @@ pub struct Core {
     pub shutdown: CancellationToken,
     /// Set once during startup, after modules are initialised.
     pub scheduler: OnceLock<Arc<Scheduler>>,
+    /// Backs `core.events.list` -- the same derived index the indexer task keeps current.
+    pub index: SharedIndex,
 }
 
 impl Core {
     /// Wire every module to its capabilities. Infallible: all validation happened when the
     /// registry and lanes were built.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         registry: Registry,
         lanes: Vec<LaneConfig>,
@@ -50,6 +62,9 @@ impl Core {
         clock: Clock,
         shutdown: CancellationToken,
         socket: &Path,
+        secrets: Arc<dyn crate::secrets::SecretStore>,
+        secrets_problem: Option<String>,
+        index: SharedIndex,
     ) -> Arc<Self> {
         // A module gets a populated, usable `Launcher` only if its manifest declares the
         // `"process"` capability (ADR 0010 §4); every other module keeps `Ctx::new`'s
@@ -76,9 +91,18 @@ impl Core {
                 backend.store.home().to_path_buf(),
                 config.http.clone(),
                 clock.clone(),
+                config.credentials.clone(),
+                secrets,
+                secrets_problem,
             )
             .expect("building the http client"),
         );
+
+        // The same shape again for `ctx.desktop` (ADR 0032 §1–§2): one real backend, given only
+        // to a module whose manifest declares `"desktop"`; every other keeps
+        // `Desktop::unavailable`.
+        let real_desktop: Arc<dyn DesktopBackend> =
+            Arc::new(crate::desktop::RealDesktopBackend::new(!config.hide_desktop));
 
         Arc::new_cyclic(|weak: &Weak<Core>| {
             let ops = registry
@@ -120,6 +144,9 @@ impl Core {
                     if e.manifest.capabilities.iter().any(|c| c == "network") {
                         ctx.http = HttpGateway::new(id.clone(), real_http.clone());
                     }
+                    if e.manifest.capabilities.iter().any(|c| c == "desktop") {
+                        ctx.desktop = Desktop::new(real_desktop.clone());
+                    }
                     (id, ctx)
                 })
                 .collect();
@@ -133,6 +160,7 @@ impl Core {
                 started: Instant::now(),
                 shutdown,
                 scheduler: OnceLock::new(),
+                index,
             }
         })
     }
@@ -155,9 +183,26 @@ impl Core {
                 let p: P = decode(params)?;
                 self.queue.list(p.lane.as_ref())
             }
-            ops::QUEUE_TASK => self.queue.task_view(self.queue.resolve(&task_id(params)?)?),
+            ops::QUEUE_SHOW => self.queue.task_view(self.queue.resolve(&task_id(params)?)?),
             ops::QUEUE_CANCEL => self.queue.cancel(self.queue.resolve(&task_id(params)?)?),
-            ops::QUEUE_REORDER => {
+            ops::EVENTS_LIST => {
+                #[derive(Deserialize, Default)]
+                #[serde(default)]
+                struct P {
+                    topic: Option<String>,
+                    limit: Option<usize>,
+                }
+                let p: P = decode(params)?;
+                let pattern = p.topic.as_deref().unwrap_or("*");
+                if !shimmer_proto::is_valid_pattern(pattern) {
+                    return Err(Error::invalid_params(format!("'{pattern}' is not a valid topic pattern")));
+                }
+                let limit = p.limit.unwrap_or(DEFAULT_EVENTS_LIMIT).clamp(1, MAX_EVENTS_LIMIT);
+                let events =
+                    self.index.lock().unwrap_or_else(|e| e.into_inner()).events_matching_recent(pattern, limit)?;
+                Ok(serde_json::to_value(EventsListData { events }).unwrap_or_default())
+            }
+            ops::QUEUE_MOVE => {
                 #[derive(Deserialize)]
                 struct P {
                     lane: LaneId,

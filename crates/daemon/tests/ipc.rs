@@ -28,7 +28,7 @@ async fn ping_and_manifest_round_trip() {
     assert!(pong["uptime_s"].is_u64());
 
     let m = c.call("core.manifest", json!({})).await.unwrap();
-    assert_eq!(m["protocol"], 1);
+    assert_eq!(m["protocol"], shimmer_proto::PROTOCOL_VERSION);
     let lanes: Vec<_> = m["lanes"].as_array().unwrap().iter().map(|l| l["id"].as_str().unwrap()).collect();
     assert_eq!(lanes, ["default", "slow"]);
     let demo = &m["modules"][0];
@@ -51,13 +51,13 @@ async fn handshake_rejects_wrong_version_and_missing_hello() {
     let d = env.start().await;
 
     let mut c = Client::raw(&env.sock).await;
-    c.send_json(json!({"v":2,"kind":"hello","client":"t","client_version":"0"})).await;
+    c.send_json(json!({"v":99,"kind":"hello","client":"t","client_version":"0"})).await;
     let Some(ServerFrame::Error { error, .. }) = c.recv().await else { panic!("want error frame") };
     assert_eq!(error.code, ErrorCode::UnsupportedVersion);
     assert!(c.recv().await.is_none(), "daemon closes after rejecting");
 
     let mut c = Client::raw(&env.sock).await;
-    c.send_json(json!({"v":1,"kind":"request","id":"1","op":"core.ping","params":{}})).await;
+    c.send_json(json!({"v":2,"kind":"request","id":"1","op":"core.ping","params":{}})).await;
     let Some(ServerFrame::Error { error, .. }) = c.recv().await else { panic!("want error frame") };
     assert_eq!(error.code, ErrorCode::BadRequest);
     assert!(c.recv().await.is_none());
@@ -93,7 +93,7 @@ async fn requests_are_pipelined_and_matched_by_id() {
     let d = env.start().await;
     let mut c = Client::connect(&env.sock).await;
     for i in 0..20 {
-        c.send_json(json!({"v":1,"kind":"request","id":format!("p{i}"),"op":"demo.echo","params":{"i":i}})).await;
+        c.send_json(json!({"v":2,"kind":"request","id":format!("p{i}"),"op":"demo.echo","params":{"i":i}})).await;
     }
     let mut seen = [false; 20];
     for _ in 0..20 {
@@ -135,7 +135,7 @@ async fn subscription_filters_by_topic_pattern() {
     let id = task_id(&h);
     let mut watcher = Client::connect(&env.sock).await;
     for _ in 0..50 {
-        if watcher.call("queue.task", json!({"task_id": id})).await.unwrap()["status"] == "succeeded" {
+        if watcher.call("queue.show", json!({"task_id": id})).await.unwrap()["status"] == "succeeded" {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -143,7 +143,7 @@ async fn subscription_filters_by_topic_pattern() {
     assert_eq!(c.call("core.ping", json!({})).await.unwrap()["pong"], true);
     assert!(c.events.iter().all(|e| e.topic.starts_with("demo.")), "{:?}", c.events);
 
-    c.send_json(json!({"v":1,"kind":"subscribe","id":"bad","topics":["rec*"]})).await;
+    c.send_json(json!({"v":2,"kind":"subscribe","id":"bad","topics":["rec*"]})).await;
     assert_eq!(c.response("bad").await.unwrap_err().code, ErrorCode::InvalidParams);
     stop(d).await;
 }
@@ -165,7 +165,7 @@ async fn queued_op_returns_a_handle_then_reports_through_events() {
     for topic in ["queue.task.enqueued", "queue.task.started", "queue.task.finished"] {
         assert_eq!(c.event(topic).await.payload["task_id"], id.as_str(), "{topic}");
     }
-    let t = c.call("queue.task", json!({"task_id": id})).await.unwrap();
+    let t = c.call("queue.show", json!({"task_id": id})).await.unwrap();
     assert_eq!(t["status"], "succeeded");
     assert_eq!(t["origin"], json!({"type": "user"}));
     stop(d).await;
@@ -227,6 +227,60 @@ async fn lane_concurrency_and_cancellation() {
     stop(d).await;
 }
 
+// ---------------------------------------------------------------- core.events.list
+
+/// Polls `core.events.list` until the index has caught up to at least `want` matches --
+/// indexing happens on its own task, off the bus, so it can briefly lag behind an op's own
+/// response (same reasoning as `subscription_filters_by_topic_pattern`'s `queue.show` poll).
+async fn wait_for_events(c: &mut Client, topic: &str, want: usize, limit: usize) -> Vec<Value> {
+    for _ in 0..50 {
+        let events = c.call("core.events.list", json!({"topic": topic, "limit": limit})).await.unwrap()["events"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if events.len() >= want {
+            return events;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("core.events.list never reached {want} matches for '{topic}'");
+}
+
+#[tokio::test]
+async fn events_list_returns_the_most_recent_matches_oldest_first() {
+    let env = Env::new();
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    for (key, val) in [("a", "1"), ("b", "2"), ("c", "3")] {
+        c.call("demo.put", json!({"key": key, "val": val})).await.unwrap();
+    }
+
+    // Asking for only the 2 most recent of 3 saved must come back as b, c -- not a, b (what
+    // an oldest-first LIMIT would give) and not c, b (newest-first).
+    let events = wait_for_events(&mut c, "demo.item.saved", 3, 100).await;
+    assert_eq!(events.len(), 3, "sanity: all three must have landed before narrowing to 2");
+    let recent = c.call("core.events.list", json!({"topic": "demo.item.saved", "limit": 2})).await.unwrap();
+    let keys: Vec<_> =
+        recent["events"].as_array().unwrap().iter().map(|e| e["payload"]["key"].as_str().unwrap()).collect();
+    assert_eq!(keys, vec!["b", "c"]);
+    stop(d).await;
+}
+
+#[tokio::test]
+async fn events_list_defaults_to_every_topic_and_rejects_a_bad_pattern() {
+    let env = Env::new();
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    c.call("demo.put", json!({"key": "a", "val": "1"})).await.unwrap();
+
+    let events = wait_for_events(&mut c, "*", 1, 100).await;
+    assert!(events.iter().any(|e| e["topic"] == "demo.item.saved"), "{events:?}");
+
+    let err = c.call("core.events.list", json!({"topic": "not valid *"})).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidParams);
+    stop(d).await;
+}
+
 // ---------------------------------------------------------------- durability and lifecycle
 
 #[tokio::test]
@@ -283,6 +337,41 @@ async fn second_daemon_on_the_same_home_is_refused() {
     .err()
     .expect("second daemon must not start");
     assert_eq!(err.code, ErrorCode::Conflict);
+    stop(d).await;
+}
+
+/// #243: a daemon that has just removed its socket may not have released `.daemon.lock` yet, so a
+/// quick restart waits for the lock briefly instead of failing at once.
+#[tokio::test]
+async fn a_lock_freed_moments_later_is_waited_for_not_refused() {
+    let env = Env::new();
+    let held = std::fs::File::create(env.home.path().join(".daemon.lock")).unwrap();
+    held.try_lock().unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        held.unlock().unwrap();
+    });
+    let d = env.try_start(vec![]).await.expect("starts once the lock is free");
+    release.join().unwrap();
+    stop(d).await;
+}
+
+/// #243: `wait` releases the lock itself, right after the socket goes, rather than leaving it to
+/// the process exiting: by the time anything sees the socket gone, the lock is free.
+#[tokio::test]
+async fn the_lock_is_free_once_wait_returns_and_the_socket_is_gone() {
+    let env = Env::new();
+    let d = env.start().await;
+    let lock = std::fs::File::open(env.home.path().join(".daemon.lock")).unwrap();
+    assert!(lock.try_lock().is_err(), "held while running");
+    stop(d).await;
+    assert!(!env.sock.exists(), "socket removed");
+    lock.try_lock().expect("released by wait, not only when the process exits");
+    lock.unlock().unwrap();
+    // And a new daemon starts at once, without waiting for it.
+    let started = std::time::Instant::now();
+    let d = env.start().await;
+    assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
     stop(d).await;
 }
 

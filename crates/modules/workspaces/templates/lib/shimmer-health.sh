@@ -169,7 +169,7 @@ health_workspaces() {
     shimmer_has shimmer || return 0
     bad=$(shimmer workspaces list 2>/dev/null | awk 'NR > 1 && ($2 == "dirty" || $2 == "invalid") { printf "%s%s (%s)", sep, $1, $2; sep = ", " }')
     if [ -n "$bad" ]; then
-        shimmer_health_line warn "workspaces needing a fix: $bad — see: shimmer workspaces status <id>"
+        shimmer_health_line warn "workspaces needing a fix: $bad — see: shimmer workspaces show <id>"
     else
         shimmer_health_line ok "workspaces: none dirty"
     fi

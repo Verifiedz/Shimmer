@@ -11,9 +11,7 @@ async fn call(w: &Workspaces, env: &TestEnv, op: &str, params: Value) -> Result<
 }
 
 async fn site(w: &Workspaces, env: &TestEnv, values: Value) {
-    call(w, env, "workspaces.create", json!({"id": "site", "template": "web-project", "values": values}))
-        .await
-        .unwrap();
+    call(w, env, "workspaces.new", json!({"id": "site", "template": "web-project", "values": values})).await.unwrap();
 }
 
 #[tokio::test]
@@ -35,10 +33,10 @@ async fn rename_moves_every_file_and_the_workspace_keeps_working() {
         ("workspaces.workspace.renamed", json!({"from": "site", "to": "portfolio"}))
     );
 
-    assert_eq!(call(&w, &env, "workspaces.status", json!({"id": "portfolio"})).await.unwrap()["state"], "ready");
+    assert_eq!(call(&w, &env, "workspaces.show", json!({"id": "portfolio"})).await.unwrap()["state"], "ready");
     let a = call(&w, &env, "workspaces.answers", json!({"id": "portfolio"})).await.unwrap();
     assert_eq!(a["template"], "web-project", "still knows its template");
-    let e = call(&w, &env, "workspaces.status", json!({"id": "site"})).await.unwrap_err();
+    let e = call(&w, &env, "workspaces.show", json!({"id": "site"})).await.unwrap_err();
     assert_eq!(e.code, ErrorCode::NotFound);
 }
 
@@ -55,7 +53,7 @@ async fn rename_says_what_stays_under_the_old_name() {
 async fn rename_refuses_anything_unsafe_and_changes_nothing() {
     let (env, w) = (TestEnv::new("workspaces"), Workspaces::default());
     site(&w, &env, json!({"PROJECT_DIR": "/home/me/code/site"})).await;
-    call(&w, &env, "workspaces.create", json!({"id": "taken", "template": "smoke-test"})).await.unwrap();
+    call(&w, &env, "workspaces.new", json!({"id": "taken", "template": "smoke-test"})).await.unwrap();
     let files = env.ctx.store.list("site").unwrap();
     for (to, code, says) in [
         ("Bad Name", ErrorCode::InvalidParams, "not a valid workspace id"),

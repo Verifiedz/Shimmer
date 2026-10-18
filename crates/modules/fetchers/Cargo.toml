@@ -1,0 +1,29 @@
+[package]
+name = "shimmer-fetchers"
+description = "The fetchers module (CLAUDE.md §8, ADR 0028): Source trait, scheduling, dedup. Depends on core only."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+shimmer-core = { path = "../../core" }
+async-trait = "0.1"
+chrono = "0.4"
+feed-rs = "3.0"
+scraper = "0.27"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+texting_robots = "0.2"
+toml = "1"
+# Already in the dependency tree transitively (via `scraper`); declared directly here only
+# to validate an `rss` source's configured url is well-formed http(s) at load time.
+url = "2"
+
+[dev-dependencies]
+shimmer-core = { path = "../../core", features = ["testing"] }
+tokio = { version = "1", features = ["macros", "rt", "test-util"] }

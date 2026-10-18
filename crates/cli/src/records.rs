@@ -40,9 +40,10 @@ commands:
                                            dates may be today, today+7, today-30
        [--search TEXT]                     text in the id or any text field
        [--sort FIELD]… [--sort -FIELD]     order, e.g. --sort oa_deadline --sort -applied_on
+       [--removed]                         instead, the removed records you can restore or purge
                                        a field named like one of these options (limit, sort…):
                                        filter it with --filter FIELD=VALUE
-  get COLLECTION/ID                    show one record
+  show COLLECTION/ID                   show one record
   update COLLECTION/ID [--FIELD VALUE]… [--unset FIELD]…
                                        change a record's fields
        [--add FIELD VALUE]… [--remove FIELD VALUE]…  change items of a list field
@@ -56,7 +57,6 @@ commands:
   remove COLLECTION/ID [--force]       remove a record (it goes to the trash); --force even
                                        if other records refer to it
   restore COLLECTION/ID                bring a removed record back
-  trash COLLECTION                     list removed records you can restore
   purge COLLECTION[/ID] [--yes]        permanently delete removed records (asks first)
 
 moving data:
@@ -114,7 +114,7 @@ pub enum RecordsCmd {
         offset: Option<usize>,
         refine: Refine,
     },
-    Get {
+    Show {
         collection: String,
         id: String,
     },
@@ -147,7 +147,8 @@ pub enum RecordsCmd {
         collection: String,
         id: String,
     },
-    Trash {
+    /// `list COLLECTION --removed`: the collection's removed records.
+    ListRemoved {
         collection: String,
     },
     Check {
@@ -290,7 +291,7 @@ pub fn parse(words: Vec<String>) -> std::result::Result<RecordsCmd, String> {
         matches!(sub.as_str(), "remove-collection" | "import" | "purge" | "purge-collection"),
         "--yes",
     );
-    let removed = take_flag(&mut rest, sub == "collections", "--removed");
+    let removed = take_flag(&mut rest, matches!(sub.as_str(), "collections" | "list"), "--removed");
     let move_schedules =
         take_flag(&mut rest, matches!(sub.as_str(), "rename" | "rename-collection"), "--move-schedules");
     let with_records = take_flag(&mut rest, sub == "copy-collection", "--with-records");
@@ -380,6 +381,13 @@ pub fn parse(words: Vec<String>) -> std::result::Result<RecordsCmd, String> {
             }
             if sub == "export" {
                 return Ok(RecordsCmd::Export { collection, format, filter, refine });
+            }
+            if removed {
+                // The whole trash (ADR 0038 §6): nothing to narrow it with.
+                if !filter.is_empty() || limit.is_some() || offset.is_some() || refine != Refine::default() {
+                    return Err("'records list --removed' lists the whole trash; it takes no filters or paging".into());
+                }
+                return Ok(RecordsCmd::ListRemoved { collection });
             }
             Ok(RecordsCmd::List { collection, filter, limit, offset, refine })
         }
@@ -474,17 +482,11 @@ pub fn parse(words: Vec<String>) -> std::result::Result<RecordsCmd, String> {
                 _ => return Err(usage.into()),
             })
         }
-        "trash" => {
-            no_flags()?;
-            let [collection]: [String; 1] =
-                positional.try_into().map_err(|_| "usage: shimmer records trash COLLECTION")?;
-            Ok(RecordsCmd::Trash { collection })
-        }
-        "get" | "remove" | "reopen" | "restore" => {
+        "show" | "remove" | "reopen" | "restore" => {
             no_flags()?;
             let (collection, id) = target(&sub, positional)?;
             Ok(match sub.as_str() {
-                "get" => RecordsCmd::Get { collection, id },
+                "show" => RecordsCmd::Show { collection, id },
                 "reopen" => RecordsCmd::Reopen { collection, id, clear_stamp },
                 "restore" => RecordsCmd::Restore { collection, id },
                 _ => RecordsCmd::Remove { collection, id, force },
@@ -556,13 +558,13 @@ impl RecordsCmd {
             Self::Add { collection, .. }
             | Self::Rename { collection, .. }
             | Self::List { collection, .. }
-            | Self::Get { collection, .. }
+            | Self::Show { collection, .. }
             | Self::Update { collection, .. }
             | Self::Complete { collection, .. }
             | Self::Reopen { collection, .. }
             | Self::Remove { collection, .. }
             | Self::Restore { collection, .. }
-            | Self::Trash { collection }
+            | Self::ListRemoved { collection }
             | Self::Check { collection }
             | Self::RenameField { collection, .. }
             | Self::Import { collection, .. }
@@ -670,7 +672,7 @@ pub fn request(cmd: &RecordsCmd, schema: &Value) -> Result<(&'static str, Value)
             }
             ("records.list", params)
         }
-        RecordsCmd::Get { collection, id } => ("records.get", json!({"collection": collection, "id": id})),
+        RecordsCmd::Show { collection, id } => ("records.show", json!({"collection": collection, "id": id})),
         RecordsCmd::Update { collection, id, set, unset, items } => {
             ("records.update", json!({"collection": collection, "id": id, "fields": changes(set, unset, items)?}))
         }
@@ -697,7 +699,7 @@ pub fn request(cmd: &RecordsCmd, schema: &Value) -> Result<(&'static str, Value)
             ("records.remove", params)
         }
         RecordsCmd::Restore { collection, id } => ("records.restore", json!({"collection": collection, "id": id})),
-        RecordsCmd::Trash { collection } => ("records.trash", json!({"collection": collection})),
+        RecordsCmd::ListRemoved { collection } => ("records.list", json!({"collection": collection, "removed": true})),
         RecordsCmd::Check { collection } => ("records.check", json!({"collection": collection})),
         RecordsCmd::Templates { .. } => ("records.templates", json!({})),
         RecordsCmd::Peek { template, file: true } => ("records.templates", json!({"id": template, "file": true})),
@@ -707,7 +709,7 @@ pub fn request(cmd: &RecordsCmd, schema: &Value) -> Result<(&'static str, Value)
             if let Some(label) = label {
                 params["label"] = json!(label);
             }
-            ("records.create_collection", params)
+            ("records.new", params)
         }
         RecordsCmd::RenameField { collection, from, to } => (
             "records.rename_field",
@@ -1248,7 +1250,7 @@ fn export(items: &[Value], schema: &Value, format: Format) -> String {
 
 /// Whether to go ahead with purging, given the daemon's message saying what goes. There is no
 /// undo, so without a person there it needs --yes.
-fn confirm_purge(prompt: &mut dyn Prompt, yes: bool, what: &str, message: &str) -> Result<bool> {
+pub(crate) fn confirm_purge(prompt: &mut dyn Prompt, yes: bool, what: &str, message: &str) -> Result<bool> {
     if yes {
         return Ok(true);
     }
@@ -1346,7 +1348,7 @@ pub fn show(cmd: &RecordsCmd, data: &Value, schema: &Value) -> String {
         RecordsCmd::PurgeCollection { id, .. } => {
             format!("✓ {id} is deleted for good ({} record(s))", cell(&data["records"]))
         }
-        RecordsCmd::Trash { collection } => match data["items"].as_array().is_none_or(Vec::is_empty) {
+        RecordsCmd::ListRemoved { collection } => match data["items"].as_array().is_none_or(Vec::is_empty) {
             true => {
                 let mut out = format!("nothing in {collection}'s trash");
                 for skipped in data["skipped"].as_array().into_iter().flatten() {
@@ -1370,7 +1372,7 @@ pub fn show(cmd: &RecordsCmd, data: &Value, schema: &Value) -> String {
             }
             out
         }
-        RecordsCmd::Get { collection, id } => item(collection, id, data, schema),
+        RecordsCmd::Show { collection, id } => item(collection, id, data, schema),
         RecordsCmd::List { .. } => list(data, schema),
         RecordsCmd::Import { collection, .. } => import_summary(collection, data, true),
         RecordsCmd::Purge { collection, .. } => match data["purged"].as_u64() {
@@ -1665,7 +1667,7 @@ fn list(data: &Value, schema: &Value) -> String {
         "no records".to_owned()
     } else {
         // Only columns some listed record has filled in: a 20-field collection with three fields
-        // set shouldn't print 17 columns of dashes. `records get` still shows every field.
+        // set shouldn't print 17 columns of dashes. `records show` still shows every field.
         let keys: Vec<String> = columns(&items[0], schema)
             .into_iter()
             .filter(|k| items.iter().any(|i| !i[k.as_str()].is_null() && i[k.as_str()] != ""))
@@ -1878,7 +1880,7 @@ mod tests {
         assert_eq!(params, json!({"collection": "leetcode", "id": "x"}));
         assert!(parse_words(&["reopen", "leetcode/x", "--title", "t"]).unwrap_err().contains("takes no options"));
         // `--clear-stamp` means nothing to other commands.
-        assert!(parse_words(&["get", "leetcode/x", "--clear-stamp"]).unwrap_err().contains("needs a value"));
+        assert!(parse_words(&["show", "leetcode/x", "--clear-stamp"]).unwrap_err().contains("needs a value"));
     }
 
     #[test]
@@ -1998,10 +2000,13 @@ mod tests {
         );
         assert_eq!(show(&restore, &json!({}), &Value::Null), "✓ jobs/acme restored");
 
-        let trash = parse_words(&["trash", "jobs"]).unwrap();
-        assert_eq!(request(&trash, &Value::Null).unwrap(), ("records.trash", json!({"collection": "jobs"})));
+        let trash = parse_words(&["list", "jobs", "--removed"]).unwrap();
+        let want = ("records.list", json!({"collection": "jobs", "removed": true}));
+        assert_eq!(request(&trash, &Value::Null).unwrap(), want);
         assert_eq!(show(&trash, &json!({"items": []}), &Value::Null), "nothing in jobs's trash");
-        assert!(parse_words(&["trash"]).unwrap_err().contains("records trash COLLECTION"));
+        assert!(parse_words(&["trash", "jobs"]).is_err(), "list --removed replaced trash (ADR 0038 §6)");
+        let narrowed = parse_words(&["list", "jobs", "--removed", "--status", "done"]).unwrap_err();
+        assert!(narrowed.contains("whole trash"), "{narrowed}");
     }
 
     #[test]
@@ -2078,7 +2083,7 @@ mod tests {
         let data = json!({"total": 1, "items": [{"id": "uni", "school": "Uni"}]});
         let cmd = parse_words(&["list", "education"]).unwrap();
         assert_eq!(show(&cmd, &data, &education), "ID   SCHOOL\nuni  Uni\n1 record");
-        let get = RecordsCmd::Get { collection: "education".into(), id: "uni".into() };
+        let get = RecordsCmd::Show { collection: "education".into(), id: "uni".into() };
         assert!(show(&get, &data["items"][0], &education).starts_with("education/uni\n"));
     }
 
@@ -2088,10 +2093,7 @@ mod tests {
         let new = parse_words(&["new", "jobs", "--from", "job-applications", "--label", "Internships"]).unwrap();
         assert_eq!(
             request(&new, &Value::Null).unwrap(),
-            (
-                "records.create_collection",
-                json!({"id": "jobs", "template": "job-applications", "label": "Internships"})
-            )
+            ("records.new", json!({"id": "jobs", "template": "job-applications", "label": "Internships"}))
         );
         assert!(parse_words(&["new", "jobs"]).unwrap_err().contains("--from TEMPLATE"));
         assert!(parse_words(&["new"]).unwrap_err().contains("usage"));
@@ -2298,7 +2300,7 @@ mod tests {
              fix those files, then: shimmer records check jobs"
         );
         assert!(!show(&rename, &json!({"updated": 2}), &Value::Null).contains("skipped"));
-        let trash = RecordsCmd::Trash { collection: "jobs".into() };
+        let trash = RecordsCmd::ListRemoved { collection: "jobs".into() };
         assert_eq!(
             show(&trash, &json!({"items": [], "skipped": ["record file 'y.toml': bad"]}), &Value::Null),
             "nothing in jobs's trash\nskipped: record file 'y.toml': bad"
@@ -2376,7 +2378,7 @@ mod tests {
     fn misuse() {
         assert_eq!(parse_words(&[]).unwrap(), RecordsCmd::Help);
         assert!(parse_words(&["frob"]).unwrap_err().contains("unknown records command"));
-        assert!(parse_words(&["get", "leetcode/x", "--title", "t"]).unwrap_err().contains("takes no options"));
+        assert!(parse_words(&["show", "leetcode/x", "--title", "t"]).unwrap_err().contains("takes no options"));
         assert!(parse_words(&["collections", "extra"]).is_err());
         assert!(parse_words(&["add", "leetcode/x", "-t", "T"]).unwrap_err().contains("unknown option"));
     }
@@ -2612,7 +2614,7 @@ lru-cache  todo    LRU Cache  medium      -            2         true
         let list = parse_words(&["collections", "--removed"]).unwrap();
         assert_eq!(list, RecordsCmd::RemovedCollections);
         assert_eq!(request(&list, &Value::Null).unwrap(), ("records.collections", json!({"removed": true})));
-        assert!(parse_words(&["trash", "jobs", "--removed"]).is_err(), "--removed is only for collections");
+        assert!(parse_words(&["show", "jobs/x", "--removed"]).is_err(), "--removed is only for collections and list");
         let data = json!({"collections": [
             {"id": "jobs", "label": "Job applications", "records": 42, "trash": 3},
             {"id": "broken", "records": 1, "trash": 0}]});
@@ -2665,7 +2667,7 @@ lru-cache  todo    LRU Cache  medium      -            2         true
         };
         assert_eq!(show(&complete, &item, &leetcode()), "✓ leetcode/two-sum done (last_solved 2026-09-25)");
 
-        let get = RecordsCmd::Get { collection: "leetcode".into(), id: "two-sum".into() };
+        let get = RecordsCmd::Show { collection: "leetcode".into(), id: "two-sum".into() };
         assert!(show(&get, &item, &leetcode()).starts_with("leetcode/two-sum  (done)\n  title        Two Sum\n"));
     }
 

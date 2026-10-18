@@ -24,8 +24,22 @@ fn index_event_count(home: &Home) -> u64 {
     Index::open(&index_path(home)).unwrap().stats().unwrap().events
 }
 
+/// The topics in the event log, the truth the index is rebuilt from.
+fn logged_topics(home: &Home) -> Vec<String> {
+    let dir = home.dir.path().join("home/events");
+    let mut topics = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        for line in std::fs::read_to_string(entry.unwrap().path()).unwrap().lines() {
+            topics.push(serde_json::from_str::<Value>(line).unwrap()["topic"].as_str().unwrap().to_owned());
+        }
+    }
+    topics
+}
+
 /// One completed record (the collection is written in by `Home::with_leetcode`, not seeded):
-/// `records.item.created` + `records.item.completed`, 2 events. Shuts the daemon down so
+/// `records.item.created` + `records.item.completed`, plus a `scheduler.trigger.added` for
+/// each module's own trigger registering on this first start of a fresh `$SHIMMER_HOME`
+/// (`fetchers`' heartbeat, ADR 0028 §5; `notify`'s hourly flush). Shuts the daemon down so
 /// the index file sits still while the test tampers with it before the next restart.
 fn seed_and_stop(home: &Home) {
     call(
@@ -43,7 +57,12 @@ fn a_corrupt_index_does_not_stop_the_daemon_starting() {
     let home = Home::with_leetcode();
     seed_and_stop(&home);
     let before = index_event_count(&home);
-    assert_eq!(before, 2, "item.created + item.completed (nothing is seeded on first start, ADR 0023)");
+    let logged = logged_topics(&home);
+    assert_eq!(before, logged.len() as u64, "the index holds every logged event");
+    // Nothing is seeded on first start (ADR 0023): the only records events are the test's own.
+    // (Others are modules' own start-up, e.g. fetchers' and notify's triggers being registered.)
+    let records: Vec<&String> = logged.iter().filter(|t| t.starts_with("records.")).collect();
+    assert_eq!(records, ["records.item.created", "records.item.completed"]);
 
     std::fs::write(index_path(&home), b"not a sqlite file at all, just garbage bytes").unwrap();
 

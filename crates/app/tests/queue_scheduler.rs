@@ -5,7 +5,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{ok, stderr, Home};
+use common::{fails, ok, stderr, Home};
 
 /// Poll `shimmer args…` until its output contains `want`, for up to 10 s.
 fn wait_for(home: &Home, args: &[&str], want: &str) -> String {
@@ -121,7 +121,7 @@ fn real_launches_wait_in_the_queue_and_can_be_moved_and_cancelled() {
 }
 
 #[test]
-fn a_trigger_fires_and_can_be_paused_resumed_and_removed() {
+fn a_trigger_fires_and_can_be_disabled_enabled_and_removed() {
     let home = Home::with_leetcode();
     let id = raw_trigger(&home, "records.list", r#"{"collection":"leetcode"}"#, 1);
 
@@ -133,7 +133,7 @@ fn a_trigger_fires_and_can_be_paused_resumed_and_removed() {
         row.contains(r#"records.list {"collection":"leetcode"}"#)
             && row.contains("every 1s")
             && row.contains("skip")
-            && row.contains("active")
+            && row.trim_end().ends_with(" on")
             && !row.ends_with("you"),
         "{row}: no FROM column without --all, every row is yours (#244)"
     );
@@ -147,12 +147,38 @@ fn a_trigger_fires_and_can_be_paused_resumed_and_removed() {
 
     // Each reply names the trigger by the ending the list shows, and what it runs.
     let what = format!("{} (records.list, every 1s)", shown(&id));
-    assert!(ok(&home, &["scheduler", "pause", &id]).starts_with(&format!("✓ paused {what}")));
-    assert!(ok(&home, &["scheduler", "show", &id]).starts_with(&format!("{id}  (paused)")));
-    assert!(ok(&home, &["scheduler", "resume", &id]).starts_with(&format!("✓ resumed {what}")));
-    assert!(ok(&home, &["scheduler", "show", &id]).starts_with(&format!("{id}  (active)")));
-    assert_eq!(ok(&home, &["scheduler", "remove", &id]).trim(), format!("✓ removed {what}"));
-    assert!(ok(&home, &["scheduler", "list"]).starts_with("no triggers yet"));
+    assert!(ok(&home, &["scheduler", "disable", &id]).starts_with(&format!("✓ {what} is off")));
+    assert!(ok(&home, &["scheduler", "show", &id]).starts_with(&format!("{id}  (off)")));
+    assert!(ok(&home, &["scheduler", "enable", &id]).starts_with(&format!("✓ {what} is on")));
+    assert!(ok(&home, &["scheduler", "show", &id]).starts_with(&format!("{id}  (on)")));
+    let undo = format!("✓ removed {what} (undo: shimmer scheduler restore {})", shown(&id));
+    assert_eq!(ok(&home, &["scheduler", "remove", &id]).trim(), undo);
+    // Gone; only modules' own remain (fetchers' heartbeat, ADR 0028 §5; notify's hourly
+    // `notify.flush`) -- #244 already hides every module-owned trigger from the default view.
+    let left = ok(&home, &["scheduler", "list"]);
+    assert!(!left.contains(shown(&id)) && !left.contains("records.list"), "{left}");
+
+    // Kept aside until restored or purged (ADR 0038).
+    assert!(ok(&home, &["scheduler", "list", "--removed"]).contains(shown(&id)));
+    assert!(ok(&home, &["scheduler", "restore", shown(&id)]).starts_with(&format!("✓ restored {what}")));
+    assert!(ok(&home, &["scheduler", "list"]).contains(shown(&id)));
+    // Edit keeps the id (ADR 0038 §6).
+    let edit =
+        ["scheduler", "edit", shown(&id), "every", "2d", "--catch-up", "skip", "records", "complete", "leetcode/x"];
+    let edited = ok(&home, &edit);
+    assert!(
+        edited.starts_with(&format!("✓ {} now runs records complete leetcode/x · every 2d", shown(&id))),
+        "{edited}"
+    );
+    // The same check as add: only a command that makes one change can be scheduled.
+    fails(
+        &home,
+        &["scheduler", "edit", shown(&id), "every", "2d", "--catch-up", "skip", "records", "list", "leetcode"],
+    );
+    assert!(ok(&home, &["scheduler", "show", &id]).contains("  schedule  every 2d"));
+    ok(&home, &["scheduler", "remove", &id]);
+    assert_eq!(ok(&home, &["scheduler", "purge", "--yes"]).trim(), "✓ 1 removed schedule(s) deleted for good");
+    assert_eq!(ok(&home, &["scheduler", "list", "--removed"]).trim(), "no removed schedules");
 }
 
 #[test]
@@ -211,8 +237,8 @@ fn a_trigger_or_task_is_reached_by_the_ending_its_list_shows() {
     assert_eq!(o.status.code(), Some(1));
     assert!(stderr(&o).contains("invalid_params") && stderr(&o).contains("at least 4"), "{}", stderr(&o));
     assert!(ok(&home, &["scheduler", "list"]).lines().any(|l| l.starts_with(end)), "still there");
-    ok(&home, &["scheduler", "pause", end]);
-    assert!(ok(&home, &["scheduler", "show", &end.to_uppercase()]).contains("(paused)"), "any case");
+    ok(&home, &["scheduler", "disable", end]);
+    assert!(ok(&home, &["scheduler", "show", &end.to_uppercase()]).contains("(off)"), "any case");
     ok(&home, &["scheduler", "remove", end]);
     let o = home.shimmer(&["scheduler", "show", end]);
     assert!(stderr(&o).contains("not_found"), "{}", stderr(&o));
@@ -230,7 +256,7 @@ fn schedule_runs_a_normal_command_in_plain_words() {
     );
     assert!(out.starts_with("✓ scheduled records complete leetcode/two-sum · every 1s"), "{out}");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while !ok(&home, &["records", "get", "leetcode/two-sum"]).contains("(done)") {
+    while !ok(&home, &["records", "show", "leetcode/two-sum"]).contains("(done)") {
         assert!(std::time::Instant::now() < deadline, "the scheduled complete never ran");
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
