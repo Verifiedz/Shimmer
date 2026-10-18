@@ -10,6 +10,7 @@ mod backend;
 mod bus;
 mod config;
 mod core;
+mod desktop;
 mod http_backend;
 mod indexer;
 mod ipc;
@@ -19,7 +20,6 @@ mod launcher;
 mod queue;
 mod registry;
 mod scheduler;
-mod short_id;
 
 use std::fs::{self, File};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -107,12 +107,23 @@ impl Daemon {
         let shutdown = CancellationToken::new();
         let bus = Bus::new();
         let backend = Arc::new(Backend { store: store.clone(), bus: bus.clone() });
-        let core = Core::new(registry, lanes, &cfg, backend, config.clock.clone(), shutdown.clone(), &config.socket);
+        // Opened before `Core::new` so `core.events.list` (`crates/daemon/src/core.rs`) has a
+        // handle to query from the moment the daemon starts answering requests.
+        let index = indexer::open(store.clone()).await?;
+        let core = Core::new(
+            registry,
+            lanes,
+            &cfg,
+            backend,
+            config.clock.clone(),
+            shutdown.clone(),
+            &config.socket,
+            index.clone(),
+        );
         let tracker = TaskTracker::new();
 
         // Subscribe before init so events a module emits while initialising are not missed.
         let receivers: Vec<_> = core.registry.entries.iter().map(|_| bus.subscribe()).collect();
-        let index = indexer::open(store.clone()).await?;
         tracker.spawn(indexer::run(index, store.clone(), bus.subscribe(), shutdown.clone()));
 
         for (entry, mut rx) in core.registry.entries.iter().zip(receivers) {

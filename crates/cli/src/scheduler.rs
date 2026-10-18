@@ -10,32 +10,20 @@ use crate::flags::Flags;
 use crate::render::{self, table};
 use crate::style::{paint, Role};
 use crate::when;
+use crate::workspaces::Prompt;
 
 pub const USAGE: &str = "usage: shimmer scheduler <command>
 
 commands:
-  list                                  every trigger: when it runs next, last ran, and its state
+  add WHEN [--catch-up WHAT] [--lane LANE] COMMAND…
+                                        run COMMAND on a schedule, e.g. shimmer scheduler add
+                                        weekdays 09:00 workspaces activate site (scheduler add --help)
+  list [--all]                          the schedules you added: when each runs next, last ran,
+                                        and its state; --all also modules' own (notify's, …)
   show TRIGGER                          one trigger in full
-  add OP [PARAMS] WHEN --catch-up WHAT  run OP on a schedule; PARAMS is a JSON object (default {})
-      [--lane LANE]
   pause TRIGGER                         stop it firing until resumed
   resume TRIGGER                        fire again, from now on (time spent paused isn't 'missed')
   remove TRIGGER                        delete one you added (a module's own can only be paused)
-
-WHEN is exactly one of:
-  --every DURATION   e.g. 30s, 15m, 2h, 3d, 1w, 1h30m
-  --cron \"EXPR\"      five fields, minute hour day month weekday; times are UTC
-  --cron-local \"EXPR\" the same, in your local timezone (config.toml's local_timezone):
-                     9am stays 9am when the clocks change
-  --once TIME        2026-10-10 09:00 (your local time) or 2026-10-10T09:00:00Z
-
---catch-up says what happens to runs missed while the machine was off or asleep. It has no
-default, because guessing wrong sends duplicates:
-  skip       drop them (polls, health checks)
-  run-once   run once on waking, however many were missed
-  backfill   run once for each missed time
-
-e.g. shimmer scheduler add records.list '{\"collection\":\"leetcode\"}' --every 1d --catch-up skip
 
 A trigger enqueues a task when it fires; 'shimmer queue' shows it running. TRIGGER is the id as
 'scheduler list' shows it: its ending is enough (at least 4 characters). Add --json to any command for raw output.";
@@ -43,109 +31,74 @@ A trigger enqueues a task when it fires; 'shimmer queue' shows it running. TRIGG
 #[derive(Clone, Debug, PartialEq)]
 pub enum SchedulerCmd {
     Help,
-    List,
-    Show { id: String },
-    Add(NewTrigger),
-    Pause { id: String },
-    Resume { id: String },
-    Remove { id: String },
-}
-
-/// `scheduler.add`'s params, already in the protocol's shapes.
-#[derive(Clone, Debug, PartialEq)]
-pub struct NewTrigger {
-    pub op: String,
-    pub params: Value,
-    /// `{"every": secs}`, `{"cron": "…"}` or `{"once": "<UTC RFC 3339>"}`.
-    pub schedule: Value,
-    /// `skip`, `run_once` or `backfill`, as the protocol spells them.
-    pub catch_up: &'static str,
-    pub lane: Option<String>,
+    /// `all`: modules' own triggers too (#244).
+    List {
+        all: bool,
+    },
+    Show {
+        id: String,
+    },
+    /// `scheduler add WHEN … COMMAND…` (ADR 0031 §6).
+    Add(crate::schedule::Planned),
+    /// `scheduler add` alone, or `scheduler add --help`.
+    AddHelp,
+    Pause {
+        id: String,
+    },
+    Resume {
+        id: String,
+    },
+    Remove {
+        id: String,
+    },
 }
 
 /// What `--catch-up` takes, as typed (shell completion offers these, #188).
 pub const CATCH_UP: &[&str] = &["skip", "run-once", "backfill"];
 
-const CATCH_UP_HELP: &str = "skip (drop missed runs), run-once (one run on waking, however many were missed) \
-                             or backfill (one run for each missed time)";
-
 /// `words` are what follows `shimmer scheduler`.
 pub fn parse(words: Vec<String>) -> std::result::Result<SchedulerCmd, String> {
     let mut words = words.into_iter();
     let Some(sub) = words.next() else { return Ok(SchedulerCmd::Help) };
-    let options: &[&str] =
-        if sub == "add" { &["--every", "--cron", "--cron-local", "--once", "--catch-up", "--lane"] } else { &[] };
-    let flags = Flags::split(words.collect(), options, &[]).map_err(|e| format!("scheduler {sub}: {e}"))?;
+    // The schedule in words, then the command as typed (ADR 0031 §6): its own parser.
+    if sub == "add" {
+        return match crate::schedule::parse(words.collect())? {
+            crate::schedule::ScheduleCmd::Add(plan) => Ok(SchedulerCmd::Add(plan)),
+            crate::schedule::ScheduleCmd::Help => Ok(SchedulerCmd::AddHelp),
+        };
+    }
+    let switches: &[&str] = if sub == "list" { &["--all"] } else { &[] };
+    let flags = Flags::split(words.collect(), &[], switches).map_err(|e| format!("scheduler {sub}: {e}"))?;
     let id = || match flags.positional.as_slice() {
         [id] => Ok(id.clone()),
         _ => Err(format!("usage: shimmer scheduler {sub} TRIGGER")),
     };
     match sub.as_str() {
         "help" => Ok(SchedulerCmd::Help),
-        "list" if flags.positional.is_empty() => Ok(SchedulerCmd::List),
+        "list" if flags.positional.is_empty() => Ok(SchedulerCmd::List { all: flags.has("--all") }),
         "list" => Err("'scheduler list' takes no arguments".into()),
         "show" => Ok(SchedulerCmd::Show { id: id()? }),
         "pause" => Ok(SchedulerCmd::Pause { id: id()? }),
         "resume" => Ok(SchedulerCmd::Resume { id: id()? }),
         "remove" => Ok(SchedulerCmd::Remove { id: id()? }),
-        "add" => add(&flags).map(SchedulerCmd::Add),
         other => Err(format!("unknown scheduler command '{other}'; see 'shimmer scheduler --help'")),
     }
 }
 
-fn add(flags: &Flags) -> std::result::Result<NewTrigger, String> {
-    let (op, params) = match flags.positional.as_slice() {
-        [op] => (op.clone(), json!({})),
-        [op, params] => {
-            let v: Value = serde_json::from_str(params).map_err(|e| format!("PARAMS is not valid JSON: {e}"))?;
-            if !v.is_object() {
-                return Err("PARAMS must be a JSON object, e.g. '{\"collection\":\"leetcode\"}'".into());
-            }
-            (op.clone(), v)
-        }
-        _ => {
-            return Err(
-                "usage: shimmer scheduler add OP [PARAMS] WHEN --catch-up WHAT; see 'shimmer scheduler --help'".into()
-            )
-        }
-    };
-    let given = [flags.value("--every"), flags.value("--cron"), flags.value("--cron-local"), flags.value("--once")];
-    let schedule = match given {
-        [Some(d), None, None, None] => json!({ "every": when::parse_duration(d)? }),
-        [None, Some(expr), None, None] => json!({ "cron": expr }),
-        [None, None, Some(expr), None] => json!({ "cron_local": expr }),
-        [None, None, None, Some(t)] => json!({ "once": when::parse_once(t)?.to_rfc3339() }),
-        _ => {
-            return Err(
-                "'scheduler add' needs exactly one of --every DURATION, --cron \"EXPR\", --cron-local \"EXPR\" \
-                        or --once TIME"
-                    .into(),
-            )
-        }
-    };
-    let catch_up = match flags.value("--catch-up") {
-        Some("skip") => "skip",
-        Some("run-once" | "run_once") => "run_once",
-        Some("backfill") => "backfill",
-        Some(other) => return Err(format!("--catch-up '{other}' isn't one of {CATCH_UP_HELP}")),
-        None => return Err(format!("'scheduler add' needs --catch-up: {CATCH_UP_HELP}. There is no default.")),
-    };
-    Ok(NewTrigger { op, params, schedule, catch_up, lane: flags.value("--lane").map(String::from) })
-}
-
-pub async fn run(client: &mut Client, cmd: &SchedulerCmd, json: bool) -> Result<String> {
+pub async fn run(client: &mut Client, cmd: &SchedulerCmd, json: bool, prompt: &mut dyn Prompt) -> Result<String> {
     let now = Utc::now();
     let one = |id: &str, op: &'static str| (op, json!({ "trigger_id": id }));
     let (op, params) = match cmd {
         SchedulerCmd::Help => return Ok(USAGE.into()),
-        SchedulerCmd::List => {
+        SchedulerCmd::List { all } => {
             let data = client.call("scheduler.list", json!({})).await?;
+            // --json stays complete, so scripts see every trigger either way.
             if json {
                 return Ok(render::json(&data));
             }
-            let all = data["triggers"].as_array().cloned().unwrap_or_default();
-            let schemas = schemas_for(client, &all).await;
-            return Ok(list(&data, now, &schemas));
+            let triggers = data["triggers"].as_array().cloned().unwrap_or_default();
+            let schemas = schemas_for(client, &triggers).await;
+            return Ok(list(&data, now, &schemas, *all));
         }
         SchedulerCmd::Show { id } => {
             let data = client.call("scheduler.get", json!({"trigger_id": id})).await?;
@@ -155,27 +108,10 @@ pub async fn run(client: &mut Client, cmd: &SchedulerCmd, json: bool) -> Result<
             let schemas = schemas_for(client, std::slice::from_ref(&data)).await;
             return Ok(trigger(&data, now, &schemas));
         }
-        SchedulerCmd::Add(t) => {
-            let mut params = json!({"schedule": t.schedule, "op": t.op, "params": t.params, "catch_up": t.catch_up});
-            if let Some(lane) = &t.lane {
-                params["lane"] = json!(lane);
-            }
-            let data = client.call("scheduler.add", params).await?;
-            if json {
-                return Ok(render::json(&data));
-            }
-            let id = data["trigger_id"].as_str().unwrap_or("?").to_string();
-            // Just the new trigger, as `show` gets it (#104). It's already added, so if this
-            // fails the command still succeeds (a script must not add it again), and says why
-            // the details are missing.
-            return Ok(match client.call("scheduler.get", json!({"trigger_id": id})).await {
-                Ok(t) => added(&id, Some(&t), now),
-                Err(e) => format!(
-                    "{}\n  (couldn't fetch its details: {}; see 'shimmer scheduler show {id}')",
-                    added(&id, None, now),
-                    e.code
-                ),
-            });
+        SchedulerCmd::AddHelp => return Ok(crate::schedule::USAGE.into()),
+        SchedulerCmd::Add(plan) => {
+            let cmd = crate::schedule::ScheduleCmd::Add(plan.clone());
+            return crate::schedule::run(client, &cmd, json, prompt).await;
         }
         SchedulerCmd::Pause { id } => one(id, "scheduler.pause"),
         SchedulerCmd::Resume { id } => one(id, "scheduler.resume"),
@@ -198,24 +134,27 @@ pub async fn run(client: &mut Client, cmd: &SchedulerCmd, json: bool) -> Result<
     })
 }
 
-fn added(id: &str, t: Option<&Value>, now: DateTime<Utc>) -> String {
-    let Some(t) = t else { return format!("✓ added trigger {id}") };
-    let next = when::timestamp(&t["next_due"]).map_or("never (already in the past)".into(), |at| {
-        format!("{} ({})", when::relative(at, now), when::local(at))
-    });
-    format!(
-        "✓ added trigger {id}: {} {}, catch-up {}\n  first run: {next}",
-        render::cell(&t["op"]),
-        schedule(&t["schedule"]),
-        catch_up(&t["catch_up"])
-    )
-}
-
 /// Every trigger in one table, or a line saying there are none.
-fn list(data: &Value, now: DateTime<Utc>, schemas: &Schemas) -> String {
-    let triggers = data["triggers"].as_array().cloned().unwrap_or_default();
+/// The schedules a person added; with `all`, modules' own too, and a FROM column to tell them
+/// apart (#244). Modules' own are never secret: a footer says how many `--all` would add.
+fn list(data: &Value, now: DateTime<Utc>, schemas: &Schemas, all: bool) -> String {
+    let every = data["triggers"].as_array().cloned().unwrap_or_default();
+    let (triggers, hidden): (Vec<Value>, usize) = if all {
+        (every, 0)
+    } else {
+        let mine: Vec<Value> = every.iter().filter(|t| t["source"]["type"] == "user").cloned().collect();
+        let hidden = every.len() - mine.len();
+        (mine, hidden)
+    };
+    let footer = match hidden {
+        0 => String::new(),
+        1 => format!("\n{}", paint(Role::Hint, "+ 1 built-in schedule (shimmer scheduler list --all)")),
+        n => format!("\n{}", paint(Role::Hint, &format!("+ {n} built-in schedules (shimmer scheduler list --all)"))),
+    };
     if triggers.is_empty() {
-        return "no triggers yet; add one with: shimmer scheduler add OP WHEN --catch-up WHAT".into();
+        return format!(
+            "no triggers yet; add one with: shimmer scheduler add WHEN COMMAND (shimmer scheduler add --help){footer}"
+        );
     }
     let ids: Vec<String> = triggers.iter().map(|t| render::cell(&t["id"])).collect();
     let rows: Vec<Vec<String>> = triggers
@@ -233,9 +172,20 @@ fn list(data: &Value, now: DateTime<Utc>, schemas: &Schemas) -> String {
                 source(&t["source"]),
             ]
         })
+        .map(|mut row: Vec<String>| {
+            // Without --all every row is yours: no FROM column to say so.
+            if !all {
+                row.pop();
+            }
+            row
+        })
         .collect();
-    let header = ["ID", "COMMAND", "SCHEDULE", "CATCH-UP", "NEXT", "LAST", "STATE", "FROM"].map(String::from);
-    table(&header, &rows)
+    let mut header: Vec<String> =
+        ["ID", "COMMAND", "SCHEDULE", "CATCH-UP", "NEXT", "LAST", "STATE", "FROM"].map(String::from).to_vec();
+    if !all {
+        header.pop();
+    }
+    format!("{}{footer}", table(&header, &rows))
 }
 
 /// One trigger as label / value lines.
@@ -288,6 +238,17 @@ fn candidates(op: &str, params: &Value) -> Vec<Vec<String>> {
     let Some(target) = crate::packs::pack::TARGETS.iter().find(|t| t.op == op) else { return Vec::new() };
     let Some(p) = params.as_object() else { return Vec::new() };
     let base: Vec<String> = target.words.iter().map(|w| w.to_string()).collect();
+    if op == "notify.send" {
+        let mut words = base;
+        let Some(title) = p.get("title").and_then(Value::as_str) else { return Vec::new() };
+        words.push(title.to_owned());
+        for key in ["body", "priority"] {
+            if let Some(v) = p.get(key).and_then(Value::as_str) {
+                words.extend([format!("--{key}"), v.to_owned()]);
+            }
+        }
+        return vec![words];
+    }
     if op.starts_with("workspaces.") {
         let mut words = base;
         words.extend(p.get("id").and_then(Value::as_str).map(String::from));
@@ -426,6 +387,7 @@ fn parses_back_to(words: &[String], op: &str, params: &Value, schemas: &Schemas)
         "workspaces" => {
             crate::workspaces::parse(rest.to_vec()).ok().and_then(|cmd| crate::schedule::workspaces_op(&cmd))
         }
+        "notify" => crate::notify::parse(rest.to_vec()).ok().as_ref().and_then(crate::notify::scheduled_send),
         _ => None,
     };
     got.is_some_and(|(got_op, got_params)| got_op == op && &got_params == params)
@@ -520,26 +482,34 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn cron_local_is_added_and_shown_as_local_time() {
-        let SchedulerCmd::Add(t) = p(&["add", "x.y", "--cron-local", "0 9 * * 1-5", "--catch-up", "skip"]).unwrap()
-        else {
-            panic!("not an add")
-        };
-        assert_eq!(t.schedule, json!({"cron_local": "0 9 * * 1-5"}));
-        assert_eq!(schedule(&t.schedule), "weekdays 09:00 (local)");
-        let both = p(&["add", "x.y", "--cron", "0 9 * * *", "--cron-local", "0 9 * * *", "--catch-up", "skip"]);
-        assert!(both.unwrap_err().contains("exactly one of"));
-    }
-
     fn p(s: &[&str]) -> std::result::Result<SchedulerCmd, String> {
         parse(s.iter().map(|w| w.to_string()).collect())
     }
 
     #[test]
+    fn add_takes_the_schedule_in_words_then_the_command() {
+        // ADR 0031 §6: one way to schedule from the CLI.
+        let Ok(SchedulerCmd::Add(plan)) =
+            p(&["add", "weekdays", "09:00", "--catch-up", "skip", "workspaces", "activate", "site"])
+        else {
+            panic!("not an add")
+        };
+        assert_eq!(plan.when.schedule, json!({"cron_local": "0 9 * * 1-5"}));
+        assert_eq!(schedule(&plan.when.schedule), "weekdays 09:00 (local)");
+        assert_eq!(plan.command, ["workspaces", "activate", "site"]);
+        assert_eq!(p(&["add"]), Ok(SchedulerCmd::AddHelp));
+        assert_eq!(p(&["add", "--help"]), Ok(SchedulerCmd::AddHelp));
+        // The raw form went: it says what to type instead.
+        let raw = p(&["add", "records.list", "{}", "--every", "1d", "--catch-up", "skip"]).unwrap_err();
+        assert!(raw.contains("shimmer call scheduler.add"), "{raw}");
+    }
+
+    #[test]
     fn simple_commands_parse() {
         assert_eq!(p(&[]), Ok(SchedulerCmd::Help));
-        assert_eq!(p(&["list"]), Ok(SchedulerCmd::List));
+        assert_eq!(p(&["list"]), Ok(SchedulerCmd::List { all: false }));
+        assert_eq!(p(&["list", "--all"]), Ok(SchedulerCmd::List { all: true }));
+        assert!(p(&["show", "x", "--all"]).is_err(), "--all is list's only");
         for (word, want) in [
             ("show", SchedulerCmd::Show { id: "usr-1".into() }),
             ("pause", SchedulerCmd::Pause { id: "usr-1".into() }),
@@ -550,59 +520,6 @@ mod tests {
             assert!(p(&[word]).unwrap_err().contains("TRIGGER"), "{word}");
         }
         assert!(p(&["frob"]).unwrap_err().contains("unknown scheduler command"));
-    }
-
-    #[test]
-    fn add_builds_the_protocols_shapes() {
-        let SchedulerCmd::Add(t) = p(&[
-            "add",
-            "records.list",
-            r#"{"collection":"leetcode"}"#,
-            "--every",
-            "1d",
-            "--catch-up",
-            "run-once",
-            "--lane=default",
-        ])
-        .unwrap() else {
-            panic!()
-        };
-        assert_eq!(
-            t,
-            NewTrigger {
-                op: "records.list".into(),
-                params: json!({"collection": "leetcode"}),
-                schedule: json!({"every": 86_400}),
-                catch_up: "run_once",
-                lane: Some("default".into()),
-            }
-        );
-        let SchedulerCmd::Add(t) = p(&["add", "core.x", "--cron", "0 9 * * 1", "--catch-up", "skip"]).unwrap() else {
-            panic!()
-        };
-        assert_eq!((t.schedule, t.params), (json!({"cron": "0 9 * * 1"}), json!({})));
-        let SchedulerCmd::Add(t) =
-            p(&["add", "core.x", "--once", "2026-10-10T09:00:00+01:00", "--catch-up", "backfill"]).unwrap()
-        else {
-            panic!()
-        };
-        assert_eq!((t.schedule, t.catch_up), (json!({"once": "2026-10-10T08:00:00+00:00"}), "backfill"));
-    }
-
-    #[test]
-    fn add_mistakes_are_explained() {
-        let e = |w: &[&str]| p(w).unwrap_err();
-        assert!(e(&["add", "x.y", "--every", "1d"]).contains("needs --catch-up: skip (drop missed runs), run-once"));
-        assert!(e(&["add", "x.y", "--every", "1d", "--catch-up", "sometimes"])
-            .contains("--catch-up 'sometimes' isn't one of"));
-        assert!(e(&["add", "x.y", "--catch-up", "skip"]).contains("exactly one of --every"));
-        assert!(
-            e(&["add", "x.y", "--every", "1d", "--cron", "* * * * *", "--catch-up", "skip"]).contains("exactly one of")
-        );
-        assert!(e(&["add", "x.y", "--every", "2", "--catch-up", "skip"]).contains("'2' isn't a duration"));
-        assert!(e(&["add", "x.y", "[1]", "--every", "1d", "--catch-up", "skip"]).contains("must be a JSON object"));
-        assert!(e(&["add", "--every", "1d", "--catch-up", "skip"]).contains("usage: shimmer scheduler add OP"));
-        assert!(e(&["pause", "x", "--every", "1d"]).contains("unknown option '--every'"));
     }
 
     fn sample(now: DateTime<Utc>) -> Value {
@@ -619,7 +536,7 @@ mod tests {
     #[test]
     fn list_shows_each_trigger_readably() {
         let now = Utc::now();
-        let out = list(&sample(now), now, &Schemas::new());
+        let out = list(&sample(now), now, &Schemas::new(), true);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(
             lines[0].split_whitespace().collect::<Vec<_>>(),
@@ -634,7 +551,29 @@ mod tests {
             row(2),
             ["digest", "notify.digest {}", "cron 0 9 * * 1 (UTC)", "skip", "-", "3m ago", "paused", "module notify"]
         );
-        assert!(list(&json!({"triggers": []}), now, &Schemas::new()).starts_with("no triggers yet"));
+        assert!(list(&json!({"triggers": []}), now, &Schemas::new(), false).starts_with("no triggers yet"));
+    }
+
+    #[test]
+    fn modules_own_schedules_are_one_footer_line_away() {
+        crate::style::init(true, true, &Default::default());
+        let now = Utc::now();
+        let out = list(&sample(now), now, &Schemas::new(), false);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines[0].split_whitespace().collect::<Vec<_>>(),
+            ["ID", "COMMAND", "SCHEDULE", "CATCH-UP", "NEXT", "LAST", "STATE"],
+            "no FROM column: every row is yours"
+        );
+        assert!(lines[1].starts_with("usr-1") && !out.contains("notify.digest"), "{out}");
+        assert_eq!(lines.last().unwrap(), &"+ 1 built-in schedule (shimmer scheduler list --all)");
+        // Only modules' own: still says there are some.
+        let modules_only = json!({"triggers": [sample(now)["triggers"][1].clone()]});
+        assert_eq!(
+            list(&modules_only, now, &Schemas::new(), false),
+            "no triggers yet; add one with: shimmer scheduler add WHEN COMMAND (shimmer scheduler add --help)\n+ 1 built-in schedule (shimmer scheduler list --all)"
+        );
+        assert!(!list(&sample(now), now, &Schemas::new(), true).contains("built-in schedule"), "--all hides nothing");
     }
 
     fn schemas() -> Schemas {
@@ -685,6 +624,7 @@ mod tests {
                 let schema = cmd.collection().and_then(|c| schemas().get(c).cloned()).unwrap_or(Value::Null);
                 crate::records::request(&cmd, &schema).unwrap()
             }
+            "notify" => crate::notify::scheduled_send(&crate::notify::parse(words[1..].to_vec()).unwrap()).unwrap(),
             _ => crate::schedule::workspaces_op(&crate::workspaces::parse(words[1..].to_vec()).unwrap()).unwrap(),
         };
         (op, params)
@@ -710,6 +650,8 @@ mod tests {
             "workspaces activate site",
             "workspaces stop site",
             "workspaces cleanup site",
+            "notify send 'Standup in 15'",
+            "notify send Stretch --body 'stand up, walk' --priority low",
             // Through `scheduler add`: list filters, options, and a field named like an option.
             "records list jobs --stage offer",
             "records list jobs --filter limit=5",
@@ -774,7 +716,7 @@ mod tests {
     }
 
     #[test]
-    fn show_and_added_read_naturally() {
+    fn show_reads_naturally() {
         let now = Utc::now();
         let data = sample(now);
         let usr1 = &data["triggers"][0];
@@ -785,16 +727,10 @@ mod tests {
             out.contains("  lane      the op's own") && out.contains("(in 2h)") && out.contains("  last run  never"),
             "{out}"
         );
-        let msg = added("usr-1", Some(usr1), now);
-        assert!(
-            msg.starts_with("✓ added trigger usr-1: records.list every 2d, catch-up run-once\n  first run: in 2h ("),
-            "{msg}"
-        );
-        assert_eq!(added("usr-9", None, now), "✓ added trigger usr-9", "still says it was added");
     }
 
-    /// A daemon that accepts `scheduler.add` and fails every other request, as one would if
-    /// `scheduler.get` broke right after the trigger was created.
+    /// A daemon that knows workspace `site`, accepts `scheduler.add`, and fails every other
+    /// request, as one would if `scheduler.get` broke right after the trigger was created.
     async fn add_only_daemon(sock: &std::path::Path) {
         use shimmer_proto::{decode_client, encode, ClientFrame, ServerFrame};
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -808,6 +744,9 @@ mod tests {
                     ClientFrame::Hello { .. } => ServerFrame::welcome("test", "s1"),
                     ClientFrame::Request { id, op, .. } if op == "scheduler.add" => {
                         ServerFrame::ok(id, json!({"trigger_id": "usr-new"}))
+                    }
+                    ClientFrame::Request { id, op, .. } if op == "workspaces.status" => {
+                        ServerFrame::ok(id, json!({"id": "site", "state": "ready"}))
                     }
                     ClientFrame::Request { id, op, .. } => {
                         ServerFrame::err(id, shimmer_core::Error::unavailable(format!("{op} broke")))
@@ -827,11 +766,9 @@ mod tests {
         let sock = dir.path().join("s.sock");
         add_only_daemon(&sock).await;
         let mut client = Client::connect(&sock).await.unwrap();
-        let cmd = p(&["add", "records.list", "--every", "1d", "--catch-up", "skip"]).unwrap();
-        let out = run(&mut client, &cmd, false).await.unwrap();
-        assert_eq!(
-            out,
-            "✓ added trigger usr-new\n  (couldn't fetch its details: unavailable; see 'shimmer scheduler show usr-new')"
-        );
+        let cmd = p(&["add", "every", "1d", "--catch-up", "skip", "workspaces", "activate", "site"]).unwrap();
+        let out = run(&mut client, &cmd, false, &mut crate::workspaces::Terminal).await.unwrap();
+        assert!(out.starts_with("✓ scheduled workspaces activate site · every 1d · catch-up skip"), "{out}");
+        assert!(out.contains("first run: see 'shimmer scheduler show'") && out.contains("id usr-new"), "{out}");
     }
 }
