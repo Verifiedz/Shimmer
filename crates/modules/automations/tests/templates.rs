@@ -119,6 +119,20 @@ async fn mistakes_and_missing_modules_are_explained() {
     assert_eq!(e.code, ErrorCode::Unavailable);
     assert!(e.message.contains("needs notify.send from the notify module"), "{}", e.message);
 
+    // Several ops from one module name it once (#254's review).
+    let env2 = crate::env(&[]);
+    let m2 = Automations::default();
+    m2.init(&env2.ctx).await.unwrap();
+    let e = m2
+        .handle(
+            "automations.create",
+            json!({"id": "x", "template": "stage-creates-workspace", "values": {}}),
+            &env2.ctx,
+        )
+        .await
+        .unwrap_err();
+    assert!(e.message.contains("from the workspaces module, which isn't"), "{}", e.message);
+
     let e = call(json!({"id": "x", "template": "stage-opens-workspace", "values": {"COLLECTION": "jobs"}}))
         .await
         .unwrap_err();

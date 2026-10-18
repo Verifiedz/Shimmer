@@ -230,6 +230,12 @@ fn is_placeholder(token: &str) -> bool {
 }
 
 fn merge(into: &mut Cmd, from: Cmd) {
+    // Both summaries, so a second usage line's description (`new RULE --from TEMPLATE`) isn't
+    // lost (#254's review).
+    if !from.summary.is_empty() && !into.summary.contains(&from.summary) {
+        into.summary =
+            if into.summary.is_empty() { from.summary } else { format!("{}; {}", into.summary, from.summary) };
+    }
     for (i, alternatives) in from.positionals.into_iter().enumerate() {
         match into.positionals.get_mut(i) {
             Some(existing) => {

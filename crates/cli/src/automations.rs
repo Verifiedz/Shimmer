@@ -415,7 +415,16 @@ async fn from_template_run(
         .await
         .map_err(|e| crate::workspaces::how_to_answer(e, prompt))?;
     let rules = shown["rules"].as_array().cloned().unwrap_or_default();
-    if prompt.interactive() && !yes {
+    // Nobody to ask (a script) and no --yes: refuse, never make rules unseen (ADR 0025 §6a,
+    // #254's review).
+    if !yes && !prompt.interactive() {
+        return Err(Error::invalid_params(format!(
+            "refusing to make {} rule{} without confirmation; pass --yes",
+            rules.len(),
+            if rules.len() == 1 { "" } else { "s" }
+        )));
+    }
+    if !yes {
         for r in &rules {
             eprintln!(
                 "
@@ -455,7 +464,7 @@ Make these {n} rules? They're on as soon as they're made."
 
 /// One template as `peek` shows it: what it does, what to know, its questions, its rules.
 fn in_full(t: &Value, categories: &[Value]) -> String {
-    let category = categories.iter().find(|c| c["category"] == t["category"] || c["id"] == t["category"]);
+    let category = categories.iter().find(|c| c["id"] == t["category"]);
     let mut out = format!(
         "{}  {}
 {}
@@ -620,15 +629,20 @@ fn summary(rule: &Value) -> String {
     format!("{} ({}): on {}", full(&rule["id"]), full(&rule["label"]), full(&rule["on"]))
 }
 
-/// The ops a rule runs: `notify.send, workspaces.activate (after 3d)`.
+/// The ops a rule runs: `notify.send, workspaces.activate (after 3d)`, each cut to a table cell.
 fn does(rule: &Value) -> String {
+    does_with(rule, render::cell)
+}
+
+/// [`does`], each op shown with `show_op`: `full` where nothing else is cut (`show`, #254's review).
+fn does_with(rule: &Value, show_op: fn(&Value) -> String) -> String {
     rule["actions"]
         .as_array()
         .into_iter()
         .flatten()
         .map(|a| match a["after_s"].as_u64() {
-            Some(s) => format!("{} (after {})", render::cell(&a["op"]), when::format_duration(s)),
-            None => render::cell(&a["op"]),
+            Some(s) => format!("{} (after {})", show_op(&a["op"]), when::format_duration(s)),
+            None => show_op(&a["op"]),
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -701,7 +715,7 @@ fn show(r: &Value, now: DateTime<Utc>) -> String {
     let mut line = |label: &str, value: String| out.push_str(&format!("  {}{value}\n", crate::style::label(label, 12)));
     line("label", full(&r["label"]));
     line("reacts to", full(&r["on"]));
-    line("does", does(r));
+    line("does", does_with(r, full));
     line("last fired", ago(&r["last_fired"], now, "never"));
     if r["loop_stopped_at"].is_string() {
         line(
