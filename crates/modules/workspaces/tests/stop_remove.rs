@@ -1,4 +1,4 @@
-//! `workspaces.stop`, `remove` and `restore` (ADR 0026) against `FakeLauncher` and the
+//! `workspaces.stop`, `remove`, `restore` (ADR 0026) and `purge` (ADR 0038) against `FakeLauncher` and the
 //! in-memory `Ctx` (CLAUDE.md §12 rule 13).
 
 use serde_json::{json, Value};
@@ -158,4 +158,56 @@ async fn restore_never_overwrites_a_new_workspace_with_the_same_id() {
     let e = call(&w, &env, "workspaces.restore").await.unwrap_err();
     assert_eq!(e.code, ErrorCode::Conflict);
     assert!(file(&env, ".removed/site/workspace.toml").is_some(), "still there to restore later");
+}
+
+#[tokio::test]
+async fn purge_asks_first_then_deletes_one_removed_workspace_for_good() {
+    let env = env_with_site(None, true);
+    let w = Workspaces::default();
+    call(&w, &env, "workspaces.remove").await.unwrap();
+
+    let e = w.handle("workspaces.purge", json!({"id": "site"}), &env.ctx).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::ConfirmationRequired);
+    assert_eq!(e.detail, Some(json!({"workspaces": 1})));
+    let stale = json!({"id": "site", "confirm": {"workspaces": 2}});
+    assert_eq!(w.handle("workspaces.purge", stale, &env.ctx).await.unwrap_err().code, ErrorCode::ConfirmationRequired);
+    assert!(file(&env, ".removed/site/workspace.toml").is_some(), "nothing deleted without a matching confirm");
+
+    let ok = json!({"id": "site", "confirm": {"workspaces": 1}});
+    assert_eq!(w.handle("workspaces.purge", ok, &env.ctx).await.unwrap(), json!({"purged": 1}));
+    assert!(env.ctx.store.list(".removed").unwrap().is_empty());
+    let purged = env.backend.events().into_iter().last().unwrap();
+    assert_eq!(
+        (purged.topic.as_str(), purged.payload),
+        ("workspaces.workspace.purged", json!({"workspace": "site", "workspaces": 1}))
+    );
+    assert_eq!(call(&w, &env, "workspaces.restore").await.unwrap_err().code, ErrorCode::NotFound);
+    let again = w.handle("workspaces.purge", json!({"id": "site"}), &env.ctx).await.unwrap_err();
+    assert_eq!(again.code, ErrorCode::NotFound, "only a removed workspace can be purged");
+}
+
+#[tokio::test]
+async fn purge_without_an_id_deletes_every_removed_workspace_and_nothing_else() {
+    let env = env_with_site(None, true);
+    let w = Workspaces::default();
+    put(&env, "blog/workspace.toml", &SITE.replace("Site", "Blog"));
+    put(&env, "blog/steps/01-server.sh", "true\n");
+    put(&env, "blog/cleanup.sh", "true\n");
+    put(&env, "keep/workspace.toml", &SITE.replace("Site", "Keep"));
+    put(&env, "keep/steps/01-server.sh", "true\n");
+    put(&env, "keep/cleanup.sh", "true\n");
+    call(&w, &env, "workspaces.remove").await.unwrap();
+    w.handle("workspaces.remove", json!({"id": "blog"}), &env.ctx).await.unwrap();
+
+    let e = w.handle("workspaces.purge", json!({}), &env.ctx).await.unwrap_err();
+    assert_eq!(e.detail, Some(json!({"workspaces": 2})));
+    let done = w.handle("workspaces.purge", json!({"confirm": {"workspaces": 2}}), &env.ctx).await.unwrap();
+    assert_eq!(done, json!({"purged": 2}));
+    assert!(env.ctx.store.list(".removed").unwrap().is_empty());
+    assert!(file(&env, "keep/workspace.toml").is_some(), "a workspace that wasn't removed is untouched");
+    assert_eq!(
+        w.handle("workspaces.purge", json!({}), &env.ctx).await.unwrap(),
+        json!({"purged": 0}),
+        "nothing to ask about"
+    );
 }

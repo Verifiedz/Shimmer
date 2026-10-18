@@ -151,10 +151,19 @@ fn a_trigger_fires_and_can_be_paused_resumed_and_removed() {
     assert!(ok(&home, &["scheduler", "show", &id]).starts_with(&format!("{id}  (paused)")));
     assert!(ok(&home, &["scheduler", "resume", &id]).starts_with(&format!("✓ resumed {what}")));
     assert!(ok(&home, &["scheduler", "show", &id]).starts_with(&format!("{id}  (active)")));
-    assert_eq!(ok(&home, &["scheduler", "remove", &id]).trim(), format!("✓ removed {what}"));
+    let undo = format!("✓ removed {what} (undo: shimmer scheduler restore {})", shown(&id));
+    assert_eq!(ok(&home, &["scheduler", "remove", &id]).trim(), undo);
     // Gone; only modules' own remain (notify's hourly `notify.flush`).
     let left = ok(&home, &["scheduler", "list"]);
     assert!(!left.contains(shown(&id)) && !left.contains("records.list"), "{left}");
+
+    // Kept aside until restored or purged (ADR 0038).
+    assert!(ok(&home, &["scheduler", "list", "--removed"]).contains(shown(&id)));
+    assert!(ok(&home, &["scheduler", "restore", shown(&id)]).starts_with(&format!("✓ restored {what}")));
+    assert!(ok(&home, &["scheduler", "list"]).contains(shown(&id)));
+    ok(&home, &["scheduler", "remove", &id]);
+    assert_eq!(ok(&home, &["scheduler", "purge", "--yes"]).trim(), "✓ 1 removed schedule(s) deleted for good");
+    assert_eq!(ok(&home, &["scheduler", "list", "--removed"]).trim(), "no removed schedules");
 }
 
 #[test]

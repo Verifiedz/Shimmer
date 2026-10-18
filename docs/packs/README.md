@@ -65,6 +65,8 @@ belongs to this machine, so copying your Shimmer folder elsewhere doesn't bring 
 | scheduler pause | `chotto-matte` | `code-freeze` | `hold-position` | `spause` |
 | scheduler resume | `hajime` | `thaw` | `full-ahead` | `sresume` |
 | scheduler remove | `mou-ii` | `deprecate` | `scrub-mission` | `sdel` |
+| scheduler restore | `fukkatsu` | `undeprecate` | `back-on-course` | `sundo` |
+| scheduler purge | `shuuryou` | `prune` | `vaporize` | `spurge` |
 | records templates | `sugoi` | `boilerplate` | `starcharts` | `rtpl` |
 | records new | `yosh` | `greenfield` | `commission` | `rnew` |
 | records trash | `gomen` | `graveyard` | `debris-field` | `rtrash` |
@@ -80,6 +82,7 @@ belongs to this machine, so copying your Shimmer folder elsewhere doesn't bring 
 | workspaces stop | `otsukare` | `eod` | `dock` | `wstop` |
 | workspaces remove | `mata-ne` | `decommission` | `stand-down` | `wrm` |
 | workspaces restore | `hisashiburi` | `cherry-pick` | `homecoming` | `wundo` |
+| workspaces purge | `bakuhatsu` | `nuke-env` | `space-junk` | `wpurge` |
 | workspaces rename | `dare-da` | `rename-env` | `callsign` | `wmv` |
 | workspaces copy | `bunshin` | `fork` | `sister-ship` | `wcp` |
 | workspaces reconfigure | `chotto` | `hotfix` | `refit` | `wset` |
@@ -137,10 +140,10 @@ On the right of each alias goes the command it runs, by its op name:
 | `records.create_collection` | `shimmer records new` |
 | `records.rename_field`, `.rename_collection`, `.remove_collection`, `.restore_collection`, `.purge_collection` | `shimmer records rename-field`, `rename-collection`, `remove-collection`, `restore-collection`, `purge-collection` |
 | `records.peek`, `.copy_collection`, `.edit` | `shimmer records peek`, `copy-collection`, `edit` |
-| `workspaces.list`, `.status`, `.activate`, `.cleanup`, `.reset`, `.stop`, `.remove`, `.restore`, `.rename`, `.copy`, `.reconfigure`, `.edit`, `.templates`, `.peek` | `shimmer workspaces <verb>` |
+| `workspaces.list`, `.status`, `.activate`, `.cleanup`, `.reset`, `.stop`, `.remove`, `.restore`, `.purge`, `.rename`, `.copy`, `.reconfigure`, `.edit`, `.templates`, `.peek` | `shimmer workspaces <verb>` |
 | `workspaces.force_relaunch`, `workspaces.create` | `shimmer workspaces force-relaunch`, `new` |
 | `queue.list`, `.task`, `.cancel`, `.reorder` | `shimmer queue list`, `show`, `cancel`, `move` |
-| `scheduler.list`, `.get`, `.add`, `.pause`, `.resume`, `.remove` | `shimmer scheduler list`, `show`, `add`, `pause`, `resume`, `remove` |
+| `scheduler.list`, `.get`, `.add`, `.pause`, `.resume`, `.remove`, `.restore`, `.purge` | `shimmer scheduler list`, `show`, `add`, `pause`, `resume`, `remove`, `restore`, `purge` |
 | `notify.list`, `.count`, `.remove`, `.send`, `.test`, `.resend`, `.pause`, `.resume`, `.quiet`, `.status`, `.cap` | `shimmer notify <verb>` |
 | `notify.get`, `.mark_read`, `.mark_unread`, `.builtin_alerts` | `shimmer notify show`, `mark-read`, `mark-unread`, `builtin-alerts` |
 

@@ -51,6 +51,7 @@ impl Module for Workspaces {
                 "workspaces.session.stopped",
                 "workspaces.workspace.removed",
                 "workspaces.workspace.restored",
+                "workspaces.workspace.purged",
                 "workspaces.workspace.copied",
                 "workspaces.workspace.renamed",
                 "workspaces.workspace.reconfigured",
@@ -104,6 +105,12 @@ impl Module for Workspaces {
                 Execution::Inline,
             ),
             ("workspaces.restore", "Bring a removed workspace back", id.clone(), Execution::Inline),
+            (
+                "workspaces.purge",
+                "Delete a removed workspace for good, or every one; asks first (ADR 0038)",
+                json!({"type": "object", "properties": {"id": {"type": "string"}, "confirm": {"type": "object"}}}),
+                Execution::Inline,
+            ),
             (
                 "workspaces.copy",
                 "Make a new workspace from an existing one, optionally with some answers changed",
@@ -174,6 +181,7 @@ impl Module for Workspaces {
             "workspaces.stop" => self.stop(ctx, &decode::<Target>(params)?.id).await,
             "workspaces.remove" => self.remove(ctx, &decode::<Target>(params)?.id),
             "workspaces.restore" => self.restore_removed(ctx, &decode::<Target>(params)?.id),
+            "workspaces.purge" => self.purge(ctx, decode(params)?),
             "workspaces.rename" => self.rename(ctx, decode(params)?),
             "workspaces.copy" => self.copy(ctx, decode(params)?),
             "workspaces.templates" => templates(decode(params)?),
@@ -189,6 +197,14 @@ impl Module for Workspaces {
 #[derive(Deserialize)]
 struct Target {
     id: String,
+}
+
+/// `workspaces.purge` (ADR 0038): one removed workspace, or all of them.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Purge {
+    id: Option<String>,
+    confirm: Option<Value>,
 }
 
 /// `workspaces.reconfigure` (ADR 0025 §9): new answers, by question name.
@@ -665,6 +681,53 @@ impl Workspaces {
         self.status(ctx, id)
     }
 
+    /// Delete removed workspaces for good: `p.id`'s, or every one, after the caller confirms how
+    /// many it was shown, as `records.purge` asks (ADR 0038 §1). The one workspaces op that can't
+    /// be undone, so it never runs on a guess.
+    fn purge(&self, ctx: &Ctx, p: Purge) -> Result<Value> {
+        let _g = self.write.lock();
+        let ids: Vec<String> = match &p.id {
+            Some(id) => {
+                if !manifest::valid_name(id) || ctx.store.list(&removed_path(id))?.is_empty() {
+                    return Err(Error::not_found(format!("no removed workspace '{id}'")));
+                }
+                vec![id.clone()]
+            }
+            None => removed_ids(ctx)?,
+        };
+        let workspaces = ids.len();
+        if workspaces == 0 {
+            return Ok(json!({"purged": 0}));
+        }
+        let expected = json!({"workspaces": workspaces});
+        if p.confirm.as_ref() != Some(&expected) {
+            let what = match &p.id {
+                Some(id) => format!("the removed workspace '{id}'"),
+                None => format!("all {workspaces} removed workspace(s)"),
+            };
+            return Err(Error::new(
+                shimmer_core::ErrorCode::ConfirmationRequired,
+                format!("purging permanently deletes {what}; confirm with {{\"workspaces\": {workspaces}}}"),
+            )
+            .with_detail(expected));
+        }
+        let mut files = Vec::new();
+        for id in &ids {
+            files.extend(ctx.store.list(&removed_path(id))?);
+        }
+        let mut event = json!({"workspaces": workspaces});
+        if let Some(id) = &p.id {
+            event["workspace"] = json!(id);
+        }
+        ctx.store.transaction(|tx| {
+            for path in &files {
+                tx.delete(path)?;
+            }
+            tx.emit("workspaces.workspace.purged", event)
+        })?;
+        Ok(json!({"purged": workspaces}))
+    }
+
     /// `dirty → ready` without running cleanup (§10.3: the last resort when there is no
     /// cleanup script). Also clears a `state.toml` Shimmer can't read, which is the one way to
     /// recover from a hand-edit gone wrong.
@@ -771,6 +834,18 @@ pub(crate) fn folder(ctx: &Ctx, id: &str) -> Result<Folder> {
 /// Where a removed workspace waits to be restored (ADR 0026 §2).
 fn removed_path(id: &str) -> String {
     format!(".removed/{id}")
+}
+
+/// Every removed workspace's id, sorted.
+fn removed_ids(ctx: &Ctx) -> Result<Vec<String>> {
+    let mut ids: Vec<String> = ctx
+        .store
+        .list(".removed")?
+        .iter()
+        .filter_map(|p| p.strip_prefix(".removed/")?.split('/').next().map(str::to_owned))
+        .collect();
+    ids.dedup();
+    Ok(ids)
 }
 
 pub(crate) fn state_path(id: &str) -> String {

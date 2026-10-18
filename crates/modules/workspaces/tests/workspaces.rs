@@ -88,6 +88,7 @@ fn it_declares_its_lane_the_process_capability_and_the_protocol_ops() {
             ("workspaces.reset".to_owned(), Execution::Inline),
             ("workspaces.remove".to_owned(), Execution::Inline),
             ("workspaces.restore".to_owned(), Execution::Inline),
+            ("workspaces.purge".to_owned(), Execution::Inline),
             ("workspaces.copy".to_owned(), Execution::Inline),
             ("workspaces.rename".to_owned(), Execution::Inline),
             ("workspaces.templates".to_owned(), Execution::Inline),

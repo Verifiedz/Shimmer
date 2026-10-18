@@ -665,6 +665,7 @@ impl Groups {
             ("queue", "TASK" | "OTHER") => self.tasks(source).await,
             ("queue" | "scheduler", "LANE") => self.lanes(source).await,
             ("scheduler", "TRIGGER") => self.triggers(command, source).await,
+            ("scheduler", "REMOVED") => self.removed_triggers(source).await,
             ("notify", "ID") => self.messages(source).await,
             ("scheduler" | "", "OP") => self.ops(source).await,
             ("scheduler", "WHAT") => {
@@ -780,6 +781,23 @@ impl Groups {
             .cloned()
             .collect();
         // The same short endings `scheduler list` shows, which every scheduler command accepts.
+        let ids: Vec<String> = all.iter().map(|t| text(&t["id"])).collect();
+        for (t, short) in all.iter().zip(crate::render::short_ids(&ids)) {
+            self.add("triggers", "triggers", short, text(&t["op"]));
+        }
+    }
+
+    /// Removed schedules, for `scheduler restore` and `purge` (ADR 0038).
+    async fn removed_triggers(&mut self, source: &mut impl Source) {
+        let Some(data) = source.call("scheduler.list", json!({"removed": true})).await else { return };
+        // Only a person's own schedule is ever removed (a module's can only be paused).
+        let all: Vec<Value> = data["triggers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|t| t["source"]["type"] == "user")
+            .cloned()
+            .collect();
         let ids: Vec<String> = all.iter().map(|t| text(&t["id"])).collect();
         for (t, short) in all.iter().zip(crate::render::short_ids(&ids)) {
             self.add("triggers", "triggers", short, text(&t["op"]));
@@ -1176,6 +1194,7 @@ mod tests {
         assert_eq!(words("records new jobs --from ").await, ["leetcode"]);
         assert_eq!(words("records templates ").await, ["practice"]);
         assert_eq!(words("scheduler remove ").await, ["VWXYZ0"], "the short ending lists show, not the whole id");
+        assert_eq!(words("scheduler restore ").await, ["VWXYZ0"], "from scheduler list --removed");
         let pause = words("scheduler pause ").await;
         assert!(pause.contains(&"VWXYZ0".to_owned()) && pause.contains(&"notify.flush".to_owned()), "{pause:?}");
         assert_eq!(words("call ").await, ["core.ping"]);

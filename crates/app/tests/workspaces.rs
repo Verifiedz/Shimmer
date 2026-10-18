@@ -60,6 +60,7 @@ fn workspaces_are_registered_with_their_lane() {
             "workspaces.reset",
             "workspaces.remove",
             "workspaces.restore",
+            "workspaces.purge",
             "workspaces.copy",
             "workspaces.rename",
             "workspaces.templates",

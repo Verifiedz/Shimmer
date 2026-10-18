@@ -41,6 +41,8 @@ commands:
                                         steps/01-check.sh) in $VISUAL/$EDITOR, then check it;
                                         --path only prints where the file is
   restore NAME                          bring a removed workspace back
+  purge [REMOVED] [--yes]               delete a removed workspace for good, or every removed
+                                        one (asks first)
   copy NAME NEW [--set QUESTION=ANSWER]… [--label TEXT]
                                         a new workspace like NAME, starting ready; asks whether
                                         to change answers (e.g. another project folder)
@@ -121,6 +123,11 @@ pub enum WorkspacesCmd {
     },
     Restore {
         id: String,
+    },
+    /// `id`: one removed workspace; `None` is every one (ADR 0038).
+    Purge {
+        id: Option<String>,
+        yes: bool,
     },
     /// `which`: a category (only its templates) or a template (as `peek` shows it).
     Templates {
@@ -228,7 +235,7 @@ pub fn parse(words: Vec<String>) -> std::result::Result<WorkspacesCmd, String> {
         "force-relaunch" => (true, true, true),
         // `--yes` there only answers --first's question.
         "activate" | "cleanup" | "stop" => (first, true, true),
-        "reset" => (true, false, false),
+        "reset" | "purge" => (true, false, false),
         _ => (false, false, false),
     };
     for (given, allowed, flag) in
@@ -269,6 +276,11 @@ pub fn parse(words: Vec<String>) -> std::result::Result<WorkspacesCmd, String> {
             }
         }
         "restore" => Ok(WorkspacesCmd::Restore { id: name(positional)? }),
+        "purge" => match <[String; 1]>::try_from(positional) {
+            Ok([id]) => Ok(WorkspacesCmd::Purge { id: Some(id), yes }),
+            Err(rest) if rest.is_empty() => Ok(WorkspacesCmd::Purge { id: None, yes }),
+            Err(_) => Err("usage: shimmer workspaces purge [REMOVED] [--yes]".into()),
+        },
         "templates" => {
             let mut words = positional.into_iter();
             match (words.next(), words.next()) {
@@ -481,6 +493,33 @@ pub async fn run(client: &mut Client, cmd: &WorkspacesCmd, json: bool, prompt: &
         WorkspacesCmd::Restore { id } => {
             let data = client.call("workspaces.restore", id_params(id)).await?;
             Ok(out(&data, format!("✓ {id} restored")))
+        }
+        WorkspacesCmd::Purge { id, yes } => {
+            // ADR 0038: the daemon says how many go; ask, then send that count back.
+            let mut params = json!({});
+            if let Some(id) = id {
+                params["id"] = json!(id);
+            }
+            let data = match client.call("workspaces.purge", params.clone()).await {
+                Err(e) if e.code == ErrorCode::ConfirmationRequired => {
+                    let what = match id {
+                        Some(id) => format!("the removed workspace '{id}'"),
+                        None => "every removed workspace".to_owned(),
+                    };
+                    if !crate::records::confirm_purge(prompt, *yes, &what, &e.message)? {
+                        return Ok("nothing purged".into());
+                    }
+                    params["confirm"] = e.detail.unwrap_or_default();
+                    client.call("workspaces.purge", params).await?
+                }
+                other => other?,
+            };
+            let text = match (data["purged"].as_u64().unwrap_or(0), id) {
+                (0, _) => "no removed workspaces to purge".to_owned(),
+                (_, Some(id)) => format!("✓ {id} is deleted for good"),
+                (n, None) => format!("✓ {n} removed workspace(s) deleted for good"),
+            };
+            Ok(out(&data, text))
         }
         WorkspacesCmd::ForceRelaunch { id, yes, wait, first } => {
             if !*yes {
@@ -1284,6 +1323,10 @@ mod tests {
         );
         assert_eq!(parse_words(&["remove", "site"]).unwrap(), WorkspacesCmd::Remove { id: "site".into() });
         assert_eq!(parse_words(&["restore", "site"]).unwrap(), WorkspacesCmd::Restore { id: "site".into() });
+        let purge = WorkspacesCmd::Purge { id: Some("site".into()), yes: true };
+        assert_eq!(parse_words(&["purge", "site", "--yes"]).unwrap(), purge);
+        assert_eq!(parse_words(&["purge"]).unwrap(), WorkspacesCmd::Purge { id: None, yes: false });
+        assert!(parse_words(&["purge", "a", "b"]).unwrap_err().contains("usage"));
         assert!(parse_words(&["remove", "site", "--wait"]).unwrap_err().contains("takes no --wait"));
     }
 

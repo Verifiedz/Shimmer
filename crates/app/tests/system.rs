@@ -291,4 +291,11 @@ fn a_removed_workspace_comes_back_with_restore_and_still_launches() {
     ok(&home, &["workspaces", "stop", "smoke", "--wait"]);
     // Restoring what isn't removed says so.
     fails(&home, &["workspaces", "restore", "smoke"]);
+
+    // Purge deletes a removed one for good; without a person there it needs --yes (ADR 0038).
+    ok(&home, &["workspaces", "remove", "smoke"]);
+    fails(&home, &["workspaces", "purge", "smoke"]);
+    assert_eq!(ok(&home, &["workspaces", "purge", "smoke", "--yes"]).trim(), "✓ smoke is deleted for good");
+    fails(&home, &["workspaces", "restore", "smoke"]);
+    assert_eq!(ok(&home, &["workspaces", "purge"]).trim(), "no removed workspaces to purge");
 }

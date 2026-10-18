@@ -9,6 +9,8 @@
 //! * A trigger never overlaps itself: if a task from an earlier firing is still queued or
 //!   running, the new firing is dropped and reported as `scheduler.trigger.skipped`.
 //! * `tick` is a plain synchronous function; the async loop only sleeps between calls.
+//! * A person's removed schedule waits in `removed/<id>.json` until restored or purged
+//!   (ADR 0038). It is never loaded, so it never fires.
 
 mod plan;
 
@@ -29,6 +31,8 @@ use crate::queue::{fallback, QueueInner};
 use plan::Parsed;
 
 const DIR: &str = "triggers";
+/// Removed user schedules, until `scheduler.restore` or `scheduler.purge` (ADR 0038).
+const REMOVED: &str = "removed";
 
 /// Who owns a trigger. Module-declared ones are re-derived from `Module::triggers()` on
 /// every start, so users may pause them but not remove them.
@@ -83,6 +87,10 @@ fn valid_trigger_id(id: &str) -> bool {
 
 fn path(id: &str) -> String {
     format!("{DIR}/{id}.json")
+}
+
+fn removed_path(id: &str) -> String {
+    format!("{REMOVED}/{id}.json")
 }
 
 impl Scheduler {
@@ -351,19 +359,58 @@ impl Scheduler {
 
     pub fn handle(&self, op: &str, params: Value) -> Result<Value> {
         match op {
-            "scheduler.list" => Ok(self.list()),
+            "scheduler.list" => self.list(params),
             "scheduler.get" => self.get(&self.resolve(&trigger_id(params)?)?),
             "scheduler.add" => self.add(params),
             "scheduler.remove" => self.remove(&self.resolve(&trigger_id(params)?)?),
             "scheduler.pause" => self.set_paused(&self.resolve(&trigger_id(params)?)?, true),
             "scheduler.resume" => self.set_paused(&self.resolve(&trigger_id(params)?)?, false),
+            "scheduler.restore" => self.restore(&trigger_id(params)?),
+            "scheduler.purge" => self.purge(params),
             _ => Err(Error::unknown_op(format!("no such scheduler op '{op}'"))),
         }
     }
 
-    fn list(&self) -> Value {
-        let triggers: Vec<Value> = self.lock().values().map(|e| trigger_view(&e.stored)).collect();
-        json!({ "triggers": triggers })
+    /// The live triggers, or with `{"removed": true}` the removed ones (ADR 0038 §3).
+    fn list(&self, params: Value) -> Result<Value> {
+        #[derive(Deserialize, Default)]
+        #[serde(default, deny_unknown_fields)]
+        struct P {
+            removed: bool,
+        }
+        let p: P = if params.is_null() {
+            P::default()
+        } else {
+            serde_json::from_value(params).map_err(|e| Error::invalid_params(e.to_string()))?
+        };
+        let triggers: Vec<Value> = if p.removed {
+            self.removed()?.iter().map(trigger_view).collect()
+        } else {
+            self.lock().values().map(|e| trigger_view(&e.stored)).collect()
+        };
+        Ok(json!({ "triggers": triggers }))
+    }
+
+    /// Every removed trigger, by id. One that can't be read is skipped and logged, as `load` does.
+    fn removed(&self) -> Result<Vec<Stored>> {
+        let mut out = Vec::new();
+        for file in self.store.list(REMOVED)? {
+            let Some(text) = self.store.read_string(&file)? else { continue };
+            match serde_json::from_str::<Stored>(&text) {
+                Ok(s) => out.push(s),
+                Err(e) => tracing::error!(file, error = %e, "ignoring unreadable removed trigger"),
+            }
+        }
+        Ok(out)
+    }
+
+    /// A removed trigger's id as a client wrote it, like `resolve` over the live ones.
+    fn resolve_removed(&self, written: &str, removed: &[Stored]) -> Result<String> {
+        let ids: Vec<String> = removed.iter().map(|s| s.spec.id.to_string()).collect();
+        if ids.iter().any(|id| id == written) {
+            return Ok(written.to_owned());
+        }
+        shimmer_core::short_id::resolve(written, &ids, "removed trigger")
     }
 
     /// A trigger id as a client wrote it: the full id, or a unique ending of one, case insensitive
@@ -431,9 +478,97 @@ impl Scheduler {
         if let Source::Module { id: owner } = &e.stored.source {
             return Err(Error::conflict(format!("trigger '{id}' is declared by module '{owner}'; pause it instead")));
         }
-        self.delete(id, ("scheduler.trigger.removed", json!({"trigger_id": id, "reason": "removed by user"})))?;
+        // Moved aside, not deleted: `scheduler.restore` brings it back (ADR 0038 §3). Only the
+        // latest removal of an id is kept, like records and workspaces.
+        let json = serde_json::to_vec_pretty(&e.stored).map_err(|e| Error::internal(format!("encode trigger: {e}")))?;
+        self.store.transaction(|tx| {
+            tx.put(&removed_path(id), json)?;
+            tx.delete(&path(id))?;
+            tx.emit("scheduler.trigger.removed", json!({"trigger_id": id, "reason": "removed by user"}))
+        })?;
         st.remove(id);
         Ok(json!({"removed": true, "trigger_id": id}))
+    }
+
+    /// Bring a removed trigger back as it was, paused or not (ADR 0038 §3). Like `resume`, it
+    /// counts from now: a recurring trigger's next run is its next time after now, and time spent
+    /// removed is never caught up. A `once` keeps its time; if that has passed, its own `catch_up`
+    /// decides on the next tick.
+    fn restore(&self, written: &str) -> Result<Value> {
+        let removed = self.removed()?;
+        let id = self.resolve_removed(written, &removed)?;
+        let mut stored = removed.into_iter().find(|s| s.spec.id.as_str() == id).expect("resolved from this list");
+        let mut st = self.lock();
+        if st.contains_key(&id) {
+            return Err(Error::conflict(format!("a trigger '{id}' exists again; remove it first")));
+        }
+        // What it runs may have gone while it was removed (a module uninstalled).
+        self.check_target(&stored.spec)?;
+        let parsed = Parsed::parse(&stored.spec.schedule, self.local_tz)?;
+        if !stored.done && !matches!(stored.spec.schedule, Schedule::Once(_)) {
+            stored.next_due = parsed.next_after(self.clock.now());
+        }
+        stored.zone = parsed.is_local().then(|| self.local_tz.name().to_owned());
+        let json = serde_json::to_vec_pretty(&stored).map_err(|e| Error::internal(format!("encode trigger: {e}")))?;
+        self.store.transaction(|tx| {
+            tx.put(&path(&id), json)?;
+            tx.delete(&removed_path(&id))?;
+            tx.emit("scheduler.trigger.restored", json!({"trigger_id": id}))
+        })?;
+        let view = trigger_view(&stored);
+        st.insert(id, Entry { stored, parsed, pending: Vec::new() });
+        Ok(view)
+    }
+
+    /// Delete removed triggers for good: one, or every one, after the caller confirms how many it
+    /// was shown, as `records.purge` asks (ADR 0038 §1).
+    fn purge(&self, params: Value) -> Result<Value> {
+        #[derive(Deserialize, Default)]
+        #[serde(default, deny_unknown_fields)]
+        struct P {
+            trigger_id: Option<String>,
+            confirm: Option<Value>,
+        }
+        let p: P = if params.is_null() {
+            P::default()
+        } else {
+            serde_json::from_value(params).map_err(|e| Error::invalid_params(e.to_string()))?
+        };
+        // Held throughout, so a `remove` can't land between the count and the delete.
+        let _st = self.lock();
+        let removed = self.removed()?;
+        let one = p.trigger_id.as_deref().map(|w| self.resolve_removed(w, &removed)).transpose()?;
+        let ids: Vec<String> = match &one {
+            Some(id) => vec![id.clone()],
+            None => removed.iter().map(|s| s.spec.id.to_string()).collect(),
+        };
+        let triggers = ids.len();
+        if triggers == 0 {
+            return Ok(json!({"purged": 0}));
+        }
+        let expected = json!({"triggers": triggers});
+        if p.confirm.as_ref() != Some(&expected) {
+            let what = match &one {
+                Some(id) => format!("the removed trigger '{id}'"),
+                None => format!("all {triggers} removed trigger(s)"),
+            };
+            return Err(Error::new(
+                shimmer_core::ErrorCode::ConfirmationRequired,
+                format!("purging permanently deletes {what}; confirm with {{\"triggers\": {triggers}}}"),
+            )
+            .with_detail(expected));
+        }
+        let mut event = json!({"triggers": triggers});
+        if let Some(id) = &one {
+            event["trigger_id"] = json!(id);
+        }
+        self.store.transaction(|tx| {
+            for id in &ids {
+                tx.delete(&removed_path(id))?;
+            }
+            tx.emit("scheduler.trigger.purged", event)
+        })?;
+        Ok(json!({"purged": triggers}))
     }
 
     fn set_paused(&self, id: &str, paused: bool) -> Result<Value> {
