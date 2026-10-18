@@ -121,14 +121,14 @@ impl Module for Fetchers {
             TICK_OP => self.tick(ctx).await,
             FETCH_OP => {
                 let p: FetchParams = decode(params)?;
-                let filter = TitleFilterOverride::from_params(p.title_contains, p.title_excludes);
+                let filter = TitleFilterOverride::from_params(p.title_contains, p.title_excludes)?;
                 self.fetch(ctx, p.source, filter).await
             }
             LIST_OP => self.list(ctx).await,
             STATUS_OP => self.status(ctx).await,
             TEST_OP => {
                 let p: FetchParams = decode(params)?;
-                let filter = TitleFilterOverride::from_params(p.title_contains, p.title_excludes);
+                let filter = TitleFilterOverride::from_params(p.title_contains, p.title_excludes)?;
                 self.test(ctx, p.source, filter).await
             }
             _ => Err(Error::unknown_op(format!("fetchers has no op '{op}'"))),
@@ -156,9 +156,25 @@ struct TitleFilterOverride {
 }
 
 impl TitleFilterOverride {
-    fn from_params(contains: Option<Vec<String>>, excludes: Option<Vec<String>>) -> Option<Self> {
-        (contains.is_some() || excludes.is_some())
-            .then(|| Self { contains: contains.unwrap_or_default(), excludes: excludes.unwrap_or_default() })
+    fn from_params(contains: Option<Vec<String>>, excludes: Option<Vec<String>>) -> Result<Option<Self>> {
+        if contains.is_none() && excludes.is_none() {
+            return Ok(None);
+        }
+        let contains = contains.unwrap_or_default();
+        let excludes = excludes.unwrap_or_default();
+        // An empty or whitespace term is a substring of every title, so it would exclude or
+        // include everything -- the same reason config load already rejects one (#126's
+        // review, B3). `fetchers.fetch`/`fetchers.test` reach this past the CLI's own
+        // comma-split filtering, so an automation or `shimmer call` sending `[""]` must be
+        // rejected here too, not just stop marking items seen (#279's re-review).
+        for (what, terms) in [("title_contains", &contains), ("title_excludes", &excludes)] {
+            if terms.iter().any(|t| t.trim().is_empty()) {
+                return Err(Error::invalid_params(format!(
+                    "{what}: an empty term matches every title -- remove it (a trailing comma?)"
+                )));
+            }
+        }
+        Ok(Some(Self { contains, excludes }))
     }
 }
 
@@ -552,11 +568,31 @@ mod tests {
 
     #[test]
     fn title_filter_override_is_none_only_when_neither_flag_was_given() {
-        assert!(TitleFilterOverride::from_params(None, None).is_none());
-        let f = TitleFilterOverride::from_params(Some(vec!["junior".into()]), None).unwrap();
+        assert!(TitleFilterOverride::from_params(None, None).unwrap().is_none());
+        let f = TitleFilterOverride::from_params(Some(vec!["junior".into()]), None).unwrap().unwrap();
         assert_eq!((f.contains, f.excludes), (vec!["junior".to_string()], Vec::new()));
-        let f = TitleFilterOverride::from_params(None, Some(vec!["senior".into()])).unwrap();
+        let f = TitleFilterOverride::from_params(None, Some(vec!["senior".into()])).unwrap().unwrap();
         assert_eq!((f.contains, f.excludes), (Vec::new(), vec!["senior".to_string()]));
+    }
+
+    #[test]
+    fn an_empty_title_filter_term_from_a_caller_is_rejected_not_just_defanged() {
+        // B2 already stops an override from marking a dropped item seen, so this was only ever
+        // wrong, not destructive -- but `fetchers.fetch`/`fetchers.test` reach `from_params`
+        // straight from an op's params, past the CLI's own comma-split filtering (#59)
+        // and config load's own rejection (B3), so an automation or `shimmer call` sending
+        // `{"title_excludes": ["senior", ""]}` must hit the same rejection here (#279's re-review).
+        match TitleFilterOverride::from_params(None, Some(vec!["senior".into(), String::new()])) {
+            Ok(_) => panic!("an empty title_excludes term must be rejected"),
+            Err(e) => {
+                assert_eq!(e.code, shimmer_core::ErrorCode::InvalidParams);
+                assert!(e.message.contains("title_excludes"), "{}", e.message);
+            }
+        }
+        match TitleFilterOverride::from_params(Some(vec!["  ".into()]), None) {
+            Ok(_) => panic!("a whitespace-only title_contains term must be rejected"),
+            Err(e) => assert!(e.message.contains("title_contains"), "{}", e.message),
+        }
     }
 
     fn source_config(enabled: bool, interval_s: u64) -> schedule::SourceConfig {
