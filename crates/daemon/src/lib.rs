@@ -20,6 +20,7 @@ mod launcher;
 mod queue;
 mod registry;
 mod scheduler;
+mod secrets;
 
 use std::fs::{self, File};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -94,6 +95,7 @@ impl Daemon {
         }
 
         let cfg = config::Config::load(store.home())?;
+        let (secrets, secrets_problem) = secrets::load_chain();
         let registry = Registry::build(modules)?;
         let lanes = registry.lanes(&cfg)?;
         let declared: Vec<_> = registry
@@ -118,6 +120,8 @@ impl Daemon {
             config.clock.clone(),
             shutdown.clone(),
             &config.socket,
+            secrets,
+            secrets_problem,
             index.clone(),
         );
         let tracker = TaskTracker::new();
