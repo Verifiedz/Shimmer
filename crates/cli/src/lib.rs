@@ -130,7 +130,7 @@ async fn run_line(alias: Option<String>, args: Vec<String>) -> ExitCode {
         }
     }
     let args = packs::active::rewrite(line, active.pack.as_ref());
-    // `shimmer schedule WHEN … ALIAS …`: the alias where the scheduled command starts, too.
+    // `shimmer scheduler add WHEN … ALIAS …`: the alias where the scheduled command starts, too.
     let args = schedule::rewrite_inner(args, active.pack.as_ref());
 
     let usage = usage_for(&args);
@@ -203,7 +203,6 @@ fn usage_for(args: &[String]) -> &'static str {
             "workspaces" => return workspaces::USAGE,
             "queue" => return queue::USAGE,
             "scheduler" => return scheduler::USAGE,
-            "schedule" => return schedule::USAGE,
             "packs" => return packs::cmd::USAGE,
             "notify" => return notify::USAGE,
             "doctor" => return doctor::USAGE,
@@ -231,8 +230,7 @@ fn prints_data(cmd: &Command) -> bool {
             )
             | Command::Workspaces(WorkspacesCmd::List | WorkspacesCmd::Status { .. })
             | Command::Queue(QueueCmd::List { .. } | QueueCmd::Show { .. })
-            | Command::Scheduler(SchedulerCmd::List | SchedulerCmd::Show { .. })
-            | Command::Schedule(_)
+            | Command::Scheduler(SchedulerCmd::List { .. } | SchedulerCmd::Show { .. } | SchedulerCmd::Add(_))
             | Command::Notify(
                 notify::NotifyCmd::List { .. } | notify::NotifyCmd::Show { .. } | notify::NotifyCmd::Send { .. }
             )
@@ -247,7 +245,6 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
         Command::Workspaces(WorkspacesCmd::Help) => return Ok(Some(workspaces::USAGE.into())),
         Command::Queue(QueueCmd::Help) => return Ok(Some(queue::USAGE.into())),
         Command::Scheduler(SchedulerCmd::Help) => return Ok(Some(scheduler::USAGE.into())),
-        Command::Schedule(schedule::ScheduleCmd::Help) => return Ok(Some(schedule::USAGE.into())),
         Command::DoctorHelp => return Ok(Some(doctor::USAGE.into())),
         // Packs live entirely in the client: no daemon needed.
         Command::Packs(cmd) => return packs::cmd::run(cmd, &packs::cmd::Env::from_process()).map(Some),
@@ -265,13 +262,10 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
         return queue::run(&mut client, cmd, args.json).await.map(Some);
     }
     if let Command::Scheduler(cmd) = &args.command {
-        return scheduler::run(&mut client, cmd, args.json).await.map(Some);
+        return scheduler::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
     }
     if let Command::Workspaces(cmd) = &args.command {
         return workspaces::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
-    }
-    if let Command::Schedule(cmd) = &args.command {
-        return schedule::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
     }
     if let Command::Call { op, params, first: Some(yes) } = &args.command {
         return call_first(&mut client, op, params.clone(), *yes).await.map(|data| Some(output(args, &data)));
@@ -288,7 +282,6 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
         | Command::Workspaces(_)
         | Command::Queue(_)
         | Command::Scheduler(_)
-        | Command::Schedule(_)
         | Command::Packs(_)
         | Command::Notify(_) => {
             unreachable!("handled above")
@@ -358,7 +351,6 @@ fn output(args: &Args, data: &Value) -> String {
         | Command::Workspaces(_)
         | Command::Queue(_)
         | Command::Scheduler(_)
-        | Command::Schedule(_)
         | Command::Packs(_)
         | Command::Notify(_) => render::json(data),
     }
