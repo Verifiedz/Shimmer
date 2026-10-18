@@ -31,7 +31,7 @@ items' own --contains/--excludes are a separate, client-side narrowing of what's
 been found and saved.
 
 A source is either one of the built-in ones (hn-whoishiring, weworkremotely) or a configured
-kind (ADR 0028 §2a) under [modules.fetchers.sources.<id>] in config.toml. Add --json to any
+kind configured under [modules.fetchers.sources.<id>] in config.toml. Add --json to any
 command for raw output.";
 
 /// `core.events.list`'s own query limit for `items` -- generous enough to cover several runs
@@ -52,8 +52,13 @@ pub enum FetchersCmd {
 /// `--contains a, b ,c` (or `--excludes`) as a term list -- comma-separated, each term
 /// trimmed. `None` means the flag was not given at all, not "given but empty" (`Flags`
 /// itself already rejects an empty value, e.g. `--contains=`).
+///
+/// An empty term is dropped rather than passed on (#126's review, B3): `--excludes senior,`
+/// used to send `["senior", ""]`, and `""` is a substring of every title, so a single stray
+/// comma excluded everything the source had. The daemon rejects empty terms too -- this just
+/// means the common typo quietly does the obvious thing instead of erroring.
 fn terms(value: Option<&str>) -> Option<Vec<String>> {
-    value.map(|s| s.split(',').map(|t| t.trim().to_owned()).collect())
+    value.map(|s| s.split(',').map(|t| t.trim().to_owned()).filter(|t| !t.is_empty()).collect())
 }
 
 /// `items`' own `--contains`/`--excludes`, narrowing what's already been found rather than

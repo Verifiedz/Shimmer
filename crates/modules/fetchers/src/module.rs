@@ -20,6 +20,9 @@ pub const TEST_OP: &str = "fetchers.test";
 /// Caps `fetchers.item.found`'s `raw_data` (ADR 0028 §3) -- big enough for a job posting's
 /// text, small enough that one large item can't become the next cache-bloat problem.
 const MAX_RAW_DATA_CHARS: usize = 8 * 1024;
+/// However many fields an item has, each still keeps enough characters to be recognisable
+/// rather than being cut to nothing.
+const MIN_FIELD_CHARS: usize = 64;
 
 #[derive(Default)]
 pub struct Fetchers {
@@ -118,14 +121,14 @@ impl Module for Fetchers {
             TICK_OP => self.tick(ctx).await,
             FETCH_OP => {
                 let p: FetchParams = decode(params)?;
-                let filter = TitleFilterOverride::from_params(p.title_contains, p.title_excludes);
+                let filter = TitleFilterOverride::from_params(p.title_contains, p.title_excludes)?;
                 self.fetch(ctx, p.source, filter).await
             }
             LIST_OP => self.list(ctx).await,
             STATUS_OP => self.status(ctx).await,
             TEST_OP => {
                 let p: FetchParams = decode(params)?;
-                let filter = TitleFilterOverride::from_params(p.title_contains, p.title_excludes);
+                let filter = TitleFilterOverride::from_params(p.title_contains, p.title_excludes)?;
                 self.test(ctx, p.source, filter).await
             }
             _ => Err(Error::unknown_op(format!("fetchers has no op '{op}'"))),
@@ -153,9 +156,25 @@ struct TitleFilterOverride {
 }
 
 impl TitleFilterOverride {
-    fn from_params(contains: Option<Vec<String>>, excludes: Option<Vec<String>>) -> Option<Self> {
-        (contains.is_some() || excludes.is_some())
-            .then(|| Self { contains: contains.unwrap_or_default(), excludes: excludes.unwrap_or_default() })
+    fn from_params(contains: Option<Vec<String>>, excludes: Option<Vec<String>>) -> Result<Option<Self>> {
+        if contains.is_none() && excludes.is_none() {
+            return Ok(None);
+        }
+        let contains = contains.unwrap_or_default();
+        let excludes = excludes.unwrap_or_default();
+        // An empty or whitespace term is a substring of every title, so it would exclude or
+        // include everything -- the same reason config load already rejects one (#126's
+        // review, B3). `fetchers.fetch`/`fetchers.test` reach this past the CLI's own
+        // comma-split filtering, so an automation or `shimmer call` sending `[""]` must be
+        // rejected here too, not just stop marking items seen (#279's re-review).
+        for (what, terms) in [("title_contains", &contains), ("title_excludes", &excludes)] {
+            if terms.iter().any(|t| t.trim().is_empty()) {
+                return Err(Error::invalid_params(format!(
+                    "{what}: an empty term matches every title -- remove it (a trailing comma?)"
+                )));
+            }
+        }
+        Ok(Some(Self { contains, excludes }))
     }
 }
 
@@ -201,7 +220,11 @@ impl Fetchers {
         // next trigger"), not hammered every tick. Held only across this call -- up to 8
         // fetches finish around the same time on this lane, and this file's own
         // read-modify-write must not interleave with another source's (PR #126 review).
-        {
+        //
+        // The one exception is cancellation (#126's review, B11): the user stopping a run
+        // isn't the source having been fetched, and recording it made the next run wait a
+        // full interval (a day, for `daily`) having fetched nothing.
+        if !ctx.cancel.is_cancelled() {
             let _g = self.write.lock();
             schedule::record_run(ctx, &source_id, ctx.clock.now())?;
         }
@@ -244,7 +267,9 @@ impl Fetchers {
                 })
             })
             .collect();
-        Ok(json!({"sources": sources}))
+        // A source whose own entry couldn't be read is reported here rather than being
+        // invisible (or, as before, failing this whole op) -- #126's review, B1.
+        Ok(json!({"sources": sources, "problems": problems_of(&config)}))
     }
 
     /// Per-source last-run time and whether it is currently mid-fetch (ADR 0028 §5's
@@ -258,7 +283,9 @@ impl Fetchers {
                 json!({"id": id, "last_run_at": last_run.get(id), "running": self.running.is_running(id)})
             })
             .collect();
-        Ok(json!({"sources": sources}))
+        let mut problems = problems_of(&FetchersConfig::load(ctx)?);
+        problems.extend(schedule::last_run_problem(ctx).map(|why| json!({"id": "last_run", "problem": why})));
+        Ok(json!({"sources": sources, "problems": problems}))
     }
 
     /// Fetches exactly one page from a source and returns its parsed items -- never the
@@ -279,9 +306,10 @@ impl Fetchers {
         let configured = config.sources.get(&source_id);
         let items: Vec<Value> = page
             .items
-            .iter()
+            .into_iter()
+            .filter_map(RawItem::sanitized)
             .filter(|item| passes_title_filter(&item.title, filter_override.as_ref(), configured))
-            .map(|item| item_payload(&source_id, item))
+            .map(|item| item_payload(&source_id, &item))
             .collect();
         Ok(json!({"source": source_id, "items": items}))
     }
@@ -323,10 +351,25 @@ impl Fetchers {
                 &format!("page {}/{}", page_index + 1, source::MAX_PAGES),
             );
             let page = source.fetch_page(ctx, cursor.as_deref()).await?;
-            for item in page.items {
+            // Fetched and found empty: marked seen so it is never fetched again (B6).
+            for id in &page.examined_only {
+                seen.touch(id.clone(), now);
+            }
+            // Untrusted remote input is cleaned (and an item with a non-http(s) url dropped)
+            // before dedup, the filter or an event ever sees it -- #126's review, B7/B8.
+            let next = page.next_cursor;
+            for item in page.items.into_iter().filter_map(RawItem::sanitized) {
                 if seen.is_new(&item.source_id) {
                     if !passes_title_filter(&item.title, filter_override, configured) {
-                        seen.touch(item.source_id.clone(), now);
+                        // A *configured* filter is a standing decision, so a title it drops is
+                        // marked seen and never re-examined. A one-off `--contains`/`--excludes`
+                        // on `run` is not: marking those seen meant a single experiment hid the
+                        // rest of a source's backlog for the full 90-day retention, and a stray
+                        // comma hid all of it (#126's review, B2 with B3). An override leaves
+                        // the items it drops untouched, so the next plain run still finds them.
+                        if filter_override.is_none() {
+                            seen.touch(item.source_id.clone(), now);
+                        }
                         continue;
                     }
                     if found.len() < dedup::MAX_NEW_PER_RUN {
@@ -341,7 +384,7 @@ impl Fetchers {
             if found.len() >= dedup::MAX_NEW_PER_RUN {
                 break;
             }
-            match page.next_cursor {
+            match next {
                 Some(next) => cursor = Some(next),
                 None => break,
             }
@@ -401,6 +444,12 @@ fn passes_title_filter(
     }
 }
 
+/// Sources whose own config entry could not be read, as `[{id, problem}]` (#126's review,
+/// B1). Empty in the normal case, so a client can show it only when there is something wrong.
+fn problems_of(config: &FetchersConfig) -> Vec<Value> {
+    config.problems.iter().map(|(id, why)| json!({"id": id, "problem": why})).collect()
+}
+
 /// `fetchers.item.found`'s payload (ADR 0028 §3, §9).
 fn item_payload(source_id: &str, item: &RawItem) -> Value {
     json!({
@@ -412,12 +461,37 @@ fn item_payload(source_id: &str, item: &RawItem) -> Value {
     })
 }
 
+/// Caps an item's `raw_data` (ADR 0028 §3) **without changing its shape** (#126's review,
+/// B12). Replacing an over-long object with `{"truncated": true, "preview": "<json text>"}`
+/// meant an automation reading `{raw_data.company}` broke on exactly the long postings and
+/// worked on every short one -- the worst possible failure distribution. Now each oversized
+/// *string field* is truncated in place, keys and nesting stay put, and a field that was cut
+/// says so.
 fn cap_raw_data(v: &Value) -> Value {
-    let s = v.to_string();
-    if s.chars().count() <= MAX_RAW_DATA_CHARS {
-        v.clone()
-    } else {
-        json!({"truncated": true, "preview": s.chars().take(MAX_RAW_DATA_CHARS).collect::<String>()})
+    if v.to_string().chars().count() <= MAX_RAW_DATA_CHARS {
+        return v.clone();
+    }
+    match v {
+        Value::Object(fields) => {
+            // Budget shared evenly across the fields, so one enormous description can't
+            // starve the small, structured fields an automation is most likely to read.
+            let budget = (MAX_RAW_DATA_CHARS / fields.len().max(1)).max(MIN_FIELD_CHARS);
+            Value::Object(fields.iter().map(|(k, v)| (k.clone(), cap_value(v, budget))).collect())
+        }
+        other => cap_value(other, MAX_RAW_DATA_CHARS),
+    }
+}
+
+/// One `raw_data` value, truncated to `budget` characters if it is a long string, recursed
+/// into if it is an array or object, and left alone if it is a number/bool/null.
+fn cap_value(v: &Value, budget: usize) -> Value {
+    match v {
+        Value::String(s) if s.chars().count() > budget => {
+            json!(format!("{}… (truncated)", s.chars().take(budget).collect::<String>()))
+        }
+        Value::Array(items) => Value::Array(items.iter().map(|i| cap_value(i, budget)).collect()),
+        Value::Object(fields) => Value::Object(fields.iter().map(|(k, v)| (k.clone(), cap_value(v, budget))).collect()),
+        other => other.clone(),
     }
 }
 
@@ -471,12 +545,54 @@ mod tests {
     }
 
     #[test]
+    fn capping_raw_data_keeps_its_shape_so_an_automation_can_still_read_a_field() {
+        // #126's review, B12: over 8 KiB, raw_data became {"truncated": true, "preview": "..."},
+        // so an automation reading {raw_data.company} broke on exactly the long postings and
+        // worked on every short one.
+        let huge = "x".repeat(MAX_RAW_DATA_CHARS * 2);
+        let capped = cap_raw_data(&json!({"company": "Acme", "text": huge, "remote": true, "salary": 120}));
+
+        assert_eq!(capped["company"], "Acme", "a short field is untouched");
+        assert_eq!(capped["remote"], true, "and so are non-strings");
+        assert_eq!(capped["salary"], 120);
+        assert!(capped["text"].as_str().unwrap().ends_with("(truncated)"), "the long one says it was cut");
+        assert!(capped.get("truncated").is_none(), "the old shape-replacing marker is gone");
+        assert!(capped.to_string().chars().count() < MAX_RAW_DATA_CHARS * 2, "and it actually got smaller");
+    }
+
+    #[test]
+    fn capping_raw_data_leaves_anything_already_small_enough_exactly_as_it_was() {
+        let small = json!({"company": "Acme", "nested": {"a": [1, "two"]}});
+        assert_eq!(cap_raw_data(&small), small);
+    }
+
+    #[test]
     fn title_filter_override_is_none_only_when_neither_flag_was_given() {
-        assert!(TitleFilterOverride::from_params(None, None).is_none());
-        let f = TitleFilterOverride::from_params(Some(vec!["junior".into()]), None).unwrap();
+        assert!(TitleFilterOverride::from_params(None, None).unwrap().is_none());
+        let f = TitleFilterOverride::from_params(Some(vec!["junior".into()]), None).unwrap().unwrap();
         assert_eq!((f.contains, f.excludes), (vec!["junior".to_string()], Vec::new()));
-        let f = TitleFilterOverride::from_params(None, Some(vec!["senior".into()])).unwrap();
+        let f = TitleFilterOverride::from_params(None, Some(vec!["senior".into()])).unwrap().unwrap();
         assert_eq!((f.contains, f.excludes), (Vec::new(), vec!["senior".to_string()]));
+    }
+
+    #[test]
+    fn an_empty_title_filter_term_from_a_caller_is_rejected_not_just_defanged() {
+        // B2 already stops an override from marking a dropped item seen, so this was only ever
+        // wrong, not destructive -- but `fetchers.fetch`/`fetchers.test` reach `from_params`
+        // straight from an op's params, past the CLI's own comma-split filtering (#59)
+        // and config load's own rejection (B3), so an automation or `shimmer call` sending
+        // `{"title_excludes": ["senior", ""]}` must hit the same rejection here (#279's re-review).
+        match TitleFilterOverride::from_params(None, Some(vec!["senior".into(), String::new()])) {
+            Ok(_) => panic!("an empty title_excludes term must be rejected"),
+            Err(e) => {
+                assert_eq!(e.code, shimmer_core::ErrorCode::InvalidParams);
+                assert!(e.message.contains("title_excludes"), "{}", e.message);
+            }
+        }
+        match TitleFilterOverride::from_params(Some(vec!["  ".into()]), None) {
+            Ok(_) => panic!("a whitespace-only title_contains term must be rejected"),
+            Err(e) => assert!(e.message.contains("title_contains"), "{}", e.message),
+        }
     }
 
     fn source_config(enabled: bool, interval_s: u64) -> schedule::SourceConfig {
@@ -725,7 +841,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_override_filter_on_a_real_run_also_marks_the_dropped_item_seen() {
+    async fn an_override_filter_on_a_real_run_leaves_the_items_it_drops_findable_later() {
         let env = TestEnv::new("fetchers"); // no config.toml filter at all -- the override is the only one
         const BASE: &str = "https://hacker-news.firebaseio.com/v0";
         {
@@ -746,10 +862,21 @@ mod tests {
         }
 
         let override_filter = TitleFilterOverride { contains: Vec::new(), excludes: vec!["senior".into()] };
-        let out = Fetchers::default().fetch(&env.ctx, "hn-whoishiring".into(), Some(override_filter)).await.unwrap();
+        let fetchers = Fetchers::default();
+        let out = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), Some(override_filter)).await.unwrap();
         assert_eq!(out["new_items"], 1);
+
+        // This test used to assert the opposite -- that an override marked what it dropped as
+        // seen, the same as a configured filter. #126's review showed why that's wrong: one
+        // `--excludes` experiment then hid the rest of a source's backlog for the full 90-day
+        // retention, and a stray trailing comma hid all of it. An ad-hoc override is an
+        // experiment, so what it drops stays findable (B2).
         let seen = dedup::load(&env.ctx, "hn-whoishiring").unwrap();
-        assert!(!seen.is_new("10"), "the ad-hoc override must mark a dropped item seen, same as a configured filter");
+        assert!(seen.is_new("10"), "an ad-hoc override must not permanently hide what it drops");
+
+        // Proof it is genuinely still reachable: the same run with no override finds it.
+        let second = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None).await.unwrap();
+        assert_eq!(second["new_items"], 1, "the item the override dropped is found by a plain run");
     }
 
     #[tokio::test]

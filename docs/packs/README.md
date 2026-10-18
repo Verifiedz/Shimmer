@@ -93,9 +93,9 @@ belongs to this machine, so copying your Shimmer folder elsewhere doesn't bring 
 | records edit | `kaizou` | `tweak-schema` | `drydock` | `redit` |
 | fetchers list | `sagasu` | `sources` | `scan-sector` | `flist` |
 | fetchers status | `machiawase` | `crawler-status` | `sensor-status` | `fstat` |
-| fetchers test | `tameshi` | `dry-run` | `trial-run` | `ftest` |
+| fetchers test | `teisatsu` | `smoke-test` | `trial-run` | `ftest` |
 | fetchers run | `shutsugeki` | `poll` | `deep-scan` | `frun` |
-| fetchers items | `shuukaku` | `inbox` | `haul` | `fitems` |
+| fetchers items | `shuukaku` | `feed` | `haul` | `fitems` |
 
 ## Writing your own
 
