@@ -319,9 +319,16 @@ impl RealHttpBackend {
         secrets: Arc<dyn SecretStore>,
         secrets_problem: Option<String>,
     ) -> Result<Self> {
+        // Every request this daemon makes, from any network-capable module, goes out
+        // identified -- an anonymous UA gets silently dropped by some hosts and makes a
+        // robots.txt rule impossible to address correctly (PR #126 review). This is a
+        // single daemon-wide identity, not the fetchers-specific `Shimmer-Fetchers/<version>`
+        // ADR 0028 §7 describes: there is no per-module custom-header plumbing yet (ADR 0027
+        // deferred it), and this client is shared by every module that declares `"network"`.
         let client = reqwest::Client::builder()
             .timeout(config.timeout)
             .redirect(reqwest::redirect::Policy::none())
+            .user_agent(format!("Shimmer/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| Error::internal(format!("building http client: {e}")))?;
         Ok(Self {
@@ -804,6 +811,20 @@ mod tests {
         let resp = b.get(&ModuleId::new("test"), &server.url("/a"), None).await.unwrap();
         assert_eq!((resp.status, resp.body), (200, b"ok".to_vec()));
         assert!(!resp.from_cache && !resp.stale && resp.retry_after_secs.is_none());
+    }
+
+    #[tokio::test]
+    async fn every_request_identifies_itself_with_a_user_agent() {
+        // Every module sharing this backend (not just fetchers) must never send an anonymous
+        // request -- some hosts silently drop one, and a robots.txt rule is unenforceable
+        // against a client that never says who it is (PR #126 review).
+        let server = TestServer::start(vec![OK]);
+        let (b, _home) = backend(generous_config(), Clock::system());
+        b.get(&ModuleId::new("test"), &server.url("/a"), None).await.unwrap();
+        assert!(
+            server.last_request_sent(&format!("User-Agent: Shimmer/{}", env!("CARGO_PKG_VERSION"))),
+            "the daemon-wide user agent must be sent on every request"
+        );
     }
 
     #[tokio::test]

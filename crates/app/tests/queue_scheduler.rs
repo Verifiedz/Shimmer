@@ -152,7 +152,8 @@ fn a_trigger_fires_and_can_be_paused_resumed_and_removed() {
     assert!(ok(&home, &["scheduler", "resume", &id]).starts_with(&format!("✓ resumed {what}")));
     assert!(ok(&home, &["scheduler", "show", &id]).starts_with(&format!("{id}  (active)")));
     assert_eq!(ok(&home, &["scheduler", "remove", &id]).trim(), format!("✓ removed {what}"));
-    // Gone; only modules' own remain (notify's hourly `notify.flush`).
+    // Gone; only modules' own remain (fetchers' heartbeat, ADR 0028 §5; notify's hourly
+    // `notify.flush`) -- #244 already hides every module-owned trigger from the default view.
     let left = ok(&home, &["scheduler", "list"]);
     assert!(!left.contains(shown(&id)) && !left.contains("records.list"), "{left}");
 }

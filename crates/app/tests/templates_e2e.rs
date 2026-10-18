@@ -842,7 +842,8 @@ fn reconfigure_changes_answers_only_while_ready_and_the_next_activate_uses_them(
 // ---------------------------------------------------------------- rename
 
 /// The scheduler's triggers, as JSON.
-/// The schedules a person added, not modules' own (notify's hourly `notify.flush`).
+/// The schedules a person added, not modules' own (fetchers' heartbeat, ADR 0028 §5; notify's
+/// hourly `notify.flush`).
 fn triggers(sb: &Sandbox) -> Vec<serde_json::Value> {
     let o = sb.run(&["--json", "scheduler", "list"]);
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();

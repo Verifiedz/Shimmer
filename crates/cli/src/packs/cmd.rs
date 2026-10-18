@@ -39,6 +39,7 @@ An alias stands for shimmer plus a whole command. In pack.toml it names one of t
   workspaces.edit  workspaces.templates  workspaces.peek  workspaces.create
   queue.list  queue.task  queue.cancel  queue.reorder
   scheduler.list  scheduler.get  scheduler.add  scheduler.pause  scheduler.resume  scheduler.remove
+  fetchers.list  fetchers.status  fetchers.test  fetchers.fetch  fetchers.items
   notify.list  notify.get  notify.count  notify.mark_read  notify.mark_unread  notify.remove
   notify.send  notify.test  notify.resend  notify.pause  notify.resume  notify.quiet
   notify.status  notify.builtin_alerts  notify.cap
