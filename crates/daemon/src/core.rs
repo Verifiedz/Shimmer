@@ -62,6 +62,8 @@ impl Core {
         clock: Clock,
         shutdown: CancellationToken,
         socket: &Path,
+        secrets: Arc<dyn crate::secrets::SecretStore>,
+        secrets_problem: Option<String>,
         index: SharedIndex,
     ) -> Arc<Self> {
         // A module gets a populated, usable `Launcher` only if its manifest declares the
@@ -89,6 +91,9 @@ impl Core {
                 backend.store.home().to_path_buf(),
                 config.http.clone(),
                 clock.clone(),
+                config.credentials.clone(),
+                secrets,
+                secrets_problem,
             )
             .expect("building the http client"),
         );
