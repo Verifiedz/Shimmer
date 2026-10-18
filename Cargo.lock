@@ -1627,6 +1627,7 @@ dependencies = [
  "shimmer-daemon",
  "shimmer-fetchers",
  "shimmer-mockd",
+ "shimmer-notify",
  "shimmer-proto",
  "shimmer-records",
  "shimmer-store",
@@ -1643,6 +1644,7 @@ name = "shimmer-cli"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "chrono-tz",
  "serde_json",
  "shimmer-core",
  "shimmer-proto",
@@ -1719,6 +1721,21 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "ulid",
+]
+
+[[package]]
+name = "shimmer-notify"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "chrono-tz",
+ "serde",
+ "serde_json",
+ "shimmer-core",
+ "tokio",
+ "toml",
  "ulid",
 ]
 

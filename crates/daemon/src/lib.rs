@@ -10,6 +10,7 @@ mod backend;
 mod bus;
 mod config;
 mod core;
+mod desktop;
 mod http_backend;
 mod indexer;
 mod ipc;
@@ -167,6 +168,7 @@ impl Daemon {
             core.queue.clone(),
             known_ops,
             lane_ids,
+            cfg.local_timezone,
         ));
         scheduler.load()?;
         scheduler.register_module_triggers(declared)?;

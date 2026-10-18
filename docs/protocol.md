@@ -329,11 +329,19 @@ Always present, independent of which modules are registered.
 |---|---|---|---|
 | `queue.list` | inline | `{"lane"?}` | Lanes, each with `running` and `queued` task arrays and `queue_version`. |
 | `queue.task` | inline | `{"task_id"}` | One task with status, progress, attempts, origin. |
-| `queue.reorder` | inline | `{"lane","task_id","before":TaskId\|null,"queue_version"}` | New `queue_version`. |
-| `queue.cancel` | inline | `{"task_id"}` | `{"cancelled":true,"was":"queued"\|"running"}`, or `not_cancellable`. A queued task is gone; a running one has been asked to stop and ends at its next cancellation check. |
+| `queue.reorder` | inline | `{"lane","task_id","before":TaskId\|null,"queue_version"}` | `{"queue_version","task_id"}`: the new `queue_version`, and the moved task's full id. |
+| `queue.cancel` | inline | `{"task_id"}` | `{"cancelled":true,"was":"queued"\|"running","task_id"}`, or `not_cancellable`. A queued task is gone; a running one has been asked to stop and ends at its next cancellation check. |
 
 Reordering is within a lane only. The running task cannot be reordered or displaced; it can
 be cancelled. A stale `queue_version` returns `conflict`.
+
+**Short ids (ADR 0031 §4).** Every `task_id` the queue ops take (and `before`) may be the full
+id or a unique ending of one, case insensitive: a ULID's start is its creation time, its end is
+random. A whole id matches at any length; an ending needs at least 4 characters (shorter is
+`invalid_params`), so a stray keystroke can't remove or cancel something. Several matches return
+`conflict` naming them; none returns `not_found`. The same holds for every `trigger_id` the
+scheduler ops take. Replies that act on one carry its full id (`task_id` / `trigger_id`), so a
+client can say which one it hit.
 
 ## Scheduler ops
 
@@ -342,12 +350,17 @@ be cancelled. A stale `queue_version` returns `conflict`.
 | `scheduler.list` | inline | `{}` | `{"triggers":[…]}`, each `{"id","op","params","schedule","catch_up","lane","fallback","next_due","last_run","paused","done","source"}`. `done` is a `once` trigger that has fired; `source` is `{"type":"user"}` or `{"type":"module","id"}`. |
 | `scheduler.get` | inline | `{"trigger_id"}` | One trigger, same shape as a `scheduler.list` entry, or `not_found`. |
 | `scheduler.add` | inline | `{"schedule","op","params","catch_up","lane"?,"fallback"?}` | `{"trigger_id"}` |
-| `scheduler.remove` | inline | `{"trigger_id"}` | `{"removed":true}` |
-| `scheduler.pause` | inline | `{"trigger_id"}` | `{"paused":true}` |
-| `scheduler.resume` | inline | `{"trigger_id"}` | `{"paused":false}` |
+| `scheduler.remove` | inline | `{"trigger_id"}` | `{"removed":true,"trigger_id"}` (the full id) |
+| `scheduler.pause` | inline | `{"trigger_id"}` | `{"paused":true,"trigger_id"}` |
+| `scheduler.resume` | inline | `{"trigger_id"}` | `{"paused":false,"trigger_id"}` |
+
+`trigger_id` may be a unique ending of the id (see "Short ids" above).
 
 Schedules are `{"cron": "0 9 * * 1"}` (5 fields, Sunday = 0 or 7, Monday = 1, UTC),
-`{"every": 172800}` (seconds) or `{"once": "2026-10-04T09:00:00Z"}`. A fired task's params
+`{"cron_local": "0 9 * * 1"}` (the same, read in config.toml's `[general] local_timezone`, so 9am
+stays 9am across a clock change; ADR 0031 §2), `{"every": 172800}` (seconds) or
+`{"once": "2026-10-04T09:00:00Z"}`. A client should show a schedule shape it doesn't know rather
+than fail on it: more may be added without a version bump. A fired task's params
 gain a `scheduled_for` timestamp when they are an object. See
 `docs/decisions/0004-scheduler-semantics.md`.
 
@@ -488,6 +501,41 @@ change or a daemon restart. See `CLAUDE.md` §15.1.
 
 ---
 
+## Notify ops
+
+ADR 0032. Every op that picks messages takes the same filters, all optional and combined:
+`{"unread"?, "read"?, "state"?: "pending"|"held"|"delivered"|"failed",
+"from"?: "send"|"schedules"|"fallbacks"|"alerts"|"automations", "priority"?: "low"|"normal"|"high",
+"since"?, "before"?, "text"?}`. `since`/`before` are a date (`2026-10-01`, the start of that local
+day), a local `2026-10-01 14:00`, or RFC 3339; `text` matches the title or body, ignoring case.
+
+| Op | Execution | Params | Returns |
+|---|---|---|---|
+| `notify.send` | queued (`notify`) | `{"title","body"?,"priority"?,"from"?}`; a fallback's params (`failure_code`, `failure_reason`, `failure_detail`, `message`) are read too, unknown keys ignored | The task ends with the message (below). Never fails because delivery did: the message is kept as `failed`. |
+| `notify.test` | queued (`notify`) | `{}` | `{"deliveries":[{"medium","at","ok","error"?}],"sinks":[…]}`: a test to every sink, past quiet hours and pause; not kept |
+| `notify.resend` | queued (`notify`) | `{"ids":[…]}` or filters | `{"items":[…]}`: each tried again, the new deliveries added to it |
+| `notify.flush` | queued (`notify`) | `{}` | `{"delivered":N}`: what quiet hours or a pause held, as one summary. Run hourly by notify's own trigger `notify.flush`. |
+| `notify.list` | inline | filters, `"limit"`? (default 50) | `{"items":[…],"counts":{"total","unread","high","held","failed"},"removed_unread"?}`, newest first; each item also has `short`, the ending to show for it |
+| `notify.count` | inline | filters | `{"count", "total","unread","high","held","failed"}` |
+| `notify.get` | inline | `{"id"}` | the message |
+| `notify.mark_read` / `notify.mark_unread` | inline | `{"ids":[…]}`, `{"all":true}` or filters | `{"marked":N}` |
+| `notify.remove` | inline | `{"ids":[…]}`; or filters / `{"all":true}` with `"confirm":true` | `{"removed":N}`. A bulk remove without `confirm` answers `confirmation_required` with `detail: {"count","unread"}`. |
+| `notify.pause` | inline | `{"until"?: RFC 3339 after now, "all"?}` | `{"paused":{"since","until"?,"all"}}`; holds low and normal (and high with `all`) until `resume` or `until` |
+| `notify.resume` | inline | `{}` | `{"was_paused","held"}`; enqueues `notify.flush` when something waited |
+| `notify.quiet` | inline | `{}` shows; `{"every_day"|"weekdays"|"weekends"|"mon"…"sun": "22:00-08:00" or null}` sets or clears; `{"off":true}` clears all | `{"quiet":{…},"quiet_now"}` |
+| `notify.builtin_alerts` | inline | `{}` lists; `{"name","on"}` switches one (`workspace_dirty`, `scheduled_task_failed`; dashes accepted) | `{"alerts":{"workspace_dirty","scheduled_task_failed"}}` |
+| `notify.cap` | inline | `{}` shows; `{"max":N}` (at least 100) sets and applies it | `{"max","messages","removed_unread"?}` |
+| `notify.status` | inline | `{}` | `{"paused","quiet","quiet_now","builtin_alerts","cap","counts","removed_unread","sinks","settings_problem"}` |
+
+A message: `{"id","at","priority","title","body"?,"source","state","read","delivery":[{"medium","at","ok","error"?}]}`.
+`source` is `send`, `schedule`, `fallback`, `alert:<name>` or `automation:<rule>`. Messages are files
+in `data/notify/inbox/`; settings are `data/notify/settings.toml`.
+
+Every `id` and `ids` entry may be a unique ending of a message id, as for tasks (see "Short ids"
+above): at least 4 characters, `conflict` when several match, `not_found` when none does. A list
+item's `short` is its last 6 characters, or more where another message in the inbox ends the same
+way: unique across the whole inbox, not only the page returned, so it always works given back.
+
 ## Topic catalogue
 
 Non-exhaustive — modules may add their own. Clients subscribe to patterns and must
@@ -500,7 +548,7 @@ tolerate unknown topics.
 | `queue.task.started` | Task began executing. |
 | `queue.task.progress` | Module called `ctx.progress`. Payload `{fraction, note}`. |
 | `queue.task.finished` | Task succeeded. |
-| `queue.task.failed` | Task failed. Payload includes `error`, `attempts`, `lane`, `origin`. |
+| `queue.task.failed` | Task failed. Payload includes `error`, `attempts`, `lane`, `origin`, and `fallback`: `true` only when a fallback is being sent for this failure (ADR 0005, 0032 §4). |
 | `queue.task.cancelled` | Task cancelled before or during execution. |
 | `queue.task.promoted` | A task jumped the lane. Payload lists displaced task ids. |
 | `queue.task.reordered` | A waiting task moved within its lane. Payload `{task_id, lane, before, queue_version}`. |
@@ -511,7 +559,7 @@ tolerate unknown topics.
 | `scheduler.trigger.missed` | A `catch_up` policy dropped due occurrences. Payload `{trigger_id, count, catch_up}`. |
 | `scheduler.trigger.added` / `.removed` / `.paused` / `.resumed` | Trigger lifecycle. |
 | `workspaces.session.launched` | All launch steps succeeded. Payload `{workspace, session_id, forced, steps}`. |
-| `workspaces.session.dirty` | A launch step failed, a launch was cancelled part-way, or the daemon restarted mid-launch. Payload `{workspace, reason, failed_step, failed_at, log}` (+ `session_id`, `forced`, `has_cleanup_script` when a launch was running). |
+| `workspaces.session.dirty` | A launch step failed, a launch was cancelled part-way, or the daemon restarted mid-launch. Payload `{workspace, reason, failed_step, failed_at, log}` (+ `session_id`, `forced`, `has_cleanup_script` when a launch was running; `recovered: true` when the daemon restarted mid-launch, the one case no failed task reports, ADR 0032 §4). |
 | `workspaces.session.forced` | Force relaunch of a dirty workspace, before any step runs. Payload `{workspace, prior}`, `prior` being the dirty state it overrides. |
 | `workspaces.session.cleaned` | Cleanup script succeeded; state back to `ready`. Payload `{workspace, log}`. |
 | `workspaces.session.abandoned` | A launch (forced or not) was claimed but no step ran: cancelled first, or step 1 couldn't start. The workspace is back to the state it had. Payload `{workspace, reason, forced, back_to}`. |
@@ -532,9 +580,13 @@ tolerate unknown topics.
 | `fetchers.fetch.finished` | A fetch run completed without error. Payload `{source, new_items}`. |
 | `fetchers.fetch.failed` | A fetch run failed. Payload `{source, error, reason}`. `reason` is one of `"network"` (a transport-level failure), `"http_error"` (a non-2xx, non-cooldown response), `"blocked"` (a `Method::Scrape` source's own robots.txt refused the fetch — the page was never requested), `"cancelled"`, or `"parse_empty"` (anything else: a malformed or unexpectedly-shaped response body, no matching "who is hiring" thread, or a corrupt local `seen.toml` — the last of these is a deliberate, already-tested tradeoff: a corrupt dedup file is a loud, reported error forever, never silently reset to an empty set). |
 | `calendar.date.registered` | A dated entry was stored. Planned (M6): not emitted by any module yet. |
-| `notify.sent` | Delivery succeeded, naming the sink used. Planned (M6): not emitted by any module yet. |
-| `notify.fallback_used` | Primary sink failed; the fallback delivered. Planned (M6): not emitted by any module yet. |
-| `notify.exhausted` | Every sink failed. Written to `notifications/failed.jsonl`. Planned (M6): not emitted by any module yet. |
+| `notify.message.received` | A message landed in the inbox. `{id, title, body, priority, source}`, plus `removed_unread` when the cap removed unread ones to fit. ADR 0032. |
+| `notify.message.held` | Quiet hours or a pause held it. `{id}`. |
+| `notify.message.sent` | At least one sink took it. `{id, mediums}`. |
+| `notify.message.exhausted` | Every sink failed; it stays in the inbox as `failed`. `{id, errors:[{medium, error}]}`. |
+| `notify.message.read` / `.unread` / `.removed` | `{ids}`; `.removed` also `reason`: `removed` or `cap`. |
+| `notify.pause.started` / `.ended` | `{until, all}` / `{held}`. |
+| `notify.settings.changed` | A setting changed: one of `{quiet}`, `{builtin_alerts}`, `{cap}`. |
 
 `queue.task.failed` is the topic a dashboard most needs: it is how failures become visible
 without polling, and it is how the elevated-priority dirty-workspace warning reaches the
@@ -598,9 +650,9 @@ Connect, discover, subscribe, enqueue, watch it run.
 // meanwhile, a scheduled workspace launch fails in another lane
 ← {"v":1,"kind":"event","event":{"topic":"queue.task.failed",
    "payload":{"task_id":"01JD2M…","lane":"workspaces","origin":"scheduler",
-     "error":"step 3/7 exited 1","workspace_dirty":true}, …}}
-← {"v":1,"kind":"event","event":{"topic":"notify.sent",
-   "payload":{"sink":"desktop","reason":"fallback","priority":"high"}, …}}
+     "error":"step 3/7 exited 1","workspace_dirty":true,"fallback":true}, …}}
+← {"v":1,"kind":"event","event":{"topic":"notify.message.sent",
+   "payload":{"id":"01JD2P…","mediums":["desktop"]}, …}}
 ```
 
 Two things to read out of the last four frames. The failing workspace task did not stall
