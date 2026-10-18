@@ -456,10 +456,10 @@ impl Scheduler {
                     "trigger '{id}' is declared by module '{owner}'; pause it instead"
                 )));
             }
-            Source::Added { id: owner, .. } => {
-                return Err(Error::conflict(format!("trigger '{id}' was added by module '{owner}'; pause it instead")));
-            }
-            Source::User => {}
+            // A module's one-time schedule (an automation's delayed action) is the person's to
+            // cancel (ADR 0035 §4): nothing re-declares it, and a paused one would never fire, so
+            // it would sit in the module's quota for good (#251's review).
+            Source::Added { .. } | Source::User => {}
         }
         self.delete(id, ("scheduler.trigger.removed", json!({"trigger_id": id, "reason": "removed by user"})))?;
         st.remove(id);
