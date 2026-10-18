@@ -199,6 +199,27 @@ and a `steps/` folder of scripts. [`CLAUDE.md`](CLAUDE.md) §10 shows an example
 has every rule. `shimmer workspaces --help`, `shimmer queue --help` and
 `shimmer scheduler --help` cover the rest.
 
+### Notifications
+
+```sh
+shimmer notify test                        # check that messages reach you (a desktop notification)
+shimmer notify send "Build finished" --body "v1.4 is live" --priority high
+shimmer notify list                        # your messages, newest first; --unread, --from alerts, --text …
+shimmer notify show 0A3F6K                 # one in full (the ending list shows is enough)
+shimmer notify quiet 22:00-08:00           # quiet hours: low and normal messages wait, then one summary
+shimmer notify pause 2h                    # do not disturb for a while; shimmer notify resume to stop
+shimmer notify remove --read               # clean up (asks first)
+shimmer scheduler add weekdays 08:45 --catch-up skip notify send "Standup in 15"
+```
+
+Every message lands in an inbox first (`$SHIMMER_HOME/data/notify/inbox/`), then appears as a
+desktop notification: `notify-send` on Linux (the `libnotify-bin` package), `osascript` on macOS.
+Nothing is lost if it can't be shown. Normal and high priority pop up; on GNOME, low priority goes
+straight to the notification list without popping up (on macOS every priority pops up the same). Shimmer also tells you by itself when a workspace couldn't
+launch or a scheduled task failed (`shimmer notify builtin-alerts`). On a machine with no screen,
+`[desktop] show = false` in `config.toml` logs notifications instead. ADR 0032 has the details;
+`shimmer notify --help` lists every command.
+
 ### Command packs
 
 A command pack gives the commands themed names, each standing for `shimmer` and a whole command:

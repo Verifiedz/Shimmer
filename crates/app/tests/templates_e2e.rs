@@ -75,6 +75,8 @@ impl Sandbox {
         for d in ["bin", "home", "tmp", "shimmer", "config", "state"] {
             std::fs::create_dir_all(sb.path(d)).unwrap();
         }
+        // Notify's popups are logged, never shown (ADR 0032 §2).
+        std::fs::write(sb.path("shimmer/config.toml"), "[desktop]\nshow = false\n").unwrap();
         for tool in SYSTEM_TOOLS {
             if let Some(real) = which(tool) {
                 symlink(real, sb.path("bin").join(tool)).unwrap();
@@ -840,10 +842,11 @@ fn reconfigure_changes_answers_only_while_ready_and_the_next_activate_uses_them(
 // ---------------------------------------------------------------- rename
 
 /// The scheduler's triggers, as JSON.
+/// The schedules a person added, not modules' own (notify's hourly `notify.flush`).
 fn triggers(sb: &Sandbox) -> Vec<serde_json::Value> {
     let o = sb.run(&["--json", "scheduler", "list"]);
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
-    v["triggers"].as_array().cloned().unwrap_or_default()
+    v["triggers"].as_array().into_iter().flatten().filter(|t| t["source"]["type"] == "user").cloned().collect()
 }
 
 #[test]
