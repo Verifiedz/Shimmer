@@ -13,6 +13,27 @@ use serde::{Deserialize, Serialize};
 use shimmer_core::{Clock, Error, HttpBackend, HttpResponse, ModuleId, Result};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::secrets::SecretStore;
+
+/// A `[credentials.<name>]` entry (ADR 0036 §2): the one module, one host and one header a
+/// named credential may ever be used for. The secret value itself is never here — resolved by
+/// name through a [`SecretStore`] only at the point a request actually needs it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CredentialBinding {
+    pub module: ModuleId,
+    /// `host:port`, matching [`host_key`]'s own bucketing.
+    pub host: String,
+    pub header: String,
+}
+
+/// A credential resolved for exactly one in-flight request: attached on a hop only when that
+/// hop's host matches `host` (ADR 0036 §4) — never logged (§6).
+struct ResolvedAuth {
+    header: String,
+    value: String,
+    host: String,
+}
+
 /// A cooling-down host is never waited on past this if the real `Retry-After` is longer —
 /// the caller gets the last-known failure back immediately instead (ADR 0027 §3).
 const DEFAULT_MAX_COOLDOWN_WAIT: Duration = Duration::from_secs(30);
@@ -281,10 +302,23 @@ pub struct RealHttpBackend {
     config: HttpConfig,
     hosts: Mutex<HashMap<String, Arc<HostEntry>>>,
     cache: ResponseCache,
+    credentials: HashMap<String, CredentialBinding>,
+    secrets: Arc<dyn SecretStore>,
+    /// Why `secrets.toml` could not be loaded, if it existed and failed (ADR 0036 §3). Quoted
+    /// on a credentialed request that finds no value, so "your secrets file is mode 0644"
+    /// reaches the caller instead of a bare "no secret value available".
+    secrets_problem: Option<String>,
 }
 
 impl RealHttpBackend {
-    pub fn new(home: PathBuf, config: HttpConfig, clock: Clock) -> Result<Self> {
+    pub fn new(
+        home: PathBuf,
+        config: HttpConfig,
+        clock: Clock,
+        credentials: HashMap<String, CredentialBinding>,
+        secrets: Arc<dyn SecretStore>,
+        secrets_problem: Option<String>,
+    ) -> Result<Self> {
         // Every request this daemon makes, from any network-capable module, goes out
         // identified -- an anonymous UA gets silently dropped by some hosts and makes a
         // robots.txt rule impossible to address correctly (PR #126 review). This is a
@@ -297,7 +331,36 @@ impl RealHttpBackend {
             .user_agent(format!("Shimmer/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| Error::internal(format!("building http client: {e}")))?;
-        Ok(Self { client, clock, config, hosts: Mutex::new(HashMap::new()), cache: ResponseCache { home } })
+        Ok(Self {
+            client,
+            clock,
+            config,
+            hosts: Mutex::new(HashMap::new()),
+            cache: ResponseCache { home },
+            credentials,
+            secrets,
+            secrets_problem,
+        })
+    }
+
+    /// Looks up `name` in `[credentials.*]`, checks it's bound to the calling module, and
+    /// resolves its secret value (ADR 0036 §2/§3). The module never sees the value — only
+    /// this backend does, for exactly the lifetime of one request.
+    fn resolve_credential(&self, module: &ModuleId, name: &str) -> Result<ResolvedAuth> {
+        let binding = self
+            .credentials
+            .get(name)
+            .ok_or_else(|| Error::invalid_params(format!("no credential named '{name}' is configured")))?;
+        if &binding.module != module {
+            return Err(Error::invalid_params(format!("credential '{name}' is not configured for module '{module}'")));
+        }
+        let value = self.secrets.resolve(name).ok_or_else(|| match &self.secrets_problem {
+            Some(why) => Error::unavailable(format!("credential '{name}' is unavailable: {why}")),
+            None => Error::unavailable(format!(
+                "credential '{name}' has no secret value available (set it in secrets.toml or SHIMMER_SECRET_*)"
+            )),
+        })?;
+        Ok(ResolvedAuth { header: binding.header.clone(), value, host: binding.host.clone() })
     }
 
     fn host_entry(&self, host_key: &str) -> Arc<HostEntry> {
@@ -336,6 +399,7 @@ impl RealHttpBackend {
         url: &reqwest::Url,
         if_none_match: Option<&str>,
         if_modified_since: Option<&str>,
+        auth: Option<&ResolvedAuth>,
     ) -> Result<HopOutcome> {
         let host_key = host_key(url)?;
         let entry = self.host_entry(&host_key);
@@ -392,7 +456,16 @@ impl RealHttpBackend {
         if let Some(lm) = if_modified_since {
             req = req.header(reqwest::header::IF_MODIFIED_SINCE, lm);
         }
-        tracing::debug!(module = %module, url = %url.as_str(), revalidating = if_none_match.is_some(), "http: sending");
+        // Attached only when THIS hop's host matches the credential's bound host (ADR 0036
+        // §4) -- re-checked on every hop, not just the first, so a cross-host redirect simply
+        // stops carrying it instead of needing a separate "strip on redirect" rule.
+        let authenticated = auth.is_some_and(|a| a.host == host_key);
+        if let Some(a) = auth {
+            if authenticated {
+                req = req.header(a.header.as_str(), a.value.as_str());
+            }
+        }
+        tracing::debug!(module = %module, url = %url.as_str(), revalidating = if_none_match.is_some(), authenticated, "http: sending");
         let resp = req.send().await.map_err(|e| Error::unavailable(format!("{url}: {e}")))?;
         Ok(HopOutcome::Response(resp, permit))
     }
@@ -406,6 +479,7 @@ impl RealHttpBackend {
         module: &ModuleId,
         mut current: reqwest::Url,
         revalidate: Option<&CacheMeta>,
+        auth: Option<&ResolvedAuth>,
     ) -> Result<(HttpResponse, ResponseMeta)> {
         for hop in 0..=MAX_REDIRECTS {
             let (if_none_match, if_modified_since) = if hop == 0 {
@@ -413,7 +487,7 @@ impl RealHttpBackend {
             } else {
                 (None, None)
             };
-            match self.send_one(module, &current, if_none_match, if_modified_since).await? {
+            match self.send_one(module, &current, if_none_match, if_modified_since, auth).await? {
                 HopOutcome::Synthesized(r) => return Ok((r, ResponseMeta::default())),
                 HopOutcome::Response(resp, permit) => {
                     if resp.status().is_redirection() {
@@ -488,9 +562,27 @@ enum HopOutcome {
 
 #[async_trait]
 impl HttpBackend for RealHttpBackend {
-    async fn get(&self, module: &ModuleId, url: &str) -> Result<HttpResponse> {
+    async fn get(&self, module: &ModuleId, url: &str, credential: Option<&str>) -> Result<HttpResponse> {
         let parsed = parse_checked_url(url)?;
-        let cached = self.cache.read(module, url);
+        let auth = credential.map(|name| self.resolve_credential(module, name)).transpose()?;
+        // The per-hop host check (§4) exists so a *redirect* to another host silently drops the
+        // header. For the URL the caller actually asked for, silence is the wrong answer: it
+        // sends an unauthenticated request and hands back an opaque 401 the caller can't tell
+        // apart from a bad token (#257's review). Mismatch on the first hop is an error that
+        // names both hosts.
+        if let (Some(a), Some(name)) = (&auth, credential) {
+            let asked = host_key(&parsed)?;
+            if a.host != asked {
+                return Err(Error::invalid_params(format!(
+                    "credential '{name}' is bound to host '{}', but this request is for '{asked}'",
+                    a.host
+                )));
+            }
+        }
+        // A credentialed response is never cached (ADR 0036 §5): a credential can be rotated
+        // or revoked at any time, and a cached body from before that must never outlive it.
+        let cacheable = auth.is_none();
+        let cached = if cacheable { self.cache.read(module, url) } else { None };
 
         if let Some((meta, body)) = &cached {
             if self.is_fresh(meta) {
@@ -504,7 +596,7 @@ impl HttpBackend for RealHttpBackend {
             }
         }
 
-        match self.fetch(module, parsed, cached.as_ref().map(|(m, _)| m)).await {
+        match self.fetch(module, parsed, cached.as_ref().map(|(m, _)| m), auth.as_ref()).await {
             Ok((resp, response_meta)) if resp.status == 304 => {
                 let Some((meta, body)) = cached else {
                     // No cached body to pair with a bare 304 -- cannot happen in practice
@@ -524,7 +616,7 @@ impl HttpBackend for RealHttpBackend {
                 })
             }
             Ok((resp, response_meta)) => {
-                if resp.status == 200 {
+                if resp.status == 200 && cacheable {
                     let meta = CacheMeta {
                         url: url.to_owned(),
                         status: resp.status,
@@ -670,9 +762,34 @@ mod tests {
         }
     }
 
+    struct TestSecrets(HashMap<String, String>);
+
+    impl SecretStore for TestSecrets {
+        fn resolve(&self, name: &str) -> Option<String> {
+            self.0.get(name).cloned()
+        }
+    }
+
     fn backend(config: HttpConfig, clock: Clock) -> (RealHttpBackend, TempDir) {
+        backend_with_credentials(config, clock, HashMap::new(), HashMap::new())
+    }
+
+    fn backend_with_credentials(
+        config: HttpConfig,
+        clock: Clock,
+        credentials: HashMap<String, CredentialBinding>,
+        secrets: HashMap<String, String>,
+    ) -> (RealHttpBackend, TempDir) {
         let home = TempDir::new().unwrap();
-        let b = RealHttpBackend::new(home.path().to_path_buf(), config, clock).unwrap();
+        let b = RealHttpBackend::new(
+            home.path().to_path_buf(),
+            config,
+            clock,
+            credentials,
+            Arc::new(TestSecrets(secrets)),
+            None,
+        )
+        .unwrap();
         (b, home)
     }
 
@@ -683,7 +800,7 @@ mod tests {
     #[tokio::test]
     async fn non_http_scheme_is_rejected_before_any_network_work() {
         let (b, _home) = backend(generous_config(), Clock::system());
-        let err = b.get(&ModuleId::new("test"), "ftp://example.com/file").await.unwrap_err();
+        let err = b.get(&ModuleId::new("test"), "ftp://example.com/file", None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidParams);
     }
 
@@ -691,7 +808,7 @@ mod tests {
     async fn a_plain_get_round_trips_status_and_body() {
         let server = TestServer::start(vec![OK]);
         let (b, _home) = backend(generous_config(), Clock::system());
-        let resp = b.get(&ModuleId::new("test"), &server.url("/a")).await.unwrap();
+        let resp = b.get(&ModuleId::new("test"), &server.url("/a"), None).await.unwrap();
         assert_eq!((resp.status, resp.body), (200, b"ok".to_vec()));
         assert!(!resp.from_cache && !resp.stale && resp.retry_after_secs.is_none());
     }
@@ -703,7 +820,7 @@ mod tests {
         // against a client that never says who it is (PR #126 review).
         let server = TestServer::start(vec![OK]);
         let (b, _home) = backend(generous_config(), Clock::system());
-        b.get(&ModuleId::new("test"), &server.url("/a")).await.unwrap();
+        b.get(&ModuleId::new("test"), &server.url("/a"), None).await.unwrap();
         assert!(
             server.last_request_sent(&format!("User-Agent: Shimmer/{}", env!("CARGO_PKG_VERSION"))),
             "the daemon-wide user agent must be sent on every request"
@@ -718,7 +835,7 @@ mod tests {
         let mut cfg = generous_config();
         cfg.default_requests_per_sec = 0.01;
         let (b, _home) = backend(cfg, Clock::system());
-        tokio::time::timeout(Duration::from_secs(2), b.get(&ModuleId::new("test"), &server.url("/a")))
+        tokio::time::timeout(Duration::from_secs(2), b.get(&ModuleId::new("test"), &server.url("/a"), None))
             .await
             .expect("the first request must not wait for a token")
             .unwrap();
@@ -734,8 +851,8 @@ mod tests {
         let (backend, _home) = backend(cfg, Clock::system());
         let module = ModuleId::new("test");
         tokio::time::timeout(Duration::from_secs(2), async {
-            backend.get(&module, &a.url("/a")).await.unwrap();
-            backend.get(&module, &b_server.url("/b")).await.unwrap();
+            backend.get(&module, &a.url("/a"), None).await.unwrap();
+            backend.get(&module, &b_server.url("/b"), None).await.unwrap();
         })
         .await
         .expect("a different host must get its own fresh bucket, not share the first host's");
@@ -750,15 +867,17 @@ mod tests {
         let (b, _home) = backend(cfg, Clock::system());
         let module = ModuleId::new("test");
 
-        let first = b.get(&module, &server.url("/a")).await.unwrap();
+        let first = b.get(&module, &server.url("/a"), None).await.unwrap();
         assert_eq!((first.status, first.retry_after_secs), (429, Some(1)));
 
         // Second call hits the same host while it's cooling down. Since 1s <= the 5s cap,
         // this must actually wait out the cooldown and then succeed for real -- one of the
         // few places in this test suite where a short, deliberate real wait is unavoidable,
         // since a real wait is exactly the behavior under test.
-        let second =
-            tokio::time::timeout(Duration::from_secs(3), b.get(&module, &server.url("/a"))).await.unwrap().unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(3), b.get(&module, &server.url("/a"), None))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!((second.status, second.body), (200, b"ok".to_vec()));
         assert_eq!(server.request_count(), 2, "it waited and sent a real second request, not a synthesized one");
     }
@@ -775,13 +894,15 @@ mod tests {
         let (b, _home) = backend(cfg, clock);
         let module = ModuleId::new("test");
 
-        let first = b.get(&module, &server.url("/a")).await.unwrap();
+        let first = b.get(&module, &server.url("/a"), None).await.unwrap();
         assert_eq!((first.status, first.retry_after_secs), (503, Some(3600)));
 
         // The cooldown is an hour, the cap is 50ms -- the next call must return instantly
         // with a synthesized response, never reaching the server at all.
-        let second =
-            tokio::time::timeout(Duration::from_millis(500), b.get(&module, &server.url("/a"))).await.unwrap().unwrap();
+        let second = tokio::time::timeout(Duration::from_millis(500), b.get(&module, &server.url("/a"), None))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!((second.status, second.retry_after_secs), (503, Some(3600)));
         assert_eq!(server.request_count(), 1, "the second call must never touch the network");
     }
@@ -793,7 +914,7 @@ mod tests {
         let a_server = TestServer::start(vec![Box::leak(redirect.into_boxed_str())]);
         let (backend, _home) = backend(generous_config(), Clock::system());
 
-        let resp = backend.get(&ModuleId::new("test"), &a_server.url("/a")).await.unwrap();
+        let resp = backend.get(&ModuleId::new("test"), &a_server.url("/a"), None).await.unwrap();
         assert_eq!((resp.status, resp.body), (200, b"ok".to_vec()));
         assert_eq!(b_server.request_count(), 1, "the redirect target must actually have been requested");
     }
@@ -805,10 +926,10 @@ mod tests {
         let (b, _home) = backend(generous_config(), Clock::system());
         let module = ModuleId::new("test");
 
-        let first = b.get(&module, &server.url("/a")).await.unwrap();
+        let first = b.get(&module, &server.url("/a"), None).await.unwrap();
         assert!(!first.from_cache);
 
-        let second = b.get(&module, &server.url("/a")).await.unwrap();
+        let second = b.get(&module, &server.url("/a"), None).await.unwrap();
         assert_eq!((second.status, second.body), (200, b"ok".to_vec()));
         assert!(second.from_cache && !second.stale);
         assert_eq!(server.request_count(), 1, "a fresh cache hit must not touch the network");
@@ -823,9 +944,9 @@ mod tests {
         let (b, _home) = backend(cfg, clock.clone());
         let module = ModuleId::new("test");
 
-        b.get(&module, &server.url("/a")).await.unwrap();
+        b.get(&module, &server.url("/a"), None).await.unwrap();
         clock.advance(Duration::from_secs(61));
-        let second = b.get(&module, &server.url("/a")).await.unwrap();
+        let second = b.get(&module, &server.url("/a"), None).await.unwrap();
         assert!(!second.from_cache, "past its TTL, the cache entry must trigger a real refetch");
         assert_eq!(server.request_count(), 2);
     }
@@ -839,10 +960,10 @@ mod tests {
         let (b, _home) = backend(cfg, Clock::system());
         let module = ModuleId::new("test");
 
-        let first = b.get(&module, &server.url("/a")).await.unwrap();
+        let first = b.get(&module, &server.url("/a"), None).await.unwrap();
         assert_eq!(first.body, b"ok".to_vec());
 
-        let second = b.get(&module, &server.url("/a")).await.unwrap();
+        let second = b.get(&module, &server.url("/a"), None).await.unwrap();
         assert_eq!((second.status, second.body), (200, b"ok".to_vec()), "a 304 must still hand back the cached body");
         assert!(second.from_cache && !second.stale);
         assert_eq!(server.request_count(), 2, "the TTL expiry must have triggered a real revalidation request");
@@ -860,7 +981,7 @@ mod tests {
         cfg.max_response_bytes = 10;
         let (b, _home) = backend(cfg, Clock::system());
 
-        let err = b.get(&ModuleId::new("test"), &server.url("/a")).await.unwrap_err();
+        let err = b.get(&ModuleId::new("test"), &server.url("/a"), None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::Unavailable);
     }
 
@@ -870,8 +991,8 @@ mod tests {
         let (b, _home) = backend(generous_config(), Clock::system());
         let url = server.url("/a");
 
-        b.get(&ModuleId::new("one"), &url).await.unwrap();
-        let second = b.get(&ModuleId::new("two"), &url).await.unwrap();
+        b.get(&ModuleId::new("one"), &url, None).await.unwrap();
+        let second = b.get(&ModuleId::new("two"), &url, None).await.unwrap();
         assert!(!second.from_cache, "a different module must never see the first module's cache entry");
         assert_eq!(server.request_count(), 2);
     }
@@ -886,7 +1007,7 @@ mod tests {
         let (b, _home) = backend(cfg, clock.clone());
         let module = ModuleId::new("test");
 
-        let first = b.get(&module, &url).await.unwrap();
+        let first = b.get(&module, &url, None).await.unwrap();
         assert!(!first.from_cache);
 
         clock.advance(Duration::from_secs(61));
@@ -895,7 +1016,7 @@ mod tests {
         // attempt fails instead of racing the thread's shutdown.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let second = b.get(&module, &url).await.unwrap();
+        let second = b.get(&module, &url, None).await.unwrap();
         assert_eq!((second.status, second.body), (200, b"ok".to_vec()));
         assert!(second.from_cache && second.stale, "a failed refetch must serve the stale cached copy, marked as such");
     }
@@ -967,7 +1088,7 @@ mod tests {
         let url_a = format!("http://{addr}/a");
         let url_b = format!("http://{addr}/b");
 
-        let (ra, rb) = tokio::join!(b.get(&module, &url_a), b.get(&module, &url_b));
+        let (ra, rb) = tokio::join!(b.get(&module, &url_a, None), b.get(&module, &url_b, None));
         assert_eq!(ra.unwrap().body, b"ok".to_vec());
         assert_eq!(rb.unwrap().body, b"ok".to_vec());
 
@@ -1022,5 +1143,225 @@ mod tests {
         assert!(wait > Duration::ZERO && wait <= Duration::from_secs(1));
         // After a full second at rate 2/s, at least one token is available again.
         assert_eq!(bucket.try_take(t0 + chrono::Duration::seconds(1)), Ok(()));
+    }
+
+    // ------------------------------------------------------- ADR 0036: credentials
+
+    fn credential(module: &str, host: &str, header: &str) -> CredentialBinding {
+        CredentialBinding { module: ModuleId::new(module), host: host.to_owned(), header: header.to_owned() }
+    }
+
+    #[tokio::test]
+    async fn an_unconfigured_credential_name_is_rejected() {
+        let (b, _home) = backend(generous_config(), Clock::system());
+        let err = b.get(&ModuleId::new("test"), "http://example.test/a", Some("nope")).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+    }
+
+    #[tokio::test]
+    async fn a_credential_bound_to_a_different_module_is_rejected() {
+        let credentials =
+            HashMap::from([("my-cred".to_owned(), credential("fetchers", "example.test:80", "Authorization"))]);
+        let (b, _home) = backend_with_credentials(generous_config(), Clock::system(), credentials, HashMap::new());
+        let err =
+            b.get(&ModuleId::new("some-other-module"), "http://example.test/a", Some("my-cred")).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+    }
+
+    #[tokio::test]
+    async fn a_credential_with_no_resolvable_secret_is_unavailable() {
+        let credentials =
+            HashMap::from([("my-cred".to_owned(), credential("test", "example.test:80", "Authorization"))]);
+        let (b, _home) = backend_with_credentials(generous_config(), Clock::system(), credentials, HashMap::new());
+        let err = b.get(&ModuleId::new("test"), "http://example.test/a", Some("my-cred")).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn a_request_to_a_host_the_credential_is_not_bound_to_fails_loudly_not_silently_unauthenticated() {
+        // The old behaviour sent the request with no header and handed back whatever the API
+        // said -- indistinguishable from a bad token, which is exactly how a mis-typed host
+        // (or one written without its port) wasted an afternoon (#257's review). Nothing is
+        // stubbed here: if this ever sends a request again, it fails with "no stub for", not
+        // the clear binding error.
+        let credentials =
+            HashMap::from([("my-cred".to_owned(), credential("test", "api.example.com:443", "Authorization"))]);
+        let secrets = HashMap::from([("my-cred".to_owned(), "Bearer s3cr3t".to_owned())]);
+        let (b, _home) = backend_with_credentials(generous_config(), Clock::system(), credentials, secrets);
+
+        let err = b.get(&ModuleId::new("test"), "https://other.example.com/a", Some("my-cred")).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+        assert!(err.message.contains("api.example.com:443"), "names the bound host: {}", err.message);
+        assert!(err.message.contains("other.example.com:443"), "names the asked-for host: {}", err.message);
+    }
+
+    #[tokio::test]
+    async fn an_unloadable_secrets_file_is_quoted_on_the_credentialed_request_it_breaks() {
+        // A broken secrets.toml no longer stops the daemon (ADR 0036 §3); the reason travels
+        // to the one place it matters instead.
+        let credentials =
+            HashMap::from([("my-cred".to_owned(), credential("test", "api.example.com:443", "Authorization"))]);
+        let home = TempDir::new().unwrap();
+        let b = RealHttpBackend::new(
+            home.path().to_path_buf(),
+            generous_config(),
+            Clock::system(),
+            credentials,
+            Arc::new(TestSecrets(HashMap::new())),
+            Some("/home/me/.config/shimmer/secrets.toml: must be mode 0600 (found 644)".to_owned()),
+        )
+        .unwrap();
+
+        let err = b.get(&ModuleId::new("test"), "https://api.example.com/a", Some("my-cred")).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert!(err.message.contains("mode 0600"), "quotes the real reason: {}", err.message);
+    }
+
+    #[tokio::test]
+    async fn a_resolved_credential_attaches_its_header_on_the_bound_host() {
+        let server = TestServer::start(vec![OK]);
+        let url = server.url("/a");
+        let host = host_key(&reqwest::Url::parse(&url).unwrap()).unwrap();
+        let credentials = HashMap::from([("my-cred".to_owned(), credential("test", &host, "Authorization"))]);
+        let secrets = HashMap::from([("my-cred".to_owned(), "Bearer s3cr3t".to_owned())]);
+        let (b, _home) = backend_with_credentials(generous_config(), Clock::system(), credentials, secrets);
+
+        let resp = b.get(&ModuleId::new("test"), &url, Some("my-cred")).await.unwrap();
+        assert_eq!(resp.status, 200);
+        assert!(server.last_request_sent("Authorization: Bearer s3cr3t"));
+    }
+
+    #[tokio::test]
+    async fn a_credential_header_is_not_sent_to_a_different_host_on_redirect() {
+        let b_server = TestServer::start(vec![OK]);
+        let redirect = format!("HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\n\r\n", b_server.url("/b"));
+        let a_server = TestServer::start(vec![Box::leak(redirect.into_boxed_str())]);
+        let a_url = a_server.url("/a");
+        let a_host = host_key(&reqwest::Url::parse(&a_url).unwrap()).unwrap();
+        // The credential is bound to `a_server`'s host only -- `b_server` is a different host
+        // (a different port counts as different, ADR 0027 §3), so the header must never reach it.
+        let credentials = HashMap::from([("my-cred".to_owned(), credential("test", &a_host, "Authorization"))]);
+        let secrets = HashMap::from([("my-cred".to_owned(), "Bearer s3cr3t".to_owned())]);
+        let (backend, _home) = backend_with_credentials(generous_config(), Clock::system(), credentials, secrets);
+
+        let resp = backend.get(&ModuleId::new("test"), &a_url, Some("my-cred")).await.unwrap();
+        assert_eq!(resp.status, 200);
+        assert!(a_server.last_request_sent("Authorization: Bearer s3cr3t"), "the bound host must still get the header");
+        assert!(
+            !b_server.last_request_sent("Authorization"),
+            "a cross-host redirect target must never see the credential header"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_credentialed_response_is_never_served_from_or_written_to_the_cache() {
+        // Two responses scripted: if either call were served from the cache, the server would
+        // only ever see one request.
+        let server = TestServer::start(vec![OK, OK]);
+        let url = server.url("/a");
+        let host = host_key(&reqwest::Url::parse(&url).unwrap()).unwrap();
+        let credentials = HashMap::from([("my-cred".to_owned(), credential("test", &host, "Authorization"))]);
+        let secrets = HashMap::from([("my-cred".to_owned(), "Bearer s3cr3t".to_owned())]);
+        let (b, _home) = backend_with_credentials(generous_config(), Clock::system(), credentials, secrets);
+        let module = ModuleId::new("test");
+
+        let first = b.get(&module, &url, Some("my-cred")).await.unwrap();
+        let second = b.get(&module, &url, Some("my-cred")).await.unwrap();
+        assert!(!first.from_cache && !second.from_cache);
+        assert_eq!(server.request_count(), 2, "a credentialed request must never be served from the cache");
+    }
+
+    /// A hand-rolled `tracing::Subscriber` recording each event's fields as debug-formatted
+    /// text -- no new dev-dependency just to prove a secret value never reaches a log line.
+    struct CapturingSubscriber {
+        messages: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct MessageVisitor<'a>(&'a mut String);
+
+    impl tracing::field::Visit for MessageVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            let _ = write!(self.0, " {}={:?}", field.name(), value);
+        }
+    }
+
+    impl tracing::Subscriber for CapturingSubscriber {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut line = String::new();
+            event.record(&mut MessageVisitor(&mut line));
+            self.messages.lock().unwrap().push(line);
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn the_secret_value_never_appears_in_a_log_line() {
+        let server = TestServer::start(vec![OK]);
+        let url = server.url("/a");
+        let host = host_key(&reqwest::Url::parse(&url).unwrap()).unwrap();
+        let credentials = HashMap::from([("my-cred".to_owned(), credential("test", &host, "Authorization"))]);
+        let secrets = HashMap::from([("my-cred".to_owned(), "s3cr3t-value".to_owned())]);
+        let (b, _home) = backend_with_credentials(generous_config(), Clock::system(), credentials, secrets);
+
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = CapturingSubscriber { messages: messages.clone() };
+        let resp = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            b.get(&ModuleId::new("test"), &url, Some("my-cred")).await.unwrap()
+        };
+
+        assert_eq!(resp.status, 200);
+        let joined = messages.lock().unwrap().join("\n");
+        assert!(!joined.contains("s3cr3t-value"), "the secret value leaked into a log line: {joined}");
+        assert!(
+            joined.contains("authenticated=true"),
+            "expected the debug log to record that a credential was attached, without its value: {joined}"
+        );
+    }
+
+    /// Manual, opt-in proof that ADR 0036's credential passthrough works against a real
+    /// authenticated API, not just the `TestServer` fixtures above. Never runs automatically
+    /// (`#[ignore]`), and skips cleanly with no token at all if `GMAIL_TEST_TOKEN` isn't set.
+    ///
+    /// To run: get a short-lived OAuth2 access token with the `gmail.readonly` scope (e.g.
+    /// from https://developers.google.com/oauthplayground -- find "Gmail API v1", check that
+    /// scope, authorize, then "Exchange authorization code for tokens"), then:
+    ///
+    ///   GMAIL_TEST_TOKEN="ya29...." cargo test -p shimmer-daemon --lib \
+    ///     a_real_gmail_api_call_succeeds_with_the_configured_credential -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "hits the real Gmail API; needs GMAIL_TEST_TOKEN (see doc comment)"]
+    async fn a_real_gmail_api_call_succeeds_with_the_configured_credential() {
+        let Ok(token) = std::env::var("GMAIL_TEST_TOKEN") else {
+            eprintln!(
+                "skipping: set GMAIL_TEST_TOKEN to a gmail.readonly OAuth2 access token to run this \
+                 (see this test's doc comment for how to get one)"
+            );
+            return;
+        };
+        let host = "gmail.googleapis.com:443".to_owned();
+        let credentials = HashMap::from([("gmail-test".to_owned(), credential("test", &host, "Authorization"))]);
+        let secrets = HashMap::from([("gmail-test".to_owned(), format!("Bearer {token}"))]);
+        let (b, _home) = backend_with_credentials(generous_config(), Clock::system(), credentials, secrets);
+
+        let resp = b
+            .get(&ModuleId::new("test"), "https://gmail.googleapis.com/gmail/v1/users/me/profile", Some("gmail-test"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status, 200, "gmail api call failed: {}", String::from_utf8_lossy(&resp.body));
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert!(body.get("emailAddress").is_some(), "unexpected profile response shape: {body}");
+        println!("ADR 0036 credential passthrough verified live against the Gmail API for {}", body["emailAddress"]);
     }
 }

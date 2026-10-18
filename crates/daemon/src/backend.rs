@@ -57,7 +57,7 @@ pub struct DisabledHttp;
 
 #[async_trait]
 impl HttpBackend for DisabledHttp {
-    async fn get(&self, module: &ModuleId, url: &str) -> Result<HttpResponse> {
+    async fn get(&self, module: &ModuleId, url: &str, _credential: Option<&str>) -> Result<HttpResponse> {
         Err(Error::unavailable(format!("http gateway not enabled ({module} requested {url})")))
     }
 }

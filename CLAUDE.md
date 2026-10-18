@@ -491,6 +491,12 @@ transfer story.
 Client settings are not in `$SHIMMER_HOME`: the CLI keeps its own (the active command pack,
 §15.1) in `~/.config/shimmer/cli.toml`, which only the CLI reads and writes (ADR 0013).
 
+Secrets are not in `$SHIMMER_HOME` either, for the same reason inverted — that directory is
+meant to be copied between machines and committed to git, so nothing secret may ever live in
+it. An outbound credential's *value* lives in `~/.config/shimmer/secrets.toml`, mode `0600`,
+read only by the daemon (ADR 0036). `config.toml` holds only the *binding* — which module, host
+and header a credential named there may be used for — never the secret itself.
+
 ### 7.1 Atomicity: all or nothing
 
 Every mutation either happens completely or not at all. There is no state in which a
