@@ -775,7 +775,8 @@ fn list(data: &Value, now: DateTime<Utc>) -> String {
                 ]
             })
             .collect();
-        let header = ["RULE", "ON", "REACTS TO", "DOES", "LAST FIRED", ""].map(String::from);
+        // on/off under STATE, coloured like every other feature's states (ADR 0038 §6).
+        let header = ["RULE", "STATE", "REACTS TO", "DOES", "LAST FIRED", ""].map(String::from);
         table(&header, &rows)
     };
     out.push_str(&problems(&data["problems"]));
