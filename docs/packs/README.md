@@ -98,6 +98,8 @@ belongs to this machine, so copying your Shimmer folder elsewhere doesn't bring 
 | automations remove | `bye-bye` | `unhook` | `belay-that` | `arm` |
 | automations restore | `modotte` | `rehook` | `reinstate` | `aundo` |
 | automations purge | `zetsumetsu` | `gc-hooks` | `incinerate` | `apurge` |
+| automations rename | `namae-kae` | `relabel` | `rechristen` | `amv` |
+| automations copy | `fukusei` | `spin-off` | `clone-ship` | `acp` |
 | automations enable | `tsukete` | `flag-on` | `arm-systems` | `aon` |
 | automations disable | `tomete` | `flag-off` | `disarm` | `aoff` |
 | automations test | `tameshi` | `dry-run` | `simulation` | `atest` |
@@ -159,8 +161,7 @@ On the right of each alias goes the command it runs, by its op name:
 | `scheduler.list`, `.get`, `.add`, `.pause`, `.resume`, `.remove` | `shimmer scheduler list`, `show`, `add`, `pause`, `resume`, `remove` |
 | `notify.list`, `.count`, `.remove`, `.send`, `.test`, `.resend`, `.pause`, `.resume`, `.quiet`, `.status`, `.cap` | `shimmer notify <verb>` |
 | `notify.get`, `.mark_read`, `.mark_unread` | `shimmer notify show`, `mark-read`, `mark-unread` |
-| `automations.list`, `.remove`, `.restore`, `.purge`, `.enable`, `.disable`, `.test`, `.events`, `.history`, `.status`, `.depth`, `.reload`, `.templates`, `.peek` | `shimmer automations <verb>` |
-| `automations.get`, `.create`, `.save` | `shimmer automations show`, `new`, `edit` |
+| `automations.list`, `.show`, `.new`, `.edit`, `.remove`, `.restore`, `.purge`, `.rename`, `.copy`, `.enable`, `.disable`, `.test`, `.events`, `.history`, `.status`, `.depth`, `.reload`, `.templates`, `.peek` | `shimmer automations <verb>` |
 
 `shimmer packs --help` prints the same list. Your own pack names as many or as few as you like;
 the built-in packs name every one.

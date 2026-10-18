@@ -35,12 +35,14 @@ const DEPTH_RANGE: std::ops::RangeInclusive<usize> = 1..=10;
 const LABEL_CHARS: usize = 150;
 
 /// Every topic automations emits, with a line on it for `automations events` (§5.5).
-const TOPICS: [(&str, &str); 10] = [
+const TOPICS: [(&str, &str); 12] = [
     ("automations.rule.created", "a rule was created"),
     ("automations.rule.edited", "a rule was changed"),
     ("automations.rule.removed", "a rule was removed (it can be restored)"),
     ("automations.rule.restored", "a removed rule came back"),
     ("automations.rule.purged", "removed rules were deleted for good"),
+    ("automations.rule.renamed", "a rule was given a new id"),
+    ("automations.rule.copied", "a new rule was made from another (switched off)"),
     ("automations.rule.enabled", "a rule was switched on"),
     ("automations.rule.disabled", "a rule was switched off"),
     ("automations.rule.fired", "a rule reacted to an event"),
@@ -212,10 +214,93 @@ impl Automations {
 
     // ------------------------------------------------------------------ ops
 
-    fn list(&self, ctx: &Ctx) -> Value {
+    /// The rules, or with `removed` the removed ones you can restore or purge (ADR 0038 §6).
+    fn list(&self, ctx: &Ctx, p: ListParams) -> Value {
+        if p.removed {
+            let rules: Vec<Value> = removed(ctx)
+                .into_iter()
+                .map(|id| {
+                    let text = ctx.store.read_string(&removed_path(&id)).ok().flatten();
+                    let label = text
+                        .and_then(|t| t.parse::<toml::Table>().ok())
+                        .and_then(|t| t.get("rule")?.get("label")?.as_str().map(str::to_owned));
+                    json!({"id": id, "label": label})
+                })
+                .collect();
+            return json!({"rules": rules});
+        }
         let history = history(ctx);
         let rules: Vec<Value> = self.state().rules.values().map(|r| view(r, &history)).collect();
-        json!({"rules": rules, "problems": self.problems(), "removed": removed(ctx)})
+        json!({"rules": rules, "problems": self.problems()})
+    }
+
+    /// Give a rule a new id (ADR 0038 §6). Refused while a delayed action from it is still waiting:
+    /// it runs under the rule's id, and would find no rule and be skipped. Only the delayed actions
+    /// in history (the last [`HISTORY_KEPT`] firings) can be seen.
+    fn rename(&self, ctx: &Ctx, p: MoveParams) -> Result<Value> {
+        let _g = self.write.lock();
+        let rule = self.rule(&p.id)?;
+        let text = self.free_copy_target(ctx, &rule, &p.to)?;
+        let now = ctx.clock.now();
+        let waiting = history(ctx)
+            .iter()
+            .filter(|e| e["rule"] == p.id.as_str())
+            .flat_map(|e| e["scheduled"].as_array().cloned().unwrap_or_default())
+            .filter(|s| s["at"].as_str().and_then(|a| a.parse::<DateTime<Utc>>().ok()).is_some_and(|at| at > now))
+            .count();
+        if waiting > 0 {
+            return Err(Error::conflict(format!(
+                "{waiting} delayed action(s) from '{}' are still waiting and would be skipped under a new id; \
+                 rename it after they run, or remove them first (shimmer scheduler list --all)",
+                p.id
+            )));
+        }
+        let renamed = Rule::parse(&p.to, &text, &ctx.catalog, false).map_err(Error::invalid_params)?;
+        ctx.store.transaction(|tx| {
+            tx.put(&path(&p.to), text.as_str())?;
+            tx.delete(&path(&p.id))?;
+            tx.emit("automations.rule.renamed", json!({"from": p.id, "to": p.to}))
+        })?;
+        let mut st = self.state();
+        st.rules.remove(&p.id);
+        st.rules.insert(p.to.clone(), renamed.clone());
+        drop(st);
+        Ok(view(&renamed, &history(ctx)))
+    }
+
+    /// A new rule from another's text, switched off so the same event doesn't fire both before
+    /// you change it (ADR 0038 §6). `label`: the copy's own.
+    fn copy(&self, ctx: &Ctx, p: CopyParams) -> Result<Value> {
+        let _g = self.write.lock();
+        let rule = self.rule(&p.id)?;
+        let text = self.free_copy_target(ctx, &rule, &p.to)?;
+        let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|e| Error::internal(e.to_string()))?;
+        doc["rule"]["enabled"] = toml_edit::value(false);
+        if let Some(label) = &p.label {
+            doc["rule"]["label"] = toml_edit::value(label.as_str());
+        }
+        let text = doc.to_string();
+        let copy = Rule::parse(&p.to, &text, &ctx.catalog, false).map_err(Error::invalid_params)?;
+        ctx.store.transaction(|tx| {
+            tx.put(&path(&p.to), text.as_str())?;
+            tx.emit("automations.rule.copied", json!({"from": p.id, "to": p.to}))
+        })?;
+        self.state().rules.insert(p.to.clone(), copy.clone());
+        Ok(view(&copy, &history(ctx)))
+    }
+
+    /// `rule`'s file text, if `to` can be a new rule's id: not built in, not taken, not the same.
+    fn free_copy_target(&self, ctx: &Ctx, rule: &Rule, to: &str) -> Result<String> {
+        if rule.builtin {
+            return Err(Error::conflict(format!("'{}' is built in: it has no file to rename or copy", rule.id)));
+        }
+        if to == rule.id {
+            return Err(Error::invalid_params(format!("'{to}' is already its id")));
+        }
+        if builtin::find(to).is_some() || ctx.store.read(&path(to))?.is_some() {
+            return Err(Error::conflict(format!("a rule '{to}' exists: pick another id")));
+        }
+        ctx.store.read_string(&path(&rule.id))?.ok_or_else(|| Error::not_found(format!("no rule '{}'", rule.id)))
     }
 
     fn problems(&self) -> Vec<Value> {
@@ -608,12 +693,12 @@ impl Module for Automations {
         [
             (
                 "automations.list",
-                "Every rule: on or off, what it reacts to, when it last fired",
-                json!({"type": "object"}),
+                "Every rule: on or off, what it reacts to, when it last fired; with removed, the removed ones",
+                json!({"type": "object", "properties": {"removed": {"type": "boolean"}}}),
             ),
-            ("automations.get", "One rule, and its file's text", id()),
+            ("automations.show", "One rule, and its file's text", id()),
             (
-                "automations.create",
+                "automations.new",
                 "Make a rule from its text, from a template's answers, or a starter rule (switched off) to edit",
                 json!({"type": "object", "required": ["id"], "properties": {
                     "id": {"type": "string"}, "text": {"type": "string"}, "label": {"type": "string"},
@@ -625,13 +710,25 @@ impl Module for Automations {
                 json!({"type": "object", "properties": {"id": {"type": "string"}}}),
             ),
             (
-                "automations.save",
+                "automations.edit",
                 "Replace a rule's text; a broken rule is refused and the old one kept",
                 json!({"type": "object", "required": ["id", "text"], "properties": {
                     "id": {"type": "string"}, "text": {"type": "string"}}}),
             ),
             ("automations.remove", "Remove a rule; it can be restored", id()),
             ("automations.restore", "Bring a removed rule back", id()),
+            (
+                "automations.rename",
+                "Give a rule a new id (refused while a delayed action from it is still waiting)",
+                json!({"type": "object", "required": ["id", "to"], "properties": {
+                    "id": {"type": "string"}, "to": {"type": "string"}}}),
+            ),
+            (
+                "automations.copy",
+                "Make a new rule from another, switched off, optionally with its own label",
+                json!({"type": "object", "required": ["id", "to"], "properties": {
+                    "id": {"type": "string"}, "to": {"type": "string"}, "label": {"type": "string"}}}),
+            ),
             (
                 "automations.purge",
                 "Delete a removed rule for good, or every one; asks first (ADR 0038)",
@@ -685,10 +782,12 @@ impl Module for Automations {
 
     async fn handle(&self, op: &str, params: Value, ctx: &Ctx) -> Result<Value> {
         match op {
-            "automations.list" => Ok(self.list(ctx)),
-            "automations.get" => self.get(ctx, &decode::<Id>(params)?.id),
-            "automations.create" => self.create(ctx, decode(params)?),
-            "automations.save" => self.save(ctx, decode(params)?),
+            "automations.list" => Ok(self.list(ctx, decode(params)?)),
+            "automations.rename" => self.rename(ctx, decode(params)?),
+            "automations.copy" => self.copy(ctx, decode(params)?),
+            "automations.show" => self.get(ctx, &decode::<Id>(params)?.id),
+            "automations.new" => self.create(ctx, decode(params)?),
+            "automations.edit" => self.save(ctx, decode(params)?),
             "automations.remove" => self.remove(ctx, &decode::<Id>(params)?.id),
             "automations.restore" => self.restore(ctx, &decode::<Id>(params)?.id),
             "automations.purge" => self.purge(ctx, decode(params)?),
@@ -734,6 +833,30 @@ struct Deferred {
 #[serde(deny_unknown_fields)]
 struct Id {
     id: String,
+}
+
+/// `automations.list`: the rules, or with `removed` the removed ones (ADR 0038 §6).
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct ListParams {
+    removed: bool,
+}
+
+/// `automations.rename`: `id` becomes `to`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MoveParams {
+    id: String,
+    to: String,
+}
+
+/// `automations.copy`: a new rule `to` from `id`'s text, with its own `label` if given.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CopyParams {
+    id: String,
+    to: String,
+    label: Option<String>,
 }
 
 #[derive(Deserialize)]

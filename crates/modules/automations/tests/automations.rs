@@ -81,17 +81,17 @@ async fn rules_are_files_made_checked_switched_and_removed() {
     let m = started(&env).await;
     let ctx = &env.ctx;
 
-    let made = call(&m, ctx, "automations.create", json!({"id": "solved", "text": DONE})).await.unwrap();
+    let made = call(&m, ctx, "automations.new", json!({"id": "solved", "text": DONE})).await.unwrap();
     assert_eq!((made["label"].clone(), made["enabled"].clone()), (json!("Tell me when it's done"), json!(true)));
     assert_eq!(env.backend.read("automations", "rules/solved.toml").unwrap().unwrap(), DONE.as_bytes());
-    let dup = call(&m, ctx, "automations.create", json!({"id": "solved", "text": DONE})).await.unwrap_err();
+    let dup = call(&m, ctx, "automations.new", json!({"id": "solved", "text": DONE})).await.unwrap_err();
     assert_eq!(dup.code, ErrorCode::Conflict);
 
     // A broken edit is refused and the old rule kept.
     let broken = DONE.replace("notify.send", "notify.nope");
-    let err = call(&m, ctx, "automations.save", json!({"id": "solved", "text": broken})).await.unwrap_err();
+    let err = call(&m, ctx, "automations.edit", json!({"id": "solved", "text": broken})).await.unwrap_err();
     assert!(err.message.contains("no op 'notify.nope'"), "{}", err.message);
-    assert_eq!(call(&m, ctx, "automations.get", json!({"id": "solved"})).await.unwrap()["text"], DONE);
+    assert_eq!(call(&m, ctx, "automations.show", json!({"id": "solved"})).await.unwrap()["text"], DONE);
 
     // Switching off keeps the file as written, comments and all.
     call(&m, ctx, "automations.disable", json!({"id": "solved"})).await.unwrap();
@@ -102,16 +102,18 @@ async fn rules_are_files_made_checked_switched_and_removed() {
     call(&m, ctx, "automations.enable", json!({"id": "solved"})).await.unwrap();
 
     // A starter rule checks, and is off until edited.
-    let starter = call(&m, ctx, "automations.create", json!({"id": "mine", "label": "Mine"})).await.unwrap();
+    let starter = call(&m, ctx, "automations.new", json!({"id": "mine", "label": "Mine"})).await.unwrap();
     assert_eq!((starter["enabled"].clone(), starter["on"].clone()), (json!(false), json!("records.item.completed")));
 
     call(&m, ctx, "automations.remove", json!({"id": "mine"})).await.unwrap();
     assert!(env.backend.read("automations", "rules/mine.toml").unwrap().is_none());
-    assert_eq!(call(&m, ctx, "automations.get", json!({"id": "mine"})).await.unwrap_err().code, ErrorCode::NotFound);
-    assert_eq!(call(&m, ctx, "automations.list", json!({})).await.unwrap()["removed"], json!(["mine"]));
+    assert_eq!(call(&m, ctx, "automations.show", json!({"id": "mine"})).await.unwrap_err().code, ErrorCode::NotFound);
+    let removed = call(&m, ctx, "automations.list", json!({"removed": true})).await.unwrap();
+    assert_eq!(removed["rules"], json!([{"id": "mine", "label": "Mine"}]), "list --removed (ADR 0038 §6)");
+    assert!(call(&m, ctx, "automations.list", json!({})).await.unwrap().get("removed").is_none(), "not mixed in");
 
     // Restored as it was; not over a rule of the same id, and only once.
-    call(&m, ctx, "automations.create", json!({"id": "mine", "text": DONE})).await.unwrap();
+    call(&m, ctx, "automations.new", json!({"id": "mine", "text": DONE})).await.unwrap();
     let busy = call(&m, ctx, "automations.restore", json!({"id": "mine"})).await.unwrap_err();
     assert_eq!(busy.code, ErrorCode::Conflict);
     let before = env.backend.read("automations", "rules/solved.toml").unwrap().unwrap();
@@ -139,6 +141,59 @@ async fn rules_are_files_made_checked_switched_and_removed() {
     );
 }
 
+/// ADR 0038 §6: rules can be renamed and copied like workspaces; a copy starts switched off.
+#[tokio::test]
+async fn rename_and_copy_like_workspaces_and_a_copy_starts_off() {
+    let env = env();
+    let m = started(&env).await;
+    let ctx = &env.ctx;
+    call(&m, ctx, "automations.new", json!({"id": "solved", "text": DONE})).await.unwrap();
+
+    let copy =
+        call(&m, ctx, "automations.copy", json!({"id": "solved", "to": "solved-2", "label": "Second"})).await.unwrap();
+    assert_eq!((copy["enabled"].clone(), copy["label"].clone()), (json!(false), json!("Second")));
+    let original = call(&m, ctx, "automations.show", json!({"id": "solved"})).await.unwrap();
+    assert_eq!(original["enabled"], true, "the original is untouched");
+    let taken = call(&m, ctx, "automations.copy", json!({"id": "solved", "to": "solved-2"})).await.unwrap_err();
+    assert_eq!(taken.code, ErrorCode::Conflict);
+
+    let renamed = call(&m, ctx, "automations.rename", json!({"id": "solved-2", "to": "second"})).await.unwrap();
+    assert_eq!(renamed["id"], "second");
+    assert!(env.backend.read("automations", "rules/solved-2.toml").unwrap().is_none());
+    assert!(env.backend.read("automations", "rules/second.toml").unwrap().is_some());
+    let gone = call(&m, ctx, "automations.show", json!({"id": "solved-2"})).await.unwrap_err();
+    assert_eq!(gone.code, ErrorCode::NotFound);
+    assert_eq!(last(&env, "automations.rule.renamed"), json!({"from": "solved-2", "to": "second"}));
+    assert_eq!(last(&env, "automations.rule.copied"), json!({"from": "solved", "to": "solved-2"}));
+    let bad = call(&m, ctx, "automations.rename", json!({"id": "second", "to": "Bad Id"})).await.unwrap_err();
+    assert_eq!(bad.code, ErrorCode::InvalidParams);
+    let builtin = call(&m, ctx, "automations.list", json!({})).await.unwrap()["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["builtin"] == true)
+        .map(|r| r["id"].clone())
+        .unwrap();
+    let refused = call(&m, ctx, "automations.rename", json!({"id": builtin, "to": "mine"})).await.unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Conflict, "a built-in rule has no file to rename");
+}
+
+/// ADR 0038 §6: a rule with a delayed action still waiting isn't renamed: under a new id that
+/// action would find no rule and be skipped.
+#[tokio::test]
+async fn a_rule_with_a_delayed_action_waiting_is_not_renamed() {
+    let env = env();
+    let m = started(&env).await;
+    let ctx = &env.ctx;
+    call(&m, ctx, "automations.new", json!({"id": "solved", "text": DONE})).await.unwrap();
+    let ev = event("records.item.completed", json!({"collection": "leetcode", "title": "Two Sum", "item": {}}), None);
+    m.on_event(&ev, ctx).await.unwrap();
+    let e = call(&m, ctx, "automations.rename", json!({"id": "solved", "to": "done"})).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::Conflict);
+    assert!(e.message.contains("1 delayed action(s)"), "{}", e.message);
+    assert!(env.backend.read("automations", "rules/solved.toml").unwrap().is_some(), "nothing moved");
+}
+
 /// ADR 0038: purge deletes removed rules for good, one or all, and always asks first.
 #[tokio::test]
 async fn purge_asks_first_then_deletes_removed_rules_for_good() {
@@ -147,7 +202,7 @@ async fn purge_asks_first_then_deletes_removed_rules_for_good() {
     let ctx = &env.ctx;
     assert_eq!(call(&m, ctx, "automations.purge", json!({})).await.unwrap(), json!({"purged": 0}));
     for id in ["one", "two", "kept"] {
-        call(&m, ctx, "automations.create", json!({"id": id, "text": DONE})).await.unwrap();
+        call(&m, ctx, "automations.new", json!({"id": id, "text": DONE})).await.unwrap();
     }
     for id in ["one", "two"] {
         call(&m, ctx, "automations.remove", json!({"id": id})).await.unwrap();
@@ -168,7 +223,7 @@ async fn purge_asks_first_then_deletes_removed_rules_for_good() {
 
     let all = call(&m, ctx, "automations.purge", json!({"confirm": {"rules": 1}})).await.unwrap();
     assert_eq!(all, json!({"purged": 1}));
-    assert_eq!(call(&m, ctx, "automations.list", json!({})).await.unwrap()["removed"], json!([]));
+    assert_eq!(call(&m, ctx, "automations.list", json!({"removed": true})).await.unwrap()["rules"], json!([]));
     assert!(env.backend.read("automations", "rules/kept.toml").unwrap().is_some(), "a live rule is untouched");
 }
 
@@ -176,7 +231,7 @@ async fn purge_asks_first_then_deletes_removed_rules_for_good() {
 async fn a_matching_event_queues_its_actions_and_schedules_the_delayed_one() {
     let env = env();
     let m = started(&env).await;
-    call(&m, &env.ctx, "automations.create", json!({"id": "solved", "text": DONE})).await.unwrap();
+    call(&m, &env.ctx, "automations.new", json!({"id": "solved", "text": DONE})).await.unwrap();
 
     let payload = json!({"collection": "leetcode", "title": "Two Sum", "item": {"topic": ["arrays", "hashing"]}});
     m.on_event(&event("records.item.completed", payload.clone(), None), &env.ctx).await.unwrap();
@@ -224,7 +279,7 @@ async fn the_loop_guard_stops_cycles_and_deep_chains() {
     let m = started(&env).await;
     let ctx = &env.ctx;
     let rule = |on: &str, op: &str| format!("[rule]\non = \"{on}\"\n[[do]]\nop = \"{op}\"\n");
-    call(&m, ctx, "automations.create", json!({"id": "again", "text": rule("records.item.updated", "records.update")}))
+    call(&m, ctx, "automations.new", json!({"id": "again", "text": rule("records.item.updated", "records.update")}))
         .await
         .unwrap();
 
@@ -240,7 +295,7 @@ async fn the_loop_guard_stops_cycles_and_deep_chains() {
 
     // Depth: with a limit of 1, a different rule can't continue the chain either.
     call(&m, ctx, "automations.depth", json!({"depth": 1})).await.unwrap();
-    call(&m, ctx, "automations.create", json!({"id": "other", "text": rule("records.item.completed", "notify.send")}))
+    call(&m, ctx, "automations.new", json!({"id": "other", "text": rule("records.item.completed", "notify.send")}))
         .await
         .unwrap();
     m.on_event(&event("records.item.completed", json!({}), Some(task)), ctx).await.unwrap();
@@ -307,7 +362,7 @@ async fn test_shows_what_a_rule_would_do_and_events_lists_what_it_can_react_to()
     let env = env();
     let m = started(&env).await;
     let ctx = &env.ctx;
-    call(&m, ctx, "automations.create", json!({"id": "solved", "text": DONE})).await.unwrap();
+    call(&m, ctx, "automations.new", json!({"id": "solved", "text": DONE})).await.unwrap();
     call(&m, ctx, "automations.disable", json!({"id": "solved"})).await.unwrap();
 
     let sample = json!({"topic": "records.item.completed", "payload": {"collection": "leetcode", "title": "Two Sum"}});
@@ -362,7 +417,7 @@ async fn one_rule_failing_never_stops_the_others() {
     };
     let m = started(&env).await;
     for id in ["a-first", "b-second"] {
-        call(&m, &env.ctx, "automations.create", json!({"id": id, "text": rule(id)})).await.unwrap();
+        call(&m, &env.ctx, "automations.new", json!({"id": id, "text": rule(id)})).await.unwrap();
     }
     let failing = FailFirstHistory { inner: env.backend.clone(), failed: Default::default() };
     env.ctx.store = shimmer_core::NamespacedStore::new(
@@ -391,7 +446,7 @@ async fn a_delayed_action_continues_its_chain() {
     let m = started(&env).await;
     let ctx = &env.ctx;
     let text = "[rule]\non = \"records.item.updated\"\n[[do]]\nop = \"records.update\"\nafter = \"3d\"\n";
-    call(&m, ctx, "automations.create", json!({"id": "waiting", "text": text})).await.unwrap();
+    call(&m, ctx, "automations.new", json!({"id": "waiting", "text": text})).await.unwrap();
 
     m.on_event(&event("records.item.updated", json!({}), None), ctx).await.unwrap();
     let (_, _, once) = env.schedules.added.lock().unwrap()[0].clone();
