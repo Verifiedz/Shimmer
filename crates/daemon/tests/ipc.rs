@@ -340,6 +340,41 @@ async fn second_daemon_on_the_same_home_is_refused() {
     stop(d).await;
 }
 
+/// #243: a daemon that has just removed its socket may not have released `.daemon.lock` yet, so a
+/// quick restart waits for the lock briefly instead of failing at once.
+#[tokio::test]
+async fn a_lock_freed_moments_later_is_waited_for_not_refused() {
+    let env = Env::new();
+    let held = std::fs::File::create(env.home.path().join(".daemon.lock")).unwrap();
+    held.try_lock().unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        held.unlock().unwrap();
+    });
+    let d = env.try_start(vec![]).await.expect("starts once the lock is free");
+    release.join().unwrap();
+    stop(d).await;
+}
+
+/// #243: `wait` releases the lock itself, right after the socket goes, rather than leaving it to
+/// the process exiting: by the time anything sees the socket gone, the lock is free.
+#[tokio::test]
+async fn the_lock_is_free_once_wait_returns_and_the_socket_is_gone() {
+    let env = Env::new();
+    let d = env.start().await;
+    let lock = std::fs::File::open(env.home.path().join(".daemon.lock")).unwrap();
+    assert!(lock.try_lock().is_err(), "held while running");
+    stop(d).await;
+    assert!(!env.sock.exists(), "socket removed");
+    lock.try_lock().expect("released by wait, not only when the process exits");
+    lock.unlock().unwrap();
+    // And a new daemon starts at once, without waiting for it.
+    let started = std::time::Instant::now();
+    let d = env.start().await;
+    assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+    stop(d).await;
+}
+
 #[tokio::test]
 async fn stale_socket_file_is_replaced() {
     let env = Env::new();

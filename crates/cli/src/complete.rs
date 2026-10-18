@@ -27,13 +27,14 @@ use crate::style::{Palette, Role};
 const DAEMON_WAIT: Duration = Duration::from_millis(500);
 
 /// The modules with their own help page, by the command word that opens it.
-fn modules() -> [(&'static str, &'static str); 6] {
+fn modules() -> [(&'static str, &'static str); 7] {
     [
         ("records", crate::records::USAGE),
         ("workspaces", crate::workspaces::USAGE),
         ("queue", crate::queue::USAGE),
         ("scheduler", crate::scheduler::USAGE),
         ("packs", crate::packs::cmd::USAGE),
+        ("fetchers", crate::fetchers::USAGE),
         ("notify", crate::notify::USAGE),
     ]
 }

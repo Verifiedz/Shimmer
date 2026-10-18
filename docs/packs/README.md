@@ -91,6 +91,11 @@ belongs to this machine, so copying your Shimmer folder elsewhere doesn't bring 
 | records peek | `hora` | `preview` | `probe` | `rpeek` |
 | records copy-collection | `futago` | `copy-pasta` | `twin-fleet` | `rcpcol` |
 | records edit | `kaizou` | `tweak-schema` | `drydock` | `redit` |
+| fetchers list | `sagasu` | `sources` | `scan-sector` | `flist` |
+| fetchers status | `machiawase` | `crawler-status` | `sensor-status` | `fstat` |
+| fetchers test | `teisatsu` | `smoke-test` | `trial-run` | `ftest` |
+| fetchers run | `shutsugeki` | `poll` | `deep-scan` | `frun` |
+| fetchers items | `shuukaku` | `feed` | `haul` | `fitems` |
 | notify list | `tegami` | `inbox` | `message-log` | `nlist` |
 | notify show | `kore` | `deep-dive` | `decode` | `nshow` |
 | notify count | `ikutsu` | `badge` | `signal-count` | `ncount` |
@@ -141,6 +146,8 @@ On the right of each alias goes the command it runs, by its op name:
 | `workspaces.force_relaunch`, `workspaces.create` | `shimmer workspaces force-relaunch`, `new` |
 | `queue.list`, `.task`, `.cancel`, `.reorder` | `shimmer queue list`, `show`, `cancel`, `move` |
 | `scheduler.list`, `.get`, `.add`, `.pause`, `.resume`, `.remove` | `shimmer scheduler list`, `show`, `add`, `pause`, `resume`, `remove` |
+| `fetchers.list`, `.status`, `.test`, `.items` | `shimmer fetchers list`, `status`, `test`, `items` |
+| `fetchers.fetch` | `shimmer fetchers run` |
 | `notify.list`, `.count`, `.remove`, `.send`, `.test`, `.resend`, `.pause`, `.resume`, `.quiet`, `.status`, `.cap` | `shimmer notify <verb>` |
 | `notify.get`, `.mark_read`, `.mark_unread`, `.builtin_alerts` | `shimmer notify show`, `mark-read`, `mark-unread`, `builtin-alerts` |
 

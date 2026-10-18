@@ -175,6 +175,16 @@
             "namespace": "fetchers",
             "commands": [
               {
+                "op": "fetchers.tick",
+                "summary": "Internal: check configured sources and enqueue a fetch for each one due (the scheduler calls this, not a person)",
+                "params_schema": {},
+                "execution": {
+                  "queued": {
+                    "lane": "fetchers"
+                  }
+                }
+              },
+              {
                 "op": "fetchers.fetch",
                 "summary": "Fetch a source now",
                 "params_schema": {},

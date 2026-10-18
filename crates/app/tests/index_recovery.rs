@@ -37,7 +37,9 @@ fn logged_topics(home: &Home) -> Vec<String> {
 }
 
 /// One completed record (the collection is written in by `Home::with_leetcode`, not seeded):
-/// `records.item.created` + `records.item.completed`, 2 events. Shuts the daemon down so
+/// `records.item.created` + `records.item.completed`, plus a `scheduler.trigger.added` for
+/// each module's own trigger registering on this first start of a fresh `$SHIMMER_HOME`
+/// (`fetchers`' heartbeat, ADR 0028 §5; `notify`'s hourly flush). Shuts the daemon down so
 /// the index file sits still while the test tampers with it before the next restart.
 fn seed_and_stop(home: &Home) {
     call(
@@ -58,7 +60,7 @@ fn a_corrupt_index_does_not_stop_the_daemon_starting() {
     let logged = logged_topics(&home);
     assert_eq!(before, logged.len() as u64, "the index holds every logged event");
     // Nothing is seeded on first start (ADR 0023): the only records events are the test's own.
-    // (Others are modules' own start-up, e.g. notify's trigger being registered.)
+    // (Others are modules' own start-up, e.g. fetchers' and notify's triggers being registered.)
     let records: Vec<&String> = logged.iter().filter(|t| t.starts_with("records.")).collect();
     assert_eq!(records, ["records.item.created", "records.item.completed"]);
 
