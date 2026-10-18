@@ -1,7 +1,7 @@
 # 0034. Start the daemon at login: `shimmer startup on`
 
 Status: proposed · Raised by Dev B (#221) · Needs sign-off: Dev A (§5's exit status is daemon /
-`crates/app` code; the unit files run his daemon; CLAUDE.md §2 gains a line) · Dev C notified ·
+`crates/app` code; the unit files run the daemon Dev A owns; CLAUDE.md §2 gains a line) · Dev C notified ·
 No `core` or `proto` change
 
 ## Context
@@ -63,9 +63,11 @@ After=graphical-session.target
 
 [Service]
 ExecStart=/home/me/.cargo/bin/shimmer daemon
-# Only when they were set when `startup on` ran:
-Environment=SHIMMER_HOME=/home/me/shimmer
+# Always: the folder and socket your commands use, resolved when `startup on` ran:
+Environment=SHIMMER_HOME=/home/me/.local/share/shimmer
+Environment=SHIMMER_SOCKET=/run/user/1000/shimmer/daemon.sock
 Restart=on-failure
+RestartSec=2
 SuccessExitStatus=3
 RestartPreventExitStatus=3
 
@@ -77,9 +79,14 @@ Then `systemctl --user daemon-reload` and `systemctl --user enable --now shimmer
 
 - `ExecStart` is the **full, resolved path** of the binary that ran `startup on`, so a second
   install elsewhere never starts the wrong one.
-- `SHIMMER_HOME` and `SHIMMER_SOCKET` are written **only if they were set** when `startup on` ran;
-  otherwise the unit uses the same defaults the CLI uses, so they always find each other
-  (`crates/proto/src/paths.rs`).
+- `SHIMMER_HOME` and `SHIMMER_SOCKET` are **always written, as your commands resolve them**
+  (`crates/proto/src/paths.rs`) when `startup on` runs. A user unit runs with systemd's user
+  manager's environment, not your shell's: a `XDG_DATA_HOME` or `XDG_RUNTIME_DIR` exported in a
+  shell rc isn't there, and leaving the unit to its own defaults would put the login daemon on
+  another folder, two daemons with the schedules you use never firing after a restart. Moving the
+  folder later means `startup on` again.
+- `RestartSec=2` rather than systemd's 100 ms, so a slow start doesn't use up its five tries in
+  half a second.
 - `Restart=on-failure`, not `always`: a deliberate `shimmer shutdown` stays respected.
 - Exit status 3 is "already running" (§5): success, never retried.
 
@@ -87,8 +94,11 @@ Then `systemctl --user daemon-reload` and `systemctl --user enable --now shimmer
 
 `~/Library/LaunchAgents/io.github.verifiedz.shimmer.plist`: `ProgramArguments` = the resolved
 binary + `daemon`; `RunAtLoad` = true; `KeepAlive` = `{ SuccessfulExit = false }` (restart only after
-a failure); `EnvironmentVariables` with `SHIMMER_HOME` / `SHIMMER_SOCKET` only if set. Loaded with
-`launchctl bootstrap gui/$UID <plist>`, removed with `launchctl bootout`.
+a failure); `EnvironmentVariables` with `SHIMMER_HOME` / `SHIMMER_SOCKET`, resolved, as in §2.
+Loaded with `launchctl bootstrap gui/$UID <plist>` when no daemon is running (otherwise at the next
+login). `off` removes the file and, when no daemon is running, unloads it with `launchctl bootout`;
+with one running, `bootout` would stop it (§6), so the agent stays loaded until logout, and `off`
+says that until then macOS still restarts the daemon if it crashes.
 
 A LaunchAgent runs in the user's GUI session, so workspaces can open windows and notify can show
 popups with no extra step. launchd can't name exit codes, so §5's "already running" exits 0 when
@@ -127,9 +137,16 @@ could meet, and what happens:
 
 **The one daemon change (Dev A):** when `shimmer daemon` finds the folder locked by another daemon
 **that answers on the socket**, it exits with a distinct status, **3**, and the message "already
-running", instead of the generic failure. When the service manager started it (systemd sets
-`INVOCATION_ID`; launchd sets `XPC_SERVICE_NAME`), it exits **0** under launchd, which can't name
-exit codes. A lock held by a daemon that *doesn't* answer is still a real failure, and is retried.
+running", instead of the generic failure. Under launchd, which can't name exit codes, it exits
+**0** instead: launchd sets `XPC_SERVICE_NAME` to the job's label, and only our own label
+(`io.github.verifiedz.shimmer`) counts, since terminals set the variable too (Terminal.app to `0`,
+iTerm2 and VS Code to their own).
+
+A daemon takes the lock **before** it answers: it recovers transactions, opens the index and starts
+modules first. So one that's still starting up isn't taken for dead: on a lock conflict, `shimmer
+daemon` waits up to **5 seconds** for the socket to answer, and exits 3 as soon as it does. A lock
+whose holder never answers in that time is still a real failure, and is retried (§2's
+`RestartSec`).
 Without this, `Restart=on-failure` / `KeepAlive` would retry the login daemon every few seconds
 while a CLI-started one runs.
 
@@ -156,7 +173,7 @@ note: schedules only run while Shimmer's daemon is running.
       `shimmer startup on` starts it every time you log in.
 ```
 
-- Today that's a schedule (`shimmer schedule`, `scheduler add`). Later: automations (#228),
+- Today that's a schedule (`shimmer scheduler add`). Later: automations (#228),
   scheduled fetch sources, reminders (a record with a deadline qualifies through the reminder
   feature, not through records itself).
 - **The test is "does it need to happen while you're not typing?"** Immediate commands
