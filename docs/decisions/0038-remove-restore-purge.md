@@ -108,6 +108,7 @@ so they're renamed outright rather than kept as second names.
 | See what's removed | `list --removed` (op `<feature>.list {"removed": true}`) | `records trash COLLECTION` (op `records.trash`), automations mixing removed ones into `list`; **new for workspaces** |
 | Rename / copy a named thing | `rename` / `copy` | records and workspaces had them; **new for automations** |
 | Reorder | `move` (op `queue.move`) | op `queue.reorder` |
+| Fetch a source now | `run` (op `fetchers.run`) | op `fetchers.fetch` |
 | Problems for `shimmer doctor` | op `<feature>.health` (ADR 0033) | records, workspaces, automations had it; **new: `notify.health`** |
 | Purged records | topic `records.item.purged` | `records.trash.purged` |
 
@@ -119,8 +120,14 @@ so they're renamed outright rather than kept as second names.
 - **Templates** (`templates`, `peek`, `new --from`) follow #202.
 - **The protocol goes to v2**, since ops were renamed (protocol.md lists the changes). `queue.task`
   and `queue.reorder` are constants in `proto`; that and the version are the only `proto` changes.
-- **Fetchers** follows this in #277 (`show`, `enable` / `disable`, `list --removed`, `health`); it
-  lives on `integration/fetchers`, not in this PR.
+- **Fetchers** (on master since #280) gets the one change that needs no redesign here: `fetchers.fetch`
+  becomes `fetchers.run`. The rest needs sources to be files, which is #277: `new` / `edit` / `remove` /
+  `restore` / `purge` / `list --removed`, `enable` / `disable`, `rename` / `copy`, `show SOURCE` (with its
+  last result) with `status` for the whole feature, `fetchers.health`, `templates`, and `items` answered by
+  the daemon rather than filtered in the CLI. #277 lists them so the rework lands consistent.
+- **Not a thing a person makes: HTTP credentials (ADR 0036).** They stay settings in `config.toml`, with
+  the secret itself in the keychain or the secrets file, and have no `new` / `remove` commands. Secrets
+  must never sit in the data folder people sync with git. Revisit when a source needs one.
 
 ## Not chosen
 

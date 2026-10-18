@@ -11,6 +11,7 @@ mod complete;
 mod csv;
 mod doctor;
 mod editor;
+mod fetchers;
 mod first;
 mod flags;
 mod follow;
@@ -35,6 +36,7 @@ use shimmer_proto::ops;
 
 pub use args::{Args, Command, USAGE};
 pub use client::{Client, ConnectError};
+pub use fetchers::FetchersCmd;
 pub use queue::QueueCmd;
 pub use records::RecordsCmd;
 pub use scheduler::SchedulerCmd;
@@ -203,6 +205,7 @@ fn usage_for(args: &[String]) -> &'static str {
             "workspaces" => return workspaces::USAGE,
             "queue" => return queue::USAGE,
             "scheduler" => return scheduler::USAGE,
+            "fetchers" => return fetchers::USAGE,
             "packs" => return packs::cmd::USAGE,
             "notify" => return notify::USAGE,
             "doctor" => return doctor::USAGE,
@@ -250,6 +253,7 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
         Command::Workspaces(WorkspacesCmd::Help) => return Ok(Some(workspaces::USAGE.into())),
         Command::Queue(QueueCmd::Help) => return Ok(Some(queue::USAGE.into())),
         Command::Scheduler(SchedulerCmd::Help) => return Ok(Some(scheduler::USAGE.into())),
+        Command::Fetchers(FetchersCmd::Help) => return Ok(Some(fetchers::USAGE.into())),
         Command::DoctorHelp => return Ok(Some(doctor::USAGE.into())),
         // Packs live entirely in the client: no daemon needed.
         Command::Packs(cmd) => return packs::cmd::run(cmd, &packs::cmd::Env::from_process()).map(Some),
@@ -272,6 +276,9 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
     if let Command::Workspaces(cmd) = &args.command {
         return workspaces::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
     }
+    if let Command::Fetchers(cmd) = &args.command {
+        return fetchers::run(&mut client, cmd, args.json).await.map(Some);
+    }
     if let Command::Call { op, params, first: Some(yes) } = &args.command {
         return call_first(&mut client, op, params.clone(), *yes).await.map(|data| Some(output(args, &data)));
     }
@@ -287,6 +294,7 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
         | Command::Workspaces(_)
         | Command::Queue(_)
         | Command::Scheduler(_)
+        | Command::Fetchers(_)
         | Command::Packs(_)
         | Command::Notify(_) => {
             unreachable!("handled above")
@@ -356,6 +364,7 @@ fn output(args: &Args, data: &Value) -> String {
         | Command::Workspaces(_)
         | Command::Queue(_)
         | Command::Scheduler(_)
+        | Command::Fetchers(_)
         | Command::Packs(_)
         | Command::Notify(_) => render::json(data),
     }

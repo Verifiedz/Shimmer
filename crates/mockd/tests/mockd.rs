@@ -251,7 +251,7 @@ async fn confirmation_round_trip() {
     c.subscribe(&["queue.*"]).await;
     let params = json!({"source": "linkedin"});
 
-    let refused = c.call_with("fetchers.fetch", params.clone(), Some(json!({"priority": "override"}))).await;
+    let refused = c.call_with("fetchers.run", params.clone(), Some(json!({"priority": "override"}))).await;
     let refused = refused.unwrap_err();
     assert_eq!(refused.code, ErrorCode::ConfirmationRequired);
     let detail = refused.detail.unwrap();
@@ -262,11 +262,11 @@ async fn confirmation_round_trip() {
 
     // Confirming a version the user was not shown is refused again, as the daemon would.
     let stale = json!({"priority": "override", "confirm": true, "queue_version": 40});
-    let again = c.call_with("fetchers.fetch", params.clone(), Some(stale)).await.unwrap_err();
+    let again = c.call_with("fetchers.run", params.clone(), Some(stale)).await.unwrap_err();
     assert_eq!(again.code, ErrorCode::ConfirmationRequired);
 
     let confirm = json!({"priority": "override", "confirm": true, "queue_version": 41});
-    let granted = c.call_with("fetchers.fetch", params.clone(), Some(confirm)).await.unwrap();
+    let granted = c.call_with("fetchers.run", params.clone(), Some(confirm)).await.unwrap();
     let handle: QueuedHandle = serde_json::from_value(granted).expect("a queued handle");
     assert_eq!((handle.lane.as_str(), handle.position), ("fetchers", 0));
     let promoted = c.events(1).await.remove(0);
@@ -275,7 +275,7 @@ async fn confirmation_round_trip() {
     assert_eq!(promoted.payload["displaced"].as_array().unwrap().len(), 3);
 
     // An ordinary request just joins the lane.
-    let plain = c.call("fetchers.fetch", params).await.unwrap();
+    let plain = c.call("fetchers.run", params).await.unwrap();
     assert_eq!(plain["position"], 4);
     stop(m).await;
 }
@@ -311,7 +311,7 @@ async fn a_long_queued_task_reports_progress_in_order() {
     let mut c = Client::connect(&env.sock()).await;
     c.subscribe(&["queue.*", "fetchers.*"]).await;
 
-    let handle = c.call("fetchers.fetch", json!({"source": "hn-whoishiring"})).await.unwrap();
+    let handle = c.call("fetchers.run", json!({"source": "hn-whoishiring"})).await.unwrap();
     let task = handle["task_id"].as_str().unwrap().to_owned();
     assert_eq!(handle["queued"], true, "the result arrives later, as events");
 

@@ -153,7 +153,8 @@ fn a_trigger_fires_and_can_be_disabled_enabled_and_removed() {
     assert!(ok(&home, &["scheduler", "show", &id]).starts_with(&format!("{id}  (on)")));
     let undo = format!("✓ removed {what} (undo: shimmer scheduler restore {})", shown(&id));
     assert_eq!(ok(&home, &["scheduler", "remove", &id]).trim(), undo);
-    // Gone; only modules' own remain (notify's hourly `notify.flush`).
+    // Gone; only modules' own remain (fetchers' heartbeat, ADR 0028 §5; notify's hourly
+    // `notify.flush`) -- #244 already hides every module-owned trigger from the default view.
     let left = ok(&home, &["scheduler", "list"]);
     assert!(!left.contains(shown(&id)) && !left.contains("records.list"), "{left}");
 

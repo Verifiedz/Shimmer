@@ -55,7 +55,7 @@ connection, starting at its first successful `subscribe`; every file's timeline 
 | File | Covers |
 |---|---|
 | `core.json` | `core.manifest`, `queue.list`, `records.list` (a hit and a `not_found`) |
-| `confirmation.json` | `fetchers.fetch` with `override`: refused with `confirmation_required`, accepted when the `queue_version` echoed is 41, refused again for any other |
+| `confirmation.json` | `fetchers.run` with `override`: refused with `confirmation_required`, accepted when the `queue_version` echoed is 41, refused again for any other |
 | `workspace-dirty.json` | `workspaces.activate` on a dirty workspace (`workspace_dirty`), on a healthy one whose launch then fails (events), and the cleanup that recovers it |
 | `long-task.json` | a queued fetch that emits `started`, five `progress` events, an item, and `finished` |
 | `stream-lagged.json` | a timeline with a `core.stream.lagged` drop in the middle |

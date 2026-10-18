@@ -41,6 +41,7 @@ An alias stands for shimmer plus a whole command. In pack.toml it names one of t
   queue.list  queue.show  queue.cancel  queue.move
   scheduler.list  scheduler.show  scheduler.add  scheduler.edit  scheduler.disable
   scheduler.enable  scheduler.remove  scheduler.restore  scheduler.purge
+  fetchers.list  fetchers.status  fetchers.test  fetchers.run  fetchers.items
   notify.list  notify.show  notify.count  notify.mark_read  notify.mark_unread  notify.remove
   notify.send  notify.test  notify.resend  notify.pause  notify.resume  notify.quiet
   notify.status  notify.builtin_alerts  notify.cap

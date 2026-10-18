@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
+use crate::fetchers::{self, FetchersCmd};
 use crate::notify::{self, NotifyCmd};
 use crate::packs::cmd::{self as packs, PacksCmd};
 use crate::queue::{self, QueueCmd};
@@ -21,8 +22,9 @@ commands:
   records …             add, list and complete records (shimmer records --help)
   workspaces …          list, inspect and reset workspaces (shimmer workspaces --help)
   queue …               what's running and waiting, and cancel or reorder it (shimmer queue --help)
-  scheduler …           run commands on a schedule, and list, pause or remove them
+  scheduler …           run commands on a schedule, and list, disable or remove them
                         (shimmer scheduler --help)
+  fetchers …            sources that reach outward for new items (shimmer fetchers --help)
   notify …              your messages: the inbox, quiet hours, pause (shimmer notify --help)
   packs …               command packs: themed aliases for these commands (shimmer packs --help)
   doctor                check everything and say how to fix what's wrong
@@ -63,6 +65,7 @@ pub enum Command {
     Workspaces(WorkspacesCmd),
     Queue(QueueCmd),
     Scheduler(SchedulerCmd),
+    Fetchers(FetchersCmd),
     Packs(PacksCmd),
     Notify(NotifyCmd),
 }
@@ -106,6 +109,7 @@ impl Args {
             (true, Some("workspaces")) => Command::Workspaces(WorkspacesCmd::Help),
             (true, Some("queue")) => Command::Queue(QueueCmd::Help),
             (true, Some("scheduler")) => Command::Scheduler(SchedulerCmd::Help),
+            (true, Some("fetchers")) => Command::Fetchers(FetchersCmd::Help),
             // `schedule --help` is what muscle memory types: the same pointer as `schedule …`.
             (true, Some("schedule")) => command(words.clone())?,
             (true, Some("packs")) => Command::Packs(PacksCmd::Help),
@@ -133,6 +137,9 @@ fn command(words: Vec<String>) -> Result<Command, String> {
     }
     if word == "scheduler" {
         return scheduler::parse(rest).map(Command::Scheduler);
+    }
+    if word == "fetchers" {
+        return fetchers::parse(rest).map(Command::Fetchers);
     }
     if word == "schedule" {
         // ADR 0031 §6: one group for schedules. Said once, never a second working spelling.

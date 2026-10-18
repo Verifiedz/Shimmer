@@ -94,6 +94,7 @@ async fn run_daemon() -> ExitCode {
     let modules: Vec<Arc<dyn Module>> = vec![
         Arc::new(shimmer_records::Records::default()),
         Arc::new(shimmer_workspaces::Workspaces::default()),
+        Arc::new(shimmer_fetchers::Fetchers::default()),
         Arc::new(shimmer_notify::Notify::default()),
     ];
     let daemon = match Daemon::start(DaemonConfig::from_env(), modules).await {

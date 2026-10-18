@@ -65,7 +65,7 @@ The client sends `hello` first, before anything else. The daemon replies `welcom
 - `v` is the **protocol** version, an integer, bumped only on breaking changes.
   - **v2** (ADR 0038 §6): every op is named by its CLI word. `records.get`, `workspaces.status`,
     `scheduler.get`, `notify.get` and `queue.task` became `.show`; `records.create_collection` and
-    `workspaces.create` became `.new`; `queue.reorder` became `queue.move`; `scheduler.pause` /
+    `workspaces.create` became `.new`; `queue.reorder` became `queue.move`; `fetchers.fetch` became `fetchers.run`; `scheduler.pause` /
     `.resume` became `scheduler.disable` / `.enable` (a trigger shows `enabled`, not `paused`);
     `records.trash` became `records.list {"removed": true}`. Topics: `records.trash.purged` became
     `records.item.purged`, `scheduler.trigger.paused` / `.resumed` became `.disabled` / `.enabled`.
@@ -130,7 +130,7 @@ Every op declares an `execution` in `core.manifest`:
 
 ```jsonc
 // → a queued op
-{"v":2,"kind":"request","id":"r2","op":"fetchers.fetch",
+{"v":2,"kind":"request","id":"r2","op":"fetchers.run",
  "params":{"source":"hn-whoishiring"}}
 
 // ← accepted, not completed
@@ -147,7 +147,7 @@ Queue behaviour is orthogonal to the op, so it lives on the **frame**, not in `p
 Ops with `execution: inline` ignore it.
 
 ```jsonc
-{"v":2,"kind":"request","id":"r3","op":"fetchers.fetch",
+{"v":2,"kind":"request","id":"r3","op":"fetchers.run",
  "params":{"source":"linkedin"},
  "queue":{"priority":"override","confirm":false}}
 ```
@@ -197,7 +197,7 @@ no server-side pending state — the daemon holds nothing between the two reques
 
 ```jsonc
 // → 1. ask to jump the lane
-{"v":2,"kind":"request","id":"p1","op":"fetchers.fetch",
+{"v":2,"kind":"request","id":"p1","op":"fetchers.run",
  "params":{"source":"linkedin"},
  "queue":{"priority":"override"}}
 
@@ -207,12 +207,12 @@ no server-side pending state — the daemon holds nothing between the two reques
   "message":"would displace 3 scheduled tasks in lane 'fetchers'",
   "detail":{"lane":"fetchers","queue_version":41,
     "would_displace":[
-      {"task_id":"01JD2P…","op":"fetchers.fetch","priority":"scheduled"},
-      {"task_id":"01JD2Q…","op":"fetchers.fetch","priority":"scheduled"},
-      {"task_id":"01JD2R…","op":"fetchers.fetch","priority":"scheduled"}]}}}
+      {"task_id":"01JD2P…","op":"fetchers.run","priority":"scheduled"},
+      {"task_id":"01JD2Q…","op":"fetchers.run","priority":"scheduled"},
+      {"task_id":"01JD2R…","op":"fetchers.run","priority":"scheduled"}]}}}
 
 // → 3. user agreed; echo the queue_version you showed them
-{"v":2,"kind":"request","id":"p2","op":"fetchers.fetch",
+{"v":2,"kind":"request","id":"p2","op":"fetchers.run",
  "params":{"source":"linkedin"},
  "queue":{"priority":"override","confirm":true,"queue_version":41}}
 
@@ -486,6 +486,20 @@ record only (`conflict` on `records.add`, `records.update`, or `records.complete
 `docs/decisions/0016-records-completion-lifecycle.md` and
 `docs/decisions/0017-records-integration-metadata.md`.
 
+## Fetchers ops
+
+| Op | Execution | Params | Returns |
+|---|---|---|---|
+| `fetchers.tick` | queued (`fetchers`) | `{}` | `{"enqueued":[…],"already_running":[…]}`, each a source id. The scheduler heartbeat trigger (every 5 minutes, ADR 0028 §5) — not meant to be called by hand, but not refused either. Enqueues `fetchers.run` for every configured, enabled source whose interval has elapsed since its last run, skipping (into `already_running`) a source already mid-fetch. |
+| `fetchers.run` | queued (`fetchers`) | `{"source","title_contains"?,"title_excludes"?}` | `{"source","new_items"}`. Fetches one source now — the fixed, compiled-in registry or a configured `kind` (e.g. `"rss"`), ADR 0028 §2a — through to completion: pages (capped at 10), dedupes against that source's own seen-id set, and emits one `fetchers.item.found` per genuinely new item. `title_contains`/`title_excludes` (ADR 0028 §14), when either is given, replace — never merge with — the source's own `[modules.fetchers.sources.<id>]` filter (§13) for this one call. `not_found` for an unknown source id; `module_error` ("already fetching") if a run for the same source is already in flight. Always records the attempt (even on failure) so a broken source waits a full interval before being retried, rather than being hammered every tick. |
+| `fetchers.list` | inline | `{}` | `{"sources":[{"id","method","kind","enabled","interval_s"}…]}`, one entry per source `fetchers.status`/`fetchers.run` could ever resolve — the fixed registry plus every configured `kind` instance (ADR 0028 §2a). `kind`/`interval_s` are `null` for a fixed source with no `[modules.fetchers.sources.<id>]` entry of its own. Backs `shimmer fetchers list` (ADR 0028 §11). |
+| `fetchers.status` | inline | `{}` | `{"sources":[{"id","last_run_at","running"}…]}` over the same source universe as `fetchers.list`. `last_run_at` is `null` for a source never fetched. Backs `shimmer fetchers status` (ADR 0028 §11). |
+| `fetchers.test` | queued (`fetchers`) | `{"source","title_contains"?,"title_excludes"?}` | `{"source","items":[{source_name,source_id,title,url,raw_data}…]}`. Fetches exactly one page and returns its parsed items — never touches `seen.toml`, `last_run.toml`, or the overlap guard, and emits no `fetchers.item.found`; a dry run only. `title_contains`/`title_excludes` work exactly as in `fetchers.run` above (ADR 0028 §13/§14). Backs `shimmer fetchers test` (ADR 0028 §11). |
+
+A fetch's failure reaches the client as `queue.task.failed` like any other queued op, and
+additionally as `fetchers.fetch.failed` on the bus (see the topic catalogue below) — the
+latter is what a dashboard or a configured `notify.*` fallback actually watches.
+
 Module ops are namespaced `<module>.<verb>`. The daemon routes on the prefix; a collision
 between two modules is a startup failure, not a runtime surprise.
 
@@ -574,8 +588,9 @@ tolerate unknown topics.
 | `records.field.renamed` | `{collection, from, to}`. |
 | `records.collection.renamed` / `.removed` / `.restored` / `.purged` | `{collection, new_id}` / `{collection, records}` / `{collection}` / `{collection, records}`. `.purged`: a removed collection was deleted for good (ADR 0021 §5a). |
 | `records.item.purged` | `records.purge` deleted trashed records for good. `{collection, records}`, plus `id` when one record was purged. ADR 0024 §5. |
-| `fetchers.item.found` | A source returned a new, deduplicated item. Planned (M6): not emitted by any module yet. |
-| `fetchers.fetch.finished` / `.failed` | A fetch run ended. Planned (M6): not emitted by any module yet. |
+| `fetchers.item.found` | A source returned a new, deduplicated item (one per item, inside the same transaction that updates that source's seen-id set). Payload `{source_name, source_id, title, url, raw_data}`; `raw_data` past 8KiB is replaced with `{"truncated":true,"preview":…}`. |
+| `fetchers.fetch.finished` | A fetch run completed without error. Payload `{source, new_items}`. |
+| `fetchers.fetch.failed` | A fetch run failed. Payload `{source, error, reason}`. `reason` is one of `"network"` (a transport-level failure), `"http_error"` (a non-2xx, non-cooldown response), `"blocked"` (a `Method::Scrape` source's own robots.txt refused the fetch — the page was never requested), `"cancelled"`, or `"parse_empty"` (anything else: a malformed or unexpectedly-shaped response body, no matching "who is hiring" thread, or a corrupt local `seen.toml` — the last of these is a deliberate, already-tested tradeoff: a corrupt dedup file is a loud, reported error forever, never silently reset to an empty set). |
 | `calendar.date.registered` | A dated entry was stored. Planned (M6): not emitted by any module yet. |
 | `notify.message.received` | A message landed in the inbox. `{id, title, body, priority, source}`, plus `removed_unread` when the cap removed unread ones to fit. ADR 0032. |
 | `notify.message.held` | Quiet hours or a pause held it. `{id}`. |
@@ -631,7 +646,7 @@ Connect, discover, subscribe, enqueue, watch it run.
 → {"v":2,"kind":"subscribe","id":"2","topics":["queue.*","fetchers.*"]}
 ← {"v":2,"kind":"response","id":"2","ok":true,"data":{"subscribed":2}}
 
-→ {"v":2,"kind":"request","id":"3","op":"fetchers.fetch","params":{"source":"hn-whoishiring"}}
+→ {"v":2,"kind":"request","id":"3","op":"fetchers.run","params":{"source":"hn-whoishiring"}}
 ← {"v":2,"kind":"response","id":"3","ok":true,
    "data":{"queued":true,"task_id":"01JD2N…","lane":"fetchers","position":1}}
 

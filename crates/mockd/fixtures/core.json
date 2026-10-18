@@ -169,7 +169,17 @@
             "namespace": "fetchers",
             "commands": [
               {
-                "op": "fetchers.fetch",
+                "op": "fetchers.tick",
+                "summary": "Internal: check configured sources and enqueue a fetch for each one due (the scheduler calls this, not a person)",
+                "params_schema": {},
+                "execution": {
+                  "queued": {
+                    "lane": "fetchers"
+                  }
+                }
+              },
+              {
+                "op": "fetchers.run",
                 "summary": "Fetch a source now",
                 "params_schema": {},
                 "execution": {
@@ -470,7 +480,7 @@
               {
                 "task_id": "01JD2P00000000000000000001",
                 "lane": "fetchers",
-                "op": "fetchers.fetch",
+                "op": "fetchers.run",
                 "status": "running",
                 "priority": "normal",
                 "origin": {
@@ -491,7 +501,7 @@
               {
                 "task_id": "01JD2P00000000000000000002",
                 "lane": "fetchers",
-                "op": "fetchers.fetch",
+                "op": "fetchers.run",
                 "status": "queued",
                 "priority": "scheduled",
                 "origin": {
@@ -511,7 +521,7 @@
               {
                 "task_id": "01JD2P00000000000000000003",
                 "lane": "fetchers",
-                "op": "fetchers.fetch",
+                "op": "fetchers.run",
                 "status": "queued",
                 "priority": "scheduled",
                 "origin": {
@@ -531,7 +541,7 @@
               {
                 "task_id": "01JD2P00000000000000000004",
                 "lane": "fetchers",
-                "op": "fetchers.fetch",
+                "op": "fetchers.run",
                 "status": "queued",
                 "priority": "scheduled",
                 "origin": {

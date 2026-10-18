@@ -174,7 +174,7 @@ mod tests {
         let hello = r#"{"v": 2, "kind": "hello", "client": "tui", "client_version": "0.3.1"}"#;
         assert!(matches!(decode_client(hello).unwrap(), ClientFrame::Hello { v: 2, .. }));
 
-        let req = r#"{"v":2,"kind":"request","id":"p2","op":"fetchers.fetch",
+        let req = r#"{"v":2,"kind":"request","id":"p2","op":"fetchers.run",
             "params":{"source":"linkedin"},
             "queue":{"priority":"override","confirm":true,"queue_version":41}}"#
             .replace('\n', "");

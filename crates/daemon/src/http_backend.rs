@@ -319,9 +319,16 @@ impl RealHttpBackend {
         secrets: Arc<dyn SecretStore>,
         secrets_problem: Option<String>,
     ) -> Result<Self> {
+        // Every request this daemon makes, from any network-capable module, goes out
+        // identified -- an anonymous UA gets silently dropped by some hosts and makes a
+        // robots.txt rule impossible to address correctly (PR #126 review). This is a
+        // single daemon-wide identity, not the fetchers-specific `Shimmer-Fetchers/<version>`
+        // ADR 0028 §7 describes: there is no per-module custom-header plumbing yet (ADR 0027
+        // deferred it), and this client is shared by every module that declares `"network"`.
         let client = reqwest::Client::builder()
             .timeout(config.timeout)
             .redirect(reqwest::redirect::Policy::none())
+            .user_agent(format!("Shimmer/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| Error::internal(format!("building http client: {e}")))?;
         Ok(Self {
@@ -707,32 +714,76 @@ mod tests {
     const OK: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
     const NOT_MODIFIED: &str = "HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\n\r\n";
 
-    /// Hand-rolled HTTP/1.1 server on an ephemeral loopback port: serves exactly the given
-    /// responses in order, one per accepted connection, and records each request's raw head
-    /// so a test can assert on what was actually sent (e.g. `If-None-Match`). No real
-    /// network, no new dependency (ADR 0027 §9).
+    /// One response, written in parts: each part is sent after waiting its `Duration`. A plain
+    /// response is one part with no wait; a slow body is the head and some bytes, then the rest
+    /// later.
+    type Reply = Vec<(&'static str, Duration)>;
+
+    /// Hand-rolled HTTP/1.1 server on an ephemeral loopback port, one response per connection,
+    /// recording each request's raw head (and when it arrived) so a test can assert on what was
+    /// actually sent (e.g. `If-None-Match`). No real network, no new dependency (ADR 0027 §9).
+    ///
+    /// Every test's server is this one, so every response goes through [`send`], which says
+    /// `Connection: close`. A test with its own listener once missed that and flaked on macOS
+    /// (#134, then again in #246's CI); `only_test_server_listens` keeps it that way.
     struct TestServer {
         addr: std::net::SocketAddr,
-        requests: Arc<Mutex<Vec<String>>>,
+        /// Each request's raw head and how long after the server started it arrived.
+        requests: Arc<Mutex<Vec<(String, Duration)>>>,
+    }
+
+    /// Writes `reply`. One response per connection, then the connection closes: say so.
+    /// Without it the client keeps the connection for its next request, and when that races
+    /// the close it fails or (for a refetch) serves the stale copy (#134).
+    fn send(stream: &mut std::net::TcpStream, reply: &[(&str, Duration)]) {
+        for (i, (part, wait)) in reply.iter().enumerate() {
+            std::thread::sleep(*wait);
+            let part = if i == 0 { part.replacen("\r\n", "\r\nConnection: close\r\n", 1) } else { (*part).to_owned() };
+            if stream.write_all(part.as_bytes()).is_err() {
+                return;
+            }
+        }
     }
 
     impl TestServer {
+        /// Serves exactly `responses`, in order, one connection after another.
         fn start(responses: Vec<&'static str>) -> Self {
+            Self::serve(false, responses.len(), move |i, _| vec![(responses[i], Duration::ZERO)])
+        }
+
+        /// Serves `connections` connections, each on its own thread the moment it's accepted, so
+        /// the server never serialises requests itself; `reply` picks each response from the
+        /// request.
+        fn start_concurrent(connections: usize, reply: impl Fn(&str) -> Reply + Send + Sync + 'static) -> Self {
+            Self::serve(true, connections, move |_, request| reply(request))
+        }
+
+        fn serve(
+            concurrent: bool,
+            connections: usize,
+            reply: impl Fn(usize, &str) -> Reply + Send + Sync + 'static,
+        ) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let requests = Arc::new(Mutex::new(Vec::new()));
-            let requests_clone = requests.clone();
+            let (recorded, reply) = (requests.clone(), Arc::new(reply));
+            let started = std::time::Instant::now();
             std::thread::spawn(move || {
-                for response in responses {
+                for i in 0..connections {
                     let Ok((mut stream, _)) = listener.accept() else { return };
-                    let mut buf = [0u8; 8192];
-                    let n = stream.read(&mut buf).unwrap_or(0);
-                    requests_clone.lock().unwrap().push(String::from_utf8_lossy(&buf[..n]).into_owned());
-                    // One response per connection, then the connection closes: say so. Without
-                    // it the client keeps the connection for its next request, and when that
-                    // races the close it fails or (for a refetch) serves the stale copy (#134).
-                    let response = response.replacen("\r\n", "\r\nConnection: close\r\n", 1);
-                    let _ = stream.write_all(response.as_bytes());
+                    let (recorded, reply) = (recorded.clone(), reply.clone());
+                    let mut handle = move || {
+                        let mut buf = [0u8; 8192];
+                        let n = stream.read(&mut buf).unwrap_or(0);
+                        let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                        recorded.lock().unwrap().push((request.clone(), started.elapsed()));
+                        send(&mut stream, &reply(i, &request));
+                    };
+                    if concurrent {
+                        std::thread::spawn(handle);
+                    } else {
+                        handle();
+                    }
                 }
             });
             Self { addr, requests }
@@ -751,7 +802,13 @@ mod tests {
                 .lock()
                 .unwrap()
                 .last()
-                .is_some_and(|r| r.to_ascii_lowercase().contains(&header.to_ascii_lowercase()))
+                .is_some_and(|(r, _)| r.to_ascii_lowercase().contains(&header.to_ascii_lowercase()))
+        }
+
+        /// How long after the server started the first request for `path` arrived.
+        fn arrived(&self, path: &str) -> Option<Duration> {
+            let first_line = format!(" {path} ");
+            self.requests.lock().unwrap().iter().find(|(r, _)| r.contains(&first_line)).map(|(_, at)| *at)
         }
     }
 
@@ -804,6 +861,20 @@ mod tests {
         let resp = b.get(&ModuleId::new("test"), &server.url("/a"), None).await.unwrap();
         assert_eq!((resp.status, resp.body), (200, b"ok".to_vec()));
         assert!(!resp.from_cache && !resp.stale && resp.retry_after_secs.is_none());
+    }
+
+    #[tokio::test]
+    async fn every_request_identifies_itself_with_a_user_agent() {
+        // Every module sharing this backend (not just fetchers) must never send an anonymous
+        // request -- some hosts silently drop one, and a robots.txt rule is unenforceable
+        // against a client that never says who it is (PR #126 review).
+        let server = TestServer::start(vec![OK]);
+        let (b, _home) = backend(generous_config(), Clock::system());
+        b.get(&ModuleId::new("test"), &server.url("/a"), None).await.unwrap();
+        assert!(
+            server.last_request_sent(&format!("User-Agent: Shimmer/{}", env!("CARGO_PKG_VERSION"))),
+            "the daemon-wide user agent must be sent on every request"
+        );
     }
 
     #[tokio::test]
@@ -1031,32 +1102,18 @@ mod tests {
     async fn the_concurrency_permit_is_held_through_the_body_read_not_just_the_headers() {
         // Each connection is handled on its own thread the instant it's accepted -- the server
         // itself must not be the thing serializing the two requests, only the backend's
-        // per-host semaphore may do that. `/a`'s handler sends a slow body (headers + one byte,
-        // a real sleep, then the rest); `/b`'s handler reports when its request actually
-        // reached the server. With `default_concurrent = 1` on one shared host, `/b` must not
-        // reach the server until `/a`'s body (not just its headers) has been fully read.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let test_start = std::time::Instant::now();
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        std::thread::spawn(move || {
-            for _ in 0..2 {
-                let (mut conn, _) = listener.accept().unwrap();
-                let tx = tx.clone();
-                std::thread::spawn(move || {
-                    let mut buf = [0u8; 8192];
-                    let n = conn.read(&mut buf).unwrap_or(0);
-                    let request = String::from_utf8_lossy(&buf[..n]).into_owned();
-                    if request.contains("/a") {
-                        conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\no").unwrap();
-                        std::thread::sleep(Duration::from_millis(200));
-                        conn.write_all(b"k").unwrap();
-                    } else {
-                        let _ = tx.send(test_start.elapsed());
-                        conn.write_all(OK.as_bytes()).unwrap();
-                    }
-                });
+        // per-host semaphore may do that. `/a` gets a slow body (headers + one byte, a real
+        // sleep, then the rest); the server records when `/b` actually reached it. With
+        // `default_concurrent = 1` on one shared host, `/b` must not reach the server until
+        // `/a`'s body (not just its headers) has been fully read.
+        let server = TestServer::start_concurrent(2, |request| {
+            if request.contains(" /a ") {
+                vec![
+                    ("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\no", Duration::ZERO),
+                    ("k", Duration::from_millis(200)),
+                ]
+            } else {
+                vec![(OK, Duration::ZERO)]
             }
         });
 
@@ -1064,19 +1121,32 @@ mod tests {
         cfg.default_concurrent = 1;
         let (b, _home) = backend(cfg, Clock::system());
         let module = ModuleId::new("test");
-        let url_a = format!("http://{addr}/a");
-        let url_b = format!("http://{addr}/b");
 
+        let (url_a, url_b) = (server.url("/a"), server.url("/b"));
         let (ra, rb) = tokio::join!(b.get(&module, &url_a, None), b.get(&module, &url_b, None));
         assert_eq!(ra.unwrap().body, b"ok".to_vec());
         assert_eq!(rb.unwrap().body, b"ok".to_vec());
 
-        let b_arrived = rx.recv_timeout(Duration::from_secs(1)).expect("the /b request never reached the server");
+        let b_arrived = server.arrived("/b").expect("the /b request never reached the server");
         assert!(
             b_arrived >= Duration::from_millis(150),
             "the /b request reached the server after only {b_arrived:?} -- the per-host \
              concurrency permit must be held until /a's body is fully read, not released once \
              /a's headers come back"
+        );
+    }
+
+    /// Keeps #134 fixed: only `TestServer` opens a listener in these tests, so every response
+    /// goes through `send` and says `Connection: close`. A test with its own listener missed
+    /// that once and flaked on macOS CI.
+    #[test]
+    fn only_test_server_listens() {
+        let needle = ["TcpListener", "::bind("].concat();
+        let listeners = include_str!("http_backend.rs").matches(needle.as_str()).count();
+        assert_eq!(
+            listeners, 1,
+            "a test opens its own listener: use TestServer::start or TestServer::start_concurrent, \
+             so its responses say Connection: close (#134)"
         );
     }
 
