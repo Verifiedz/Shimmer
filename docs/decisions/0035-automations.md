@@ -79,7 +79,8 @@ params = { title = "Interview stage: {title}", priority = "high" }
   description (§5.5), so a rule can be written without reading the protocol.
 - **`when`** (optional): conditions on the event's payload, in **records' filter language**
   (ADR 0019, ADR 0024 §5): a plain value is equality; an object holds operators that must all pass:
-  `eq`, `ne`, `lt`, `lte`, `gt`, `gte`, `in`, `set`, `contains`, `has`; relative dates (`today+3`)
+  `eq`, `ne`, `lt`, `lte`, `gt`, `gte`, `in`, `set`, `contains`, `has`; a top-level
+  `or = [{…}, {…}]` passes when any one of its alternatives does (§5.3); relative dates (`today+3`)
   resolve in the local timezone. Keys are payload fields; `item.<field>` reaches into a record
   event's record (ADR 0017 §7); dotted paths reach nested fields (`detail.workspace`).
 - **`do`:** one or more actions, each an op and its params. **All of a rule's actions start
