@@ -337,7 +337,7 @@ on = "records.item.updated"
 when = { collection = "jobs", "item.stage" = "interviewing", changed = "stage" }
 [[do]]
 op = "workspaces.create"
-params = { id = "{id}-prep", template = "interview-prep", answers = { COMPANY = "{title}", JOB_URL = "{item.url}" } }
+params = { id = "{id}-prep", template = "interview-prep", values = { COMPANY = "{title}", JOB_URL = "{item.url}" } }
 ```
 ```toml
 # 2: that workspace was created → open it (a chain of 2, §3)
