@@ -53,8 +53,8 @@ pub struct FileSecretStore {
 impl FileSecretStore {
     /// `None` is a normal, silent "no file store configured" (no `secrets.toml` exists) —
     /// distinct from `Some(Err(..))`, a file that exists but is unreadable, malformed, or (on
-    /// unix) not mode `0600`, which must stop the daemon's startup rather than quietly running
-    /// with no secrets loaded.
+    /// unix) not mode `0600`. `load_chain` treats that `Err` as a non-fatal `problem`, not a
+    /// reason to stop the daemon's startup (#257's review).
     pub fn load_if_present(path: &Path) -> Option<Result<Self>> {
         if !path.exists() {
             return None;
@@ -68,7 +68,20 @@ impl FileSecretStore {
         let text =
             std::fs::read_to_string(path).map_err(|e| Error::internal(format!("reading {}: {e}", path.display())))?;
         let table: HashMap<String, String> = toml::from_str(&text).map_err(|e| {
-            Error::invalid_params(format!("{}: must be a flat table of name = \"value\" pairs: {e}", path.display()))
+            // `e`'s `Display` quotes the offending source line, which is exactly the secret
+            // value a malformed entry mistyped -- that string flows into the daemon log,
+            // `unavailable` IPC errors and the permanent event log (a second reviewer's
+            // finding on #257). `message()` + `span()` give the same "what's wrong, where" a
+            // person needs to fix it, with no file content attached.
+            let where_ = e.span().map_or_else(String::new, |span| {
+                let line = text[..span.start].matches('\n').count() + 1;
+                format!(" at line {line}")
+            });
+            Error::invalid_params(format!(
+                "{}: must be a flat table of name = \"value\" pairs ({}{where_})",
+                path.display(),
+                e.message()
+            ))
         })?;
         Ok(Self { values: table })
     }
@@ -187,6 +200,19 @@ mod tests {
         match FileSecretStore::load_if_present(&path).unwrap() {
             Ok(_) => panic!("a world-readable secrets file must be rejected, not loaded"),
             Err(e) => assert_eq!(e.code, shimmer_core::ErrorCode::InvalidParams),
+        }
+    }
+
+    #[test]
+    fn a_malformed_files_error_never_contains_the_attempted_secret() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("secrets.toml");
+        std::fs::write(&path, "gmail-token = ya29.s3cr3t-value\n").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        match FileSecretStore::load_if_present(&path).unwrap() {
+            Ok(_) => panic!("malformed TOML must be rejected, not loaded"),
+            Err(e) => assert!(!e.message.contains("s3cr3t-value"), "the attempted secret leaked into the error: {e}"),
         }
     }
 

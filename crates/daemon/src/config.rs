@@ -159,6 +159,9 @@ fn normalized_host(name: &str, host: &str) -> Result<String> {
     if host.contains('/') {
         return Err(bad("must be a host, optionally with a port -- not a url"));
     }
+    if host.contains('[') || host.contains(']') {
+        return Err(bad("looks like an IPv6 literal, which isn't supported here"));
+    }
     match host.rsplit_once(':') {
         Some((h, port)) => {
             if h.is_empty() {
@@ -422,7 +425,14 @@ mod tests {
 
     #[test]
     fn a_credential_host_that_is_a_url_or_has_a_bad_port_is_rejected() {
-        for host in ["https://api.example.com", "api.example.com/v1", "api.example.com:https", "api.example.com:"] {
+        for host in [
+            "https://api.example.com",
+            "api.example.com/v1",
+            "api.example.com:https",
+            "api.example.com:",
+            "[::1]",
+            "[::1]:8443",
+        ] {
             let text = format!("[credentials.k]\nmodule = \"f\"\nhost = \"{host}\"\nheader = \"Authorization\"\n");
             let e = Config::parse(&text).unwrap_err();
             assert_eq!(e.code, shimmer_core::ErrorCode::InvalidParams, "host: {host}");
