@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
+use crate::notify::{self, NotifyCmd};
 use crate::packs::cmd::{self as packs, PacksCmd};
 use crate::queue::{self, QueueCmd};
 use crate::records::{self, RecordsCmd};
@@ -20,10 +21,9 @@ commands:
   records …             add, list and complete records (shimmer records --help)
   workspaces …          list, inspect and reset workspaces (shimmer workspaces --help)
   queue …               what's running and waiting, and cancel or reorder it (shimmer queue --help)
-  schedule WHEN … COMMAND
-                        run a command on a schedule, e.g. shimmer schedule weekdays 09:00
-                        workspaces activate site (shimmer schedule --help)
-  scheduler …           list, pause, resume and remove schedules (shimmer scheduler --help)
+  scheduler …           run commands on a schedule, and list, pause or remove them
+                        (shimmer scheduler --help)
+  notify …              your messages: the inbox, quiet hours, pause (shimmer notify --help)
   packs …               command packs: themed aliases for these commands (shimmer packs --help)
   doctor                check everything and say how to fix what's wrong
   call OP [PARAMS]      send any op; PARAMS is a JSON object (default {});
@@ -63,8 +63,8 @@ pub enum Command {
     Workspaces(WorkspacesCmd),
     Queue(QueueCmd),
     Scheduler(SchedulerCmd),
-    Schedule(crate::schedule::ScheduleCmd),
     Packs(PacksCmd),
+    Notify(NotifyCmd),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -106,8 +106,10 @@ impl Args {
             (true, Some("workspaces")) => Command::Workspaces(WorkspacesCmd::Help),
             (true, Some("queue")) => Command::Queue(QueueCmd::Help),
             (true, Some("scheduler")) => Command::Scheduler(SchedulerCmd::Help),
-            (true, Some("schedule")) => Command::Schedule(crate::schedule::ScheduleCmd::Help),
+            // `schedule --help` is what muscle memory types: the same pointer as `schedule …`.
+            (true, Some("schedule")) => command(words.clone())?,
             (true, Some("packs")) => Command::Packs(PacksCmd::Help),
+            (true, Some("notify")) => Command::Notify(NotifyCmd::Help),
             (true, Some("doctor")) => Command::DoctorHelp,
             (true, _) => Command::Help,
             (false, _) => command(words)?,
@@ -133,7 +135,13 @@ fn command(words: Vec<String>) -> Result<Command, String> {
         return scheduler::parse(rest).map(Command::Scheduler);
     }
     if word == "schedule" {
-        return crate::schedule::parse(rest).map(Command::Schedule);
+        // ADR 0031 §6: one group for schedules. Said once, never a second working spelling.
+        return Err("'shimmer schedule' is now 'shimmer scheduler add', e.g. shimmer scheduler add weekdays 09:00 \
+                    --catch-up skip workspaces activate site"
+            .into());
+    }
+    if word == "notify" {
+        return notify::parse(rest).map(Command::Notify);
     }
     if word == "packs" {
         return packs::parse(rest).map(Command::Packs);

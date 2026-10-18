@@ -91,6 +91,7 @@ async fn a_failed_tasks_slot_frees_before_the_next_task_starts() {
     let finished_next = index_of(&seen, "queue.task.finished", &next);
 
     assert!(started_failing < failed, "it ran, then failed");
+    assert_eq!(seen[failed].payload["fallback"], false, "no fallback was sent for it (ADR 0032 §4)");
     assert!(failed < started_next, "the failure is reported before the next task takes the slot");
     assert!(started_next < finished_next);
     assert_eq!(seen[failed].payload["lane"], "slow");
@@ -449,9 +450,20 @@ async fn a_structural_failure_enqueues_the_fallback_in_the_notify_lane() {
         index_of(&seen, "queue.task.failed", &primary) < seen.len() - 1,
         "the failure is reported before the fallback is enqueued"
     );
-    let failed = &seen[index_of(&seen, "queue.task.failed", &primary)];
+    // Cause, then effect: the failure is logged before the fallback task even joins its lane
+    // (#281's review).
+    let fallback_events: Vec<&str> =
+        seen.iter().filter(|e| e.payload["task_id"] == fallback.as_str()).map(|e| e.topic.as_str()).collect();
+    let failed_at = index_of(&seen, "queue.task.failed", &primary);
+    let first_fallback_event = seen.iter().position(|e| e.payload["task_id"] == fallback.as_str());
+    assert!(
+        first_fallback_event.is_none_or(|i| i > failed_at),
+        "the fallback's {fallback_events:?} came before the failure that caused it"
+    );
+    let failed = &seen[failed_at];
     assert_eq!(failed.payload["code"], "unavailable");
     assert_eq!(failed.payload["lane"], "slow", "the primary ran in its own lane");
+    assert_eq!(failed.payload["fallback"], true, "a fallback is being sent for this failure (ADR 0032 §4)");
 
     // The fallback is an ordinary task, configured exactly as the trigger declared it.
     let done = until(&mut c, "queue.task.finished", &fallback).await;
@@ -571,6 +583,10 @@ async fn a_fallback_that_cannot_be_enqueued_is_reported_and_never_stalls_the_lan
     let ev = seen.last().unwrap();
     assert_eq!(ev.payload["op"], "notify.ghost");
     assert_eq!(ev.payload["code"], "unknown_op");
+    // No fallback is being sent, so the failure must say so: notify's alerts stay quiet only
+    // when one is (#276's review). Reported before the fallback's own failure.
+    let failed = seen.iter().find(|e| e.topic == "queue.task.failed").expect("the failure is reported first");
+    assert_eq!(failed.payload["fallback"], false, "the fallback couldn't be enqueued");
 
     let next = quick(&mut c).await;
     assert_eq!(until(&mut c, "queue.task.finished", &next).await.last().unwrap().payload["task_id"], next.as_str());

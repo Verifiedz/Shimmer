@@ -208,6 +208,48 @@ impl Module for ProcessUser {
     }
 }
 
+/// Asks `ctx.desktop` for a note, with or without `"desktop"` declared (ADR 0032 §1), to prove
+/// `Core::new`'s capability-scoped wiring.
+pub struct DesktopUser {
+    pub declares_capability: bool,
+}
+
+#[async_trait]
+impl Module for DesktopUser {
+    fn manifest(&self) -> Manifest {
+        Manifest {
+            id: "deskuser".into(),
+            version: "0.0.1".into(),
+            namespace: "deskuser".into(),
+            topics: vec![],
+            capabilities: if self.declares_capability { vec!["desktop".into()] } else { vec![] },
+        }
+    }
+
+    async fn init(&self, _ctx: &Ctx) -> Result<()> {
+        Ok(())
+    }
+
+    fn commands(&self) -> Vec<CommandSpec> {
+        vec![spec("deskuser.show", Execution::Inline)]
+    }
+
+    async fn handle(&self, op: &str, _params: Value, ctx: &Ctx) -> Result<Value> {
+        match op {
+            "deskuser.show" => {
+                let note = shimmer_core::DesktopNote {
+                    title: "hello".into(),
+                    body: "from a test".into(),
+                    urgency: shimmer_core::Urgency::Normal,
+                };
+                ctx.desktop.show(&note).await?;
+                Ok(json!({"shown": true}))
+            }
+            _ => Err(Error::unknown_op(op)),
+        }
+    }
+}
+
 /// Its manifest's `capabilities` is configurable so a test can start the *same* op logic
 /// with and without `"network"` declared, to prove `Core::new`'s capability-scoped
 /// `ctx.http` wiring (ADR 0027 §4) rather than anything about fetch behaviour itself

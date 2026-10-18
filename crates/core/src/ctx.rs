@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::bus::Emitter;
 use crate::clock::Clock;
+use crate::desktop::Desktop;
 use crate::error::{Error, Result};
 use crate::http::HttpGateway;
 use crate::ids::ModuleId;
@@ -72,6 +73,9 @@ pub struct Ctx {
     /// separate change once ADR 0010 is signed off. Modules must never call
     /// `std::process::Command` directly (§12 rule 4).
     pub launcher: Launcher,
+    /// Show a desktop notification (ADR 0032 §1). Defaults to [`Desktop::unavailable`]; the
+    /// daemon gives the real one only to a module whose manifest declares `"desktop"`.
+    pub desktop: Desktop,
     /// Cooperative cancellation. Long tasks must poll this.
     pub cancel: CancellationToken,
     pub config: ModuleConfig,
@@ -101,6 +105,7 @@ impl Ctx {
             clock,
             local_tz,
             launcher: Launcher::unavailable(),
+            desktop: Desktop::unavailable(),
             cancel,
             config,
             module_id,

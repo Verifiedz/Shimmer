@@ -189,14 +189,36 @@ shimmer workspaces activate site           # run its steps in order; add --wait 
 shimmer workspaces status site             # steps, last session, and why it's dirty if it is
 shimmer workspaces stop site               # stop what it started
 shimmer queue list                     # what is running and waiting, per lane
-shimmer scheduler list                 # every trigger, when it next fires and its state
-shimmer scheduler add records.list '{"collection":"leetcode"}' --every 1d --catch-up skip
+shimmer scheduler list                 # your schedules, when each next fires and its state (--all: modules' too)
+shimmer scheduler add weekdays 09:00 --catch-up skip workspaces activate site   # the command as you'd type it
+shimmer scheduler add mon,wed,fri 18:00 --catch-up skip records complete habits/gym
 ```
 
 A workspace is a folder in `$SHIMMER_HOME/data/workspaces/<name>/` holding a `workspace.toml`
 and a `steps/` folder of scripts. [`CLAUDE.md`](CLAUDE.md) §10 shows an example and ADR 0012
 has every rule. `shimmer workspaces --help`, `shimmer queue --help` and
 `shimmer scheduler --help` cover the rest.
+
+### Notifications
+
+```sh
+shimmer notify test                        # check that messages reach you (a desktop notification)
+shimmer notify send "Build finished" --body "v1.4 is live" --priority high
+shimmer notify list                        # your messages, newest first; --unread, --from alerts, --text …
+shimmer notify show 0A3F6K                 # one in full (the ending list shows is enough)
+shimmer notify quiet 22:00-08:00           # quiet hours: low and normal messages wait, then one summary
+shimmer notify pause 2h                    # do not disturb for a while; shimmer notify resume to stop
+shimmer notify remove --read               # clean up (asks first)
+shimmer scheduler add weekdays 08:45 --catch-up skip notify send "Standup in 15"
+```
+
+Every message lands in an inbox first (`$SHIMMER_HOME/data/notify/inbox/`), then appears as a
+desktop notification: `notify-send` on Linux (the `libnotify-bin` package), `osascript` on macOS.
+Nothing is lost if it can't be shown. Normal and high priority pop up; on GNOME, low priority goes
+straight to the notification list without popping up (on macOS every priority pops up the same). Shimmer also tells you by itself when a workspace couldn't
+launch or a scheduled task failed (`shimmer notify builtin-alerts`). On a machine with no screen,
+`[desktop] show = false` in `config.toml` logs notifications instead. ADR 0032 has the details;
+`shimmer notify --help` lists every command.
 
 ### Command packs
 

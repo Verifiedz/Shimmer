@@ -37,7 +37,9 @@ Fallback::Notify { fallback_op: String, params: Value, priority: NotifyPriority 
 
 `notify` already owns a terminating failure path that is not another fallback (§11.3): each
 `Sink` may name one `fallback_sink_id`, tried once, and a delivery that exhausts every sink
-appends to `notifications/failed.jsonl` and emits `notify.exhausted`. So the worst outcome of a
+stays in notify's inbox as `failed` and emits `notify.message.exhausted` (amended by ADR 0032:
+the inbox, where every message lands first, replaced `notifications/failed.jsonl`, which a module
+couldn't write outside its namespace). So the worst outcome of a
 fallback is a durable, visible record, never a loop and never silence. A generic op has no such
 terminal and would need one invented per op.
 
