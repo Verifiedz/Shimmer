@@ -18,11 +18,16 @@ named `other-branches`, since deleted). **Never add a ruleset that matches all b
 
 Both rulesets:
 
-- **Require a PR with 1 approval** that is not from the person who pushed last
-  (`require_last_push_approval`), so an author cannot add commits after someone else's approval
-  and merge them unreviewed.
-- **Dismiss approvals when new commits are pushed** (`dismiss_stale_reviews_on_push`): an approval
-  covers exactly the code that was reviewed.
+- **Require a PR with 1 approval.**
+  - On **`master`** the approval must not come from the person who pushed last
+    (`require_last_push_approval`), so an author cannot add commits after someone else's approval
+    and merge them unreviewed, and **approvals are dismissed when new commits are pushed**
+    (`dismiss_stale_reviews_on_push`): an approval covers exactly the code that was reviewed.
+  - On **integration branches** both are **off**. Merging one PR of a stack moves the merge-base
+    of the others, which GitHub counts as a change and dismisses their approvals; updating a
+    stacked branch counts as a new push. Together that meant re-approving every PR of a stack each
+    time one landed (#246–#248, 2026-10-17). Nothing reaches `master` less reviewed: each
+    integration branch goes to `master` through an umbrella PR, which has both rules.
 - **Require review conversations to be resolved** before merging.
 - **Require CI to pass** on both platforms (`check (ubuntu-latest)`, `check (macos-latest)`, the
   job names from `.github/workflows/ci.yml`; update them here if those change).
@@ -33,7 +38,7 @@ Both rulesets:
   - On **integration branches** it isn't required (`false`): a PR must pass CI on its own
     commits, but needn't be re-run each time a sibling PR lands in the umbrella. The umbrella
     itself is held to the stricter rule when it merges into `master`.
-  - Note: updating the branch adds a commit, so with stale-approval dismissal (below) a `master`
+  - Note: updating the branch adds a commit, so with stale-approval dismissal (above) a `master`
     PR may need re-approving after **Update branch**.
 - **Allow only merge commits**, no squash or rebase merges. Stacked PRs (a PR based on another
   PR's branch) break when their base is squash-merged.
