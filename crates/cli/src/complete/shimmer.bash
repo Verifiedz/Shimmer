@@ -20,7 +20,7 @@ _shimmer() {
                 word=${entry%%$'\t'*}
                 COMPREPLY+=("$word")
                 (( words_seen++ ))
-                [[ $word == */ ]] && (( slashed++ ))
+                [[ $word == */ || $word == *= ]] && (( slashed++ ))
                 ;;
         esac
     done < <(@EXE@ __complete "${words[@]}" 2>/dev/null)
@@ -28,8 +28,8 @@ _shimmer() {
         local f
         while IFS= read -r f; do COMPREPLY+=("$f"); done < <(compgen -f -- "$cur")
     fi
-    # bash's nospace is for the whole list: only when every suggestion is a `collection/`, so
-    # picking a plain word still gets its space.
+    # bash's nospace is for the whole list: only when every suggestion is a `collection/` or a
+    # `QUESTION=` (its answer still to come), so picking a plain word still gets its space.
     if (( words_seen > 0 && slashed == words_seen )) && type compopt &>/dev/null; then
         compopt -o nospace 2>/dev/null
     fi

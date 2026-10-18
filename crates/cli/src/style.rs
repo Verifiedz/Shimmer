@@ -167,7 +167,7 @@ pub fn state(word: &str) -> String {
 
 fn state_role(word: &str) -> Option<Role> {
     match word {
-        "done" | "active" | "on" | "succeeded" => Some(Role::Success),
+        "done" | "active" | "on" | "running" | "succeeded" => Some(Role::Success),
         "dirty" | "failed" | "invalid" => Some(Role::Error),
         "paused" | "off" | "cancelled" => Some(Role::Warning),
         _ => None,
@@ -375,6 +375,7 @@ mod tests {
         assert_eq!(state_role("failed"), Some(Role::Error));
         assert_eq!(state_role("paused"), Some(Role::Warning));
         assert_eq!((state_role("on"), state_role("off")), (Some(Role::Success), Some(Role::Warning)));
+        assert_eq!((state_role("running"), state_role("idle")), (Some(Role::Success), None), "idle: nothing to say");
         assert_eq!(state_role("todo"), None, "nothing to say about it: plain");
         assert_eq!(state_role("ready"), None);
         assert_eq!(state("dirty"), "dirty", "never initialised here: plain");

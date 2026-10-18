@@ -41,7 +41,7 @@ commands:
   edit NAME [FILE] [--path]             open its workspace.toml (or FILE in its folder, e.g.
                                         steps/01-check.sh) in $VISUAL/$EDITOR, then check it;
                                         --path only prints where the file is
-  restore NAME                          bring a removed workspace back
+  restore REMOVED                       bring a removed workspace back
   purge [REMOVED] [--yes]               delete a removed workspace for good, or every removed
                                         one (asks first)
   copy NAME NEW [--set QUESTION=ANSWER]… [--label TEXT]
