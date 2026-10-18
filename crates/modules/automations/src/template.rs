@@ -260,8 +260,8 @@ impl Question {
         };
         match self.kind {
             Kind::Text => {
-                if a.contains(['{', '}', '[', ']', '\n']) {
-                    return Err("can't contain { } [ ] or a new line".into());
+                if a.contains(['{', '}', '[', ']']) || a.chars().any(char::is_control) {
+                    return Err("can't contain { } [ ], a new line or another control character".into());
                 }
                 Ok(escape(a))
             }
@@ -275,6 +275,10 @@ impl Question {
             Kind::Choice => Err(format!("'{a}' isn't one of {}", self.choices.join(", "))),
             Kind::List => {
                 let items: Vec<&str> = a.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+                // A new line or other control character would break the rule file (#254's review).
+                if items.iter().any(|i| i.chars().any(char::is_control)) {
+                    return Err("can't contain a new line or another control character".into());
+                }
                 if items.is_empty() || items.iter().any(|i| i.contains(['{', '}', '[', ']'])) {
                     return Err("write values separated by commas, e.g. offer, rejected".into());
                 }
@@ -345,6 +349,11 @@ mod tests {
         }
         assert_eq!(q(Kind::List).check("offer, rejected,"), Ok(r#""offer", "rejected""#.into()));
         assert!(q(Kind::List).check(" , ").is_err());
+        // A new line or another control character would break the rule file (#254's review).
+        for bad in ["offer\nrejected", "of\rfer", "of\u{7}fer"] {
+            assert!(q(Kind::List).check(bad).is_err(), "{bad:?}");
+            assert!(q(Kind::Text).check(bad).is_err(), "{bad:?}");
+        }
         assert_eq!(
             q(Kind::Pairs).check("COMPANY=title, JOB_URL=item.url"),
             Ok(r#"COMPANY = "{title}", JOB_URL = "{item.url}""#.into())

@@ -381,3 +381,28 @@ async fn a_delayed_action_continues_its_chain() {
     assert!(skipped["skipped"].is_string(), "{skipped}");
     assert_eq!(env.queue.requests.lock().unwrap().len(), before);
 }
+
+/// settings.toml is hand-editable: one that doesn't parse is refused, never replaced, and a
+/// `builtin` that isn't a table is fixed rather than a panic (#255's review). A bad `depth` falls
+/// back alone, keeping the switched-off built-ins.
+#[tokio::test]
+async fn a_hand_edited_settings_file_is_never_lost_or_a_panic() {
+    let env = env();
+    env.ctx.store.write("settings.toml", "depth = 3\n[builtin\n").unwrap();
+    let m = started(&env).await;
+    let err = call(&m, &env.ctx, "automations.depth", json!({"depth": 4})).await.unwrap_err();
+    assert!(err.message.contains("doesn't parse") && err.message.contains("fix it first"), "{}", err.message);
+    assert_eq!(env.ctx.store.read_string("settings.toml").unwrap().unwrap(), "depth = 3\n[builtin\n", "left as it was");
+
+    env.ctx.store.write("settings.toml", "builtin = true\n").unwrap();
+    call(&m, &env.ctx, "automations.disable", json!({"id": "scheduled-task-failed"})).await.unwrap();
+    let text = env.ctx.store.read_string("settings.toml").unwrap().unwrap();
+    assert!(text.contains("[builtin]") && text.contains("scheduled_task_failed = false"), "{text}");
+
+    // A bad depth doesn't switch built-ins back on.
+    env.ctx.store.write("settings.toml", "depth = 99\n[builtin]\nscheduled_task_failed = false\n").unwrap();
+    call(&m, &env.ctx, "automations.reload", json!({})).await.unwrap();
+    let listed = call(&m, &env.ctx, "automations.list", json!({})).await.unwrap();
+    let rule = listed["rules"].as_array().unwrap().iter().find(|r| r["id"] == "scheduled-task-failed").unwrap().clone();
+    assert_eq!(rule["enabled"], false, "{rule}");
+}

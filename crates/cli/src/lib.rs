@@ -235,9 +235,16 @@ fn prints_data(cmd: &Command) -> bool {
             | Command::Workspaces(WorkspacesCmd::List | WorkspacesCmd::Status { .. })
             | Command::Queue(QueueCmd::List { .. } | QueueCmd::Show { .. })
             | Command::Scheduler(SchedulerCmd::List | SchedulerCmd::Show { .. })
+            // Every reply that can carry a rule's label, which is the person's text (#253's review).
             | Command::Automations(
                 AutomationsCmd::List
                     | AutomationsCmd::Show { .. }
+                    | AutomationsCmd::New { .. }
+                    | AutomationsCmd::Edit { .. }
+                    | AutomationsCmd::Remove { .. }
+                    | AutomationsCmd::Restore { .. }
+                    | AutomationsCmd::Enable { .. }
+                    | AutomationsCmd::Disable { .. }
                     | AutomationsCmd::Test { .. }
                     | AutomationsCmd::History { .. }
                     | AutomationsCmd::Status
@@ -418,6 +425,9 @@ mod tests {
             &["workspaces", "status", "site"],
             &["scheduler", "list"],
             &["call", "core.ping"],
+            &["automations", "new", "x", "--file", "rule.toml"],
+            &["automations", "edit", "x"],
+            &["automations", "restore", "x"],
         ] {
             assert!(prints_data(&cmd(words)), "{words:?}");
         }
