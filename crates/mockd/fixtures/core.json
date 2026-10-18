@@ -326,6 +326,137 @@
               "workspaces.workspace.renamed",
               "workspaces.workspace.copied"
             ]
+          },
+          {
+            "id": "notify",
+            "version": "0.1.0",
+            "namespace": "notify",
+            "commands": [
+              {
+                "op": "notify.send",
+                "summary": "Send a message: to the inbox, then every way Shimmer can reach you",
+                "params_schema": {},
+                "execution": {
+                  "queued": {
+                    "lane": "notify"
+                  }
+                }
+              },
+              {
+                "op": "notify.test",
+                "summary": "Send a test message to every way Shimmer can reach you",
+                "params_schema": {},
+                "execution": {
+                  "queued": {
+                    "lane": "notify"
+                  }
+                }
+              },
+              {
+                "op": "notify.resend",
+                "summary": "Try messages again (e.g. the failed ones)",
+                "params_schema": {},
+                "execution": {
+                  "queued": {
+                    "lane": "notify"
+                  }
+                }
+              },
+              {
+                "op": "notify.flush",
+                "summary": "Send what quiet hours or a pause held back, as one summary",
+                "params_schema": {},
+                "execution": {
+                  "queued": {
+                    "lane": "notify"
+                  }
+                }
+              },
+              {
+                "op": "notify.list",
+                "summary": "The inbox, newest first",
+                "params_schema": {},
+                "execution": "inline"
+              },
+              {
+                "op": "notify.count",
+                "summary": "How many messages match",
+                "params_schema": {},
+                "execution": "inline"
+              },
+              {
+                "op": "notify.get",
+                "summary": "One message in full",
+                "params_schema": {},
+                "execution": "inline"
+              },
+              {
+                "op": "notify.mark_read",
+                "summary": "Mark messages read",
+                "params_schema": {},
+                "execution": "inline"
+              },
+              {
+                "op": "notify.mark_unread",
+                "summary": "Mark messages unread",
+                "params_schema": {},
+                "execution": "inline"
+              },
+              {
+                "op": "notify.remove",
+                "summary": "Delete messages",
+                "params_schema": {},
+                "execution": "inline"
+              },
+              {
+                "op": "notify.pause",
+                "summary": "Hold messages until resume (high priority still comes through unless all)",
+                "params_schema": {},
+                "execution": "inline"
+              },
+              {
+                "op": "notify.resume",
+                "summary": "Stop holding messages and send what waited",
+                "params_schema": {},
+                "execution": "inline"
+              },
+              {
+                "op": "notify.quiet",
+                "summary": "Show or set quiet hours",
+                "params_schema": {},
+                "execution": "inline"
+              },
+              {
+                "op": "notify.builtin_alerts",
+                "summary": "Show or switch the built-in alerts",
+                "params_schema": {},
+                "execution": "inline"
+              },
+              {
+                "op": "notify.cap",
+                "summary": "Show or set how many messages the inbox keeps",
+                "params_schema": {},
+                "execution": "inline"
+              },
+              {
+                "op": "notify.status",
+                "summary": "Notify at a glance: settings, pause, counts",
+                "params_schema": {},
+                "execution": "inline"
+              }
+            ],
+            "topics": [
+              "notify.message.received",
+              "notify.message.held",
+              "notify.message.sent",
+              "notify.message.exhausted",
+              "notify.message.read",
+              "notify.message.unread",
+              "notify.message.removed",
+              "notify.pause.started",
+              "notify.pause.ended",
+              "notify.settings.changed"
+            ]
           }
         ]
       }

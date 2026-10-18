@@ -643,6 +643,10 @@ mod tests {
                     let mut buf = [0u8; 8192];
                     let n = stream.read(&mut buf).unwrap_or(0);
                     requests_clone.lock().unwrap().push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                    // One response per connection, then the connection closes: say so. Without
+                    // it the client keeps the connection for its next request, and when that
+                    // races the close it fails or (for a refetch) serves the stale copy (#134).
+                    let response = response.replacen("\r\n", "\r\nConnection: close\r\n", 1);
                     let _ = stream.write_all(response.as_bytes());
                 }
             });

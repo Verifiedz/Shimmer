@@ -75,6 +75,8 @@ impl Sandbox {
         for d in ["bin", "home", "tmp", "shimmer", "config", "state"] {
             std::fs::create_dir_all(sb.path(d)).unwrap();
         }
+        // Notify's popups are logged, never shown (ADR 0032 §2).
+        std::fs::write(sb.path("shimmer/config.toml"), "[desktop]\nshow = false\n").unwrap();
         for tool in SYSTEM_TOOLS {
             if let Some(real) = which(tool) {
                 symlink(real, sb.path("bin").join(tool)).unwrap();
@@ -839,38 +841,21 @@ fn reconfigure_changes_answers_only_while_ready_and_the_next_activate_uses_them(
 
 // ---------------------------------------------------------------- rename
 
-/// The scheduler's *user*-created triggers, as JSON -- never a module's own declared one
-/// (e.g. `fetchers`' always-present heartbeat, `fetchers.tick`, ADR 0028 §5), which this test
-/// neither created nor should assert anything about. `scheduler.add` always mints a `usr-`
-/// prefixed id (`crates/daemon/src/scheduler/mod.rs`); a module's own trigger keeps whatever
-/// literal id it chose, never that prefix.
+/// The scheduler's triggers, as JSON.
+/// The schedules a person added, not modules' own (fetchers' heartbeat, ADR 0028 §5; notify's
+/// hourly `notify.flush`).
 fn triggers(sb: &Sandbox) -> Vec<serde_json::Value> {
     let o = sb.run(&["--json", "scheduler", "list"]);
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
-    v["triggers"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|t| t["id"].as_str().is_some_and(|id| id.starts_with("usr-")))
-        .collect()
+    v["triggers"].as_array().into_iter().flatten().filter(|t| t["source"]["type"] == "user").cloned().collect()
 }
 
 #[test]
 fn rename_moves_the_workspace_and_only_with_a_yes_its_schedules() {
     let sb = Sandbox::new();
     sb.create("smoke", "smoke-test", &[]);
-    sb.ok(&[
-        "scheduler",
-        "add",
-        "workspaces.activate",
-        r#"{"id":"smoke"}"#,
-        "--cron",
-        "0 9 * * 1-5",
-        "--catch-up",
-        "skip",
-    ]);
-    sb.ok(&["scheduler", "add", "workspaces.stop", r#"{"id":"smoke"}"#, "--every", "1d", "--catch-up", "skip"]);
+    sb.ok(&["scheduler", "add", "cron", "0 9 * * 1-5", "--catch-up", "skip", "workspaces", "activate", "smoke"]);
+    sb.ok(&["scheduler", "add", "every", "1d", "--catch-up", "skip", "workspaces", "stop", "smoke"]);
     let paused = triggers(&sb).into_iter().find(|t| t["op"] == "workspaces.stop").unwrap();
     sb.ok(&["scheduler", "pause", paused["id"].as_str().unwrap()]);
 

@@ -416,6 +416,6 @@ mod tests {
         assert_eq!(lines[1].trim_end(), "  up        shimmer ping");
         assert_eq!(lines[34].trim_end(), "  wreset    shimmer workspaces reset");
         assert_eq!(lines[54].trim_end(), "  sdel      shimmer scheduler remove");
-        assert_eq!(lines.len(), 61);
+        assert_eq!(lines.len(), crate::packs::pack::TARGETS.len() + 2, "a line per alias, a heading and a blank");
     }
 }

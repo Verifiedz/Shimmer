@@ -12,10 +12,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use shimmer_core::params::decode;
 use shimmer_core::{
-    Clock, Ctx, Emitter, Error, Execution, HttpBackend, HttpGateway, LaneConfig, LaneId, ModuleConfig, ModuleId,
-    NamespacedStore, Origin, Priority, ProgressFn, QueueHandle, Result,
+    Clock, Ctx, Desktop, DesktopBackend, Emitter, Error, Execution, HttpBackend, HttpGateway, LaneConfig, LaneId,
+    ModuleConfig, ModuleId, NamespacedStore, Origin, Priority, ProgressFn, QueueHandle, Result,
 };
-use shimmer_core::{EnqueueRequest, TaskId, TaskSubmitter};
+use shimmer_core::{EnqueueRequest, TaskSubmitter};
 #[cfg(unix)]
 use shimmer_core::{LaunchBackend, Launcher};
 use shimmer_proto::{
@@ -93,6 +93,12 @@ impl Core {
             .expect("building the http client"),
         );
 
+        // The same shape again for `ctx.desktop` (ADR 0032 §1–§2): one real backend, given only
+        // to a module whose manifest declares `"desktop"`; every other keeps
+        // `Desktop::unavailable`.
+        let real_desktop: Arc<dyn DesktopBackend> =
+            Arc::new(crate::desktop::RealDesktopBackend::new(!config.hide_desktop));
+
         Arc::new_cyclic(|weak: &Weak<Core>| {
             let ops = registry
                 .entries
@@ -133,6 +139,9 @@ impl Core {
                     if e.manifest.capabilities.iter().any(|c| c == "network") {
                         ctx.http = HttpGateway::new(id.clone(), real_http.clone());
                     }
+                    if e.manifest.capabilities.iter().any(|c| c == "desktop") {
+                        ctx.desktop = Desktop::new(real_desktop.clone());
+                    }
                     (id, ctx)
                 })
                 .collect();
@@ -169,8 +178,8 @@ impl Core {
                 let p: P = decode(params)?;
                 self.queue.list(p.lane.as_ref())
             }
-            ops::QUEUE_TASK => self.queue.task_view(task_id(params)?),
-            ops::QUEUE_CANCEL => self.queue.cancel(task_id(params)?),
+            ops::QUEUE_TASK => self.queue.task_view(self.queue.resolve(&task_id(params)?)?),
+            ops::QUEUE_CANCEL => self.queue.cancel(self.queue.resolve(&task_id(params)?)?),
             ops::EVENTS_LIST => {
                 #[derive(Deserialize, Default)]
                 #[serde(default)]
@@ -197,8 +206,8 @@ impl Core {
                     queue_version: u64,
                 }
                 let p: P = decode(params)?;
-                let id = p.task_id.parse()?;
-                let before = p.before.map(|s| s.parse()).transpose()?;
+                let id = self.queue.resolve(&p.task_id)?;
+                let before = p.before.map(|s| self.queue.resolve(&s)).transpose()?;
                 self.queue.reorder(&p.lane, id, before, p.queue_version)
             }
             _ if op.starts_with("scheduler.") => match self.scheduler.get() {
@@ -293,10 +302,11 @@ impl OpRunner for Core {
     }
 }
 
-fn task_id(params: Value) -> Result<TaskId> {
+/// The `task_id` as written: a full id or a unique ending of one (ADR 0031 §4).
+fn task_id(params: Value) -> Result<String> {
     #[derive(Deserialize)]
     struct P {
         task_id: String,
     }
-    decode::<P>(params)?.task_id.parse()
+    Ok(decode::<P>(params)?.task_id)
 }

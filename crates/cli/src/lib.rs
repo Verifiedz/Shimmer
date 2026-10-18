@@ -15,10 +15,12 @@ mod fetchers;
 mod first;
 mod flags;
 mod follow;
+mod notify;
 pub mod packs;
 mod queue;
 mod records;
 mod render;
+mod schedule;
 mod scheduler;
 mod schedules;
 mod style;
@@ -130,6 +132,8 @@ async fn run_line(alias: Option<String>, args: Vec<String>) -> ExitCode {
         }
     }
     let args = packs::active::rewrite(line, active.pack.as_ref());
+    // `shimmer scheduler add WHEN … ALIAS …`: the alias where the scheduled command starts, too.
+    let args = schedule::rewrite_inner(args, active.pack.as_ref());
 
     let usage = usage_for(&args);
     let args = match Args::parse(args) {
@@ -203,6 +207,7 @@ fn usage_for(args: &[String]) -> &'static str {
             "scheduler" => return scheduler::USAGE,
             "fetchers" => return fetchers::USAGE,
             "packs" => return packs::cmd::USAGE,
+            "notify" => return notify::USAGE,
             "doctor" => return doctor::USAGE,
             _ => return USAGE,
         }
@@ -228,7 +233,10 @@ fn prints_data(cmd: &Command) -> bool {
             )
             | Command::Workspaces(WorkspacesCmd::List | WorkspacesCmd::Status { .. })
             | Command::Queue(QueueCmd::List { .. } | QueueCmd::Show { .. })
-            | Command::Scheduler(SchedulerCmd::List | SchedulerCmd::Show { .. })
+            | Command::Scheduler(SchedulerCmd::List { .. } | SchedulerCmd::Show { .. } | SchedulerCmd::Add(_))
+            | Command::Notify(
+                notify::NotifyCmd::List { .. } | notify::NotifyCmd::Show { .. } | notify::NotifyCmd::Send { .. }
+            )
     )
 }
 
@@ -251,11 +259,14 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
     if let Command::Records(cmd) = &args.command {
         return records::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
     }
+    if let Command::Notify(cmd) = &args.command {
+        return notify::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
+    }
     if let Command::Queue(cmd) = &args.command {
         return queue::run(&mut client, cmd, args.json).await.map(Some);
     }
     if let Command::Scheduler(cmd) = &args.command {
-        return scheduler::run(&mut client, cmd, args.json).await.map(Some);
+        return scheduler::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
     }
     if let Command::Workspaces(cmd) = &args.command {
         return workspaces::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
@@ -279,7 +290,8 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
         | Command::Queue(_)
         | Command::Scheduler(_)
         | Command::Fetchers(_)
-        | Command::Packs(_) => {
+        | Command::Packs(_)
+        | Command::Notify(_) => {
             unreachable!("handled above")
         }
     };
@@ -348,7 +360,8 @@ fn output(args: &Args, data: &Value) -> String {
         | Command::Queue(_)
         | Command::Scheduler(_)
         | Command::Fetchers(_)
-        | Command::Packs(_) => render::json(data),
+        | Command::Packs(_)
+        | Command::Notify(_) => render::json(data),
     }
 }
 
