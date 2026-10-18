@@ -96,8 +96,8 @@ pub struct Env {
     pub cli_toml: Option<PathBuf>,
     /// The real `shimmer` binary, symlinks resolved: what the service runs.
     pub exe: std::io::Result<PathBuf>,
-    /// `SHIMMER_HOME` / `SHIMMER_SOCKET` when they're set: the service gets the same, so it and
-    /// your commands always find each other (ADR 0034 §2).
+    /// `SHIMMER_HOME` and `SHIMMER_SOCKET` as your commands resolve them: the service gets the
+    /// same, so it and your commands always find each other (ADR 0034 §2, [`pinned`]).
     pub pinned: Vec<(String, String)>,
     /// A desktop is showing: `WAYLAND_DISPLAY` or `DISPLAY` is set.
     pub display: bool,
@@ -105,6 +105,18 @@ pub struct Env {
     pub hyprland: bool,
     /// A daemon answers on the socket right now.
     pub daemon_up: bool,
+}
+
+/// The data folder and socket your commands use, resolved now, always. A login service runs with
+/// the service manager's environment, not your shell's: on Linux a `XDG_DATA_HOME` or
+/// `XDG_RUNTIME_DIR` set in your shell's rc isn't there, so leaving them to the service's own
+/// defaults could put the login daemon on another folder, two daemons with their schedules
+/// never firing after a restart (#242's review).
+fn pinned() -> Vec<(String, String)> {
+    vec![
+        ("SHIMMER_HOME".into(), shimmer_proto::paths::shimmer_home().display().to_string()),
+        ("SHIMMER_SOCKET".into(), shimmer_proto::paths::socket_path().display().to_string()),
+    ]
 }
 
 impl Env {
@@ -124,10 +136,7 @@ impl Env {
             home_dir,
             cli_toml: settings::path(),
             exe: std::env::current_exe().and_then(|p| p.canonicalize()),
-            pinned: ["SHIMMER_HOME", "SHIMMER_SOCKET"]
-                .iter()
-                .filter_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()).map(|v| (k.to_string(), v)))
-                .collect(),
+            pinned: pinned(),
             display: var("WAYLAND_DISPLAY").is_some() || var("DISPLAY").is_some(),
             hyprland: var("HYPRLAND_INSTANCE_SIGNATURE").is_some(),
             daemon_up: std::os::unix::net::UnixStream::connect(shimmer_proto::paths::socket_path()).is_ok(),
@@ -385,13 +394,28 @@ fn off(env: &Env, services: &mut impl Services) -> Result<String> {
     if env.os == Os::Linux {
         ok(services, "systemctl", &["--user", "daemon-reload"])?;
     }
+    // launchd keeps a removed agent loaded until logout, and would restart a daemon that crashes
+    // meanwhile. Unloaded now when no daemon runs; `bootout` would stop a running one, so then it
+    // stays until logout, and says so (#242's review).
+    let mut lingers = false;
+    if env.os == Os::Mac {
+        if env.daemon_up {
+            lingers = true;
+        } else if let Ok(uid) = ok(services, "id", &["-u"]) {
+            let _ = services.run("launchctl", &["bootout", &format!("gui/{uid}/{LABEL}")]);
+        }
+    }
     saved.startup = None;
     settings::save(&cli_toml, &saved)
         .map_err(|e| Error::internal(format!("can't update {}: {e}", cli_toml.display())))?;
-    Ok(format!(
+    let mut out = format!(
         "off: Shimmer's daemon won't start at login any more (removed {}).\nThe daemon running now keeps running; 'shimmer shutdown' stops it.",
         file.display()
-    ))
+    );
+    if lingers {
+        out.push_str("\nUntil you log out, macOS still restarts it if it crashes.");
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------- status
@@ -493,7 +517,7 @@ fn systemd_unit(exe: &Path, pinned: &[(String, String)], desktop: bool) -> Resul
         unit.push_str(&format!("Environment={}\n", systemd_quote(&format!("{key}={value}"))?));
     }
     unit.push_str(&format!(
-        "Restart=on-failure\nSuccessExitStatus={ALREADY_RUNNING}\nRestartPreventExitStatus={ALREADY_RUNNING}\n\n[Install]\nWantedBy={}\n",
+        "Restart=on-failure\nRestartSec=2\nSuccessExitStatus={ALREADY_RUNNING}\nRestartPreventExitStatus={ALREADY_RUNNING}\n\n[Install]\nWantedBy={}\n",
         if desktop { "graphical-session.target" } else { "default.target" }
     ));
     Ok(unit)
@@ -693,7 +717,7 @@ mod tests {
         let unit = systemd_unit(Path::new("/home/me/.cargo/bin/shimmer"), &[], false).unwrap();
         assert!(unit.starts_with(&format!("# {MARK}\n")));
         assert!(unit.contains("ExecStart=\"/home/me/.cargo/bin/shimmer\" daemon\n"));
-        assert!(unit.contains("Restart=on-failure\nSuccessExitStatus=3\nRestartPreventExitStatus=3\n"));
+        assert!(unit.contains("Restart=on-failure\nRestartSec=2\nSuccessExitStatus=3\nRestartPreventExitStatus=3\n"));
         assert!(unit.contains("WantedBy=default.target"));
         assert!(!unit.contains("graphical-session") && !unit.contains("Environment="));
 
@@ -919,9 +943,33 @@ mod tests {
         assert!(!fake.calls.iter().any(|c| c.contains("bootstrap") || c.contains("bootout")), "{:?}", fake.calls);
 
         let mut fake = Fake::default();
-        off(&t.env, &mut fake).unwrap();
+        let out = off(&t.env, &mut fake).unwrap();
         assert!(!plist.exists());
         assert!(!fake.calls.iter().any(|c| c.contains("bootout")), "off never stops the running daemon");
+        assert!(out.contains("Until you log out, macOS still restarts it"), "{out}");
+
+        // With no daemon running, off unloads the agent too, so nothing restarts until logout.
+        t.env.daemon_up = false;
+        on(&t.env, &mut Fake::default()).unwrap();
+        let mut fake = Fake::default();
+        let out = off(&t.env, &mut fake).unwrap();
+        assert!(
+            fake.calls.contains(&"launchctl bootout gui/501/io.github.verifiedz.shimmer".to_owned()),
+            "{:?}",
+            fake.calls
+        );
+        assert!(!out.contains("Until you log out"), "{out}");
+    }
+
+    /// The service always gets the folder and socket your commands use, resolved: on Linux the
+    /// login manager doesn't see your shell's XDG_DATA_HOME (#242's review).
+    #[test]
+    fn the_service_always_gets_the_resolved_folder_and_socket() {
+        let keys: Vec<String> = pinned().into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, ["SHIMMER_HOME", "SHIMMER_SOCKET"]);
+        assert!(pinned().iter().all(|(_, v)| v.starts_with('/')), "{:?}", pinned());
+        let unit = systemd_unit(Path::new("/x/shimmer"), &pinned(), false).unwrap();
+        assert!(unit.contains("Environment=\"SHIMMER_HOME=/") && unit.contains("RestartSec=2"), "{unit}");
     }
 
     #[test]
