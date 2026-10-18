@@ -123,6 +123,14 @@ pub struct PingData {
     pub uptime_s: u64,
 }
 
+/// `data` of `core.events.list`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EventsListData {
+    /// Oldest first, same convention as `events_matching`/`events_matching_recent`
+    /// (`crates/store/src/index.rs`).
+    pub events: Vec<Event>,
+}
+
 /// `data` of `core.manifest`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ManifestData {
