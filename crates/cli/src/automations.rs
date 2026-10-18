@@ -203,6 +203,8 @@ fn from_template(words: impl Iterator<Item = String>) -> std::result::Result<Aut
 fn since(text: &str) -> std::result::Result<DateTime<Utc>, String> {
     if let Ok(day) = NaiveDate::parse_from_str(text, "%Y-%m-%d") {
         let start = day.and_hms_opt(0, 0, 0).unwrap_or_default();
+        // A midnight the clocks repeat counts from the first one: "since" that day includes all
+        // of it. One they skip falls through to the full form below.
         if let Some(t) = Local.from_local_datetime(&start).earliest() {
             return Ok(t.with_timezone(&Utc));
         }
@@ -211,7 +213,7 @@ fn since(text: &str) -> std::result::Result<DateTime<Utc>, String> {
 }
 
 fn count(what: &str, n: &str) -> std::result::Result<u64, String> {
-    n.parse::<u64>().ok().filter(|n| *n > 0).ok_or_else(|| format!("{what} takes a whole number, e.g. 3"))
+    n.parse::<u64>().ok().filter(|n| *n > 0).ok_or_else(|| format!("{what} takes a number from 1 up, e.g. 3"))
 }
 
 pub async fn run(client: &mut Client, cmd: &AutomationsCmd, json: bool, prompt: &mut impl Prompt) -> Result<String> {
@@ -413,7 +415,16 @@ async fn from_template_run(
         .await
         .map_err(|e| crate::workspaces::how_to_answer(e, prompt))?;
     let rules = shown["rules"].as_array().cloned().unwrap_or_default();
-    if prompt.interactive() && !yes {
+    // Nobody to ask (a script) and no --yes: refuse, never make rules unseen (ADR 0025 §6a,
+    // #254's review).
+    if !yes && !prompt.interactive() {
+        return Err(Error::invalid_params(format!(
+            "refusing to make {} rule{} without confirmation; pass --yes",
+            rules.len(),
+            if rules.len() == 1 { "" } else { "s" }
+        )));
+    }
+    if !yes {
         for r in &rules {
             eprintln!(
                 "
@@ -453,7 +464,7 @@ Make these {n} rules? They're on as soon as they're made."
 
 /// One template as `peek` shows it: what it does, what to know, its questions, its rules.
 fn in_full(t: &Value, categories: &[Value]) -> String {
-    let category = categories.iter().find(|c| c["category"] == t["category"] || c["id"] == t["category"]);
+    let category = categories.iter().find(|c| c["id"] == t["category"]);
     let mut out = format!(
         "{}  {}
 {}
@@ -561,8 +572,7 @@ async fn data_text(client: &mut Client, id: &str) -> Result<String> {
 /// Edit a copy of the rule in the editor and send it with `automations.save`; a refused rule can
 /// be edited again with your text kept (ADR 0035 §8). True when something was saved.
 async fn edit_loop(client: &mut Client, id: &str, text: String, prompt: &mut impl Prompt) -> Result<bool> {
-    let path = std::env::temp_dir().join(format!("shimmer-rule-{id}-{}.toml", std::process::id()));
-    std::fs::write(&path, &text).map_err(|e| Error::internal(format!("can't write {}: {e}", path.display())))?;
+    let path = new_private_file(id, &text)?;
     loop {
         editor::open(&path)?;
         let edited = read(&path)?;
@@ -584,9 +594,34 @@ async fn edit_loop(client: &mut Client, id: &str, text: String, prompt: &mut imp
                     )));
                 }
             }
-            Err(e) => return Err(e),
+            // Whatever went wrong (the rule removed meanwhile, the daemon restarted), the edit isn't
+            // lost: say where it is (#253's review).
+            Err(e) => {
+                return Err(Error::new(
+                    e.code,
+                    format!("{}; {id} not saved, your text is in {}", e.message, path.display()),
+                ))
+            }
         }
     }
+}
+
+/// A new file in the temp folder holding `text`, readable only by you, at a name nobody else can
+/// have made first: it's created with `create_new`, so a file or link someone planted there is
+/// refused rather than written through (#253's review).
+fn new_private_file(id: &str, text: &str) -> Result<std::path::PathBuf> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let path = std::env::temp_dir().join(format!("shimmer-rule-{id}-{}-{stamp}.toml", std::process::id()));
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| Error::internal(format!("can't create {}: {e}", path.display())))?;
+    f.write_all(text.as_bytes()).map_err(|e| Error::internal(format!("can't write {}: {e}", path.display())))?;
+    Ok(path)
 }
 
 /// `id` (label): what the rule reacts to.
@@ -594,15 +629,20 @@ fn summary(rule: &Value) -> String {
     format!("{} ({}): on {}", full(&rule["id"]), full(&rule["label"]), full(&rule["on"]))
 }
 
-/// The ops a rule runs: `notify.send, workspaces.activate (after 3d)`.
+/// The ops a rule runs: `notify.send, workspaces.activate (after 3d)`, each cut to a table cell.
 fn does(rule: &Value) -> String {
+    does_with(rule, render::cell)
+}
+
+/// [`does`], each op shown with `show_op`: `full` where nothing else is cut (`show`, #254's review).
+fn does_with(rule: &Value, show_op: fn(&Value) -> String) -> String {
     rule["actions"]
         .as_array()
         .into_iter()
         .flatten()
         .map(|a| match a["after_s"].as_u64() {
-            Some(s) => format!("{} (after {})", render::cell(&a["op"]), when::format_duration(s)),
-            None => render::cell(&a["op"]),
+            Some(s) => format!("{} (after {})", show_op(&a["op"]), when::format_duration(s)),
+            None => show_op(&a["op"]),
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -675,7 +715,7 @@ fn show(r: &Value, now: DateTime<Utc>) -> String {
     let mut line = |label: &str, value: String| out.push_str(&format!("  {}{value}\n", crate::style::label(label, 12)));
     line("label", full(&r["label"]));
     line("reacts to", full(&r["on"]));
-    line("does", does(r));
+    line("does", does_with(r, full));
     line("last fired", ago(&r["last_fired"], now, "never"));
     if r["loop_stopped_at"].is_string() {
         line(
@@ -795,7 +835,7 @@ mod tests {
         for (bad, want) in [
             ("show", "usage: shimmer automations show RULE"),
             ("test x", "--event FILE"),
-            ("depth zero", "whole number"),
+            ("depth zero", "from 1 up"),
             ("history --since soon", "isn't a date"),
             ("list x", "takes no arguments"),
             ("frob", "unknown automations command"),
@@ -848,5 +888,15 @@ mod tests {
         let stopped =
             json!({"kind": "stopped", "rule": "again", "reason": "cycle", "event": {"topic": "records.item.updated"}});
         assert!(entry(&stopped, now).contains("⚠ again stopped on records.item.updated: it was already in the chain"));
+    }
+
+    /// The edit file is new, private, and never written through a planted file (#253's review).
+    #[test]
+    fn the_edit_file_is_private_and_never_reuses_a_planted_one() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = new_private_file("x", "[rule]").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[rule]");
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = std::fs::remove_file(&path);
     }
 }

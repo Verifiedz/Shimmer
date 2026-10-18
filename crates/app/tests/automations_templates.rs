@@ -97,6 +97,14 @@ fn stage_opens_workspace_runs_the_workspace_when_the_field_changes() {
     std::fs::write(ws.join("steps/01-mark.sh"), "echo opened >> \"$SHIMMER_WORKSPACE_DIR/opened\"\n").unwrap();
 
     let set = ["COLLECTION=jobs", "FIELD=stage", "VALUE=interviewing", "WORKSPACE=prep"];
+    // From a script without --yes: refused, nothing made (#254's review).
+    let mut unconfirmed = vec!["automations", "new", "open-prep", "--from", "stage-opens-workspace"];
+    for s in &set {
+        unconfirmed.extend(["--set", s]);
+    }
+    let refused = fails(&home, &unconfirmed);
+    assert!(refused.contains("without confirmation; pass --yes"), "{refused}");
+    assert!(!ok(&home, &["automations", "list"]).contains("open-prep"), "nothing made");
     let mut args = vec!["automations", "new", "open-prep", "--from", "stage-opens-workspace", "--yes"];
     for s in &set {
         args.extend(["--set", s]);

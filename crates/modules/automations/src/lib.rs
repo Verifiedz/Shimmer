@@ -273,9 +273,13 @@ impl Automations {
             .ok_or_else(|| Error::not_found(format!("no template '{template}' (shimmer automations templates)")))?;
         let missing: Vec<String> = t.ops().into_iter().filter(|op| ctx.catalog.op(op).is_none()).collect();
         if !missing.is_empty() {
-            let modules: Vec<&str> = missing.iter().filter_map(|op| op.split('.').next()).collect();
+            // Each module named once, however many of its ops the template uses (#254's review).
+            let mut modules: Vec<&str> = missing.iter().filter_map(|op| op.split('.').next()).collect();
+            modules.sort_unstable();
+            modules.dedup();
+            let (which, isnt) = if modules.len() == 1 { ("module", "isn't") } else { ("modules", "aren't") };
             return Err(Error::unavailable(format!(
-                "the {template} template needs {} from the {} module, which isn't installed",
+                "the {template} template needs {} from the {} {which}, which {isnt} installed",
                 missing.join(", "),
                 modules.join(", ")
             )));

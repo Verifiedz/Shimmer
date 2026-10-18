@@ -224,13 +224,13 @@ fn meets(conditions: &[Cond], data: &Value, today: NaiveDate, tz: Tz) -> bool {
     })
 }
 
-/// `today+N` as a date; any other value as it is.
 /// The "today" a filter's relative dates are checked against when it's written: any ordinary
 /// date works, since only the form is being checked.
 fn check_day() -> NaiveDate {
     NaiveDate::from_ymd_opt(2000, 1, 1).expect("a valid date")
 }
 
+/// `today+N` as a date; any other value as it is.
 fn resolve(v: &Value, today: NaiveDate) -> Result<Value, String> {
     match v.as_str().map(|s| relative_date(s, today)).transpose()?.flatten() {
         Some(day) => Ok(Value::String(day.format("%Y-%m-%d").to_string())),
