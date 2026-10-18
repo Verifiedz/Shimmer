@@ -352,7 +352,7 @@ client can say which one it hit.
 
 | Op | Execution | Params | Returns |
 |---|---|---|---|
-| `scheduler.list` | inline | `{}` | `{"triggers":[…]}`, each `{"id","op","params","schedule","catch_up","lane","fallback","next_due","last_run","paused","done","source"}`. `done` is a `once` trigger that has fired; `source` is `{"type":"user"}`, `{"type":"module","id"}` (declared by a module), or `{"type":"added","id","label"}`: a one-time schedule a module added while running (ADR 0035 §5.6), removed once it has run (`scheduler.trigger.removed`, `reason: "ran"`). Module ones answer `scheduler.remove` with `conflict`; pause them instead. |
+| `scheduler.list` | inline | `{}` | `{"triggers":[…]}`, each `{"id","op","params","schedule","catch_up","lane","fallback","next_due","last_run","paused","done","source"}`. `done` is a `once` trigger that has fired; `source` is `{"type":"user"}`, `{"type":"module","id"}` (declared by a module), or `{"type":"added","id","label"}`: a one-time schedule a module added while running (ADR 0035 §5.6), removed once it has run (`scheduler.trigger.removed`, `reason: "ran"`), or by `scheduler.remove`. Declared module ones (`"module"`) answer `scheduler.remove` with `conflict`, since start-up would declare them again; pause them instead. |
 | `scheduler.get` | inline | `{"trigger_id"}` | One trigger, same shape as a `scheduler.list` entry, or `not_found`. |
 | `scheduler.add` | inline | `{"schedule","op","params","catch_up","lane"?,"fallback"?}` | `{"trigger_id"}` |
 | `scheduler.remove` | inline | `{"trigger_id"}` | `{"removed":true,"trigger_id"}` (the full id) |

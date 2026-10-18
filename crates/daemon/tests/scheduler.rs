@@ -691,7 +691,7 @@ async fn a_module_one_time_schedule_is_listed_survives_a_restart_runs_once_and_i
 }
 
 #[tokio::test]
-async fn a_module_removes_only_its_own_one_time_schedules_and_people_pause_them() {
+async fn a_module_removes_only_its_own_one_time_schedules_and_people_remove_any() {
     let env = Env::fake_clock();
     let d = env.start().await;
     let mut c = Client::connect(&env.sock).await;
@@ -701,13 +701,16 @@ async fn a_module_removes_only_its_own_one_time_schedules_and_people_pause_them(
     let cancel = |id: &str| json!({"trigger_id": id});
     assert_eq!(c.call("demo.cancel", cancel(&persons)).await.unwrap()["removed"], false, "not its own");
     assert!(trigger(&mut c, &persons).await.is_some());
-    let err = c.call("scheduler.remove", cancel(&mine)).await.unwrap_err();
-    assert_eq!(err.code, ErrorCode::Conflict, "{}", err.message);
     assert_eq!(c.call("scheduler.pause", cancel(&mine)).await.unwrap()["paused"], true);
-
     assert_eq!(c.call("demo.cancel", cancel(&mine)).await.unwrap()["removed"], true);
     assert!(trigger(&mut c, &mine).await.is_none());
     assert_eq!(c.call("demo.cancel", cancel(&mine)).await.unwrap()["removed"], false, "gone already");
+
+    // A person cancels a module's one-time schedule with `scheduler remove`, so a cancelled
+    // reminder never sits in the module's quota (ADR 0035 §4, #251's review).
+    let theirs = later(&mut c, iso(DAY), "demo.echo", "a reminder").await.unwrap();
+    assert_eq!(c.call("scheduler.remove", cancel(&theirs)).await.unwrap()["removed"], true);
+    assert!(trigger(&mut c, &theirs).await.is_none());
 
     // Checked like a person's: the op must exist, and the label is one line.
     assert_eq!(later(&mut c, iso(DAY), "demo.nope", "x").await.unwrap_err().code, ErrorCode::UnknownOp);
