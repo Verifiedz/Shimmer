@@ -12,8 +12,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use shimmer_core::params::decode;
 use shimmer_core::{
-    Clock, Ctx, Emitter, Error, Execution, HttpBackend, HttpGateway, LaneConfig, LaneId, ModuleConfig, ModuleId,
-    NamespacedStore, Origin, Priority, ProgressFn, QueueHandle, Result,
+    Clock, Ctx, Desktop, DesktopBackend, Emitter, Error, Execution, HttpBackend, HttpGateway, LaneConfig, LaneId,
+    ModuleConfig, ModuleId, NamespacedStore, Origin, Priority, ProgressFn, QueueHandle, Result,
 };
 use shimmer_core::{EnqueueRequest, TaskSubmitter};
 #[cfg(unix)]
@@ -86,6 +86,12 @@ impl Core {
             .expect("building the http client"),
         );
 
+        // The same shape again for `ctx.desktop` (ADR 0032 §1–§2): one real backend, given only
+        // to a module whose manifest declares `"desktop"`; every other keeps
+        // `Desktop::unavailable`.
+        let real_desktop: Arc<dyn DesktopBackend> =
+            Arc::new(crate::desktop::RealDesktopBackend::new(!config.hide_desktop));
+
         Arc::new_cyclic(|weak: &Weak<Core>| {
             let ops = registry
                 .entries
@@ -125,6 +131,9 @@ impl Core {
                     }
                     if e.manifest.capabilities.iter().any(|c| c == "network") {
                         ctx.http = HttpGateway::new(id.clone(), real_http.clone());
+                    }
+                    if e.manifest.capabilities.iter().any(|c| c == "desktop") {
+                        ctx.desktop = Desktop::new(real_desktop.clone());
                     }
                     (id, ctx)
                 })

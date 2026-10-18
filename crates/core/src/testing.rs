@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::bus::{Emitter, EventSink};
 use crate::clock::Clock;
 use crate::ctx::{Ctx, ModuleConfig};
+use crate::desktop::{Desktop, DesktopBackend, DesktopNote};
 use crate::error::{Error, Result};
 use crate::event::Event;
 use crate::http::{HttpBackend, HttpGateway, HttpResponse};
@@ -130,6 +131,25 @@ impl LaunchBackend for FakeLauncher {
     }
 }
 
+/// `ctx.desktop` for tests (ADR 0032 §1): shows nothing, records every note, and fails with
+/// `fail`'s message while it's set.
+#[derive(Default)]
+pub struct FakeDesktop {
+    pub shown: Mutex<Vec<DesktopNote>>,
+    pub fail: Mutex<Option<String>>,
+}
+
+#[async_trait]
+impl DesktopBackend for FakeDesktop {
+    async fn show(&self, note: &DesktopNote) -> Result<()> {
+        self.shown.lock().unwrap().push(note.clone());
+        match self.fail.lock().unwrap().clone() {
+            Some(why) => Err(Error::unavailable(why)),
+            None => Ok(()),
+        }
+    }
+}
+
 /// A `Ctx` wired to in-memory fakes, with the fakes exposed for assertions.
 pub struct TestEnv {
     pub ctx: Ctx,
@@ -137,6 +157,7 @@ pub struct TestEnv {
     pub queue: Arc<StubQueue>,
     pub http: Arc<StubHttp>,
     pub launcher: Arc<FakeLauncher>,
+    pub desktop: Arc<FakeDesktop>,
     pub clock: Clock,
 }
 
@@ -161,7 +182,9 @@ impl TestEnv {
             id,
         );
         ctx.launcher = Launcher::new(launcher.clone());
-        Self { ctx, backend, queue, http, launcher, clock }
+        let desktop = Arc::new(FakeDesktop::default());
+        ctx.desktop = Desktop::new(desktop.clone());
+        Self { ctx, backend, queue, http, launcher, desktop, clock }
     }
 }
 

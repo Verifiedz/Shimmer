@@ -1,4 +1,4 @@
-//! `shimmer schedule WHEN [options] COMMAND…` (ADR 0031 §1): the schedule in words, then the
+//! `shimmer scheduler add WHEN [options] COMMAND…` (ADR 0031 §1, §6): the schedule in words, then the
 //! command exactly as you'd run it. The command becomes the one op + params that running it
 //! sends, using the same parsers, and is stored with `scheduler.add` as before. Nothing is
 //! reserved on any command: the scheduling words all come before it.
@@ -11,13 +11,13 @@ use crate::packs::pack::Pack;
 use crate::workspaces::{Prompt, WorkspacesCmd};
 use crate::{records, render, when, workspaces};
 
-pub const USAGE: &str = "usage: shimmer schedule WHEN [--catch-up WHAT] [--lane LANE] COMMAND…
+pub const USAGE: &str = "usage: shimmer scheduler add WHEN [--catch-up WHAT] [--lane LANE] COMMAND…
 
 Runs COMMAND on a schedule instead of now: the command exactly as you'd type it.
-  shimmer schedule weekdays 09:00 --catch-up skip workspaces activate site
-  shimmer schedule daily 18:00 --catch-up skip workspaces stop site
-  shimmer schedule every 1d --catch-up run-once records complete habits/stretch
-  shimmer schedule once 2026-10-20 18:00 --catch-up skip workspaces stop site
+  shimmer scheduler add weekdays 09:00 --catch-up skip workspaces activate site
+  shimmer scheduler add daily 18:00 --catch-up skip workspaces stop site
+  shimmer scheduler add every 1d --catch-up run-once records complete habits/stretch
+  shimmer scheduler add once 2026-10-20 18:00 --catch-up skip workspaces stop site
 
 WHEN is one of:
   daily HH:MM, weekdays HH:MM, weekends HH:MM, mon,wed,fri HH:MM
@@ -32,8 +32,10 @@ run-once (once on waking) or backfill (once for each missed time). Leave it out 
 to be asked.
 
 What can be scheduled: a records or workspaces command that makes one change, e.g.
-records add/update/complete/reopen/remove/restore, workspaces activate/stop/cleanup. An alias
-from your command pack works too. See schedules with 'shimmer scheduler list'.";
+records add/update/complete/reopen/remove/restore, workspaces activate/stop/cleanup, and
+notify send (a reminder: shimmer scheduler add weekdays 08:45 --catch-up skip notify send \"Standup in 15\"). An
+alias from your command pack works too. See schedules with 'shimmer scheduler list'. Any other op:
+shimmer call scheduler.add '{...}' (see docs/protocol.md).";
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ScheduleCmd {
@@ -77,14 +79,15 @@ fn is_command_word(word: &str) -> bool {
 }
 
 /// What can be scheduled: the commands that make exactly one change (ADR 0031 §1). Running one
-/// checks it in [`request`]; completion offers only these after `shimmer schedule WHEN`.
-pub const SCHEDULABLE: [(&str, &[&str]); 2] = [
+/// checks it in [`request`]; completion offers only these after `shimmer scheduler add WHEN`.
+pub const SCHEDULABLE: [(&str, &[&str]); 3] = [
     ("records", &["add", "update", "complete", "reopen", "remove", "restore"]),
     ("workspaces", &["activate", "stop", "cleanup"]),
+    ("notify", &["send"]),
 ];
 
 /// `shimmer`'s own options that go before the command (`--pack`, `--canonical`, `--no-color`):
-/// put after `schedule`, they're not the schedule's.
+/// put after `scheduler add`, they're not the schedule's.
 const FRONT_FLAGS: &[&str] = &["--pack", "--canonical", "--no-color"];
 
 const EXAMPLES: &str = "e.g. 'weekdays 09:00', 'daily 18:00', 'every 2h' or 'once 2026-10-20 18:00'";
@@ -92,6 +95,18 @@ const EXAMPLES: &str = "e.g. 'weekdays 09:00', 'daily 18:00', 'every 2h' or 'onc
 pub fn parse(words: Vec<String>) -> std::result::Result<ScheduleCmd, String> {
     if words.is_empty() || matches!(words[0].as_str(), "help" | "--help" | "-h") {
         return Ok(ScheduleCmd::Help);
+    }
+    // The raw `OP [PARAMS] --every …` form went (ADR 0031 §6): an op name where the time goes
+    // says what to type instead.
+    let raw_form =
+        words[0].contains('.') || matches!(words[0].as_str(), "--every" | "--cron" | "--cron-local" | "--once");
+    if raw_form && parse_when(&words).is_err() {
+        return Err(format!(
+            "'{}' is the old way of scheduling: say when first, then the command as you'd type it, e.g. scheduler add \
+             weekdays 09:00 --catch-up skip workspaces activate site. For any other op: shimmer call \
+             scheduler.add '{{\"schedule\":…,\"op\":…,\"params\":…,\"catch_up\":…}}'",
+            words[0]
+        ));
     }
     let (when, used) = parse_when(&words)?;
     let (mut catch_up, mut lane) = (None, None);
@@ -116,7 +131,7 @@ pub fn parse(words: Vec<String>) -> std::result::Result<ScheduleCmd, String> {
             "--lane" => lane = Some(value()?),
             other if FRONT_FLAGS.contains(&other) => {
                 return Err(format!(
-                    "'{other}' is one of shimmer's own options: put it before 'schedule', e.g. shimmer {other} … schedule …"
+                    "'{other}' is one of shimmer's own options: put it before 'scheduler add', e.g. shimmer {other} … scheduler add …"
                 ))
             }
             other => {
@@ -235,7 +250,7 @@ fn clock(text: &str) -> std::result::Result<(u32, u32), String> {
     Ok((h, m))
 }
 
-/// Where the command starts in `words` (what follows `shimmer schedule`), by position (ADR 0031
+/// Where the command starts in `words` (what follows `shimmer scheduler add`), by position (ADR 0031
 /// §1): after `WHEN`, which has a fixed shape, and the schedule's `--option value` pairs. So an
 /// option's value is never taken for the command (`--lane workspaces workspaces activate site`),
 /// and no word needs reserving: `daily` may be a pack's alias too. For rewriting an alias there,
@@ -252,18 +267,19 @@ fn command_start(words: &[String]) -> Option<usize> {
     None
 }
 
-/// `shimmer schedule WHEN … ALIAS rest…` → the alias replaced by the words it stands for, so
-/// what's stored is canonical (CLAUDE.md §12 rule 16). `args` is the whole line; anything
-/// that isn't a `schedule` line comes back unchanged.
+/// `shimmer scheduler add WHEN … ALIAS rest…` → the alias replaced by the words it stands for, so
+/// what's stored is canonical (CLAUDE.md §12 rule 16). `args` is the whole line (a pack's alias for
+/// `scheduler add` already written out); anything that isn't a `scheduler add` line comes back
+/// unchanged.
 pub fn rewrite_inner(mut args: Vec<String>, pack: Option<&Pack>) -> Vec<String> {
     let (Some(pack), Some(i)) = (pack, crate::packs::active::command_word(&args)) else { return args };
-    if args[i] != "schedule" {
+    if args[i] != "scheduler" || args.get(i + 1).map(String::as_str) != Some("add") {
         return args;
     }
-    let rest = &args[i + 1..];
+    let rest = &args[i + 2..];
     if let Some(start) = command_start(rest) {
         if let Some(target) = pack.aliases.get(&rest[start]) {
-            let at = i + 1 + start;
+            let at = i + 2 + start;
             args.splice(at..=at, target.words.iter().map(|w| w.to_string()));
         }
     }
@@ -349,8 +365,13 @@ async fn request(client: &mut Client, command: &[String]) -> Result<(&'static st
                 None => Err(not("only workspaces activate, stop and cleanup can")),
             },
         },
+        "notify" => crate::notify::parse(rest.to_vec())
+            .ok()
+            .as_ref()
+            .and_then(crate::notify::scheduled_send)
+            .ok_or_else(|| not("only notify send can (one message each time)")),
         other => Err(Error::invalid_params(format!(
-            "'{other}' can't be scheduled: only records and workspaces commands that make one change can"
+            "'{other}' can't be scheduled: only records and workspaces commands that make one change, and notify send, can"
         ))),
     }
 }
@@ -454,7 +475,7 @@ mod tests {
     #[test]
     fn command_words_come_from_the_help() {
         // Every entry in `shimmer --help`'s commands, with no second list to keep (#185's review).
-        for word in ["records", "workspaces", "queue", "scheduler", "schedule", "packs", "ping", "call", "shutdown"] {
+        for word in ["records", "workspaces", "queue", "scheduler", "packs", "ping", "call", "shutdown"] {
             assert!(is_command_word(word), "{word}");
         }
         assert!(is_command_word("help"));
@@ -464,7 +485,7 @@ mod tests {
     #[test]
     fn shimmers_own_options_are_sent_before_schedule() {
         let e = parse(w(&["weekdays", "09:00", "--catch-up", "skip", "--pack", "short", "wgo", "site"])).unwrap_err();
-        assert!(e.contains("'--pack' is one of shimmer's own options: put it before 'schedule'"), "{e}");
+        assert!(e.contains("'--pack' is one of shimmer's own options: put it before 'scheduler add'"), "{e}");
     }
 
     #[test]
@@ -486,17 +507,17 @@ mod tests {
     fn an_alias_where_the_command_starts_is_turned_into_the_command() {
         let pack = crate::packs::builtin::builtin("short").unwrap();
         let (alias, target) = pack.aliases.iter().find(|(_, t)| t.op == "workspaces.activate").unwrap();
-        let line = w(&["schedule", "weekdays", "09:00", "--catch-up", "skip", alias, "site"]);
+        let line = w(&["scheduler", "add", "weekdays", "09:00", "--catch-up", "skip", alias, "site"]);
         let out = rewrite_inner(line, Some(&pack));
-        let mut want = w(&["schedule", "weekdays", "09:00", "--catch-up", "skip"]);
+        let mut want = w(&["scheduler", "add", "weekdays", "09:00", "--catch-up", "skip"]);
         want.extend(target.words.iter().map(|s| s.to_string()));
         want.push("site".into());
         assert_eq!(out, want);
         // Not a schedule line, or no pack: unchanged.
         assert_eq!(rewrite_inner(w(&["records", "list", "x"]), Some(&pack)), w(&["records", "list", "x"]));
         assert_eq!(
-            rewrite_inner(w(&["schedule", "daily", "09:00", alias]), None),
-            w(&["schedule", "daily", "09:00", alias])
+            rewrite_inner(w(&["scheduler", "add", "daily", "09:00", alias]), None),
+            w(&["scheduler", "add", "daily", "09:00", alias])
         );
     }
 
@@ -507,32 +528,33 @@ mod tests {
 
     #[test]
     fn the_command_starts_by_position_so_a_pack_may_alias_when_words() {
-        // ADR 0031 §1 (#175's review): nothing is reserved but `schedule` itself.
+        // ADR 0031 §1 (#175's review): nothing is reserved (§6 freed `schedule` itself too).
         let pack = pack("\"daily\" = \"records.list\"\n\"mon\" = \"workspaces.activate\"\n");
         // `daily` as WHEN, then `daily` the alias as the command: only the second is rewritten.
-        let line = w(&["schedule", "daily", "09:00", "--catch-up", "skip", "daily", "lc"]);
+        let line = w(&["scheduler", "add", "daily", "09:00", "--catch-up", "skip", "daily", "lc"]);
         assert_eq!(
             rewrite_inner(line, Some(&pack)),
-            w(&["schedule", "daily", "09:00", "--catch-up", "skip", "records", "list", "lc"])
+            w(&["scheduler", "add", "daily", "09:00", "--catch-up", "skip", "records", "list", "lc"])
         );
         // An option's value is never the command, even when it's an alias's or a command's name.
-        let line = w(&["schedule", "mon", "09:00", "--lane", "mon", "mon", "site"]);
+        let line = w(&["scheduler", "add", "mon", "09:00", "--lane", "mon", "mon", "site"]);
         assert_eq!(
             rewrite_inner(line, Some(&pack)),
-            w(&["schedule", "mon", "09:00", "--lane", "mon", "workspaces", "activate", "site"])
+            w(&["scheduler", "add", "mon", "09:00", "--lane", "mon", "workspaces", "activate", "site"])
         );
         let p = plan(&["weekdays", "09:00", "--lane", "workspaces", "workspaces", "activate", "site"]);
         assert_eq!((p.lane.as_deref(), p.command), (Some("workspaces"), w(&["workspaces", "activate", "site"])));
     }
 
     #[test]
-    fn schedule_itself_is_the_one_word_no_pack_may_use() {
-        let problems = crate::packs::pack::parse(
+    fn schedule_is_free_for_a_pack_again() {
+        // ADR 0031 §6: `shimmer schedule` went, so `schedule` is no longer a command word.
+        let pack = crate::packs::pack::parse(
             "p",
-            "[pack]\nid = \"p\"\nlabel = \"P\"\n[alias]\n\"schedule\" = \"core.ping\"\n",
+            "[pack]\nid = \"p\"\nlabel = \"P\"\n[alias]\n\"schedule\" = \"scheduler.add\"\n",
         )
-        .unwrap_err();
-        assert!(problems.iter().any(|p| p.contains("schedule")), "{problems:?}");
+        .unwrap();
+        assert_eq!(pack.aliases["schedule"].words, ["scheduler", "add"]);
     }
 
     struct Answer(Option<&'static str>, bool);

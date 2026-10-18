@@ -3,7 +3,7 @@
 Status: proposed · Raised by Dev B (issue #77) · Needs sign-off: Dev A (§2 changes `Schedule` in
 `crates/core` and the scheduler; §4 adds short ids to `queue.*` and `scheduler.*`; CLAUDE.md §4)
 · Dev C notified (a new `schedule` shape that older clients must tolerate, §2; short ids, §4) ·
-Changes `core`
+Changes `core` · §1's commands amended by §6 (2026-10-16): one command group, `scheduler add`
 
 ## Context
 
@@ -157,6 +157,19 @@ prefix can rarely tell them apart. Its last sixteen characters are random.
 - **The CLI shows the same short ending** (the last six characters, more if needed to be unique
   among what it lists), so what you see is what you type.
 
+**Amendment (ADR 0032, from #246's review): the rule lives in `core`, and notify uses it too.**
+Notify's message ids are ULIDs as well, and `shimmer notify` first resolved endings in the CLI,
+with no minimum length (`notify remove 5` removed a message). Notify is a module, and modules can't
+use daemon code, so the matching moves unchanged from `crates/daemon/src/short_id.rs` to
+`crates/core/src/short_id.rs` (`core::short_id`). The queue, the scheduler and notify all call it,
+so there is one rule: a whole id at any length; an ending of at least 4 characters (shorter is
+`invalid_params`, so a stray keystroke can't remove or cancel anything); several matches are
+`conflict`, none `not_found`. It adds `ending()`, the shortest ending a list should show (the last
+six characters, more where another id ends the same way), worked out against every id that will
+be resolved, not only the page shown. Resolution still happens in the daemon or a module, never in
+a client, as this section intended. A purely additive `core` change: needs Dev A's and Dev B's
+sign-off (CLAUDE.md §4).
+
 ### 5. `--catch-up`, in plain words (CLI)
 
 It stays required: a guessed default is how duplicate runs happen (§6.3). At a terminal, leaving it
@@ -170,6 +183,45 @@ out asks instead of failing:
 
 Without a terminal (scripts, a workspace step) it is still an error naming the option.
 
+### 6. Amendment (2026-10-16): one command group, `shimmer scheduler add`
+
+Using it showed two problems with §1's split. Two top-level words a letter apart (`schedule`,
+`scheduler`) are easy to mix up, and every other area is one group word with verbs under it
+(`records add`, `workspaces activate`, `notify send`). And `scheduler add OP [PARAMS] WHEN`, kept
+in §1 "for ops with no friendly command yet", is the daemon's language typed by hand: JSON in a
+shell is easy to get wrong, and it bypasses §1's own rule by scheduling ops that make no change
+(`records.list` every day runs, and its answer goes nowhere).
+
+- **`shimmer scheduler add WHEN [options] COMMAND…` is the one way to schedule from the CLI.**
+  It is §1's form, unchanged: the same `WHEN` words, `--catch-up` and `--lane`, the command found
+  by position, aliases resolved to canonical words, the same rules for what can be scheduled,
+  relative values kept relative, and the same reply.
+
+      shimmer scheduler add weekdays 09:00 --catch-up skip workspaces activate site
+      shimmer scheduler add mon,wed,fri 18:00 --catch-up skip records add habits --title Gym
+      shimmer scheduler add cron-local "*/15 9-17 * * 1-5" --catch-up skip records add habits --title Stretch
+
+- **`shimmer schedule` goes.** For a while, typing it is an error that says what to type instead
+  (`shimmer scheduler add …`), never a second working spelling. `schedule` stops being a command
+  word, so a pack may use it as an alias again. A pack's alias for `scheduler.add` (`sadd`,
+  `kimeta`, `schedule-it`, `plot-course`) now runs the friendly form.
+- **The raw `scheduler add OP [PARAMS] --every|--cron|--cron-local|--once` form goes from the
+  CLI.** Nothing becomes impossible: `shimmer call scheduler.add '{…}'` sends any op with any
+  fields (the escape hatch for an op no command covers yet), and the `scheduler.add` op itself is
+  unchanged for the daemon, the TUI, scripts and any other client. Triggers made the raw way keep
+  working; `scheduler list` already shows each as the command it would be, or as op and params
+  when no command reads back to it.
+- **No fallback flag.** A scheduled task that fails is reported without one: the queue emits
+  `queue.task.failed` (`origin: scheduler`), in the event log and on the stream. Once notify (ADR
+  0032, #276) and automations (ADR 0035, #238) are in, a built-in rule turns that into a message,
+  and a custom message for one schedule is an automation on that event; until then the event is
+  the report. ADR 0005's `fallback` field stays, reachable with `shimmer call
+  scheduler.add`, but the CLI doesn't expose it.
+- **Kept as they are:** Tab completion (the `WHEN` words, then the schedule's options, then only
+  commands that can be scheduled). The one-time "starts at login" note on the first schedule made
+  (ADR 0034 §7) comes with `shimmer startup` (#242) and goes on `scheduler add` when that lands. `scheduler list|show|pause|resume|remove` are
+  unchanged.
+
 ## Consequences
 
 - People schedule the commands they already use, in their own time and in their pack's words, and
@@ -180,10 +232,9 @@ Without a terminal (scripts, a workspace step) it is still an error naming the o
   when the zone changed), and short-id resolution. The CLI gains `schedule` (one parser for `WHEN` plus the existing command parsers)
   and the workspaces equivalent of `records::request`. No new logic moves into the client: the op +
   params are what running the command already sends.
-- No word is reserved for the schedule. `schedule` itself becomes a command word, so a user's pack
-  that already uses `schedule` as an alias stops loading until it's renamed: Shimmer prints one
-  warning and runs with the real names (ADR 0013), and `shimmer packs check` names the problem.
-  No built-in pack uses it.
+- No word is reserved for the schedule. (§1 made `schedule` a command word; §6 frees it again.)
+- §6: one group for everything about schedules, and one readable way to add one; the raw form and
+  fallbacks stay reachable through `shimmer call` for whoever needs them.
 - Protocol: `{"cron_local": …}` as a schedule, and id endings: both additive. protocol.md updated
   and Dev C told when each lands.
 - Built in small PRs after sign-off: the core and scheduler change (§2), short ids (§4), then the

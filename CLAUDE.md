@@ -68,7 +68,7 @@ Worked example — an OA arrives and its deadline eventually notifies you:
    `calendar.date.registered`.
 4. `scheduler` is subscribed, registers a one-shot trigger for that date.
 5. On the day, the trigger fires and enqueues a task.
-6. `queue` runs it; `notify` delivers it and emits `notify.sent`.
+6. `queue` runs it; `notify` delivers it and emits `notify.message.sent`.
 
 Six mechanisms cooperated. **No module called another module.** Delete `calendar` and the
 chain degrades rather than fails to compile. That property is the whole design, and it is
@@ -297,6 +297,10 @@ pub struct Ctx {
     /// declares the `"process"` capability; every other module gets a stub that fails
     /// `unavailable`. Modules must never call `std::process::Command` directly (§12 rule 4).
     pub launcher: Launcher,
+    /// Show a desktop notification (ADR 0032 §1). Populated only for a module whose manifest
+    /// declares the `"desktop"` capability; every other module gets a stub that fails
+    /// `unavailable`. A note is plain text; no program or path reaches the module.
+    pub desktop: Desktop,
     /// Cooperative cancellation. Long tasks must poll this.
     pub cancel: CancellationToken,
     pub config: ModuleConfig,
@@ -462,7 +466,9 @@ $SHIMMER_HOME/
   data/workspaces/<name>/  workspace.toml + steps/ + cleanup script + state.toml (ADRs 0010, 0012).
   data/workspaces/.removed/<name>/  Removed workspaces, until restored (ADR 0026).
   data/scheduler/triggers/<id>.json  One per trigger, JSON because params are JSON (ADR 0004).
-  notifications/failed.jsonl  Deliveries that exhausted every sink (§11.3). Not built yet (M6).
+  data/notify/             Notify's inbox (inbox/<id>.toml, one file per message), settings.toml,
+                           and held/ markers (ADR 0032). A message no sink could deliver stays in
+                           the inbox as failed (§11.3).
   packs/<name>/            Command packs: aliases + animations (§15.1). Client-read only.
   .staging/<txid>/         In-flight store transactions (§7.1). Never edit by hand.
   cache/http/<module>/     Gateway response cache (ADR 0027), per module. Safe to delete.
@@ -746,8 +752,8 @@ pub enum Fallback {
  
 Fallback is deliberately not "run any op on failure." A fully generic fallback can itself
 fail, which reopens the question of what *its* fallback is. Constraining the target to
-`notify.*` — a namespace whose own failure path already terminates in
-`notifications/failed.jsonl` (§11.3) rather than another fallback — closes that regress
+`notify.*` — a namespace whose own failure path already terminates in its inbox
+(`data/notify/inbox/`, §11.3) rather than another fallback — closes that regress
 instead of deferring it. See ADR 0005.
  
 If the primary task fails for a structural reason (`workspace_dirty`, `unavailable`), the
@@ -757,8 +763,9 @@ dirty, see logs" instead of silence.
  
 `notify` has its own fallback: each `Sink` declares an optional `fallback_sink_id`, tried
 once before giving up. Desktop notification is the sane universal last resort — no network,
-no external account. Deliveries that exhaust every sink append to
-`notifications/failed.jsonl` rather than vanishing.
+no external account. A message that exhausts every sink stays in notify's inbox as `failed`
+(and emits `notify.message.exhausted`) rather than vanishing; every message is in the inbox
+first (ADR 0032).
  
 ---
 

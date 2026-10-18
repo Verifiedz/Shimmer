@@ -24,6 +24,9 @@ pub struct Config {
     /// bound to. The secret value itself never lives here -- resolved separately, by name,
     /// through a `SecretStore` (`crates/daemon/src/secrets.rs`).
     pub credentials: HashMap<String, CredentialBinding>,
+    /// `[desktop] show = false` (ADR 0032 §2): log desktop notes instead of showing them, for
+    /// machines with no screen and for tests.
+    pub hide_desktop: bool,
 }
 
 impl Config {
@@ -97,6 +100,23 @@ impl Config {
         if let Some(credentials) = root.get("credentials").and_then(|c| c.as_table()) {
             for (name, entry) in credentials {
                 cfg.credentials.insert(name.clone(), parse_credential(name, entry)?);
+            }
+        }
+        if let Some(desktop) = root.get("desktop") {
+            let table =
+                desktop.as_table().ok_or_else(|| Error::invalid_params("config.toml: [desktop] must be a table"))?;
+            for (key, v) in table {
+                match (key.as_str(), v.as_bool()) {
+                    ("show", Some(show)) => cfg.hide_desktop = !show,
+                    ("show", None) => {
+                        return Err(Error::invalid_params("config.toml: desktop.show must be true or false"))
+                    }
+                    (other, _) => {
+                        return Err(Error::invalid_params(format!(
+                            "config.toml: desktop.{other} isn't a setting (only show)"
+                        )))
+                    }
+                }
             }
         }
         Ok(cfg)
@@ -302,6 +322,14 @@ fn general_table_header_end(existing: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_notes_can_be_logged_instead_of_shown() {
+        assert!(!Config::parse("").unwrap().hide_desktop, "shown by default");
+        assert!(Config::parse("[desktop]\nshow = false\n").unwrap().hide_desktop);
+        assert!(Config::parse("[desktop]\nshow = \"no\"\n").unwrap_err().message.contains("true or false"));
+        assert!(Config::parse("[desktop]\nsound = true\n").unwrap_err().message.contains("only show"));
+    }
 
     #[test]
     fn parses_lanes_and_module_sections() {

@@ -10,6 +10,7 @@ mod backend;
 mod bus;
 mod config;
 mod core;
+mod desktop;
 mod http_backend;
 mod indexer;
 mod ipc;
@@ -20,7 +21,6 @@ mod queue;
 mod registry;
 mod scheduler;
 mod secrets;
-mod short_id;
 
 use std::fs::{self, File};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};

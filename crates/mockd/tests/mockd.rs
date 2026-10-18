@@ -146,7 +146,7 @@ async fn handshake_ping_and_a_manifest_that_parses_as_the_wire_type() {
     let parsed: ManifestData = serde_json::from_value(manifest).expect("manifest matches shimmer_proto::ManifestData");
     assert_eq!(parsed.protocol, 1);
     let ids: Vec<_> = parsed.modules.iter().map(|m| m.id.as_str()).collect();
-    assert_eq!(ids, ["records", "fetchers", "workspaces"]);
+    assert_eq!(ids, ["records", "fetchers", "workspaces", "notify"]);
     let lanes: Vec<_> = parsed.lanes.iter().map(|l| (l.id.as_str(), l.max_concurrent)).collect();
     assert!(lanes.contains(&("workspaces", 1)) && lanes.contains(&("fetchers", 8)), "{lanes:?}");
     stop(m).await;

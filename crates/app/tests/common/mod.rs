@@ -16,7 +16,12 @@ pub struct Home {
 
 impl Home {
     pub fn new() -> Self {
-        Self { dir: TempDir::new().unwrap() }
+        let dir = TempDir::new().unwrap();
+        // Notify's popups are logged, never shown: no test may pop anything up on a developer's
+        // screen (ADR 0032 §2).
+        std::fs::create_dir_all(dir.path().join("home")).unwrap();
+        std::fs::write(dir.path().join("home/config.toml"), "[desktop]\nshow = false\n").unwrap();
+        Self { dir }
     }
 
     /// A home with a LeetCode-style collection already in it. A fresh install has no
