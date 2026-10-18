@@ -165,9 +165,9 @@ pub fn workspaces_op(cmd: &WorkspacesCmd) -> Option<(&'static str, Value)> {
 }
 
 /// `op` for workspace `id`, once the daemon has it: a typo is caught when it's scheduled, not each
-/// time it fires (#185's review). `workspaces.status` is the read-only lookup `status` makes.
+/// time it fires (#185's review). `workspaces.show` is the read-only lookup `status` makes.
 async fn known_workspace(client: &mut Client, op: &'static str, id: &str) -> Result<()> {
-    client.call("workspaces.status", json!({"id": id})).await.map(|_| ()).map_err(|e| match e.code {
+    client.call("workspaces.show", json!({"id": id})).await.map(|_| ()).map_err(|e| match e.code {
         shimmer_core::ErrorCode::NotFound => Error::not_found(format!("no workspace '{id}' to schedule for ({op})")),
         _ => e,
     })
@@ -303,7 +303,7 @@ pub async fn run(client: &mut Client, cmd: &ScheduleCmd, json: bool, prompt: &mu
     }
     let id = data["trigger_id"].as_str().unwrap_or("?").to_owned();
     let short = render::short_ids(std::slice::from_ref(&id)).remove(0);
-    let first = match client.call("scheduler.get", json!({"trigger_id": id})).await {
+    let first = match client.call("scheduler.show", json!({"trigger_id": id})).await {
         Ok(t) => when::timestamp(&t["next_due"]).map_or("never (already past)".into(), |at| {
             format!("{} ({})", when::relative(at, chrono::Utc::now()), when::local(at))
         }),
@@ -311,6 +311,44 @@ pub async fn run(client: &mut Client, cmd: &ScheduleCmd, json: bool, prompt: &mu
     };
     Ok(format!(
         "✓ scheduled {} · {} · catch-up {}\n  first run: {first}\n  id {short} (shimmer scheduler show {short})",
+        typed(&plan.command),
+        plan.when.words,
+        catch_up.replace('_', "-"),
+    ))
+}
+
+/// `scheduler edit TRIGGER …` (ADR 0038 §6): the same checks as `add`, sent as `scheduler.edit`
+/// for the trigger's full id, so it keeps its id, whether it's on, and when it last ran.
+pub async fn edit(
+    client: &mut Client,
+    id: &str,
+    plan: &Planned,
+    json: bool,
+    prompt: &mut dyn Prompt,
+) -> Result<String> {
+    let current = client.call("scheduler.show", json!({"trigger_id": id})).await?;
+    let full = current["id"].as_str().unwrap_or(id).to_owned();
+    let (op, params) = request(client, &plan.command).await?;
+    let catch_up = match plan.catch_up {
+        Some(c) => c,
+        None => ask_catch_up(prompt, &plan.when)?,
+    };
+    let mut edit = json!({"trigger_id": full, "schedule": plan.when.schedule, "op": op, "params": params,
+                          "catch_up": catch_up});
+    if let Some(lane) = &plan.lane {
+        edit["lane"] = json!(lane);
+    }
+    let data = client.call("scheduler.edit", edit).await?;
+    if json {
+        return Ok(render::json(&data));
+    }
+    let short = render::short_ids(std::slice::from_ref(&full)).remove(0);
+    let next = when::timestamp(&data["next_due"]).map_or("never (already past)".into(), |at| {
+        format!("{} ({})", when::relative(at, chrono::Utc::now()), when::local(at))
+    });
+    let off = if data["enabled"] == false { " (off: shimmer scheduler enable it to run)" } else { "" };
+    Ok(format!(
+        "✓ {short} now runs {} · {} · catch-up {}{off}\n  next run: {next}",
         typed(&plan.command),
         plan.when.words,
         catch_up.replace('_', "-"),

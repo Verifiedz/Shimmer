@@ -28,7 +28,7 @@ async fn ping_and_manifest_round_trip() {
     assert!(pong["uptime_s"].is_u64());
 
     let m = c.call("core.manifest", json!({})).await.unwrap();
-    assert_eq!(m["protocol"], 1);
+    assert_eq!(m["protocol"], shimmer_proto::PROTOCOL_VERSION);
     let lanes: Vec<_> = m["lanes"].as_array().unwrap().iter().map(|l| l["id"].as_str().unwrap()).collect();
     assert_eq!(lanes, ["default", "slow"]);
     let demo = &m["modules"][0];
@@ -51,13 +51,13 @@ async fn handshake_rejects_wrong_version_and_missing_hello() {
     let d = env.start().await;
 
     let mut c = Client::raw(&env.sock).await;
-    c.send_json(json!({"v":2,"kind":"hello","client":"t","client_version":"0"})).await;
+    c.send_json(json!({"v":99,"kind":"hello","client":"t","client_version":"0"})).await;
     let Some(ServerFrame::Error { error, .. }) = c.recv().await else { panic!("want error frame") };
     assert_eq!(error.code, ErrorCode::UnsupportedVersion);
     assert!(c.recv().await.is_none(), "daemon closes after rejecting");
 
     let mut c = Client::raw(&env.sock).await;
-    c.send_json(json!({"v":1,"kind":"request","id":"1","op":"core.ping","params":{}})).await;
+    c.send_json(json!({"v":2,"kind":"request","id":"1","op":"core.ping","params":{}})).await;
     let Some(ServerFrame::Error { error, .. }) = c.recv().await else { panic!("want error frame") };
     assert_eq!(error.code, ErrorCode::BadRequest);
     assert!(c.recv().await.is_none());
@@ -93,7 +93,7 @@ async fn requests_are_pipelined_and_matched_by_id() {
     let d = env.start().await;
     let mut c = Client::connect(&env.sock).await;
     for i in 0..20 {
-        c.send_json(json!({"v":1,"kind":"request","id":format!("p{i}"),"op":"demo.echo","params":{"i":i}})).await;
+        c.send_json(json!({"v":2,"kind":"request","id":format!("p{i}"),"op":"demo.echo","params":{"i":i}})).await;
     }
     let mut seen = [false; 20];
     for _ in 0..20 {
@@ -135,7 +135,7 @@ async fn subscription_filters_by_topic_pattern() {
     let id = task_id(&h);
     let mut watcher = Client::connect(&env.sock).await;
     for _ in 0..50 {
-        if watcher.call("queue.task", json!({"task_id": id})).await.unwrap()["status"] == "succeeded" {
+        if watcher.call("queue.show", json!({"task_id": id})).await.unwrap()["status"] == "succeeded" {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -143,7 +143,7 @@ async fn subscription_filters_by_topic_pattern() {
     assert_eq!(c.call("core.ping", json!({})).await.unwrap()["pong"], true);
     assert!(c.events.iter().all(|e| e.topic.starts_with("demo.")), "{:?}", c.events);
 
-    c.send_json(json!({"v":1,"kind":"subscribe","id":"bad","topics":["rec*"]})).await;
+    c.send_json(json!({"v":2,"kind":"subscribe","id":"bad","topics":["rec*"]})).await;
     assert_eq!(c.response("bad").await.unwrap_err().code, ErrorCode::InvalidParams);
     stop(d).await;
 }
@@ -165,7 +165,7 @@ async fn queued_op_returns_a_handle_then_reports_through_events() {
     for topic in ["queue.task.enqueued", "queue.task.started", "queue.task.finished"] {
         assert_eq!(c.event(topic).await.payload["task_id"], id.as_str(), "{topic}");
     }
-    let t = c.call("queue.task", json!({"task_id": id})).await.unwrap();
+    let t = c.call("queue.show", json!({"task_id": id})).await.unwrap();
     assert_eq!(t["status"], "succeeded");
     assert_eq!(t["origin"], json!({"type": "user"}));
     stop(d).await;
@@ -231,7 +231,7 @@ async fn lane_concurrency_and_cancellation() {
 
 /// Polls `core.events.list` until the index has caught up to at least `want` matches --
 /// indexing happens on its own task, off the bus, so it can briefly lag behind an op's own
-/// response (same reasoning as `subscription_filters_by_topic_pattern`'s `queue.task` poll).
+/// response (same reasoning as `subscription_filters_by_topic_pattern`'s `queue.show` poll).
 async fn wait_for_events(c: &mut Client, topic: &str, want: usize, limit: usize) -> Vec<Value> {
     for _ in 0..50 {
         let events = c.call("core.events.list", json!({"topic": topic, "limit": limit})).await.unwrap()["events"]

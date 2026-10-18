@@ -89,7 +89,7 @@ pub fn load(ctx: &Ctx, source: &str) -> Result<SeenSet> {
     }
 }
 
-/// Prevents a scheduled tick and a manual `fetchers.fetch` for the same source running at
+/// Prevents a scheduled tick and a manual `fetchers.run` for the same source running at
 /// once (ADR 0028 §5). In-process only -- correct because there is exactly one daemon
 /// process per `$SHIMMER_HOME` (CLAUDE.md §1.6, "one writer").
 #[derive(Default)]

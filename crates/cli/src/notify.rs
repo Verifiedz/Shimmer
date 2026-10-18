@@ -298,7 +298,7 @@ pub async fn run(client: &mut Client, cmd: &NotifyCmd, json: bool, prompt: &mut 
             Ok(out(data, &|d| list(d, !filters.is_empty(), Utc::now())))
         }
         NotifyCmd::Show { id } => {
-            let m = client.call("notify.get", json!({"id": id})).await?;
+            let m = client.call("notify.show", json!({"id": id})).await?;
             if m["read"] == false {
                 client.call("notify.mark_read", json!({"ids": [m["id"]]})).await?;
             }

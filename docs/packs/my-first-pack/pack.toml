@@ -16,7 +16,7 @@ label = "My First Pack"       # shown in 'shimmer packs list'
 "tasks"    = "records.list"
 "finished" = "records.complete"
 "focus"    = "workspaces.activate"
-"how-is"   = "workspaces.status"
+"how-is"   = "workspaces.show"
 
 # Animations are coming in a later version. The format is already fixed, so you can add them now:
 # each file must be plain text inside this folder.

@@ -3,7 +3,7 @@
 #
 #   shimmer workspaces activate <id> --wait     ready → launching → active
 #   shimmer workspaces stop <id> --wait         active → ready
-#   shimmer workspaces status <id>              each step, and the log of a failed one
+#   shimmer workspaces show <id>                each step, and the log of a failed one
 #
 # To see a launch go dirty: shimmer workspaces reconfigure <id> --set FAIL_AT=check, then
 #   shimmer workspaces cleanup <id> --wait      dirty → ready (unless FAIL_AT = "cleanup")

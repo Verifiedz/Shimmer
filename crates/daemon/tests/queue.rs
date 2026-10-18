@@ -103,7 +103,7 @@ async fn a_failed_tasks_slot_frees_before_the_next_task_starts() {
         "the failed task started exactly once"
     );
 
-    let t = c.call("queue.task", json!({"task_id": failing})).await.unwrap();
+    let t = c.call("queue.show", json!({"task_id": failing})).await.unwrap();
     assert_eq!(t["status"], "failed");
     let (waiting, _) = waiting(&mut c).await;
     assert!(waiting.is_empty());
@@ -134,7 +134,7 @@ async fn scheduled_and_normal_tasks_run_in_arrival_order() {
 
     let (order, _) = waiting(&mut c).await;
     assert_eq!(order, [first.clone(), scheduled.clone(), last.clone()], "arrival order, neither tier outranks");
-    let view = c.call("queue.task", json!({"task_id": scheduled})).await.unwrap();
+    let view = c.call("queue.show", json!({"task_id": scheduled})).await.unwrap();
     assert_eq!(view["priority"], "scheduled", "provenance is still recorded");
 
     c.call("queue.cancel", json!({"task_id": spin})).await.unwrap();
@@ -183,7 +183,7 @@ async fn promotion_is_refused_until_confirmed_and_the_refusal_changes_nothing() 
     let ev = c.event("queue.task.promoted").await;
     assert_eq!(ev.payload["task_id"], promoted_id.as_str());
     assert_eq!(ev.payload["displaced"], json!([a, b]));
-    let view = c.call("queue.task", json!({"task_id": promoted_id})).await.unwrap();
+    let view = c.call("queue.show", json!({"task_id": promoted_id})).await.unwrap();
     assert_eq!(view["priority"]["overridden"]["by"], "user");
 
     // 4. It really does run first.
@@ -287,7 +287,7 @@ async fn queue_reorder_moves_a_waiting_task_over_the_real_socket() {
     assert_eq!(before, [a.clone(), b.clone()]);
 
     let moved = c
-        .call("queue.reorder", json!({"lane": "slow", "task_id": b, "before": a, "queue_version": version}))
+        .call("queue.move", json!({"lane": "slow", "task_id": b, "before": a, "queue_version": version}))
         .await
         .unwrap();
     let new_version = moved["queue_version"].as_u64().unwrap();
@@ -318,7 +318,7 @@ async fn a_stale_queue_version_on_reorder_is_a_conflict_and_changes_nothing() {
     let b = quick(&mut c).await;
 
     let err = c
-        .call("queue.reorder", json!({"lane": "slow", "task_id": b, "before": a, "queue_version": stale}))
+        .call("queue.move", json!({"lane": "slow", "task_id": b, "before": a, "queue_version": stale}))
         .await
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::Conflict);
@@ -340,7 +340,7 @@ async fn the_running_task_cannot_be_reordered_over_the_real_socket() {
     let (_, version) = waiting(&mut c).await;
 
     let err = c
-        .call("queue.reorder", json!({"lane": "slow", "task_id": spin, "before": a, "queue_version": version}))
+        .call("queue.move", json!({"lane": "slow", "task_id": spin, "before": a, "queue_version": version}))
         .await
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::NotFound, "the running task is not in the waiting list");
@@ -360,7 +360,7 @@ async fn a_noop_reorder_changes_nothing_and_emits_no_event() {
 
     // `a` is already directly before `b`, so this asks for the order it's already in.
     let moved = c
-        .call("queue.reorder", json!({"lane": "slow", "task_id": a, "before": b, "queue_version": version}))
+        .call("queue.move", json!({"lane": "slow", "task_id": a, "before": b, "queue_version": version}))
         .await
         .unwrap();
     assert_eq!(moved["queue_version"].as_u64().unwrap(), version, "nothing moved, so the version is unchanged");
@@ -474,7 +474,7 @@ async fn a_structural_failure_enqueues_the_fallback_in_the_notify_lane() {
                "failure_code": "unavailable", "failure_detail": null}),
         "as configured, plus what the queue stamps"
     );
-    let view = c.call("queue.task", json!({"task_id": fallback})).await.unwrap();
+    let view = c.call("queue.show", json!({"task_id": fallback})).await.unwrap();
     assert_eq!(view["lane"], "notify");
     assert_eq!(view["priority"], "normal", "a fallback takes its turn and cannot promote itself");
     assert_eq!(view["origin"], json!({"type": "module", "id": "queue"}));

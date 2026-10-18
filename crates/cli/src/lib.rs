@@ -224,16 +224,21 @@ fn prints_data(cmd: &Command) -> bool {
         Command::Call { .. }
             | Command::Records(
                 RecordsCmd::List { .. }
-                    | RecordsCmd::Get { .. }
+                    | RecordsCmd::Show { .. }
                     | RecordsCmd::Export { .. }
-                    | RecordsCmd::Trash { .. }
+                    | RecordsCmd::ListRemoved { .. }
                     | RecordsCmd::Collections
                     | RecordsCmd::Check { .. }
                     | RecordsCmd::Peek { file: true, .. }
             )
-            | Command::Workspaces(WorkspacesCmd::List | WorkspacesCmd::Status { .. })
+            | Command::Workspaces(WorkspacesCmd::List { .. } | WorkspacesCmd::Show { .. })
             | Command::Queue(QueueCmd::List { .. } | QueueCmd::Show { .. })
-            | Command::Scheduler(SchedulerCmd::List { .. } | SchedulerCmd::Show { .. } | SchedulerCmd::Add(_))
+            | Command::Scheduler(
+                SchedulerCmd::List { .. }
+                    | SchedulerCmd::Show { .. }
+                    | SchedulerCmd::Add(_)
+                    | SchedulerCmd::Edit { .. }
+            )
             | Command::Notify(
                 notify::NotifyCmd::List { .. } | notify::NotifyCmd::Show { .. } | notify::NotifyCmd::Send { .. }
             )
@@ -396,10 +401,10 @@ mod tests {
         let cmd = |words: &[&str]| Args::parse(words.iter().map(|w| w.to_string())).unwrap().command;
         for words in [
             &["records", "list", "lc"][..],
-            &["records", "get", "lc/x"],
+            &["records", "show", "lc/x"],
             &["records", "export", "lc"],
             &["records", "collections"],
-            &["workspaces", "status", "site"],
+            &["workspaces", "show", "site"],
             &["scheduler", "list"],
             &["call", "core.ping"],
         ] {
@@ -415,7 +420,7 @@ mod tests {
     #[test]
     fn usage_follows_the_command_word() {
         assert_eq!(usage(&["workspaces", "activate", "x", "--bogus"]), workspaces::USAGE);
-        assert_eq!(usage(&["--json", "--socket", "/tmp/s", "workspaces", "status"]), workspaces::USAGE);
+        assert_eq!(usage(&["--json", "--socket", "/tmp/s", "workspaces", "show"]), workspaces::USAGE);
         assert_eq!(usage(&["records", "list", "--limit", "x"]), records::USAGE);
         assert_eq!(usage(&["call"]), USAGE);
         assert_eq!(usage(&["--bogus"]), USAGE);

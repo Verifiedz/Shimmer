@@ -13,7 +13,7 @@
 //!
 //! While launching, `step` records the step that is running, so a daemon that dies mid-launch
 //! can say which step it was on when it restarts. `[last_session]` describes the most recent
-//! launch attempt, for `workspaces.status`:
+//! launch attempt, for `workspaces.show`:
 //!
 //! ```toml
 //! [last_session]

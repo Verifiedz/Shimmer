@@ -37,7 +37,7 @@ Chosen for debuggability: a whole session can be driven from a shell.
 
 ```
 $ socat - UNIX-CONNECT:$SOCK
-{"v":1,"kind":"hello","client":"manual","client_version":"0.0.0"}
+{"v":2,"kind":"hello","client":"manual","client_version":"0.0.0"}
 ```
 
 `$SOCK` is the socket path from the Transport table above. `socat` behaves the same on every
@@ -56,13 +56,19 @@ The client sends `hello` first, before anything else. The daemon replies `welcom
 
 ```jsonc
 // →
-{"v": 1, "kind": "hello", "client": "tui", "client_version": "0.3.1"}
+{"v": 2, "kind": "hello", "client": "tui", "client_version": "0.3.1"}
 
 // ←
-{"v": 1, "kind": "welcome", "daemon_version": "0.3.0", "session": "01JD2K…"}
+{"v": 2, "kind": "welcome", "daemon_version": "0.3.0", "session": "01JD2K…"}
 ```
 
 - `v` is the **protocol** version, an integer, bumped only on breaking changes.
+  - **v2** (ADR 0038 §6): every op is named by its CLI word. `records.get`, `workspaces.status`,
+    `scheduler.get`, `notify.get` and `queue.task` became `.show`; `records.create_collection` and
+    `workspaces.create` became `.new`; `queue.reorder` became `queue.move`; `fetchers.fetch` became `fetchers.run`; `scheduler.pause` /
+    `.resume` became `scheduler.disable` / `.enable` (a trigger shows `enabled`, not `paused`);
+    `records.trash` became `records.list {"removed": true}`. Topics: `records.trash.purged` became
+    `records.item.purged`, `scheduler.trigger.paused` / `.resumed` became `.disabled` / `.enabled`.
 - Daemon rejects an unknown `v` with `unsupported_version` and closes.
 - `daemon_version` and `client_version` are informational. Never branch on them.
 
@@ -79,7 +85,7 @@ A failure with no request to answer: a rejected handshake, or a line that could 
 parsed. It has no `id`. See `docs/decisions/0002-error-frame-and-ephemeral-progress.md`.
 
 ```jsonc
-{"v":1,"kind":"error","error":{"code":"unsupported_version","message":"…","detail":{"supported":[1]}}}
+{"v":2,"kind":"error","error":{"code":"unsupported_version","message":"…","detail":{"supported":[1]}}}
 ```
 
 After a rejected handshake or an over-long line the daemon closes the connection. After an
@@ -92,15 +98,15 @@ it. Requests may be pipelined; responses may arrive out of order, so match on `i
 
 ```jsonc
 // →
-{"v":1,"kind":"request","id":"r1","op":"records.list",
+{"v":2,"kind":"request","id":"r1","op":"records.list",
  "params":{"collection":"leetcode","filter":{"status":"todo"},"limit":50}}
 
 // ← success
-{"v":1,"kind":"response","id":"r1","ok":true,
+{"v":2,"kind":"response","id":"r1","ok":true,
  "data":{"items":[…],"total":137}}
 
 // ← failure
-{"v":1,"kind":"response","id":"r1","ok":false,
+{"v":2,"kind":"response","id":"r1","ok":false,
  "error":{"code":"not_found","message":"no collection 'leetcode'","detail":null}}
 ```
 
@@ -124,11 +130,11 @@ Every op declares an `execution` in `core.manifest`:
 
 ```jsonc
 // → a queued op
-{"v":1,"kind":"request","id":"r2","op":"fetchers.fetch",
+{"v":2,"kind":"request","id":"r2","op":"fetchers.run",
  "params":{"source":"hn-whoishiring"}}
 
 // ← accepted, not completed
-{"v":1,"kind":"response","id":"r2","ok":true,
+{"v":2,"kind":"response","id":"r2","ok":true,
  "data":{"queued":true,"task_id":"01JD2N…","lane":"fetchers","position":3}}
 ```
 
@@ -141,7 +147,7 @@ Queue behaviour is orthogonal to the op, so it lives on the **frame**, not in `p
 Ops with `execution: inline` ignore it.
 
 ```jsonc
-{"v":1,"kind":"request","id":"r3","op":"fetchers.fetch",
+{"v":2,"kind":"request","id":"r3","op":"fetchers.run",
  "params":{"source":"linkedin"},
  "queue":{"priority":"override","confirm":false}}
 ```
@@ -158,12 +164,12 @@ Ops with `execution: inline` ignore it.
 
 ```jsonc
 // →
-{"v":1,"kind":"subscribe","id":"s1","topics":["records.*","queue.task.failed"]}
+{"v":2,"kind":"subscribe","id":"s1","topics":["records.*","queue.task.failed"]}
 // ← acknowledgement
-{"v":1,"kind":"response","id":"s1","ok":true,"data":{"subscribed":2}}
+{"v":2,"kind":"response","id":"s1","ok":true,"data":{"subscribed":2}}
 
 // ← pushed at any time thereafter, no id
-{"v":1,"kind":"event","event":{
+{"v":2,"kind":"event","event":{
   "id":"01JD2K…","at":"2026-09-16T14:03:11Z","source":"fetchers",
   "topic":"fetchers.fetch.finished",
   "payload":{"source":"hn-whoishiring","new_items":12}}}
@@ -191,27 +197,27 @@ no server-side pending state — the daemon holds nothing between the two reques
 
 ```jsonc
 // → 1. ask to jump the lane
-{"v":1,"kind":"request","id":"p1","op":"fetchers.fetch",
+{"v":2,"kind":"request","id":"p1","op":"fetchers.run",
  "params":{"source":"linkedin"},
  "queue":{"priority":"override"}}
 
 // ← 2. refused pending confirmation, with what it would cost
-{"v":1,"kind":"response","id":"p1","ok":false,
+{"v":2,"kind":"response","id":"p1","ok":false,
  "error":{"code":"confirmation_required",
   "message":"would displace 3 scheduled tasks in lane 'fetchers'",
   "detail":{"lane":"fetchers","queue_version":41,
     "would_displace":[
-      {"task_id":"01JD2P…","op":"fetchers.fetch","priority":"scheduled"},
-      {"task_id":"01JD2Q…","op":"fetchers.fetch","priority":"scheduled"},
-      {"task_id":"01JD2R…","op":"fetchers.fetch","priority":"scheduled"}]}}}
+      {"task_id":"01JD2P…","op":"fetchers.run","priority":"scheduled"},
+      {"task_id":"01JD2Q…","op":"fetchers.run","priority":"scheduled"},
+      {"task_id":"01JD2R…","op":"fetchers.run","priority":"scheduled"}]}}}
 
 // → 3. user agreed; echo the queue_version you showed them
-{"v":1,"kind":"request","id":"p2","op":"fetchers.fetch",
+{"v":2,"kind":"request","id":"p2","op":"fetchers.run",
  "params":{"source":"linkedin"},
  "queue":{"priority":"override","confirm":true,"queue_version":41}}
 
 // ← 4. accepted
-{"v":1,"kind":"response","id":"p2","ok":true,
+{"v":2,"kind":"response","id":"p2","ok":true,
  "data":{"queued":true,"task_id":"01JD2S…","lane":"fetchers","position":0}}
 ```
 
@@ -264,11 +270,11 @@ Clients should offer: run cleanup, force relaunch, or open the log. Never auto-f
 
 ```jsonc
 // →
-{"v":1,"kind":"request","id":"m1","op":"core.manifest","params":{}}
+{"v":2,"kind":"request","id":"m1","op":"core.manifest","params":{}}
 
 // ←
-{"v":1,"kind":"response","id":"m1","ok":true,"data":{
-  "protocol":1,
+{"v":2,"kind":"response","id":"m1","ok":true,"data":{
+  "protocol":2,
   "lanes":[
     {"id":"workspaces","max_concurrent":1},
     {"id":"fetchers","max_concurrent":8},
@@ -328,8 +334,8 @@ Always present, independent of which modules are registered.
 | Op | Execution | Params | Returns |
 |---|---|---|---|
 | `queue.list` | inline | `{"lane"?}` | Lanes, each with `running` and `queued` task arrays and `queue_version`. |
-| `queue.task` | inline | `{"task_id"}` | One task with status, progress, attempts, origin. |
-| `queue.reorder` | inline | `{"lane","task_id","before":TaskId\|null,"queue_version"}` | `{"queue_version","task_id"}`: the new `queue_version`, and the moved task's full id. |
+| `queue.show` | inline | `{"task_id"}` | One task with status, progress, attempts, origin. |
+| `queue.move` | inline | `{"lane","task_id","before":TaskId\|null,"queue_version"}` | `{"queue_version","task_id"}`: the new `queue_version`, and the moved task's full id. |
 | `queue.cancel` | inline | `{"task_id"}` | `{"cancelled":true,"was":"queued"\|"running","task_id"}`, or `not_cancellable`. A queued task is gone; a running one has been asked to stop and ends at its next cancellation check. |
 
 Reordering is within a lane only. The running task cannot be reordered or displaced; it can
@@ -347,12 +353,15 @@ client can say which one it hit.
 
 | Op | Execution | Params | Returns |
 |---|---|---|---|
-| `scheduler.list` | inline | `{}` | `{"triggers":[…]}`, each `{"id","op","params","schedule","catch_up","lane","fallback","next_due","last_run","paused","done","source"}`. `done` is a `once` trigger that has fired; `source` is `{"type":"user"}` or `{"type":"module","id"}`. |
-| `scheduler.get` | inline | `{"trigger_id"}` | One trigger, same shape as a `scheduler.list` entry, or `not_found`. |
+| `scheduler.list` | inline | `{"removed"?}` | `{"triggers":[…]}`, each `{"id","op","params","schedule","catch_up","lane","fallback","next_due","last_run","enabled","done","source"}`. `done` is a `once` trigger that has fired; `source` is `{"type":"user"}` or `{"type":"module","id"}`. With `"removed": true`, the removed triggers instead, same shape (ADR 0038). |
+| `scheduler.show` | inline | `{"trigger_id"}` | One trigger, same shape as a `scheduler.list` entry, or `not_found`. |
 | `scheduler.add` | inline | `{"schedule","op","params","catch_up","lane"?,"fallback"?}` | `{"trigger_id"}` |
-| `scheduler.remove` | inline | `{"trigger_id"}` | `{"removed":true,"trigger_id"}` (the full id) |
-| `scheduler.pause` | inline | `{"trigger_id"}` | `{"paused":true,"trigger_id"}` |
-| `scheduler.resume` | inline | `{"trigger_id"}` | `{"paused":false,"trigger_id"}` |
+| `scheduler.edit` | inline | `{"trigger_id","schedule","op","params","catch_up","lane"?,"fallback"?}` | The trigger, same shape as a `scheduler.list` entry: a new schedule for the same id, keeping whether it's enabled and its `last_run`, counting from now. Checked as `scheduler.add` is. A module's own trigger is `conflict`. Emits `scheduler.trigger.edited` (payload as `.added`). ADR 0038 §6. |
+| `scheduler.remove` | inline | `{"trigger_id"}` | `{"removed":true,"trigger_id"}` (the full id). Moves the trigger to `data/scheduler/removed/<id>.json`, where it never fires (the latest removal of an id replaces an older one). A module's own trigger is `conflict`: disable it instead. ADR 0038. |
+| `scheduler.restore` | inline | `{"trigger_id"}` | The trigger, same shape as a `scheduler.list` entry, back as removed (paused or not). Counts from now, like `resume`: a recurring trigger's `next_due` is its next time after now; a `once` keeps its time, and its `catch_up` decides if that has passed. `trigger_id` may be a unique ending of a removed one's. `not_found` with nothing to restore; `conflict` if that id exists again; the `scheduler.add` errors if its op or lane has gone. Emits `scheduler.trigger.restored`. ADR 0038. |
+| `scheduler.purge` | inline | `{"trigger_id"?,"confirm"?}` | `{"purged":N}`. Permanently deletes one removed trigger, or every one. Without a matching `confirm`, `confirmation_required` with `detail: {"triggers":N}`; re-send with `"confirm": {"triggers":N}`. `{"purged":0}` without asking when nothing is removed; `not_found` for a `trigger_id` that isn't removed. Emits `scheduler.trigger.purged`. ADR 0038. |
+| `scheduler.disable` | inline | `{"trigger_id"}` | `{"enabled":false,"trigger_id"}`: it won't fire until enabled. ADR 0038 §6. |
+| `scheduler.enable` | inline | `{"trigger_id"}` | `{"enabled":true,"trigger_id"}`: counts from now; time spent off is never caught up. ADR 0038 §6. |
 
 `trigger_id` may be a unique ending of the id (see "Short ids" above).
 
@@ -372,21 +381,22 @@ emails.
 
 | Op | Execution | Params | Returns |
 |---|---|---|---|
-| `workspaces.list` | inline | `{}` | `{"workspaces":[{"id","label","state"}]}`, sorted by id. `dirty_reason` when dirty; `error` when invalid. |
-| `workspaces.status` | inline | `{"id"}` | `{"id","label","description"?,"state","steps":[{"index","name","mode","timeout_s"?,"description"?}],"cleanup_timeout_s"?,"has_cleanup_script","last_session"}`. When dirty also `dirty_reason`, `log` and `dirty:{reason,failed_step,failed_at,log}`; when launching, `running_step`; when invalid, `error`. |
+| `workspaces.list` | inline | `{"removed"?}` | `{"workspaces":[{"id","label","state"}]}`, sorted by id. `dirty_reason` when dirty; `error` when invalid. With `"removed": true`, the removed workspaces instead, `[{"id","label"?}]`, to restore or purge (ADR 0038 §6). |
+| `workspaces.show` | inline | `{"id"}` | `{"id","label","description"?,"state","steps":[{"index","name","mode","timeout_s"?,"description"?}],"cleanup_timeout_s"?,"has_cleanup_script","last_session"}`. When dirty also `dirty_reason`, `log` and `dirty:{reason,failed_step,failed_at,log}`; when launching, `running_step`; when invalid, `error`. |
 | `workspaces.activate` | queued (`workspaces`) | `{"id"}` | Task handle. The task ends `{"id","state":"active","session_id","log"}`, or fails (see below). `log` is the last step's log (relative to `$SHIMMER_HOME`) when that step is supervised, else `""`: a template that ends with a summary step shows it this way (ADR 0025). |
 | `workspaces.cleanup` | queued (`workspaces`) | `{"id"}` | Task handle. Runs `cleanup.{sh,ps1}` supervised; on success `dirty → ready`. The task ends `{"id","state":"ready","log"}`: the script's log, for a client to show what it did. |
 | `workspaces.force_relaunch` | queued (`workspaces`) | `{"id"}` | Task handle. Launches a `dirty` workspace anyway; emits `workspaces.session.forced` before any step runs. |
 | `workspaces.reset` | inline | `{"id"}` | `{"id","state":"ready"}`. Clears `dirty` without running cleanup. Last resort; also clears an unreadable `state.toml`. |
 | `workspaces.stop` | queued (`workspaces`) | `{"id"}` | Task handle. Runs `cleanup.{sh,ps1}` supervised on an `active` workspace; success → `ready` and `workspaces.session.stopped`; the task ends `{"id","state":"ready","log"}` (`log` empty with no script). No cleanup script: `ready` at once, nothing run. Failure leaves it `active`; the task fails with the log in `detail`. `invalid_params` when ready or dirty, `conflict` while launching. Windows are never closed: the script stops processes. ADR 0026. |
 | `workspaces.remove` | inline | `{"id"}` | `{"removed":true}`. Moves the folder to `data/workspaces/.removed/<id>/` (the latest removal of an id replaces an older one); emits `workspaces.workspace.removed`. `conflict` when active, launching or dirty ("stop it first" / "clean it up or reset it first"). Folders starting with `.` are never listed as workspaces. ADR 0026. |
-| `workspaces.restore` | inline | `{"id"}` | The workspace, as `workspaces.status` shows it, back exactly as removed; emits `workspaces.workspace.restored`. `not_found` with nothing to restore; `conflict` if that id exists again. ADR 0026. |
+| `workspaces.restore` | inline | `{"id"}` | The workspace, as `workspaces.show` shows it, back exactly as removed; emits `workspaces.workspace.restored`. `not_found` with nothing to restore; `conflict` if that id exists again. ADR 0026. |
+| `workspaces.purge` | inline | `{"id"?,"confirm"?}` | `{"purged":N}`. Permanently deletes one removed workspace, or every one. Without a matching `confirm`, `confirmation_required` with `detail: {"workspaces":N}`; re-send with `"confirm": {"workspaces":N}`. `{"purged":0}` without asking when nothing is removed; `not_found` for an `id` that isn't removed. Emits `workspaces.workspace.purged`. ADR 0038. |
 | `workspaces.copy` | inline | `{"id","to","values"?,"label"?}` | `{"from","to","changed":[{"name","from","to"}]}`: a new workspace at `<to>` with every file of `<id>` but its state (it starts `ready`, no history), `values` as new answers (checked as `workspaces.reconfigure` checks them; `invalid_params` for a workspace made by hand) and `label` as its label. The original may be in any state: it's only read. Emits `workspaces.workspace.copied`. A copy that wouldn't be a valid workspace isn't made. ADR 0026 §2b. |
 | `workspaces.rename` | inline | `{"id","to"}` | `{"from","to","notes":[…]}`: every file of the workspace moved to `data/workspaces/<to>/` in one transaction; emits `workspaces.workspace.renamed`. Only while `ready` (`conflict` when active, launching or dirty: stop and cleanup find what a launch started by its id). `to` must be a valid id (`invalid_params`), not the same, and free (`conflict`). `notes` names what stays under the old id outside the Shimmer folder (a separate browser window's profile) and how to move it. Schedules aren't changed: the CLI lists the ones naming the old id and moves them (`scheduler.add` again, then `scheduler.remove`) only when asked. ADR 0026 §2a. |
 | `workspaces.templates` | inline | `{"id"?, "files"?}` | `{"templates":[{"id","label","description","category","needs":[…],"good_to_know":[…],"on_stop","steps":[{"name","mode","timeout_s"?,"description"?}],"questions":[{"name","prompt","kind","required","default"?,"choices"?,"help"?}]}],"categories":[{"id","label"}]}`: templates by category (in `categories`' order), then id; `categories` gives each heading. With `id`, only that template (`not_found` naming the others); with `files: true`, each template also has `"files":[{"path","text"}]`: every file a workspace made from it gets (not `template.toml`), for `peek --scripts`. `kind` is `text`, `command`, `folder`, `file`, `url`, `urls` or `choice`. ADR 0025. |
 | `workspaces.answers` | inline | `{"id"}` | `{"id","template","questions":[…as workspaces.templates],"answers":{NAME: value or null}}`: the template the workspace was made from (its `.template` file, or the "Created from Shimmer's X template" line in `workspace.toml`) and its current answers. `invalid_params` for a workspace made by hand. ADR 0025 §9. |
 | `workspaces.reconfigure` | inline | `{"id","values":{NAME: answer}}` | `{"id","template","changed":[{"name","from","to"}]}`. Only while `ready` (`conflict` when active, launching or dirty: cleanup reads the answers). Only `[env]` in `workspace.toml` is rewritten; changed answers are checked as `create` checks them; an empty one clears an optional question. Nothing changed: nothing written. ADR 0025 §9. |
-| `workspaces.create` | inline | `{"id","template","values"?,"label"?}` | The new workspace, as `workspaces.status` shows it (state `ready`). `values` maps question names to strings; left out means the default, or empty. Every answer is written to the workspace's `[env]`. A missing required answer, an unknown question, or an answer that doesn't fit its kind (`folder`/`file` must be absolute, `url`s must start with `http://` or `https://`) is `invalid_params` naming the question; an unknown template is `not_found` naming the ones there are; anything already at `data/workspaces/<id>/` is `conflict`, never overwritten. One transaction writes the folder and emits `workspaces.workspace.created`. ADR 0025. |
+| `workspaces.new` | inline | `{"id","template","values"?,"label"?}` | The new workspace, as `workspaces.show` shows it (state `ready`). `values` maps question names to strings; left out means the default, or empty. Every answer is written to the workspace's `[env]`. A missing required answer, an unknown question, or an answer that doesn't fit its kind (`folder`/`file` must be absolute, `url`s must start with `http://` or `https://`) is `invalid_params` naming the question; an unknown template is `not_found` naming the ones there are; anything already at `data/workspaces/<id>/` is `conflict`, never overwritten. One transaction writes the folder and emits `workspaces.workspace.created`. ADR 0025. |
 | `workspaces.health` | inline | `{}` | `{"checks":[…]}` in the shape ADR 0033 sets: a `fail` for each workspace that can't be read and each dirty one (fix: `workspaces.cleanup`, or `workspaces.reset` with no cleanup script), a `warn` for each with a detached step and no cleanup script, or one `ok` line. Writes nothing. |
 
 `state` is one of `ready`, `launching`, `active`, `dirty`, or `invalid` when the workspace's
@@ -421,19 +431,18 @@ after a step has run leaves it `dirty`.
 |---|---|---|---|
 | `records.collections` | inline | `{"removed"?}` | `{"collections":[...]}`, each collection definition as JSON (+ `"skipped"` naming each malformed collection file). A collection made from a built-in template also has `"template"`: its id, read from the "Created from Shimmer's X template" line its file starts with (absent for one made by hand, or once that line is edited away). ADR 0030 §4. With `"removed": true`, the removed collections instead, by id: `{"collections":[{"id","label"?,"records","trash"}]}` (no `label` when its file doesn't parse). ADR 0021 §5a. |
 | `records.add` | inline | `{"collection","id"?,"fields"?}` | The new item, which carries its `id`. Without an `id`, one is made from the collection's `title` (`"Two Sum"` → `two-sum`, then `two-sum-2`, …), or from today's date (`2026-10-05-1`) when there's no title to use. An explicit `id` that exists is `conflict`. ADR 0018. |
-| `records.get` | inline | `{"collection","id"}` | The item. |
-| `records.list` | inline | `{"collection","filter"?,"search"?,"sort"?,"limit"?,"offset"?}` | `{"items","total","titles"}` (+ `"skipped"` if a hand-edited file was unreadable). `titles` is `{id: title}` for the listed items (ADR 0024 §5). Ordered by `sort`, then by id. See below. |
+| `records.show` | inline | `{"collection","id"}` | The item. |
+| `records.list` | inline | `{"collection","filter"?,"search"?,"sort"?,"limit"?,"offset"?,"removed"?}` | `{"items","total","titles"}` (+ `"skipped"` if a hand-edited file was unreadable). `titles` is `{id: title}` for the listed items (ADR 0024 §5). Ordered by `sort`, then by id. See below. With `"removed": true`, the collection's removed records instead, by id: `{"items":[…]}` (+ `"skipped"`); it takes no filter, search, sort or paging (`invalid_params`). ADR 0038 §6. |
 | `records.update` | inline | `{"collection","id","fields"}` | The item. A `null` field value unsets it. A list field takes a whole new list or `{"add":[…],"remove":[…]}` (ADR 0024 §2). Setting a `unique` field to a value another record has is `conflict`, naming that record. |
 | `records.complete` | inline | `{"collection","id","fields"?}` | The item, now `done`, with its `stamp_on_complete` field set. `fields` are applied first, with `records.update`'s rules; an explicit value for the stamp field wins over today (back-dating). One `records.item.completed`. When the record is already `done`: re-stamped again, unless the collection says `repeat_complete = "refuse"`, then `conflict`. |
 | `records.rename` | inline | `{"collection","id","new_id"}` | The item under its new id. One transaction moves the file, rewrites every `ref` to it, and emits `records.item.renamed`. `conflict` if `new_id` exists; `not_found` if `id` doesn't. ADR 0018. |
 | `records.reopen` | inline | `{"collection","id","clear_stamp"?}` | The item, now `todo`. The stamp is kept unless `clear_stamp`. `conflict` if it isn't `done`. ADR 0016. |
 | `records.remove` | inline | `{"collection","id","force"?}` | `{"removed":true}`. The record moves to `data/records/trash/<collection>/<id>.toml` (the latest removed version of each id), out of every other op. ADR 0020. If other records refer to it through a `ref` field, `conflict` with `detail: {"referred_by":["collection/id",…]}` unless `force` (ADR 0024 §3). |
 | `records.restore` | inline | `{"collection","id"}` | The record, back exactly as removed; emits `records.item.restored`. `not_found` if it isn't in the trash; `conflict` if the id, or one of its `unique` values, is taken again. |
-| `records.trash` | inline | `{"collection"}` | `{"items":[…]}`: the collection's removed records, by id (+ `"skipped"` naming each file that couldn't be read, as in `records.list`). |
-| `records.purge` | inline | `{"collection","id"?,"confirm"?}` | `{"purged":N}`. Permanently deletes one trashed record, or the whole trash. Without a matching `confirm`, `confirmation_required` with `detail: {"records":N}`; re-send with `"confirm": {"records":N}`. `{"purged":0}` without asking when the trash is empty; `not_found` for an `id` not in it. Emits `records.trash.purged`. ADR 0024 §5. |
+| `records.purge` | inline | `{"collection","id"?,"confirm"?}` | `{"purged":N}`. Permanently deletes one trashed record, or the whole trash. Without a matching `confirm`, `confirmation_required` with `detail: {"records":N}`; re-send with `"confirm": {"records":N}`. `{"purged":0}` without asking when the trash is empty; `not_found` for an `id` not in it. Emits `records.item.purged`. ADR 0024 §5. |
 | `records.import` | inline | `{"collection","rows":[{…}],"dry_run"?,"skip_invalid"?}` | `{"added":[ids],"skipped":[{"row","reason"}],"invalid":[{"row","error"}],"written":bool}`. Each row (an object of field values, plus optional `id` and `status`) is checked like `records.add` and against the other rows; rows numbered from 1. A row whose id or `unique` value exists is skipped. Everything added is written in one transaction, one `records.item.created` each; nothing is written on a `dry_run`, or while any row is invalid unless `skip_invalid`. At most 5000 rows. ADR 0024 §4. |
-| `records.templates` | inline | `{"id"?, "file"?}` | `{"templates":[…],"categories":[{"id","label"}]}`: each built-in template as `records.collections` shows a collection, plus `"category"`, `"notes":["…"]` (the header comment's paragraphs, each as one line) and `"examples":["…"]` (its "How it works" lines as written); by category (in `categories`' order), then id. With `id`, only that template (`not_found` naming the others); with `file: true`, each also has `"file"`: its text exactly as `records.create_collection` copies it. ADRs 0022, 0030 §1. |
-| `records.create_collection` | inline | `{"id","template","label"?}` | The new collection. Copies the template's file (comments kept) with only `id` and `label` changed, checks it, and writes it with `records.collection.created` in one transaction. `conflict` if the id exists; `not_found` naming the templates for an unknown one. |
+| `records.templates` | inline | `{"id"?, "file"?}` | `{"templates":[…],"categories":[{"id","label"}]}`: each built-in template as `records.collections` shows a collection, plus `"category"`, `"notes":["…"]` (the header comment's paragraphs, each as one line) and `"examples":["…"]` (its "How it works" lines as written); by category (in `categories`' order), then id. With `id`, only that template (`not_found` naming the others); with `file: true`, each also has `"file"`: its text exactly as `records.new` copies it. ADRs 0022, 0030 §1. |
+| `records.new` | inline | `{"id","template","label"?}` | The new collection. Copies the template's file (comments kept) with only `id` and `label` changed, checks it, and writes it with `records.collection.created` in one transaction. `conflict` if the id exists; `not_found` naming the templates for an unknown one. |
 | `records.check` | inline | `{"collection"}` | `{"checked":N,"problems":[{"id","problems":["…"]}]}`: records that don't fit the collection (missing required, wrong type, unknown keys, unreadable, `ref`s to records that don't exist). Writes nothing. ADR 0021. |
 | `records.rename_field` | inline | `{"collection","from","to"}` | `{"collection":{…},"updated":N}` (+ `"skipped"`: each record file that couldn't be read or parsed, which keeps the old name). One transaction renames the field in the collection file (comments kept) and in every live and trashed record it can read; emits `records.field.renamed`. |
 | `records.rename_collection` | inline | `{"id","new_id"}` | The collection under its new id; moves its file, records and trash, and rewrites `collection = "…"` in every ref field pointing into it, in one transaction; emits `records.collection.renamed`. `conflict` if `new_id` exists. |
@@ -481,11 +490,11 @@ record only (`conflict` on `records.add`, `records.update`, or `records.complete
 
 | Op | Execution | Params | Returns |
 |---|---|---|---|
-| `fetchers.tick` | queued (`fetchers`) | `{}` | `{"enqueued":[…],"already_running":[…]}`, each a source id. The scheduler heartbeat trigger (every 5 minutes, ADR 0028 §5) — not meant to be called by hand, but not refused either. Enqueues `fetchers.fetch` for every configured, enabled source whose interval has elapsed since its last run, skipping (into `already_running`) a source already mid-fetch. |
-| `fetchers.fetch` | queued (`fetchers`) | `{"source","title_contains"?,"title_excludes"?}` | `{"source","new_items"}`. Fetches one source now — the fixed, compiled-in registry or a configured `kind` (e.g. `"rss"`), ADR 0028 §2a — through to completion: pages (capped at 10), dedupes against that source's own seen-id set, and emits one `fetchers.item.found` per genuinely new item. `title_contains`/`title_excludes` (ADR 0028 §14), when either is given, replace — never merge with — the source's own `[modules.fetchers.sources.<id>]` filter (§13) for this one call. `not_found` for an unknown source id; `module_error` ("already fetching") if a run for the same source is already in flight. Always records the attempt (even on failure) so a broken source waits a full interval before being retried, rather than being hammered every tick. |
-| `fetchers.list` | inline | `{}` | `{"sources":[{"id","method","kind","enabled","interval_s"}…]}`, one entry per source `fetchers.status`/`fetchers.fetch` could ever resolve — the fixed registry plus every configured `kind` instance (ADR 0028 §2a). `kind`/`interval_s` are `null` for a fixed source with no `[modules.fetchers.sources.<id>]` entry of its own. Backs `shimmer fetchers list` (ADR 0028 §11). |
+| `fetchers.tick` | queued (`fetchers`) | `{}` | `{"enqueued":[…],"already_running":[…]}`, each a source id. The scheduler heartbeat trigger (every 5 minutes, ADR 0028 §5) — not meant to be called by hand, but not refused either. Enqueues `fetchers.run` for every configured, enabled source whose interval has elapsed since its last run, skipping (into `already_running`) a source already mid-fetch. |
+| `fetchers.run` | queued (`fetchers`) | `{"source","title_contains"?,"title_excludes"?}` | `{"source","new_items"}`. Fetches one source now — the fixed, compiled-in registry or a configured `kind` (e.g. `"rss"`), ADR 0028 §2a — through to completion: pages (capped at 10), dedupes against that source's own seen-id set, and emits one `fetchers.item.found` per genuinely new item. `title_contains`/`title_excludes` (ADR 0028 §14), when either is given, replace — never merge with — the source's own `[modules.fetchers.sources.<id>]` filter (§13) for this one call. `not_found` for an unknown source id; `module_error` ("already fetching") if a run for the same source is already in flight. Always records the attempt (even on failure) so a broken source waits a full interval before being retried, rather than being hammered every tick. |
+| `fetchers.list` | inline | `{}` | `{"sources":[{"id","method","kind","enabled","interval_s"}…]}`, one entry per source `fetchers.status`/`fetchers.run` could ever resolve — the fixed registry plus every configured `kind` instance (ADR 0028 §2a). `kind`/`interval_s` are `null` for a fixed source with no `[modules.fetchers.sources.<id>]` entry of its own. Backs `shimmer fetchers list` (ADR 0028 §11). |
 | `fetchers.status` | inline | `{}` | `{"sources":[{"id","last_run_at","running"}…]}` over the same source universe as `fetchers.list`. `last_run_at` is `null` for a source never fetched. Backs `shimmer fetchers status` (ADR 0028 §11). |
-| `fetchers.test` | queued (`fetchers`) | `{"source","title_contains"?,"title_excludes"?}` | `{"source","items":[{source_name,source_id,title,url,raw_data}…]}`. Fetches exactly one page and returns its parsed items — never touches `seen.toml`, `last_run.toml`, or the overlap guard, and emits no `fetchers.item.found`; a dry run only. `title_contains`/`title_excludes` work exactly as in `fetchers.fetch` above (ADR 0028 §13/§14). Backs `shimmer fetchers test` (ADR 0028 §11). |
+| `fetchers.test` | queued (`fetchers`) | `{"source","title_contains"?,"title_excludes"?}` | `{"source","items":[{source_name,source_id,title,url,raw_data}…]}`. Fetches exactly one page and returns its parsed items — never touches `seen.toml`, `last_run.toml`, or the overlap guard, and emits no `fetchers.item.found`; a dry run only. `title_contains`/`title_excludes` work exactly as in `fetchers.run` above (ADR 0028 §13/§14). Backs `shimmer fetchers test` (ADR 0028 §11). |
 
 A fetch's failure reaches the client as `queue.task.failed` like any other queued op, and
 additionally as `fetchers.fetch.failed` on the bus (see the topic catalogue below) — the
@@ -517,7 +526,7 @@ day), a local `2026-10-01 14:00`, or RFC 3339; `text` matches the title or body,
 | `notify.flush` | queued (`notify`) | `{}` | `{"delivered":N}`: what quiet hours or a pause held, as one summary. Run hourly by notify's own trigger `notify.flush`. |
 | `notify.list` | inline | filters, `"limit"`? (default 50) | `{"items":[…],"counts":{"total","unread","high","held","failed"},"removed_unread"?}`, newest first; each item also has `short`, the ending to show for it |
 | `notify.count` | inline | filters | `{"count", "total","unread","high","held","failed"}` |
-| `notify.get` | inline | `{"id"}` | the message |
+| `notify.show` | inline | `{"id"}` | the message |
 | `notify.mark_read` / `notify.mark_unread` | inline | `{"ids":[…]}`, `{"all":true}` or filters | `{"marked":N}` |
 | `notify.remove` | inline | `{"ids":[…]}`; or filters / `{"all":true}` with `"confirm":true` | `{"removed":N}`. A bulk remove without `confirm` answers `confirmation_required` with `detail: {"count","unread"}`. |
 | `notify.pause` | inline | `{"until"?: RFC 3339 after now, "all"?}` | `{"paused":{"since","until"?,"all"}}`; holds low and normal (and high with `all`) until `resume` or `until` |
@@ -526,6 +535,7 @@ day), a local `2026-10-01 14:00`, or RFC 3339; `text` matches the title or body,
 | `notify.builtin_alerts` | inline | `{}` lists; `{"name","on"}` switches one (`workspace_dirty`, `scheduled_task_failed`; dashes accepted) | `{"alerts":{"workspace_dirty","scheduled_task_failed"}}` |
 | `notify.cap` | inline | `{}` shows; `{"max":N}` (at least 100) sets and applies it | `{"max","messages","removed_unread"?}` |
 | `notify.status` | inline | `{}` | `{"paused","quiet","quiet_now","builtin_alerts","cap","counts","removed_unread","sinks","settings_problem"}` |
+| `notify.health` | inline | `{}` | `{"checks":[…]}` in ADR 0033's shape: a `warn` for a `settings.toml` it can't use, each inbox file it can't read, messages no sink delivered (fix: `notify.resend {"state":"failed"}`) and a pause left on; otherwise one `ok`. Writes nothing. ADR 0038 §6. |
 
 A message: `{"id","at","priority","title","body"?,"source","state","read","delivery":[{"medium","at","ok","error"?}]}`.
 `source` is `send`, `schedule`, `fallback`, `alert:<name>` or `automation:<rule>`. Messages are files
@@ -557,7 +567,8 @@ tolerate unknown topics.
 | `scheduler.trigger.fired` | Trigger fired and enqueued a task. |
 | `scheduler.trigger.skipped` | Trigger fired while its previous task was still pending (`reason: "overlap"`), or its task could not be enqueued (`reason: "enqueue_failed"`). |
 | `scheduler.trigger.missed` | A `catch_up` policy dropped due occurrences. Payload `{trigger_id, count, catch_up}`. |
-| `scheduler.trigger.added` / `.removed` / `.paused` / `.resumed` | Trigger lifecycle. |
+| `scheduler.trigger.added` / `.edited` / `.removed` / `.disabled` / `.enabled` / `.restored` | Trigger lifecycle. `.restored`: `{trigger_id}` (ADR 0038). |
+| `scheduler.trigger.purged` | `scheduler.purge` deleted removed triggers for good. `{triggers}`, plus `trigger_id` when one was purged. ADR 0038. |
 | `workspaces.session.launched` | All launch steps succeeded. Payload `{workspace, session_id, forced, steps}`. |
 | `workspaces.session.dirty` | A launch step failed, a launch was cancelled part-way, or the daemon restarted mid-launch. Payload `{workspace, reason, failed_step, failed_at, log}` (+ `session_id`, `forced`, `has_cleanup_script` when a launch was running; `recovered: true` when the daemon restarted mid-launch, the one case no failed task reports, ADR 0032 §4). |
 | `workspaces.session.forced` | Force relaunch of a dirty workspace, before any step runs. Payload `{workspace, prior}`, `prior` being the dirty state it overrides. |
@@ -566,16 +577,17 @@ tolerate unknown topics.
 | `workspaces.workspace.reset` | `workspaces.reset` cleared `dirty` without cleanup. Payload `{workspace, prior}`. |
 | `workspaces.session.stopped` | `workspaces.stop` finished. Payload `{workspace, ran_cleanup, log}` (`log` empty when there was no cleanup script). ADR 0026. |
 | `workspaces.workspace.removed` / `.restored` | `{workspace}`. ADR 0026. |
-| `workspaces.workspace.created` | `workspaces.create` made a workspace from a template. Payload `{workspace, template}`. ADR 0025. |
+| `workspaces.workspace.purged` | `workspaces.purge` deleted removed workspaces for good. `{workspaces}`, plus `workspace` when one was purged. ADR 0038. |
+| `workspaces.workspace.created` | `workspaces.new` made a workspace from a template. Payload `{workspace, template}`. ADR 0025. |
 | `workspaces.workspace.copied` | `workspaces.copy` made a workspace from another. Payload `{from, to, changed: [name…]}` (names, never values). ADR 0026 §2b. |
 | `workspaces.workspace.renamed` | `workspaces.rename` gave a workspace a new id. Payload `{from, to}`. ADR 0026 §2a. |
 | `workspaces.workspace.reconfigured` | `workspaces.reconfigure` changed a workspace's answers. Payload `{workspace, changed: [name…]}`: the names, never the values. ADR 0025 §9. |
 | `records.item.created` / `.updated` / `.completed` / `.reopened` / `.renamed` / `.removed` / `.restored` | Record mutations. All carry `{collection, id, title, deadlines, item}` (for `.removed`, `item` is the record as it was): `item` is the full wire item, `title` the record's readable name (the collection's `title` template, or the id), `deadlines` `{field: date}` for every set field with `role = "deadline"` (ADR 0017). `.updated` also carries `changed`: the fields whose value actually changed, sorted (`[]` when nothing did). `.renamed` also carries `new_id` (`id` is the old one; `item` is under the new one) and `references` (how many `ref` values were rewritten to point at the new id). |
-| `records.collection.created` | `records.create_collection` made a collection from a template. Payload `{collection, template}`. Nothing is created on first start (ADR 0023). |
+| `records.collection.created` | `records.new` made a collection from a template. Payload `{collection, template}`. Nothing is created on first start (ADR 0023). |
 | `records.collection.copied` | `records.copy_collection` made a collection from another. Payload `{collection, from, records}`. ADR 0030 §3. |
 | `records.field.renamed` | `{collection, from, to}`. |
 | `records.collection.renamed` / `.removed` / `.restored` / `.purged` | `{collection, new_id}` / `{collection, records}` / `{collection}` / `{collection, records}`. `.purged`: a removed collection was deleted for good (ADR 0021 §5a). |
-| `records.trash.purged` | `records.purge` deleted trashed records for good. `{collection, records}`, plus `id` when one record was purged. ADR 0024 §5. |
+| `records.item.purged` | `records.purge` deleted trashed records for good. `{collection, records}`, plus `id` when one record was purged. ADR 0024 §5. |
 | `fetchers.item.found` | A source returned a new, deduplicated item (one per item, inside the same transaction that updates that source's seen-id set). Payload `{source_name, source_id, title, url, raw_data}`; `raw_data` past 8KiB is replaced with `{"truncated":true,"preview":…}`. |
 | `fetchers.fetch.finished` | A fetch run completed without error. Payload `{source, new_items}`. |
 | `fetchers.fetch.failed` | A fetch run failed. Payload `{source, error, reason}`. `reason` is one of `"network"` (a transport-level failure), `"http_error"` (a non-2xx, non-cooldown response), `"blocked"` (a `Method::Scrape` source's own robots.txt refused the fetch — the page was never requested), `"cancelled"`, or `"parse_empty"` (anything else: a malformed or unexpectedly-shaped response body, no matching "who is hiring" thread, or a corrupt local `seen.toml` — the last of these is a deliberate, already-tested tradeoff: a corrupt dedup file is a loud, reported error forever, never silently reset to an empty set). |
@@ -625,33 +637,33 @@ swap to the real daemon at M5.
 Connect, discover, subscribe, enqueue, watch it run.
 
 ```jsonc
-→ {"v":1,"kind":"hello","client":"tui","client_version":"0.1.0"}
-← {"v":1,"kind":"welcome","daemon_version":"0.1.0","session":"01JD2KQ…"}
+→ {"v":2,"kind":"hello","client":"tui","client_version":"0.1.0"}
+← {"v":2,"kind":"welcome","daemon_version":"0.1.0","session":"01JD2KQ…"}
 
-→ {"v":1,"kind":"request","id":"1","op":"core.manifest","params":{}}
-← {"v":1,"kind":"response","id":"1","ok":true,"data":{"protocol":1,"lanes":[…],"modules":[…]}}
+→ {"v":2,"kind":"request","id":"1","op":"core.manifest","params":{}}
+← {"v":2,"kind":"response","id":"1","ok":true,"data":{"protocol":2,"lanes":[…],"modules":[…]}}
 
-→ {"v":1,"kind":"subscribe","id":"2","topics":["queue.*","fetchers.*"]}
-← {"v":1,"kind":"response","id":"2","ok":true,"data":{"subscribed":2}}
+→ {"v":2,"kind":"subscribe","id":"2","topics":["queue.*","fetchers.*"]}
+← {"v":2,"kind":"response","id":"2","ok":true,"data":{"subscribed":2}}
 
-→ {"v":1,"kind":"request","id":"3","op":"fetchers.fetch","params":{"source":"hn-whoishiring"}}
-← {"v":1,"kind":"response","id":"3","ok":true,
+→ {"v":2,"kind":"request","id":"3","op":"fetchers.run","params":{"source":"hn-whoishiring"}}
+← {"v":2,"kind":"response","id":"3","ok":true,
    "data":{"queued":true,"task_id":"01JD2N…","lane":"fetchers","position":1}}
 
-← {"v":1,"kind":"event","event":{"topic":"queue.task.started",
+← {"v":2,"kind":"event","event":{"topic":"queue.task.started",
    "payload":{"task_id":"01JD2N…","lane":"fetchers"}, …}}
-← {"v":1,"kind":"event","event":{"topic":"queue.task.progress",
+← {"v":2,"kind":"event","event":{"topic":"queue.task.progress",
    "payload":{"task_id":"01JD2N…","fraction":0.4,"note":"page 2 of 5"}, …}}
-← {"v":1,"kind":"event","event":{"topic":"fetchers.item.found",
+← {"v":2,"kind":"event","event":{"topic":"fetchers.item.found",
    "payload":{"source":"hn-whoishiring","id":"c-41883"}, …}}
-← {"v":1,"kind":"event","event":{"topic":"queue.task.finished",
+← {"v":2,"kind":"event","event":{"topic":"queue.task.finished",
    "payload":{"task_id":"01JD2N…","new_items":12}, …}}
 
 // meanwhile, a scheduled workspace launch fails in another lane
-← {"v":1,"kind":"event","event":{"topic":"queue.task.failed",
+← {"v":2,"kind":"event","event":{"topic":"queue.task.failed",
    "payload":{"task_id":"01JD2M…","lane":"workspaces","origin":"scheduler",
      "error":"step 3/7 exited 1","workspace_dirty":true,"fallback":true}, …}}
-← {"v":1,"kind":"event","event":{"topic":"notify.message.sent",
+← {"v":2,"kind":"event","event":{"topic":"notify.message.sent",
    "payload":{"id":"01JD2P…","mediums":["desktop"]}, …}}
 ```
 

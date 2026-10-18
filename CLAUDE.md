@@ -464,8 +464,9 @@ $SHIMMER_HOME/
   data/records/trash/<collection>/<id>.toml  Removed records, until restored or purged (ADR 0020).
   data/records/removed-collections/<id>/  Removed collections, until restored (ADR 0021).
   data/workspaces/<name>/  workspace.toml + steps/ + cleanup script + state.toml (ADRs 0010, 0012).
-  data/workspaces/.removed/<name>/  Removed workspaces, until restored (ADR 0026).
+  data/workspaces/.removed/<name>/  Removed workspaces, until restored or purged (ADRs 0026, 0038).
   data/scheduler/triggers/<id>.json  One per trigger, JSON because params are JSON (ADR 0004).
+  data/scheduler/removed/<id>.json   Removed schedules, until restored or purged (ADR 0038).
   data/notify/             Notify's inbox (inbox/<id>.toml, one file per message), settings.toml,
                            and held/ markers (ADR 0032). A message no sink could deliver stays in
                            the inbox as failed (§11.3).
@@ -886,7 +887,7 @@ label = "Anime Tropes"
 
 [alias]
 "ikuzo"  = "workspaces.activate"
-"nani"   = "workspaces.status"
+"nani"   = "workspaces.show"
 "yatta"  = "records.complete"
 
 [anim]

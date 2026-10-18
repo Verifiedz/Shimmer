@@ -13,7 +13,7 @@
 //! [`html`] and [`robots`] are the scraping and robots.txt helpers `weworkremotely` uses,
 //! since `Method::Scrape` is responsible for checking robots.txt itself (ADR 0028 §7).
 //! [`module`]'s `Fetchers` wires all of this together: `fetchers.tick` finds due sources
-//! and enqueues `fetchers.fetch` for each, which runs the matching `Source`, dedupes its
+//! and enqueues `fetchers.run` for each, which runs the matching `Source`, dedupes its
 //! items, and emits `fetchers.item.found` for each new one.
 //!
 //! Depends on `core` only.

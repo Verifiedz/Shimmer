@@ -183,7 +183,7 @@ impl Core {
                 let p: P = decode(params)?;
                 self.queue.list(p.lane.as_ref())
             }
-            ops::QUEUE_TASK => self.queue.task_view(self.queue.resolve(&task_id(params)?)?),
+            ops::QUEUE_SHOW => self.queue.task_view(self.queue.resolve(&task_id(params)?)?),
             ops::QUEUE_CANCEL => self.queue.cancel(self.queue.resolve(&task_id(params)?)?),
             ops::EVENTS_LIST => {
                 #[derive(Deserialize, Default)]
@@ -202,7 +202,7 @@ impl Core {
                     self.index.lock().unwrap_or_else(|e| e.into_inner()).events_matching_recent(pattern, limit)?;
                 Ok(serde_json::to_value(EventsListData { events }).unwrap_or_default())
             }
-            ops::QUEUE_REORDER => {
+            ops::QUEUE_MOVE => {
                 #[derive(Deserialize)]
                 struct P {
                     lane: LaneId,

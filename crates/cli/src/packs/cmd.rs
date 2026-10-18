@@ -27,20 +27,22 @@ commands:
 
 An alias stands for shimmer plus a whole command. In pack.toml it names one of these:
   core.ping  core.shutdown  core.manifest
-  records.collections  records.add  records.list  records.get  records.update
+  records.collections  records.add  records.list  records.show  records.update
   records.complete  records.reopen  records.rename  records.remove  records.restore
-  records.templates  records.create_collection  records.trash  records.purge
+  records.templates  records.new  records.purge
   records.import  records.export  records.check  records.rename_field
   records.rename_collection  records.remove_collection  records.restore_collection
   records.purge_collection  records.peek  records.copy_collection  records.edit
-  workspaces.list  workspaces.status  workspaces.activate  workspaces.cleanup
+  workspaces.list  workspaces.show  workspaces.activate  workspaces.cleanup
   workspaces.force_relaunch  workspaces.reset  workspaces.stop  workspaces.remove
-  workspaces.restore  workspaces.rename  workspaces.copy  workspaces.reconfigure
-  workspaces.edit  workspaces.templates  workspaces.peek  workspaces.create
-  queue.list  queue.task  queue.cancel  queue.reorder
-  scheduler.list  scheduler.get  scheduler.add  scheduler.pause  scheduler.resume  scheduler.remove
-  fetchers.list  fetchers.status  fetchers.test  fetchers.fetch  fetchers.items
-  notify.list  notify.get  notify.count  notify.mark_read  notify.mark_unread  notify.remove
+  workspaces.restore  workspaces.purge  workspaces.rename  workspaces.copy
+  workspaces.reconfigure  workspaces.edit  workspaces.templates  workspaces.peek
+  workspaces.new
+  queue.list  queue.show  queue.cancel  queue.move
+  scheduler.list  scheduler.show  scheduler.add  scheduler.edit  scheduler.disable
+  scheduler.enable  scheduler.remove  scheduler.restore  scheduler.purge
+  fetchers.list  fetchers.status  fetchers.test  fetchers.run  fetchers.items
+  notify.list  notify.show  notify.count  notify.mark_read  notify.mark_unread  notify.remove
   notify.send  notify.test  notify.resend  notify.pause  notify.resume  notify.quiet
   notify.status  notify.builtin_alerts  notify.cap
 

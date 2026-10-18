@@ -26,7 +26,7 @@ const MIN_FIELD_CHARS: usize = 64;
 
 #[derive(Default)]
 pub struct Fetchers {
-    /// A scheduled tick and a manual `fetchers.fetch` for the same source must never overlap
+    /// A scheduled tick and a manual `fetchers.run` for the same source must never overlap
     /// (ADR 0028 §5).
     running: RunGuard,
     /// Serialises `last_run.toml`'s read-modify-write (`schedule::record_run`) against itself
@@ -147,7 +147,7 @@ struct FetchParams {
     title_excludes: Option<Vec<String>>,
 }
 
-/// An ad-hoc title filter from a `fetchers.fetch`/`fetchers.test` caller (the CLI's
+/// An ad-hoc title filter from a `fetchers.run`/`fetchers.test` caller (the CLI's
 /// `--contains`/`--excludes` flags), scoped to one call -- it replaces, never merges with,
 /// whatever `[modules.fetchers.sources.<id>]` configures for this source (ADR 0028 §14).
 /// `None` means neither flag was given at all, so the configured filter (if any) applies
@@ -166,7 +166,7 @@ impl TitleFilterOverride {
         let excludes = excludes.unwrap_or_default();
         // An empty or whitespace term is a substring of every title, so it would exclude or
         // include everything -- the same reason config load already rejects one (#126's
-        // review, B3). `fetchers.fetch`/`fetchers.test` reach this past the CLI's own
+        // review, B3). `fetchers.run`/`fetchers.test` reach this past the CLI's own
         // comma-split filtering, so an automation or `shimmer call` sending `[""]` must be
         // rejected here too, not just stop marking items seen (#279's re-review).
         for (what, terms) in [("title_contains", &contains), ("title_excludes", &excludes)] {
@@ -580,7 +580,7 @@ mod tests {
     #[test]
     fn an_empty_title_filter_term_from_a_caller_is_rejected_not_just_defanged() {
         // B2 already stops an override from marking a dropped item seen, so this was only ever
-        // wrong, not destructive -- but `fetchers.fetch`/`fetchers.test` reach `from_params`
+        // wrong, not destructive -- but `fetchers.run`/`fetchers.test` reach `from_params`
         // straight from an op's params, past the CLI's own comma-split filtering (#59)
         // and config load's own rejection (B3), so an automation or `shimmer call` sending
         // `{"title_excludes": ["senior", ""]}` must hit the same rejection here (#279's re-review).

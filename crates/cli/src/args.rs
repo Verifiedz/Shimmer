@@ -22,7 +22,7 @@ commands:
   records …             add, list and complete records (shimmer records --help)
   workspaces …          list, inspect and reset workspaces (shimmer workspaces --help)
   queue …               what's running and waiting, and cancel or reorder it (shimmer queue --help)
-  scheduler …           run commands on a schedule, and list, pause or remove them
+  scheduler …           run commands on a schedule, and list, disable or remove them
                         (shimmer scheduler --help)
   fetchers …            sources that reach outward for new items (shimmer fetchers --help)
   notify …              your messages: the inbox, quiet hours, pause (shimmer notify --help)

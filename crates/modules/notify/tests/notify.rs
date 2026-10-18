@@ -243,11 +243,11 @@ async fn the_inbox_lists_newest_first_with_filters_and_counts() {
 
     let c = t.call("notify.count", json!({"priority": "high"})).await;
     assert_eq!((c["count"].as_u64(), c["unread"].as_u64()), (Some(1), Some(3)));
-    let one = t.call("notify.get", json!({"id": alert["id"]})).await;
+    let one = t.call("notify.show", json!({"id": alert["id"]})).await;
     assert_eq!(one["source"], "alert:workspace_dirty");
-    assert!(t.fails("notify.get", json!({"id": "01JD2T0000000000000000000A"})).await.message.contains("no message"));
+    assert!(t.fails("notify.show", json!({"id": "01JD2T0000000000000000000A"})).await.message.contains("no message"));
     assert_eq!(
-        t.fails("notify.get", json!({"id": "../x"})).await.code,
+        t.fails("notify.show", json!({"id": "../x"})).await.code,
         ErrorCode::NotFound,
         "only inbox ids are paths"
     );
@@ -307,10 +307,10 @@ async fn an_id_can_be_the_ending_list_shows_but_never_under_four_characters() {
     let page = t.call("notify.list", json!({"limit": 1})).await;
     let short = page["items"][0]["short"].as_str().unwrap().to_owned();
     assert!(short.len() >= 6 && ids[2].ends_with(&short), "{short}");
-    assert_eq!(t.call("notify.get", json!({"id": short.to_lowercase()})).await["title"], "c");
+    assert_eq!(t.call("notify.show", json!({"id": short.to_lowercase()})).await["title"], "c");
     let list = t.call("notify.list", json!({})).await;
     for item in list["items"].as_array().unwrap() {
-        assert_eq!(t.call("notify.get", json!({"id": item["short"]})).await["id"], item["id"]);
+        assert_eq!(t.call("notify.show", json!({"id": item["short"]})).await["id"], item["id"]);
     }
 
     // `shimmer notify remove 5`: one character never picks a message, even when only one ends so.
@@ -367,7 +367,7 @@ async fn test_and_resend_try_the_sinks_again() {
     let r = t.call("notify.resend", json!({"state": "failed"})).await;
     assert_eq!(r["items"][0]["state"], "delivered");
     assert_eq!(r["items"][0]["delivery"].as_array().unwrap().len(), 2, "both attempts on the one message");
-    assert_eq!(t.call("notify.get", json!({"id": failed})).await["state"], "delivered");
+    assert_eq!(t.call("notify.show", json!({"id": failed})).await["state"], "delivered");
     assert!(t.fails("notify.resend", json!({})).await.message.contains("say which messages"));
 }
 
@@ -458,7 +458,7 @@ async fn the_manifest_declares_its_lane_trigger_and_ops() {
     assert_eq!(notify.lanes()[0].max_concurrent, 2);
     let t = &notify.triggers()[0];
     assert_eq!((t.id.as_str(), t.op.as_str()), ("notify.flush", "notify.flush"));
-    assert_eq!(notify.commands().len(), 16);
+    assert_eq!(notify.commands().len(), 17);
     assert_eq!(notify.manifest().capabilities, ["desktop"], "the real ctx.desktop, nothing more");
     for topic in notify.manifest().topics {
         assert!(topic.starts_with("notify."), "{topic}");
@@ -517,4 +517,31 @@ async fn a_damaged_inbox_file_never_stops_a_send() {
     // Over the cap, so capping reads every older message, the damaged one included (#276's review).
     t.send("one more").await;
     assert!(t.files("inbox").contains(&damaged), "the damaged file is left alone, not removed");
+}
+
+/// ADR 0033 / 0038 §6: what `shimmer doctor` shows for notify. Writes nothing.
+#[tokio::test]
+async fn health_names_what_needs_attention_and_how_to_fix_it() {
+    let t = setup();
+    t.send("fine").await;
+    let ok = t.call("notify.health", json!({})).await;
+    assert_eq!(ok["checks"], json!([{"status": "ok", "message": "1 message(s) in the inbox, none failed"}]));
+
+    // A message no sink could deliver, a damaged inbox file, and a pause left on.
+    let failing = Notify::with_sinks(vec![Fake::failing("desktop", None)]);
+    failing.handle("notify.send", json!({"title": "lost"}), &t.env.ctx).await.unwrap();
+    t.env.ctx.store.write("inbox/zzzz.toml", "title = [").unwrap();
+    t.call("notify.pause", json!({})).await;
+    let before = t.env.backend.events().len();
+    let checks = t.call("notify.health", json!({})).await["checks"].as_array().unwrap().clone();
+    assert_eq!(t.env.backend.events().len(), before, "health writes nothing");
+    assert!(checks.iter().all(|c| c["status"] == "warn"), "{checks:?}");
+    let messages: Vec<&str> = checks.iter().map(|c| c["message"].as_str().unwrap()).collect();
+    assert!(messages.iter().any(|m| m.contains("zzzz")), "the damaged file is named: {messages:?}");
+    let failed = checks.iter().find(|c| c["message"].as_str().unwrap().contains("couldn't be delivered")).unwrap();
+    assert_eq!(
+        failed["fix"],
+        json!({"summary": "send them again", "op": "notify.resend", "params": {"state": "failed"}})
+    );
+    assert!(messages.contains(&"notifications are paused until you resume"), "{messages:?}");
 }

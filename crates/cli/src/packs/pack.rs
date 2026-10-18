@@ -66,7 +66,7 @@ pub const TARGETS: &[Target] = &[
     Target { op: "records.collections", words: &["records", "collections"] },
     Target { op: "records.add", words: &["records", "add"] },
     Target { op: "records.list", words: &["records", "list"] },
-    Target { op: "records.get", words: &["records", "get"] },
+    Target { op: "records.show", words: &["records", "show"] },
     Target { op: "records.update", words: &["records", "update"] },
     Target { op: "records.complete", words: &["records", "complete"] },
     Target { op: "records.reopen", words: &["records", "reopen"] },
@@ -75,8 +75,7 @@ pub const TARGETS: &[Target] = &[
     Target { op: "records.restore", words: &["records", "restore"] },
     // ADR 0029: every command, the rare and destructive ones too (they still ask first).
     Target { op: "records.templates", words: &["records", "templates"] },
-    Target { op: "records.create_collection", words: &["records", "new"] },
-    Target { op: "records.trash", words: &["records", "trash"] },
+    Target { op: "records.new", words: &["records", "new"] },
     Target { op: "records.purge", words: &["records", "purge"] },
     Target { op: "records.import", words: &["records", "import"] },
     Target { op: "records.export", words: &["records", "export"] },
@@ -92,7 +91,7 @@ pub const TARGETS: &[Target] = &[
     Target { op: "records.copy_collection", words: &["records", "copy-collection"] },
     Target { op: "records.edit", words: &["records", "edit"] },
     Target { op: "workspaces.list", words: &["workspaces", "list"] },
-    Target { op: "workspaces.status", words: &["workspaces", "status"] },
+    Target { op: "workspaces.show", words: &["workspaces", "show"] },
     Target { op: "workspaces.activate", words: &["workspaces", "activate"] },
     Target { op: "workspaces.cleanup", words: &["workspaces", "cleanup"] },
     Target { op: "workspaces.force_relaunch", words: &["workspaces", "force-relaunch"] },
@@ -100,35 +99,39 @@ pub const TARGETS: &[Target] = &[
     Target { op: "workspaces.stop", words: &["workspaces", "stop"] },
     Target { op: "workspaces.remove", words: &["workspaces", "remove"] },
     Target { op: "workspaces.restore", words: &["workspaces", "restore"] },
+    Target { op: "workspaces.purge", words: &["workspaces", "purge"] },
     Target { op: "workspaces.rename", words: &["workspaces", "rename"] },
     Target { op: "workspaces.copy", words: &["workspaces", "copy"] },
     Target { op: "workspaces.reconfigure", words: &["workspaces", "reconfigure"] },
     Target { op: "workspaces.edit", words: &["workspaces", "edit"] },
     Target { op: "workspaces.templates", words: &["workspaces", "templates"] },
     Target { op: "workspaces.peek", words: &["workspaces", "peek"] },
-    Target { op: "workspaces.create", words: &["workspaces", "new"] },
+    Target { op: "workspaces.new", words: &["workspaces", "new"] },
     // ADR 0015 §5: the queue and scheduler commands. A user's pack may leave these out; the
     // built-in packs name all of them.
     Target { op: "queue.list", words: &["queue", "list"] },
-    Target { op: "queue.task", words: &["queue", "show"] },
+    Target { op: "queue.show", words: &["queue", "show"] },
     Target { op: "queue.cancel", words: &["queue", "cancel"] },
-    Target { op: "queue.reorder", words: &["queue", "move"] },
+    Target { op: "queue.move", words: &["queue", "move"] },
     Target { op: "scheduler.list", words: &["scheduler", "list"] },
-    Target { op: "scheduler.get", words: &["scheduler", "show"] },
+    Target { op: "scheduler.show", words: &["scheduler", "show"] },
     Target { op: "scheduler.add", words: &["scheduler", "add"] },
-    Target { op: "scheduler.pause", words: &["scheduler", "pause"] },
-    Target { op: "scheduler.resume", words: &["scheduler", "resume"] },
+    Target { op: "scheduler.edit", words: &["scheduler", "edit"] },
+    Target { op: "scheduler.disable", words: &["scheduler", "disable"] },
+    Target { op: "scheduler.enable", words: &["scheduler", "enable"] },
     Target { op: "scheduler.remove", words: &["scheduler", "remove"] },
+    Target { op: "scheduler.restore", words: &["scheduler", "restore"] },
+    Target { op: "scheduler.purge", words: &["scheduler", "purge"] },
     // ADR 0028: fetchers' own ops.
     Target { op: "fetchers.list", words: &["fetchers", "list"] },
     Target { op: "fetchers.status", words: &["fetchers", "status"] },
     Target { op: "fetchers.test", words: &["fetchers", "test"] },
-    Target { op: "fetchers.fetch", words: &["fetchers", "run"] },
+    Target { op: "fetchers.run", words: &["fetchers", "run"] },
     // `items` has no op of its own -- it reads `core.events.list` -- so it's named like
     // `records.peek`/`workspaces.edit` above.
     Target { op: "fetchers.items", words: &["fetchers", "items"] },
     Target { op: "notify.list", words: &["notify", "list"] },
-    Target { op: "notify.get", words: &["notify", "show"] },
+    Target { op: "notify.show", words: &["notify", "show"] },
     Target { op: "notify.count", words: &["notify", "count"] },
     Target { op: "notify.mark_read", words: &["notify", "mark-read"] },
     Target { op: "notify.mark_unread", words: &["notify", "mark-unread"] },
@@ -451,20 +454,10 @@ label = "My Pack"
 
     #[test]
     fn every_target_is_an_op_with_its_command_words() {
-        assert_eq!(TARGETS.len(), 74);
-        // Where the CLI's word differs from the op's verb (ADR 0015 §1).
-        let renamed = [
-            ("queue.task", "show"),
-            ("queue.reorder", "move"),
-            ("records.create_collection", "new"),
-            ("workspaces.create", "new"),
-            ("scheduler.get", "show"),
-            ("fetchers.fetch", "run"),
-            ("notify.get", "show"),
-        ];
+        assert_eq!(TARGETS.len(), 77);
+        // Every command's word is its op's verb (ADR 0038 §6): no exceptions are left.
         for t in TARGETS {
             let (module, verb) = t.op.split_once('.').unwrap();
-            let verb = renamed.iter().find(|(op, _)| *op == t.op).map_or(verb, |(_, word)| word);
             let words: Vec<String> = t.words.iter().map(|w| w.replace('-', "_")).collect();
             match module {
                 "core" => assert_eq!(words, [verb]),
@@ -472,8 +465,8 @@ label = "My Pack"
             }
         }
         assert_eq!(target("workspaces.force_relaunch").unwrap().words, ["workspaces", "force-relaunch"]);
-        assert_eq!(target("queue.reorder").unwrap().words, ["queue", "move"]);
-        for plumbing in ["core.daemon", "core.subscribe", "queue.promote", "scheduler.show", "packs.use"] {
+        assert_eq!(target("queue.move").unwrap().words, ["queue", "move"]);
+        for plumbing in ["core.daemon", "core.subscribe", "queue.promote", "scheduler.trigger", "packs.use"] {
             assert!(target(plumbing).is_none(), "{plumbing} must not be aliasable");
         }
     }
@@ -626,7 +619,7 @@ colour = "red"
 
     #[test]
     fn animation_files_must_exist_be_small_text_and_stay_inside() {
-        let anim = format!("{GOOD}\n[anim]\n\"core.ping\" = \"anim/a.txt\"\n\"core.shutdown\" = \"anim/b.txt\"\n\"records.add\" = \"anim/c.txt\"\n\"records.get\" = \"anim\"\n");
+        let anim = format!("{GOOD}\n[anim]\n\"core.ping\" = \"anim/a.txt\"\n\"core.shutdown\" = \"anim/b.txt\"\n\"records.add\" = \"anim/c.txt\"\n\"records.show\" = \"anim\"\n");
         let (_tmp, dir) = folder("my-pack", &anim);
         std::fs::write(dir.join("anim/b.txt"), vec![b'x'; MAX_ANIM as usize + 1]).unwrap();
         std::fs::write(dir.join("anim/c.txt"), [0xff, 0xfe]).unwrap();
@@ -634,7 +627,7 @@ colour = "red"
         has(&p, "[anim] core.ping: 'anim/a.txt' doesn't exist");
         has(&p, "[anim] core.shutdown: 'anim/b.txt' is larger than 256 KiB");
         has(&p, "[anim] records.add: 'anim/c.txt' is not UTF-8 text");
-        has(&p, "[anim] records.get: 'anim' is not a file");
+        has(&p, "[anim] records.show: 'anim' is not a file");
     }
 
     #[cfg(unix)]

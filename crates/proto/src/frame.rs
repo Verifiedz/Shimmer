@@ -171,10 +171,10 @@ mod tests {
 
     #[test]
     fn protocol_md_examples_parse() {
-        let hello = r#"{"v": 1, "kind": "hello", "client": "tui", "client_version": "0.3.1"}"#;
-        assert!(matches!(decode_client(hello).unwrap(), ClientFrame::Hello { v: 1, .. }));
+        let hello = r#"{"v": 2, "kind": "hello", "client": "tui", "client_version": "0.3.1"}"#;
+        assert!(matches!(decode_client(hello).unwrap(), ClientFrame::Hello { v: 2, .. }));
 
-        let req = r#"{"v":1,"kind":"request","id":"p2","op":"fetchers.fetch",
+        let req = r#"{"v":2,"kind":"request","id":"p2","op":"fetchers.run",
             "params":{"source":"linkedin"},
             "queue":{"priority":"override","confirm":true,"queue_version":41}}"#
             .replace('\n', "");
@@ -184,28 +184,28 @@ mod tests {
             QueueControl { priority: QueuePriority::Override, confirm: true, queue_version: Some(41) }
         );
 
-        let sub = r#"{"v":1,"kind":"subscribe","id":"s1","topics":["records.*","queue.task.failed"]}"#;
+        let sub = r#"{"v":2,"kind":"subscribe","id":"s1","topics":["records.*","queue.task.failed"]}"#;
         assert!(matches!(decode_client(sub).unwrap(), ClientFrame::Subscribe { .. }));
     }
 
     #[test]
     fn request_defaults_and_scheduled_is_not_settable() {
-        let req = r#"{"v":1,"kind":"request","id":"1","op":"core.ping"}"#;
+        let req = r#"{"v":2,"kind":"request","id":"1","op":"core.ping"}"#;
         let ClientFrame::Request { params, queue, .. } = decode_client(req).unwrap() else { panic!() };
         assert_eq!((params, queue), (Value::Null, None));
 
-        let sched = r#"{"v":1,"kind":"request","id":"1","op":"x.y","queue":{"priority":"scheduled"}}"#;
+        let sched = r#"{"v":2,"kind":"request","id":"1","op":"x.y","queue":{"priority":"scheduled"}}"#;
         assert!(decode_client(sched).is_err());
     }
 
     #[test]
     fn responses_match_documented_shape() {
         let ok = serde_json::to_value(ServerFrame::ok("r1", json!({"pong": true}))).unwrap();
-        assert_eq!(ok, json!({"v":1,"kind":"response","id":"r1","ok":true,"data":{"pong":true}}));
+        assert_eq!(ok, json!({"v":2,"kind":"response","id":"r1","ok":true,"data":{"pong":true}}));
         let err = serde_json::to_value(ServerFrame::err("r1", Error::not_found("no collection 'x'"))).unwrap();
         assert_eq!(
             err,
-            json!({"v":1,"kind":"response","id":"r1","ok":false,
+            json!({"v":2,"kind":"response","id":"r1","ok":false,
                 "error":{"code":"not_found","message":"no collection 'x'","detail":null}})
         );
     }

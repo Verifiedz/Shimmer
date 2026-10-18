@@ -131,6 +131,47 @@ fn inbox_ids(ctx: &Ctx) -> Result<Vec<String>> {
 }
 
 /// Every message, oldest first. One that can't be read is skipped, never fatal to the rest.
+/// What `shimmer doctor` shows for notify (ADR 0033, ADR 0038 §6): a settings file it can't use,
+/// inbox files it can't read, messages no sink could deliver, and a pause left on. Writes nothing.
+fn health(ctx: &Ctx) -> Result<Value> {
+    let mut checks = Vec::new();
+    let (s, problem) = settings(ctx)?;
+    if let Some(problem) = problem {
+        checks.push(json!({"status": "warn", "subject": settings::FILE,
+            "message": format!("{} can't be used, so the defaults apply: {problem}", settings::FILE),
+            "fix": {"summary": format!("fix data/notify/{} by hand", settings::FILE)}}));
+    }
+    let (mut messages, mut damaged) = (Vec::new(), Vec::new());
+    for id in inbox_ids(ctx)? {
+        match read_message(ctx, &id) {
+            Ok(Some(m)) => messages.push(m),
+            Ok(None) => {}
+            Err(e) => damaged.push(e.message),
+        }
+    }
+    for problem in damaged {
+        checks.push(json!({"status": "warn", "message": problem,
+            "fix": {"summary": "fix or delete the file in data/notify/inbox/"}}));
+    }
+    let failed = messages.iter().filter(|m| m.state == State::Failed).count();
+    if failed > 0 {
+        checks.push(json!({"status": "warn",
+            "message": format!("{failed} message(s) couldn't be delivered by any way of notifying you; they're in the inbox"),
+            "fix": {"summary": "send them again", "op": "notify.resend", "params": {"state": "failed"}}}));
+    }
+    if let Some(p) = pause_now(&s, ctx) {
+        let until = p.until.map_or("until you resume".to_owned(), |t| format!("until {t}"));
+        checks.push(json!({"status": "warn", "message": format!("notifications are paused {until}"),
+            "fix": {"summary": "resume them", "op": "notify.resume", "params": {}}}));
+    }
+    if checks.is_empty() {
+        checks.push(
+            json!({"status": "ok", "message": format!("{} message(s) in the inbox, none failed", messages.len())}),
+        );
+    }
+    Ok(json!({"checks": checks}))
+}
+
 fn all_messages(ctx: &Ctx) -> Result<Vec<Message>> {
     Ok(inbox_ids(ctx)?.iter().filter_map(|id| read_message(ctx, id).ok().flatten()).collect())
 }
@@ -275,7 +316,7 @@ impl Module for Notify {
             ("notify.flush", "Send what quiet hours or a pause held back, as one summary", queued()),
             ("notify.list", "The inbox, newest first", Execution::Inline),
             ("notify.count", "How many messages match", Execution::Inline),
-            ("notify.get", "One message in full", Execution::Inline),
+            ("notify.show", "One message in full", Execution::Inline),
             ("notify.mark_read", "Mark messages read", Execution::Inline),
             ("notify.mark_unread", "Mark messages unread", Execution::Inline),
             ("notify.remove", "Delete messages", Execution::Inline),
@@ -289,6 +330,7 @@ impl Module for Notify {
             ("notify.builtin_alerts", "Show or switch the built-in alerts", Execution::Inline),
             ("notify.cap", "Show or set how many messages the inbox keeps", Execution::Inline),
             ("notify.status", "Notify at a glance: settings, pause, counts", Execution::Inline),
+            ("notify.health", "Check notify for problems; changes nothing (ADR 0033)", Execution::Inline),
         ]
         .into_iter()
         .map(|(op, summary, execution)| CommandSpec {
@@ -308,7 +350,7 @@ impl Module for Notify {
             "notify.flush" => self.flush(ctx).await,
             "notify.list" => list(&params, ctx),
             "notify.count" => count(&params, ctx),
-            "notify.get" => get(&params, ctx),
+            "notify.show" => show(&params, ctx),
             "notify.mark_read" => self.mark(&params, ctx, true),
             "notify.mark_unread" => self.mark(&params, ctx, false),
             "notify.remove" => self.remove(&params, ctx),
@@ -318,6 +360,7 @@ impl Module for Notify {
             "notify.builtin_alerts" => self.builtin_alerts(&params, ctx),
             "notify.cap" => self.cap(&params, ctx),
             "notify.status" => self.status(ctx),
+            "notify.health" => health(ctx),
             other => Err(Error::unknown_op(format!("notify has no op '{other}'"))),
         }
     }
@@ -614,8 +657,8 @@ fn count(params: &Value, ctx: &Ctx) -> Result<Value> {
     Ok(out)
 }
 
-/// `notify.get`: `{"id"}`, the whole id or a unique ending of one.
-fn get(params: &Value, ctx: &Ctx) -> Result<Value> {
+/// `notify.show`: `{"id"}`, the whole id or a unique ending of one.
+fn show(params: &Value, ctx: &Ctx) -> Result<Value> {
     let written = params
         .get("id")
         .and_then(Value::as_str)

@@ -21,7 +21,7 @@ use shimmer_core::{CatchUp, Ctx, Error, Result, Schedule, TriggerSpec};
 /// How often the heartbeat fires.
 pub const TICK_INTERVAL: Duration = Duration::from_secs(300);
 pub const TICK_OP: &str = "fetchers.tick";
-pub const FETCH_OP: &str = "fetchers.fetch";
+pub const FETCH_OP: &str = "fetchers.run";
 
 /// Floors below which a source's own cadence may not be set, per `Method` (ADR 0028 §5/§7).
 /// An API source hits a known, source-maintained endpoint built for this kind of polling; a

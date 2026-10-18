@@ -310,8 +310,8 @@ impl Client {
 
     pub async fn connect(sock: &Path) -> Self {
         let mut c = Self::raw(sock).await;
-        c.send_json(json!({"v":1,"kind":"hello","client":"test","client_version":"0"})).await;
-        assert!(matches!(c.recv().await, Some(ServerFrame::Welcome { v: 1, .. })));
+        c.send_json(json!({"v":2,"kind":"hello","client":"test","client_version":"0"})).await;
+        assert!(matches!(c.recv().await, Some(ServerFrame::Welcome { v: 2, .. })));
         c
     }
 
@@ -338,7 +338,7 @@ impl Client {
     ) -> std::result::Result<Value, Error> {
         self.n += 1;
         let id = format!("r{}", self.n);
-        let mut req = json!({"v":1,"kind":"request","id":id,"op":op,"params":params});
+        let mut req = json!({"v":2,"kind":"request","id":id,"op":op,"params":params});
         if let Some(q) = queue {
             req["queue"] = q;
         }
@@ -361,7 +361,7 @@ impl Client {
     pub async fn subscribe(&mut self, topics: &[&str]) {
         self.n += 1;
         let id = format!("s{}", self.n);
-        self.send_json(json!({"v":1,"kind":"subscribe","id":id,"topics":topics})).await;
+        self.send_json(json!({"v":2,"kind":"subscribe","id":id,"topics":topics})).await;
         self.response(&id).await.unwrap();
     }
 

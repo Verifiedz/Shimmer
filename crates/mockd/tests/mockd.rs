@@ -62,8 +62,8 @@ impl Client {
 
     async fn connect(sock: &Path) -> Self {
         let mut c = Self::raw(sock).await;
-        c.send(json!({"v":1,"kind":"hello","client":"test","client_version":"0"})).await;
-        assert!(matches!(c.recv().await, Some(ServerFrame::Welcome { v: 1, .. })));
+        c.send(json!({"v":2,"kind":"hello","client":"test","client_version":"0"})).await;
+        assert!(matches!(c.recv().await, Some(ServerFrame::Welcome { v: 2, .. })));
         c
     }
 
@@ -84,7 +84,7 @@ impl Client {
     async fn call_with(&mut self, op: &str, params: Value, queue: Option<Value>) -> Result<Value, Error> {
         self.n += 1;
         let id = format!("r{}", self.n);
-        let mut req = json!({"v":1,"kind":"request","id":id,"op":op,"params":params});
+        let mut req = json!({"v":2,"kind":"request","id":id,"op":op,"params":params});
         if let Some(q) = queue {
             req["queue"] = q;
         }
@@ -107,7 +107,7 @@ impl Client {
     async fn subscribe(&mut self, topics: &[&str]) {
         self.n += 1;
         let id = format!("s{}", self.n);
-        self.send(json!({"v":1,"kind":"subscribe","id":id,"topics":topics})).await;
+        self.send(json!({"v":2,"kind":"subscribe","id":id,"topics":topics})).await;
         self.response(&id).await.unwrap();
     }
 
@@ -144,7 +144,7 @@ async fn handshake_ping_and_a_manifest_that_parses_as_the_wire_type() {
 
     let manifest = c.call("core.manifest", json!({})).await.unwrap();
     let parsed: ManifestData = serde_json::from_value(manifest).expect("manifest matches shimmer_proto::ManifestData");
-    assert_eq!(parsed.protocol, 1);
+    assert_eq!(parsed.protocol, shimmer_proto::PROTOCOL_VERSION);
     let ids: Vec<_> = parsed.modules.iter().map(|m| m.id.as_str()).collect();
     assert_eq!(ids, ["records", "fetchers", "workspaces", "notify"]);
     let lanes: Vec<_> = parsed.lanes.iter().map(|l| (l.id.as_str(), l.max_concurrent)).collect();
@@ -162,12 +162,12 @@ async fn it_behaves_like_the_daemon_at_the_edges() {
     c.send(json!({"v":9,"kind":"hello","client":"t","client_version":"0"})).await;
     let Some(ServerFrame::Error { error, .. }) = c.recv().await else { panic!("expected an error frame") };
     assert_eq!(error.code, ErrorCode::UnsupportedVersion);
-    assert_eq!(error.detail.unwrap()["supported"], json!([1]));
+    assert_eq!(error.detail.unwrap()["supported"], json!([shimmer_proto::PROTOCOL_VERSION]));
     assert!(c.recv().await.is_none());
 
     // Anything before hello is refused.
     let mut c = Client::raw(&env.sock()).await;
-    c.send(json!({"v":1,"kind":"request","id":"1","op":"core.ping","params":{}})).await;
+    c.send(json!({"v":2,"kind":"request","id":"1","op":"core.ping","params":{}})).await;
     assert!(matches!(c.recv().await, Some(ServerFrame::Error { .. })));
 
     // A malformed line is reported and the connection survives.
@@ -184,7 +184,7 @@ async fn it_behaves_like_the_daemon_at_the_edges() {
     assert!(gap.message.contains("none match"), "{}", gap.message);
 
     // Bad subscribe patterns are refused as they are by the daemon.
-    c.send(json!({"v":1,"kind":"subscribe","id":"bad","topics":["rec*"]})).await;
+    c.send(json!({"v":2,"kind":"subscribe","id":"bad","topics":["rec*"]})).await;
     assert_eq!(c.response("bad").await.unwrap_err().code, ErrorCode::InvalidParams);
     stop(m).await;
 }
@@ -195,7 +195,7 @@ async fn requests_are_pipelined_and_matched_by_id() {
     let m = env.start().await;
     let mut c = Client::connect(&env.sock()).await;
     for i in 0..5 {
-        c.send(json!({"v":1,"kind":"request","id":format!("p{i}"),"op":"core.ping","params":{}})).await;
+        c.send(json!({"v":2,"kind":"request","id":format!("p{i}"),"op":"core.ping","params":{}})).await;
     }
     for i in 0..5 {
         assert_eq!(c.response(&format!("p{i}")).await.unwrap()["pong"], true);
@@ -251,7 +251,7 @@ async fn confirmation_round_trip() {
     c.subscribe(&["queue.*"]).await;
     let params = json!({"source": "linkedin"});
 
-    let refused = c.call_with("fetchers.fetch", params.clone(), Some(json!({"priority": "override"}))).await;
+    let refused = c.call_with("fetchers.run", params.clone(), Some(json!({"priority": "override"}))).await;
     let refused = refused.unwrap_err();
     assert_eq!(refused.code, ErrorCode::ConfirmationRequired);
     let detail = refused.detail.unwrap();
@@ -262,11 +262,11 @@ async fn confirmation_round_trip() {
 
     // Confirming a version the user was not shown is refused again, as the daemon would.
     let stale = json!({"priority": "override", "confirm": true, "queue_version": 40});
-    let again = c.call_with("fetchers.fetch", params.clone(), Some(stale)).await.unwrap_err();
+    let again = c.call_with("fetchers.run", params.clone(), Some(stale)).await.unwrap_err();
     assert_eq!(again.code, ErrorCode::ConfirmationRequired);
 
     let confirm = json!({"priority": "override", "confirm": true, "queue_version": 41});
-    let granted = c.call_with("fetchers.fetch", params.clone(), Some(confirm)).await.unwrap();
+    let granted = c.call_with("fetchers.run", params.clone(), Some(confirm)).await.unwrap();
     let handle: QueuedHandle = serde_json::from_value(granted).expect("a queued handle");
     assert_eq!((handle.lane.as_str(), handle.position), ("fetchers", 0));
     let promoted = c.events(1).await.remove(0);
@@ -275,7 +275,7 @@ async fn confirmation_round_trip() {
     assert_eq!(promoted.payload["displaced"].as_array().unwrap().len(), 3);
 
     // An ordinary request just joins the lane.
-    let plain = c.call("fetchers.fetch", params).await.unwrap();
+    let plain = c.call("fetchers.run", params).await.unwrap();
     assert_eq!(plain["position"], 4);
     stop(m).await;
 }
@@ -311,7 +311,7 @@ async fn a_long_queued_task_reports_progress_in_order() {
     let mut c = Client::connect(&env.sock()).await;
     c.subscribe(&["queue.*", "fetchers.*"]).await;
 
-    let handle = c.call("fetchers.fetch", json!({"source": "hn-whoishiring"})).await.unwrap();
+    let handle = c.call("fetchers.run", json!({"source": "hn-whoishiring"})).await.unwrap();
     let task = handle["task_id"].as_str().unwrap().to_owned();
     assert_eq!(handle["queued"], true, "the result arrives later, as events");
 

@@ -18,12 +18,21 @@ commands:
   add WHEN [--catch-up WHAT] [--lane LANE] COMMAND…
                                         run COMMAND on a schedule, e.g. shimmer scheduler add
                                         weekdays 09:00 workspaces activate site (scheduler add --help)
-  list [--all]                          the schedules you added: when each runs next, last ran,
-                                        and its state; --all also modules' own (notify's, …)
+  list [--all] [--removed]              the schedules you added: when each runs next, last ran,
+                                        and its state; --all also modules' own (notify's, …);
+                                        --removed the ones you removed, to restore or purge
   show TRIGGER                          one trigger in full
-  pause TRIGGER                         stop it firing until resumed
-  resume TRIGGER                        fire again, from now on (time spent paused isn't 'missed')
-  remove TRIGGER                        delete one you added (a module's own can only be paused)
+  disable TRIGGER                       stop it firing until enabled
+  enable TRIGGER                        fire again, from now on (time spent off isn't 'missed')
+  edit TRIGGER WHEN [--catch-up WHAT] [--lane LANE] COMMAND…
+                                        change one you added, keeping its id and whether it's on
+                                        (same words as add)
+  remove TRIGGER                        remove one you added; restore brings it back (a module's
+                                        own can only be disabled)
+  restore REMOVED                       bring a removed schedule back; it runs again from now on
+                                        (time spent removed isn't 'missed')
+  purge [REMOVED] [--yes]               delete a removed schedule for good, or every removed one
+                                        (asks first)
 
 A trigger enqueues a task when it fires; 'shimmer queue' shows it running. TRIGGER is the id as
 'scheduler list' shows it: its ending is enough (at least 4 characters). Add --json to any command for raw output.";
@@ -31,9 +40,10 @@ A trigger enqueues a task when it fires; 'shimmer queue' shows it running. TRIGG
 #[derive(Clone, Debug, PartialEq)]
 pub enum SchedulerCmd {
     Help,
-    /// `all`: modules' own triggers too (#244).
+    /// `all`: modules' own triggers too (#244). `removed`: the removed ones instead (ADR 0038).
     List {
         all: bool,
+        removed: bool,
     },
     Show {
         id: String,
@@ -42,14 +52,27 @@ pub enum SchedulerCmd {
     Add(crate::schedule::Planned),
     /// `scheduler add` alone, or `scheduler add --help`.
     AddHelp,
-    Pause {
+    /// `scheduler edit TRIGGER WHEN … COMMAND…`: a new schedule for the same id (ADR 0038 §6).
+    Edit {
+        id: String,
+        plan: crate::schedule::Planned,
+    },
+    Disable {
         id: String,
     },
-    Resume {
+    Enable {
         id: String,
     },
     Remove {
         id: String,
+    },
+    Restore {
+        id: String,
+    },
+    /// `id`: one removed trigger; `None` is every one (ADR 0038).
+    Purge {
+        id: Option<String>,
+        yes: bool,
     },
 }
 
@@ -67,20 +90,42 @@ pub fn parse(words: Vec<String>) -> std::result::Result<SchedulerCmd, String> {
             crate::schedule::ScheduleCmd::Help => Ok(SchedulerCmd::AddHelp),
         };
     }
-    let switches: &[&str] = if sub == "list" { &["--all"] } else { &[] };
+    // `edit TRIGGER` then the same words as `add` (ADR 0038 §6).
+    if sub == "edit" {
+        let usage = "usage: shimmer scheduler edit TRIGGER WHEN [--catch-up WHAT] [--lane LANE] COMMAND…";
+        let id = words.next().filter(|w| !w.starts_with('-')).ok_or(usage)?;
+        return match crate::schedule::parse(words.collect())? {
+            crate::schedule::ScheduleCmd::Add(plan) => Ok(SchedulerCmd::Edit { id, plan }),
+            crate::schedule::ScheduleCmd::Help => Err(usage.into()),
+        };
+    }
+    let switches: &[&str] = match sub.as_str() {
+        "list" => &["--all", "--removed"],
+        "purge" => &["--yes"],
+        _ => &[],
+    };
     let flags = Flags::split(words.collect(), &[], switches).map_err(|e| format!("scheduler {sub}: {e}"))?;
     let id = || match flags.positional.as_slice() {
         [id] => Ok(id.clone()),
+        _ if sub == "restore" => Err("usage: shimmer scheduler restore REMOVED".to_owned()),
         _ => Err(format!("usage: shimmer scheduler {sub} TRIGGER")),
     };
     match sub.as_str() {
         "help" => Ok(SchedulerCmd::Help),
-        "list" if flags.positional.is_empty() => Ok(SchedulerCmd::List { all: flags.has("--all") }),
+        "list" if flags.positional.is_empty() => {
+            Ok(SchedulerCmd::List { all: flags.has("--all"), removed: flags.has("--removed") })
+        }
         "list" => Err("'scheduler list' takes no arguments".into()),
         "show" => Ok(SchedulerCmd::Show { id: id()? }),
-        "pause" => Ok(SchedulerCmd::Pause { id: id()? }),
-        "resume" => Ok(SchedulerCmd::Resume { id: id()? }),
+        "disable" => Ok(SchedulerCmd::Disable { id: id()? }),
+        "enable" => Ok(SchedulerCmd::Enable { id: id()? }),
         "remove" => Ok(SchedulerCmd::Remove { id: id()? }),
+        "restore" => Ok(SchedulerCmd::Restore { id: id()? }),
+        "purge" => match flags.positional.as_slice() {
+            [] => Ok(SchedulerCmd::Purge { id: None, yes: flags.has("--yes") }),
+            [id] => Ok(SchedulerCmd::Purge { id: Some(id.clone()), yes: flags.has("--yes") }),
+            _ => Err("usage: shimmer scheduler purge [REMOVED] [--yes]".into()),
+        },
         other => Err(format!("unknown scheduler command '{other}'; see 'shimmer scheduler --help'")),
     }
 }
@@ -90,7 +135,19 @@ pub async fn run(client: &mut Client, cmd: &SchedulerCmd, json: bool, prompt: &m
     let one = |id: &str, op: &'static str| (op, json!({ "trigger_id": id }));
     let (op, params) = match cmd {
         SchedulerCmd::Help => return Ok(USAGE.into()),
-        SchedulerCmd::List { all } => {
+        SchedulerCmd::List { removed: true, .. } => {
+            let data = client.call("scheduler.list", json!({"removed": true})).await?;
+            if json {
+                return Ok(render::json(&data));
+            }
+            let triggers = data["triggers"].as_array().cloned().unwrap_or_default();
+            if triggers.is_empty() {
+                return Ok("no removed schedules".into());
+            }
+            let schemas = schemas_for(client, &triggers).await;
+            return Ok(list(&data, now, &schemas, true));
+        }
+        SchedulerCmd::List { all, .. } => {
             let data = client.call("scheduler.list", json!({})).await?;
             // --json stays complete, so scripts see every trigger either way.
             if json {
@@ -101,7 +158,7 @@ pub async fn run(client: &mut Client, cmd: &SchedulerCmd, json: bool, prompt: &m
             return Ok(list(&data, now, &schemas, *all));
         }
         SchedulerCmd::Show { id } => {
-            let data = client.call("scheduler.get", json!({"trigger_id": id})).await?;
+            let data = client.call("scheduler.show", json!({"trigger_id": id})).await?;
             if json {
                 return Ok(render::json(&data));
             }
@@ -113,13 +170,24 @@ pub async fn run(client: &mut Client, cmd: &SchedulerCmd, json: bool, prompt: &m
             let cmd = crate::schedule::ScheduleCmd::Add(plan.clone());
             return crate::schedule::run(client, &cmd, json, prompt).await;
         }
-        SchedulerCmd::Pause { id } => one(id, "scheduler.pause"),
-        SchedulerCmd::Resume { id } => one(id, "scheduler.resume"),
+        SchedulerCmd::Edit { id, plan } => return crate::schedule::edit(client, id, plan, json, prompt).await,
+        SchedulerCmd::Disable { id } => one(id, "scheduler.disable"),
+        SchedulerCmd::Enable { id } => one(id, "scheduler.enable"),
         SchedulerCmd::Remove { id } => one(id, "scheduler.remove"),
+        SchedulerCmd::Restore { id } => {
+            let data = client.call("scheduler.restore", json!({"trigger_id": id})).await?;
+            if json {
+                return Ok(render::json(&data));
+            }
+            let shown = render::short_id(data["id"].as_str().unwrap_or("?"));
+            let what = format!("{shown} ({}, {})", render::cell(&data["op"]), schedule(&data["schedule"]));
+            return Ok(format!("✓ restored {what}: it runs again from now on"));
+        }
+        SchedulerCmd::Purge { id, yes } => return purge(client, id.as_deref(), *yes, json, prompt).await,
     };
     // Find the trigger first, then act on its full id, and say which one it was and what it runs:
     // never just echo what was typed (#183's review). A removed trigger can't be looked up after.
-    let trigger = client.call("scheduler.get", params).await?;
+    let trigger = client.call("scheduler.show", params).await?;
     let full = trigger["id"].as_str().unwrap_or("?").to_string();
     let data = client.call(op, json!({ "trigger_id": full })).await?;
     if json {
@@ -128,9 +196,45 @@ pub async fn run(client: &mut Client, cmd: &SchedulerCmd, json: bool, prompt: &m
     let shown = render::short_id(&full);
     let what = format!("{shown} ({}, {})", render::cell(&trigger["op"]), schedule(&trigger["schedule"]));
     Ok(match op {
-        "scheduler.pause" => format!("✓ paused {what}: it won't fire until 'shimmer scheduler resume {shown}'"),
-        "scheduler.resume" => format!("✓ resumed {what}: it fires again from now on"),
-        _ => format!("✓ removed {what}"),
+        "scheduler.disable" => format!("✓ {what} is off: it won't fire until 'shimmer scheduler enable {shown}'"),
+        "scheduler.enable" => format!("✓ {what} is on: it fires again from now on"),
+        _ => format!("✓ removed {what} (undo: shimmer scheduler restore {shown})"),
+    })
+}
+
+/// `scheduler purge [TRIGGER]` (ADR 0038): the daemon says how many go; ask, then send that count
+/// back.
+async fn purge(
+    client: &mut Client,
+    id: Option<&str>,
+    yes: bool,
+    json: bool,
+    prompt: &mut dyn Prompt,
+) -> Result<String> {
+    let mut params = json!({});
+    if let Some(id) = id {
+        params["trigger_id"] = json!(id);
+    }
+    let data = match client.call("scheduler.purge", params.clone()).await {
+        Err(e) if e.code == shimmer_core::ErrorCode::ConfirmationRequired => {
+            let what = match id {
+                Some(id) => format!("the removed schedule '{id}'"),
+                None => "every removed schedule".to_owned(),
+            };
+            if !crate::records::confirm_purge(prompt, yes, &what, &e.message)? {
+                return Ok("nothing purged".into());
+            }
+            params["confirm"] = e.detail.unwrap_or_default();
+            client.call("scheduler.purge", params).await?
+        }
+        other => other?,
+    };
+    if json {
+        return Ok(render::json(&data));
+    }
+    Ok(match data["purged"].as_u64().unwrap_or(0) {
+        0 => "no removed schedules to purge".to_owned(),
+        n => format!("✓ {n} removed schedule(s) deleted for good"),
     })
 }
 
@@ -460,14 +564,14 @@ fn catch_up(v: &Value) -> String {
 fn state(t: &Value) -> String {
     if t["done"].as_bool() == Some(true) {
         "done".into()
-    } else if t["paused"].as_bool() == Some(true) {
-        "paused".into()
+    } else if t["enabled"].as_bool() == Some(false) {
+        "off".into()
     } else {
-        "active".into()
+        "on".into()
     }
 }
 
-/// `you`, or `module <id>` for one a module declared (it can be paused, not removed).
+/// `you`, or `module <id>` for one a module declared (it can be disabled, not removed).
 fn source(v: &Value) -> String {
     match v["type"].as_str() {
         Some("user") => "you".into(),
@@ -498,6 +602,14 @@ mod tests {
         assert_eq!(schedule(&plan.when.schedule), "weekdays 09:00 (local)");
         assert_eq!(plan.command, ["workspaces", "activate", "site"]);
         assert_eq!(p(&["add"]), Ok(SchedulerCmd::AddHelp));
+        let Ok(SchedulerCmd::Edit { id, plan }) =
+            p(&["edit", "usr-1", "daily", "09:00", "--catch-up", "skip", "workspaces", "stop", "site"])
+        else {
+            panic!("edit parses as add's words after the trigger")
+        };
+        assert_eq!((id.as_str(), plan.command.join(" ")), ("usr-1", "workspaces stop site".into()));
+        assert!(p(&["edit"]).unwrap_err().contains("scheduler edit TRIGGER WHEN"));
+        assert!(p(&["edit", "--catch-up"]).unwrap_err().contains("scheduler edit TRIGGER WHEN"));
         assert_eq!(p(&["add", "--help"]), Ok(SchedulerCmd::AddHelp));
         // The raw form went: it says what to type instead.
         let raw = p(&["add", "records.list", "{}", "--every", "1d", "--catch-up", "skip"]).unwrap_err();
@@ -507,13 +619,19 @@ mod tests {
     #[test]
     fn simple_commands_parse() {
         assert_eq!(p(&[]), Ok(SchedulerCmd::Help));
-        assert_eq!(p(&["list"]), Ok(SchedulerCmd::List { all: false }));
-        assert_eq!(p(&["list", "--all"]), Ok(SchedulerCmd::List { all: true }));
+        assert_eq!(p(&["list"]), Ok(SchedulerCmd::List { all: false, removed: false }));
+        assert_eq!(p(&["list", "--all"]), Ok(SchedulerCmd::List { all: true, removed: false }));
+        assert_eq!(p(&["list", "--removed"]), Ok(SchedulerCmd::List { all: false, removed: true }));
+        assert_eq!(p(&["restore", "usr-1"]), Ok(SchedulerCmd::Restore { id: "usr-1".into() }));
+        assert!(p(&["restore"]).unwrap_err().contains("REMOVED"));
+        assert_eq!(p(&["purge"]), Ok(SchedulerCmd::Purge { id: None, yes: false }));
+        assert_eq!(p(&["purge", "usr-1", "--yes"]), Ok(SchedulerCmd::Purge { id: Some("usr-1".into()), yes: true }));
+        assert!(p(&["remove", "usr-1", "--yes"]).is_err(), "--yes is purge's only");
         assert!(p(&["show", "x", "--all"]).is_err(), "--all is list's only");
         for (word, want) in [
             ("show", SchedulerCmd::Show { id: "usr-1".into() }),
-            ("pause", SchedulerCmd::Pause { id: "usr-1".into() }),
-            ("resume", SchedulerCmd::Resume { id: "usr-1".into() }),
+            ("disable", SchedulerCmd::Disable { id: "usr-1".into() }),
+            ("enable", SchedulerCmd::Enable { id: "usr-1".into() }),
             ("remove", SchedulerCmd::Remove { id: "usr-1".into() }),
         ] {
             assert_eq!(p(&[word, "usr-1"]), Ok(want));
@@ -526,10 +644,10 @@ mod tests {
         json!({"triggers": [
             {"id": "usr-1", "source": {"type": "user"}, "schedule": {"every": 172_800}, "op": "records.list",
              "params": {"collection": "leetcode", "filter": {}}, "catch_up": "run_once", "lane": null, "fallback": null,
-             "next_due": (now + Duration::seconds(7_201)).to_rfc3339(), "last_run": null, "paused": false, "done": false},
+             "next_due": (now + Duration::seconds(7_201)).to_rfc3339(), "last_run": null, "enabled": true, "done": false},
             {"id": "digest", "source": {"type": "module", "id": "notify"}, "schedule": {"cron": "0 9 * * 1"},
              "op": "notify.digest", "params": {}, "catch_up": "skip", "lane": "notify", "fallback": null,
-             "next_due": null, "last_run": (now - Duration::seconds(180)).to_rfc3339(), "paused": true, "done": false}
+             "next_due": null, "last_run": (now - Duration::seconds(180)).to_rfc3339(), "enabled": false, "done": false}
         ]})
     }
 
@@ -543,13 +661,10 @@ mod tests {
             ["ID", "COMMAND", "SCHEDULE", "CATCH-UP", "NEXT", "LAST", "STATE", "FROM"]
         );
         let row = |i: usize| lines[i].split("  ").map(str::trim).filter(|c| !c.is_empty()).collect::<Vec<_>>();
-        assert_eq!(
-            row(1),
-            ["usr-1", "records list leetcode", "every 2d", "run-once", "in 2h", "never", "active", "you"]
-        );
+        assert_eq!(row(1), ["usr-1", "records list leetcode", "every 2d", "run-once", "in 2h", "never", "on", "you"]);
         assert_eq!(
             row(2),
-            ["digest", "notify.digest {}", "cron 0 9 * * 1 (UTC)", "skip", "-", "3m ago", "paused", "module notify"]
+            ["digest", "notify.digest {}", "cron 0 9 * * 1 (UTC)", "skip", "-", "3m ago", "off", "module notify"]
         );
         assert!(list(&json!({"triggers": []}), now, &Schemas::new(), false).starts_with("no triggers yet"));
     }
@@ -722,7 +837,7 @@ mod tests {
         let usr1 = &data["triggers"][0];
         assert_eq!(usr1["id"], "usr-1");
         let out = trigger(usr1, now, &schemas());
-        assert!(out.starts_with("usr-1  (active)\n  command   records list leetcode\n  op        records.list\n  params    {\"collection\":\"leetcode\",\"filter\":{}}\n  schedule  every 2d"), "{out}");
+        assert!(out.starts_with("usr-1  (on)\n  command   records list leetcode\n  op        records.list\n  params    {\"collection\":\"leetcode\",\"filter\":{}}\n  schedule  every 2d"), "{out}");
         assert!(
             out.contains("  lane      the op's own") && out.contains("(in 2h)") && out.contains("  last run  never"),
             "{out}"
@@ -730,7 +845,7 @@ mod tests {
     }
 
     /// A daemon that knows workspace `site`, accepts `scheduler.add`, and fails every other
-    /// request, as one would if `scheduler.get` broke right after the trigger was created.
+    /// request, as one would if `scheduler.show` broke right after the trigger was created.
     async fn add_only_daemon(sock: &std::path::Path) {
         use shimmer_proto::{decode_client, encode, ClientFrame, ServerFrame};
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -745,7 +860,7 @@ mod tests {
                     ClientFrame::Request { id, op, .. } if op == "scheduler.add" => {
                         ServerFrame::ok(id, json!({"trigger_id": "usr-new"}))
                     }
-                    ClientFrame::Request { id, op, .. } if op == "workspaces.status" => {
+                    ClientFrame::Request { id, op, .. } if op == "workspaces.show" => {
                         ServerFrame::ok(id, json!({"id": "site", "state": "ready"}))
                     }
                     ClientFrame::Request { id, op, .. } => {

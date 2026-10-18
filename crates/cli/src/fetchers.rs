@@ -155,7 +155,7 @@ pub async fn run(client: &mut Client, cmd: &FetchersCmd, json_out: bool) -> Resu
                 client.subscribe(&["queue.task.*"]).await?;
             }
             let params = filter_params(source, title_contains, title_excludes);
-            let handle = client.call("fetchers.fetch", params).await?;
+            let handle = client.call("fetchers.run", params).await?;
             let task = task_id(&handle)?;
             if !*wait {
                 return Ok(if json_out {
@@ -190,7 +190,7 @@ pub async fn run(client: &mut Client, cmd: &FetchersCmd, json_out: bool) -> Resu
     }
 }
 
-/// `fetchers.fetch`/`fetchers.test`'s params: `source`, plus `title_contains`/
+/// `fetchers.run`/`fetchers.test`'s params: `source`, plus `title_contains`/
 /// `title_excludes` only when a `--contains`/`--excludes` flag was actually given --
 /// omitted entirely, not sent as an empty list, so the module falls back to the source's
 /// own configured filter (ADR 0028 §14) rather than overriding it with "nothing allowed."
@@ -242,11 +242,11 @@ async fn follow(client: &mut Client, task: &str) -> Result<Value> {
 }
 
 /// After `core.stream.lagged`: has the task ended? `None` while it is still queued or
-/// running. `queue.task`'s response has no `result` field for a succeeded task -- only
+/// running. `queue.show`'s response has no `result` field for a succeeded task -- only
 /// `error` for a failed one (`crates/daemon/src/queue/mod.rs`'s `view`) -- so a succeeded
 /// outcome here is reported as a (rare) miss, honestly, rather than as a silent empty result.
 async fn finished_task(client: &mut Client, task: &str) -> Result<Option<Result<Value>>> {
-    let t = client.call("queue.task", json!({ "task_id": task })).await?;
+    let t = client.call("queue.show", json!({ "task_id": task })).await?;
     Ok(match t["status"].as_str() {
         Some("succeeded") => Some(Err(Error::new(
             ErrorCode::Unavailable,
@@ -278,12 +278,13 @@ fn list(data: &Value) -> String {
                 render::cell(&s["id"]),
                 render::cell(&s["method"]),
                 s["kind"].as_str().unwrap_or("-").to_string(),
-                if s["enabled"].as_bool().unwrap_or(false) { "yes".into() } else { "no".into() },
+                // on/off under STATE, coloured like every other feature's (ADR 0038 §6).
+                if s["enabled"].as_bool().unwrap_or(false) { "on".into() } else { "off".into() },
                 s["interval_s"].as_u64().map(when::format_duration).unwrap_or_else(|| "-".into()),
             ]
         })
         .collect();
-    let header = ["ID", "METHOD", "KIND", "ENABLED", "INTERVAL"].map(String::from);
+    let header = ["ID", "METHOD", "KIND", "STATE", "INTERVAL"].map(String::from);
     let n = sources.len();
     format!("{}\n{n} source{}", table(&header, &rows), if n == 1 { "" } else { "s" })
 }
@@ -301,11 +302,11 @@ fn status(data: &Value, now: DateTime<Utc>) -> String {
             vec![
                 render::cell(&s["id"]),
                 last_run.map_or("never".into(), |t| when::relative(t, now)),
-                if s["running"].as_bool().unwrap_or(false) { "yes".into() } else { "no".into() },
+                if s["running"].as_bool().unwrap_or(false) { "running".into() } else { "idle".into() },
             ]
         })
         .collect();
-    table(&["ID", "LAST RUN", "RUNNING"].map(String::from), &rows)
+    table(&["ID", "LAST RUN", "STATE"].map(String::from), &rows)
 }
 
 /// Every parsed item `fetchers.test` found, title and url, or a line saying it found none.
@@ -462,9 +463,9 @@ mod tests {
         ]});
         let out = list(&data);
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines[0].split_whitespace().collect::<Vec<_>>(), ["ID", "METHOD", "KIND", "ENABLED", "INTERVAL"]);
-        assert!(lines[1].contains("hn-whoishiring") && lines[1].contains("yes") && lines[1].contains("1d"), "{out}");
-        assert!(lines[2].contains("my-team-blog") && lines[2].contains("rss") && lines[2].contains("no"), "{out}");
+        assert_eq!(lines[0].split_whitespace().collect::<Vec<_>>(), ["ID", "METHOD", "KIND", "STATE", "INTERVAL"]);
+        assert!(lines[1].contains("hn-whoishiring") && lines[1].contains(" on ") && lines[1].contains("1d"), "{out}");
+        assert!(lines[2].contains("my-team-blog") && lines[2].contains("rss") && lines[2].contains(" off "), "{out}");
         assert_eq!(lines[3], "2 sources");
     }
 
@@ -482,9 +483,9 @@ mod tests {
         ]});
         let out = status(&data, now);
         let lines: Vec<&str> = out.lines().collect();
-        assert!(lines[1].contains("hn-whoishiring") && lines[1].contains("ago") && lines[1].ends_with("no"), "{out}");
+        assert!(lines[1].contains("hn-whoishiring") && lines[1].contains("ago") && lines[1].ends_with("idle"), "{out}");
         assert!(
-            lines[2].contains("weworkremotely") && lines[2].contains("never") && lines[2].ends_with("yes"),
+            lines[2].contains("weworkremotely") && lines[2].contains("never") && lines[2].ends_with("running"),
             "{out}"
         );
     }
