@@ -513,6 +513,7 @@ saved and loaded: its `on` pattern, its `when` filter, every op exists and none 
 | `automations.save` | inline | `{"id","text"}` | The rule. A broken rule is refused and the old one kept. |
 | `automations.remove` | inline | `{"id"}` | `{"removed":true,"rule"}`. Moves the file to `data/automations/removed/` (replacing an older removed rule of the same id); also removes a rule file that couldn't be used. |
 | `automations.restore` | inline | `{"id"}` | `{"restored":true,"rule","problem"}`: the rule back as it was. One that no longer checks is still restored, with `rule: null` and the `problem` (also in `list`). `conflict` if a rule has that id, `not_found` if none was removed. |
+| `automations.purge` | inline | `{"id"?,"confirm"?}` | `{"purged":N}`. Permanently deletes one removed rule, or every one. Without a matching `confirm`, `confirmation_required` with `detail: {"rules":N}`; re-send with `"confirm": {"rules":N}`. `{"purged":0}` without asking when nothing is removed; `not_found` for an `id` that isn't removed. Emits `automations.rule.purged`. ADR 0038. |
 | `automations.enable` / `.disable` | inline | `{"id"}` | The rule; only `enabled` in its file changes. |
 | `automations.reload` | inline | `{}` | `{"rules":N,"problems":[…]}`, after re-reading files edited by hand. |
 | `automations.test` | inline | `{"id","event":{"topic","payload"}}` | `{"rule","enabled","matches","actions":[{"op","params","after_s"}]}`: what it would do, as if on. Runs nothing. |
@@ -609,6 +610,7 @@ tolerate unknown topics.
 | `records.collection.renamed` / `.removed` / `.restored` / `.purged` | `{collection, new_id}` / `{collection, records}` / `{collection}` / `{collection, records}`. `.purged`: a removed collection was deleted for good (ADR 0021 §5a). |
 | `records.trash.purged` | `records.purge` deleted trashed records for good. `{collection, records}`, plus `id` when one record was purged. ADR 0024 §5. |
 | `automations.rule.created` / `.edited` / `.removed` / `.restored` / `.enabled` / `.disabled` | `{rule}`. ADR 0035. |
+| `automations.rule.purged` | `automations.purge` deleted removed rules for good. `{rules}`, plus `rule` when one was purged. ADR 0038. |
 | `automations.rule.fired` | A rule reacted to an event. `{rule, event: {id, topic}, chain, depth, queued: [{op, task_id, lane}], scheduled: [{op, trigger_id, at}], failed: [{op, error}]}`. |
 | `automations.chain.stopped` | The loop guard stopped a rule. `{chain, rules, rule, reason: "cycle" \| "depth", event: {id, topic}}`. |
 | `automations.settings.changed` | `{depth}`. |

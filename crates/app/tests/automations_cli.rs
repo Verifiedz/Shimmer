@@ -52,6 +52,13 @@ fn rules_are_made_shown_tested_switched_and_brought_back() {
     assert!(ok(&home, &["automations", "remove", "solved"]).contains("shimmer automations restore solved"));
     assert!(ok(&home, &["automations"]).contains("removed: solved"));
     assert!(ok(&home, &["automations", "restore", "solved"]).contains("✓ restored rule solved"));
+    // Purge deletes a removed rule for good, and asks first (ADR 0038).
+    ok(&home, &["automations", "remove", "solved"]);
+    fails(&home, &["automations", "purge", "solved"]);
+    assert_eq!(ok(&home, &["automations", "purge", "--yes"]).trim(), "✓ 1 removed rule(s) deleted for good");
+    fails(&home, &["automations", "restore", "solved"]);
+    std::fs::write(&rule, RULE).unwrap();
+    ok(&home, &["automations", "new", "solved", "--file", file]);
 
     assert!(ok(&home, &["automations", "events"]).contains("records.item.completed"));
     assert!(ok(&home, &["automations", "depth", "4"]).contains("✓ depth is 4"));

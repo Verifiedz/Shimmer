@@ -35,11 +35,12 @@ const DEPTH_RANGE: std::ops::RangeInclusive<usize> = 1..=10;
 const LABEL_CHARS: usize = 150;
 
 /// Every topic automations emits, with a line on it for `automations events` (§5.5).
-const TOPICS: [(&str, &str); 9] = [
+const TOPICS: [(&str, &str); 10] = [
     ("automations.rule.created", "a rule was created"),
     ("automations.rule.edited", "a rule was changed"),
     ("automations.rule.removed", "a rule was removed (it can be restored)"),
     ("automations.rule.restored", "a removed rule came back"),
+    ("automations.rule.purged", "removed rules were deleted for good"),
     ("automations.rule.enabled", "a rule was switched on"),
     ("automations.rule.disabled", "a rule was switched off"),
     ("automations.rule.fired", "a rule reacted to an event"),
@@ -384,6 +385,46 @@ impl Automations {
         Ok(json!({"removed": true, "rule": id}))
     }
 
+    /// Delete removed rules for good: `p.id`'s, or every one, after the caller confirms how many it
+    /// was shown, as `records.purge` asks (ADR 0038 §1).
+    fn purge(&self, ctx: &Ctx, p: Purge) -> Result<Value> {
+        let _g = self.write.lock();
+        let ids = match &p.id {
+            Some(id) if ctx.store.read(&removed_path(id))?.is_none() => {
+                return Err(Error::not_found(format!("no removed rule '{id}'")));
+            }
+            Some(id) => vec![id.clone()],
+            None => removed(ctx),
+        };
+        let rules = ids.len();
+        if rules == 0 {
+            return Ok(json!({"purged": 0}));
+        }
+        let expected = json!({"rules": rules});
+        if p.confirm.as_ref() != Some(&expected) {
+            let what = match &p.id {
+                Some(id) => format!("the removed rule '{id}'"),
+                None => format!("all {rules} removed rule(s)"),
+            };
+            return Err(Error::new(
+                shimmer_core::ErrorCode::ConfirmationRequired,
+                format!("purging permanently deletes {what}; confirm with {{\"rules\": {rules}}}"),
+            )
+            .with_detail(expected));
+        }
+        let mut event = json!({"rules": rules});
+        if let Some(id) = &p.id {
+            event["rule"] = json!(id);
+        }
+        ctx.store.transaction(|tx| {
+            for id in &ids {
+                tx.delete(&removed_path(id))?;
+            }
+            tx.emit("automations.rule.purged", event)
+        })?;
+        Ok(json!({"purged": rules}))
+    }
+
     /// Bring a removed rule back, as it was. One that no longer checks (an op it names is gone) is
     /// still restored, and reported like any rule file that can't be used.
     fn restore(&self, ctx: &Ctx, id: &str) -> Result<Value> {
@@ -591,6 +632,11 @@ impl Module for Automations {
             ),
             ("automations.remove", "Remove a rule; it can be restored", id()),
             ("automations.restore", "Bring a removed rule back", id()),
+            (
+                "automations.purge",
+                "Delete a removed rule for good, or every one; asks first (ADR 0038)",
+                json!({"type": "object", "properties": {"id": {"type": "string"}, "confirm": {"type": "object"}}}),
+            ),
             ("automations.enable", "Switch a rule on", id()),
             ("automations.disable", "Switch a rule off", id()),
             ("automations.reload", "Re-read the rule files after editing them by hand", json!({"type": "object"})),
@@ -645,6 +691,7 @@ impl Module for Automations {
             "automations.save" => self.save(ctx, decode(params)?),
             "automations.remove" => self.remove(ctx, &decode::<Id>(params)?.id),
             "automations.restore" => self.restore(ctx, &decode::<Id>(params)?.id),
+            "automations.purge" => self.purge(ctx, decode(params)?),
             "automations.enable" => self.set_enabled(ctx, &decode::<Id>(params)?.id, true),
             "automations.disable" => self.set_enabled(ctx, &decode::<Id>(params)?.id, false),
             "automations.reload" => {
@@ -743,6 +790,14 @@ struct HistoryParams {
 #[serde(deny_unknown_fields)]
 struct DepthParams {
     depth: Option<usize>,
+}
+
+/// `automations.purge` (ADR 0038): one removed rule, or all of them.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Purge {
+    id: Option<String>,
+    confirm: Option<Value>,
 }
 
 // ---------------------------------------------------------------------- helpers

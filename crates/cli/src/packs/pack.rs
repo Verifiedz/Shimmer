@@ -126,6 +126,7 @@ pub const TARGETS: &[Target] = &[
     Target { op: "automations.save", words: &["automations", "edit"] },
     Target { op: "automations.remove", words: &["automations", "remove"] },
     Target { op: "automations.restore", words: &["automations", "restore"] },
+    Target { op: "automations.purge", words: &["automations", "purge"] },
     Target { op: "automations.enable", words: &["automations", "enable"] },
     Target { op: "automations.disable", words: &["automations", "disable"] },
     Target { op: "automations.test", words: &["automations", "test"] },
@@ -459,7 +460,7 @@ label = "My Pack"
 
     #[test]
     fn every_target_is_an_op_with_its_command_words() {
-        assert_eq!(TARGETS.len(), 84);
+        assert_eq!(TARGETS.len(), 85);
         // Where the CLI's word differs from the op's verb (ADR 0015 §1).
         let renamed = [
             ("queue.task", "show"),

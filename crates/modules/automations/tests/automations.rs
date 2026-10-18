@@ -139,6 +139,39 @@ async fn rules_are_files_made_checked_switched_and_removed() {
     );
 }
 
+/// ADR 0038: purge deletes removed rules for good, one or all, and always asks first.
+#[tokio::test]
+async fn purge_asks_first_then_deletes_removed_rules_for_good() {
+    let env = env();
+    let m = started(&env).await;
+    let ctx = &env.ctx;
+    assert_eq!(call(&m, ctx, "automations.purge", json!({})).await.unwrap(), json!({"purged": 0}));
+    for id in ["one", "two", "kept"] {
+        call(&m, ctx, "automations.create", json!({"id": id, "text": DONE})).await.unwrap();
+    }
+    for id in ["one", "two"] {
+        call(&m, ctx, "automations.remove", json!({"id": id})).await.unwrap();
+    }
+
+    let ask = call(&m, ctx, "automations.purge", json!({"id": "one"})).await.unwrap_err();
+    assert_eq!((ask.code, ask.detail), (ErrorCode::ConfirmationRequired, Some(json!({"rules": 1}))));
+    let stale = call(&m, ctx, "automations.purge", json!({"confirm": {"rules": 1}})).await.unwrap_err();
+    assert_eq!(stale.detail, Some(json!({"rules": 2})), "a stale count is refused with the fresh one");
+    let one = call(&m, ctx, "automations.purge", json!({"id": "one", "confirm": {"rules": 1}})).await.unwrap();
+    assert_eq!(one, json!({"purged": 1}));
+    assert!(env.backend.read("automations", "removed/one.toml").unwrap().is_none());
+    assert_eq!(last(&env, "automations.rule.purged"), json!({"rule": "one", "rules": 1}));
+    let gone = call(&m, ctx, "automations.restore", json!({"id": "one"})).await.unwrap_err();
+    assert_eq!(gone.code, ErrorCode::NotFound);
+    let not_removed = call(&m, ctx, "automations.purge", json!({"id": "kept"})).await.unwrap_err();
+    assert_eq!(not_removed.code, ErrorCode::NotFound, "only a removed rule can be purged");
+
+    let all = call(&m, ctx, "automations.purge", json!({"confirm": {"rules": 1}})).await.unwrap();
+    assert_eq!(all, json!({"purged": 1}));
+    assert_eq!(call(&m, ctx, "automations.list", json!({})).await.unwrap()["removed"], json!([]));
+    assert!(env.backend.read("automations", "rules/kept.toml").unwrap().is_some(), "a live rule is untouched");
+}
+
 #[tokio::test]
 async fn a_matching_event_queues_its_actions_and_schedules_the_delayed_one() {
     let env = env();

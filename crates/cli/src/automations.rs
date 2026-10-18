@@ -28,6 +28,7 @@ commands:
                              rule is refused and the old one kept
   remove RULE                remove a rule (restore brings it back)
   restore REMOVED            bring a removed rule back
+  purge [REMOVED] [--yes]    delete a removed rule for good, or every removed one (asks first)
   enable RULE                switch a rule on
   disable RULE               switch a rule off
   test RULE --event FILE     what it would do for a sample event, without doing it; FILE is
@@ -87,6 +88,11 @@ pub enum AutomationsCmd {
     Restore {
         id: String,
     },
+    /// `id`: one removed rule; `None` is every one (ADR 0038).
+    Purge {
+        id: Option<String>,
+        yes: bool,
+    },
     Enable {
         id: String,
     },
@@ -123,7 +129,8 @@ pub fn parse(words: Vec<String>) -> std::result::Result<AutomationsCmd, String> 
         "history" => &["--since", "--limit"],
         _ => &[],
     };
-    let flags = Flags::split(words.collect(), options, &[]).map_err(|e| format!("automations {sub}: {e}"))?;
+    let switches: &[&str] = if sub == "purge" { &["--yes"] } else { &[] };
+    let flags = Flags::split(words.collect(), options, switches).map_err(|e| format!("automations {sub}: {e}"))?;
     let usage = |what: &str| format!("usage: shimmer automations {sub} {what}");
     let id = |what: &str| match flags.positional.as_slice() {
         [id] => Ok(id.clone()),
@@ -142,6 +149,11 @@ pub fn parse(words: Vec<String>) -> std::result::Result<AutomationsCmd, String> 
         "edit" => AutomationsCmd::Edit { id: id("RULE [--file FILE]")?, file },
         "remove" => AutomationsCmd::Remove { id: id("RULE")? },
         "restore" => AutomationsCmd::Restore { id: id("REMOVED")? },
+        "purge" => match flags.positional.as_slice() {
+            [] => AutomationsCmd::Purge { id: None, yes: flags.has("--yes") },
+            [id] => AutomationsCmd::Purge { id: Some(id.clone()), yes: flags.has("--yes") },
+            _ => return Err(usage("[REMOVED] [--yes]")),
+        },
         "enable" => AutomationsCmd::Enable { id: id("RULE")? },
         "disable" => AutomationsCmd::Disable { id: id("RULE")? },
         "test" => {
@@ -296,6 +308,35 @@ pub async fn run(client: &mut Client, cmd: &AutomationsCmd, json: bool, prompt: 
                 Some(problem) => format!(
                     "✓ restored {id}, but it can't run: {problem}\n  fix it with: shimmer automations edit {id}"
                 ),
+            })
+        }
+        AutomationsCmd::Purge { id, yes } => {
+            // ADR 0038: the daemon says how many go; ask, then send that count back.
+            let mut params = json!({});
+            if let Some(id) = id {
+                params["id"] = json!(id);
+            }
+            let data = match client.call("automations.purge", params.clone()).await {
+                Err(e) if e.code == shimmer_core::ErrorCode::ConfirmationRequired => {
+                    let what = match id {
+                        Some(id) => format!("the removed rule '{id}'"),
+                        None => "every removed rule".to_owned(),
+                    };
+                    if !crate::records::confirm_purge(prompt, *yes, &what, &e.message)? {
+                        return Ok("nothing purged".into());
+                    }
+                    params["confirm"] = e.detail.unwrap_or_default();
+                    client.call("automations.purge", params).await?
+                }
+                other => other?,
+            };
+            if json {
+                return raw(data);
+            }
+            Ok(match (data["purged"].as_u64().unwrap_or(0), id) {
+                (0, _) => "no removed rules to purge".to_owned(),
+                (_, Some(id)) => format!("✓ {id} is deleted for good"),
+                (n, None) => format!("✓ {n} removed rule(s) deleted for good"),
             })
         }
         AutomationsCmd::Enable { id } | AutomationsCmd::Disable { id } => {
@@ -825,6 +866,9 @@ mod tests {
         assert_eq!(p("new x --file r.toml"), Ok(AutomationsCmd::New { id: "x".into(), file: Some("r.toml".into()) }));
         assert_eq!(p("edit x"), Ok(AutomationsCmd::Edit { id: "x".into(), file: None }));
         assert_eq!(p("test x --event e.json"), Ok(AutomationsCmd::Test { id: "x".into(), event: "e.json".into() }));
+        assert_eq!(p("purge"), Ok(AutomationsCmd::Purge { id: None, yes: false }));
+        assert_eq!(p("purge x --yes"), Ok(AutomationsCmd::Purge { id: Some("x".into()), yes: true }));
+        assert!(p("remove x --yes").is_err(), "--yes is purge's only");
         assert_eq!(p("depth"), Ok(AutomationsCmd::Depth { depth: None }));
         assert_eq!(p("depth 5"), Ok(AutomationsCmd::Depth { depth: Some(5) }));
         assert_eq!(
@@ -838,6 +882,7 @@ mod tests {
             ("depth zero", "from 1 up"),
             ("history --since soon", "isn't a date"),
             ("list x", "takes no arguments"),
+            ("purge a b", "usage: shimmer automations purge [REMOVED] [--yes]"),
             ("frob", "unknown automations command"),
         ] {
             assert!(p(bad).unwrap_err().contains(want), "{bad}: {:?}", p(bad));
