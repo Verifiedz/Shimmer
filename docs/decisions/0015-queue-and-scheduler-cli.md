@@ -2,7 +2,10 @@
 
 Status: accepted (M5, #75) · Raised by Dev B (owner of `crates/cli`) · Signed off: Dev A (owner of
 the queue and scheduler ops these commands drive) · No `core`, `proto` or daemon change: every op
-used already exists on master (`docs/protocol.md`, "Queue ops" and "Scheduler ops")
+used already exists on master (`docs/protocol.md`, "Queue ops" and "Scheduler ops") · **Amended by
+ADR 0031 §6:** the `scheduler add OP [PARAMS] (--every … | --cron … | --once …)` form below is gone
+from the CLI; `shimmer scheduler add WHEN [options] COMMAND…` is the one way to schedule, and
+`shimmer call scheduler.add '{…}'` sends any op. The other scheduler commands are unchanged.
 
 ## Context
 
