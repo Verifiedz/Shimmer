@@ -69,7 +69,9 @@ impl Module for Fetchers {
         vec![
             CommandSpec {
                 op: TICK_OP.into(),
-                summary: "Check configured sources and enqueue a fetch for each one due".into(),
+                summary: "Internal: check configured sources and enqueue a fetch for each one due (the scheduler \
+                          calls this, not a person)"
+                    .into(),
                 params_schema: json!({"type": "null"}),
                 execution: Execution::Queued { lane: LANE.into() },
             },

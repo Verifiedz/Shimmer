@@ -176,7 +176,7 @@
             "commands": [
               {
                 "op": "fetchers.tick",
-                "summary": "Check configured sources and enqueue a fetch for each one due",
+                "summary": "Internal: check configured sources and enqueue a fetch for each one due (the scheduler calls this, not a person)",
                 "params_schema": {},
                 "execution": {
                   "queued": {
