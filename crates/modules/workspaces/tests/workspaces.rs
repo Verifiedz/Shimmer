@@ -80,7 +80,7 @@ fn it_declares_its_lane_the_process_capability_and_the_protocol_ops() {
         ops,
         [
             ("workspaces.list".to_owned(), Execution::Inline),
-            ("workspaces.status".to_owned(), Execution::Inline),
+            ("workspaces.show".to_owned(), Execution::Inline),
             ("workspaces.activate".to_owned(), queued()),
             ("workspaces.cleanup".to_owned(), queued()),
             ("workspaces.force_relaunch".to_owned(), queued()),
@@ -92,7 +92,7 @@ fn it_declares_its_lane_the_process_capability_and_the_protocol_ops() {
             ("workspaces.copy".to_owned(), Execution::Inline),
             ("workspaces.rename".to_owned(), Execution::Inline),
             ("workspaces.templates".to_owned(), Execution::Inline),
-            ("workspaces.create".to_owned(), Execution::Inline),
+            ("workspaces.new".to_owned(), Execution::Inline),
             ("workspaces.answers".to_owned(), Execution::Inline),
             ("workspaces.reconfigure".to_owned(), Execution::Inline),
             ("workspaces.health".to_owned(), Execution::Inline),
@@ -225,7 +225,7 @@ async fn an_invalid_workspace_shows_its_error_not_a_stale_dirty_reason() {
     assert!(entry["error"].as_str().unwrap().starts_with("deep-work/workspace.toml: "), "{entry}");
     assert!(entry.get("dirty_reason").is_none(), "no stale reason: {entry}");
 
-    let status = call(&w, &env, "workspaces.status", json!({"id": "deep-work"})).await.unwrap();
+    let status = call(&w, &env, "workspaces.show", json!({"id": "deep-work"})).await.unwrap();
     assert_eq!(status["state"], "invalid");
     for stale in ["dirty_reason", "dirty", "log", "running_step"] {
         assert!(status.get(stale).is_none(), "no stale {stale}: {status}");
@@ -240,7 +240,7 @@ async fn when_both_files_are_broken_both_errors_are_shown() {
     put(&env, "deep-work/state.toml", "state = \"sleeping\"\n");
     for data in [
         call(&w, &env, "workspaces.list", json!({})).await.unwrap()["workspaces"][0].clone(),
-        call(&w, &env, "workspaces.status", json!({"id": "deep-work"})).await.unwrap(),
+        call(&w, &env, "workspaces.show", json!({"id": "deep-work"})).await.unwrap(),
     ] {
         let error = data["error"].as_str().unwrap();
         assert!(error.contains("deep-work/workspace.toml: "), "{error}");
@@ -253,7 +253,7 @@ async fn when_both_files_are_broken_both_errors_are_shown() {
 #[tokio::test]
 async fn status_describes_the_workspace_in_full() {
     let (w, env) = setup().await;
-    let data = call(&w, &env, "workspaces.status", json!({"id": "deep-work"})).await.unwrap();
+    let data = call(&w, &env, "workspaces.show", json!({"id": "deep-work"})).await.unwrap();
     assert_eq!(
         data,
         json!({
@@ -271,7 +271,7 @@ async fn status_describes_the_workspace_in_full() {
 async fn status_of_a_dirty_workspace_includes_the_failure() {
     let (w, env) = setup().await;
     put(&env, "deep-work/state.toml", DIRTY_STATE);
-    let data = call(&w, &env, "workspaces.status", json!({"id": "deep-work"})).await.unwrap();
+    let data = call(&w, &env, "workspaces.show", json!({"id": "deep-work"})).await.unwrap();
     assert_eq!(data["state"], "dirty");
     // The fields crates/mockd/fixtures/workspace-dirty.json gives clients.
     assert_eq!(data["dirty_reason"], "step 1/2 setup: exit code 1");
@@ -293,7 +293,7 @@ async fn status_of_an_invalid_workspace_says_why() {
         "deep-work/workspace.toml",
         "[workspace]\nlabel = \"\"\n[[step]]\nname = \"setup\"\nmode = \"detached\"\n",
     );
-    let data = call(&w, &env, "workspaces.status", json!({"id": "deep-work"})).await.unwrap();
+    let data = call(&w, &env, "workspaces.show", json!({"id": "deep-work"})).await.unwrap();
     assert_eq!(data["state"], "invalid");
     assert_eq!(data["error"], "deep-work/workspace.toml: [workspace] label must not be empty");
 }
@@ -302,12 +302,12 @@ async fn status_of_an_invalid_workspace_says_why() {
 async fn an_unknown_id_is_not_found_whatever_it_contains() {
     let (w, env) = setup().await;
     for id in ["nope", "../records", "deep-work/steps", ""] {
-        for op in ["workspaces.status", "workspaces.reset"] {
+        for op in ["workspaces.show", "workspaces.reset"] {
             let e = call(&w, &env, op, json!({"id": id})).await.unwrap_err();
             assert_eq!(e.code, ErrorCode::NotFound, "{op} {id:?}: {}", e.message);
         }
     }
-    let e = call(&w, &env, "workspaces.status", json!({})).await.unwrap_err();
+    let e = call(&w, &env, "workspaces.show", json!({})).await.unwrap_err();
     assert_eq!(e.code, ErrorCode::InvalidParams, "missing id");
 }
 

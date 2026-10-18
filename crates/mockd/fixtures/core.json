@@ -3,7 +3,7 @@
     {
       "op": "core.manifest",
       "data": {
-        "protocol": 1,
+        "protocol": 2,
         "lanes": [
           {
             "id": "workspaces",
@@ -45,7 +45,7 @@
                 "execution": "inline"
               },
               {
-                "op": "records.get",
+                "op": "records.show",
                 "summary": "Get one record",
                 "params_schema": {},
                 "execution": "inline"
@@ -87,19 +87,13 @@
                 "execution": "inline"
               },
               {
-                "op": "records.trash",
-                "summary": "List a collection's removed records",
-                "params_schema": {},
-                "execution": "inline"
-              },
-              {
                 "op": "records.templates",
                 "summary": "List the built-in collection templates",
                 "params_schema": {},
                 "execution": "inline"
               },
               {
-                "op": "records.create_collection",
+                "op": "records.new",
                 "summary": "Create a collection from a template",
                 "params_schema": {},
                 "execution": "inline"
@@ -166,7 +160,7 @@
               "records.collection.restored",
               "records.item.removed",
               "records.collection.created",
-              "records.trash.purged"
+              "records.item.purged"
             ]
           },
           {
@@ -203,7 +197,7 @@
                 "execution": "inline"
               },
               {
-                "op": "workspaces.status",
+                "op": "workspaces.show",
                 "summary": "Full state of one workspace",
                 "params_schema": {},
                 "execution": "inline"
@@ -285,7 +279,7 @@
                 "execution": "inline"
               },
               {
-                "op": "workspaces.create",
+                "op": "workspaces.new",
                 "summary": "Create a workspace from a template and your answers",
                 "params_schema": {},
                 "execution": "inline"
@@ -375,7 +369,7 @@
                 "execution": "inline"
               },
               {
-                "op": "notify.get",
+                "op": "notify.show",
                 "summary": "One message in full",
                 "params_schema": {},
                 "execution": "inline"
@@ -431,6 +425,12 @@
               {
                 "op": "notify.status",
                 "summary": "Notify at a glance: settings, pause, counts",
+                "params_schema": {},
+                "execution": "inline"
+              },
+              {
+                "op": "notify.health",
+                "summary": "Check notify for problems; changes nothing (ADR 0033)",
                 "params_schema": {},
                 "execution": "inline"
               }
@@ -664,7 +664,7 @@
       }
     },
     {
-      "op": "records.get",
+      "op": "records.show",
       "params": {
         "collection": "leetcode",
         "id": "two-sum"

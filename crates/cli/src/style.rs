@@ -167,15 +167,15 @@ pub fn state(word: &str) -> String {
 
 fn state_role(word: &str) -> Option<Role> {
     match word {
-        "done" | "active" | "succeeded" => Some(Role::Success),
+        "done" | "active" | "on" | "succeeded" => Some(Role::Success),
         "dirty" | "failed" | "invalid" => Some(Role::Error),
-        "paused" | "cancelled" => Some(Role::Warning),
+        "paused" | "off" | "cancelled" => Some(Role::Warning),
         _ => None,
     }
 }
 
 /// `label` followed by spaces to `width`, in the hint colour: the labels down the left of a
-/// page about one thing (`records get`, `queue show`), so the values stand out.
+/// page about one thing (`records show`, `queue show`), so the values stand out.
 pub fn label(label: &str, width: usize) -> String {
     let pad = " ".repeat(width.saturating_sub(label.chars().count()));
     format!("{}{pad}", paint(Role::Hint, label))
@@ -374,6 +374,7 @@ mod tests {
         assert_eq!(state_role("dirty"), Some(Role::Error));
         assert_eq!(state_role("failed"), Some(Role::Error));
         assert_eq!(state_role("paused"), Some(Role::Warning));
+        assert_eq!((state_role("on"), state_role("off")), (Some(Role::Success), Some(Role::Warning)));
         assert_eq!(state_role("todo"), None, "nothing to say about it: plain");
         assert_eq!(state_role("ready"), None);
         assert_eq!(state("dirty"), "dirty", "never initialised here: plain");

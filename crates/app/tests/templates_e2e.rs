@@ -193,7 +193,7 @@ impl Sandbox {
     }
 
     fn state(&self, id: &str) -> String {
-        let o = self.run(&["--json", "workspaces", "status", id]);
+        let o = self.run(&["--json", "workspaces", "show", id]);
         let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_default();
         v["state"].as_str().unwrap_or_default().to_owned()
     }
@@ -856,7 +856,7 @@ fn rename_moves_the_workspace_and_only_with_a_yes_its_schedules() {
     sb.ok(&["scheduler", "add", "cron", "0 9 * * 1-5", "--catch-up", "skip", "workspaces", "activate", "smoke"]);
     sb.ok(&["scheduler", "add", "every", "1d", "--catch-up", "skip", "workspaces", "stop", "smoke"]);
     let paused = triggers(&sb).into_iter().find(|t| t["op"] == "workspaces.stop").unwrap();
-    sb.ok(&["scheduler", "pause", paused["id"].as_str().unwrap()]);
+    sb.ok(&["scheduler", "disable", paused["id"].as_str().unwrap()]);
 
     // No terminal, no --move-schedules: renamed, and the schedules are named but left alone.
     let out = sb.ok(&["workspaces", "rename", "smoke", "checks"]);
@@ -864,7 +864,7 @@ fn rename_moves_the_workspace_and_only_with_a_yes_its_schedules() {
     assert!(out.contains("they'll fail until moved"), "{out}");
     assert!(triggers(&sb).iter().all(|t| t["params"]["id"] == "smoke"), "untouched");
     assert_eq!(sb.state("checks"), "ready");
-    assert!(sb.fails(&["workspaces", "status", "smoke"]).contains("no workspace 'smoke'"));
+    assert!(sb.fails(&["workspaces", "show", "smoke"]).contains("no workspace 'smoke'"));
 
     // Back, then with --move-schedules: each added again for the new name, paused if it was.
     sb.ok(&["workspaces", "rename", "checks", "smoke"]);
@@ -874,7 +874,7 @@ fn rename_moves_the_workspace_and_only_with_a_yes_its_schedules() {
     assert_eq!(now.len(), 2);
     assert!(now.iter().all(|t| t["params"]["id"] == "checks"), "{now:#?}");
     let stop = now.iter().find(|t| t["op"] == "workspaces.stop").unwrap();
-    assert_eq!(stop["paused"], true, "still paused");
+    assert_eq!(stop["enabled"], false, "still off");
     assert_eq!(now.iter().find(|t| t["op"] == "workspaces.activate").unwrap()["schedule"]["cron"], "0 9 * * 1-5");
 
     // It works under its new name, and can't be renamed while it runs.

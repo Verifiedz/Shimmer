@@ -27,8 +27,9 @@ use crate::style::{paint, Role};
 pub const USAGE: &str = "usage: shimmer workspaces <command>
 
 commands:
-  list                                  list workspaces and their state
-  status NAME                           show one workspace in full: steps, last session, why it is dirty
+  list [--removed]                      list workspaces and their state; --removed: the ones you
+                                        removed, to restore or purge
+  show NAME                             show one workspace in full: steps, last session, why it is dirty
   activate NAME [--wait] [--first]      launch its steps in order
   cleanup NAME [--wait] [--first]       run a dirty workspace's cleanup script
   force-relaunch NAME [--yes] [--wait]  launch a dirty workspace anyway (asks first)
@@ -64,7 +65,7 @@ commands:
       [--label TEXT]                    --set answers one without asking (needed in scripts)
 
 --wait  follow the launch until it ends and show how it went. Without it the command
-        returns once the launch is queued; check on it with 'shimmer workspaces status NAME'.
+        returns once the launch is queued; check on it with 'shimmer workspaces show NAME'.
         Don't use --wait from a workspace's own step scripts: launches run one at a time.
         With --json: the op's result, or {\"result_missed\": true, \"task\": {…}} when it
         succeeded but its result was lost to dropped events (then fields like log are absent).
@@ -83,8 +84,11 @@ pub type First = Option<bool>;
 #[derive(Clone, Debug, PartialEq)]
 pub enum WorkspacesCmd {
     Help,
-    List,
-    Status {
+    /// `removed`: the removed workspaces instead (ADR 0038 §6).
+    List {
+        removed: bool,
+    },
+    Show {
         id: String,
     },
     Activate {
@@ -217,13 +221,14 @@ pub fn parse(words: Vec<String>) -> std::result::Result<WorkspacesCmd, String> {
         return Ok(WorkspacesCmd::Rename { id, to, move_schedules });
     }
     let mut positional = Vec::new();
-    let (mut yes, mut wait, mut path_only, mut first) = (false, false, false, false);
+    let (mut yes, mut wait, mut path_only, mut first, mut removed) = (false, false, false, false, false);
     for word in words {
         match word.as_str() {
             "--yes" | "-y" => yes = true,
             "--wait" => wait = true,
             "--first" => first = true,
             "--path" if sub == "edit" => path_only = true,
+            "--removed" if sub == "list" => removed = true,
             w if w.starts_with('-') && w.len() > 1 => {
                 return Err(format!("unknown option '{}'", w.split('=').next().unwrap_or(w)));
             }
@@ -258,10 +263,10 @@ pub fn parse(words: Vec<String>) -> std::result::Result<WorkspacesCmd, String> {
     match sub.as_str() {
         "help" => Ok(WorkspacesCmd::Help),
         "list" => match positional.is_empty() {
-            true => Ok(WorkspacesCmd::List),
+            true => Ok(WorkspacesCmd::List { removed }),
             false => Err("'workspaces list' takes no arguments".into()),
         },
-        "status" => Ok(WorkspacesCmd::Status { id: name(positional)? }),
+        "show" => Ok(WorkspacesCmd::Show { id: name(positional)? }),
         "activate" => Ok(WorkspacesCmd::Activate { id: name(positional)?, wait, first }),
         "cleanup" => Ok(WorkspacesCmd::Cleanup { id: name(positional)?, wait, first }),
         "force-relaunch" => Ok(WorkspacesCmd::ForceRelaunch { id: name(positional)?, yes, wait, first }),
@@ -429,7 +434,7 @@ impl Prompt for Terminal {
 }
 
 /// Decide whether to go ahead with an action that skips safety. `status` is what
-/// `workspaces.status` returned, shown so the person knows what they're overriding.
+/// `workspaces.show` returned, shown so the person knows what they're overriding.
 /// `Ok(false)` means they said no.
 fn confirm(prompt: &mut dyn Prompt, yes: bool, action: &str, question: &str, id: &str, status: &Value) -> Result<bool> {
     if yes {
@@ -451,12 +456,16 @@ pub async fn run(client: &mut Client, cmd: &WorkspacesCmd, json: bool, prompt: &
     let out = |data: &Value, text: String| if json { render::json(data) } else { text };
     match cmd {
         WorkspacesCmd::Help => Ok(USAGE.into()),
-        WorkspacesCmd::List => {
+        WorkspacesCmd::List { removed: false } => {
             let data = client.call("workspaces.list", json!({})).await?;
             Ok(out(&data, list(&data)))
         }
-        WorkspacesCmd::Status { id } => {
-            let data = client.call("workspaces.status", id_params(id)).await?;
+        WorkspacesCmd::List { removed: true } => {
+            let data = client.call("workspaces.list", json!({"removed": true})).await?;
+            Ok(out(&data, removed_list(&data)))
+        }
+        WorkspacesCmd::Show { id } => {
+            let data = client.call("workspaces.show", id_params(id)).await?;
             Ok(out(&data, status(&data)))
         }
         WorkspacesCmd::Activate { id, wait, first } => {
@@ -470,7 +479,7 @@ pub async fn run(client: &mut Client, cmd: &WorkspacesCmd, json: bool, prompt: &
         }
         WorkspacesCmd::Edit { id, file, path_only } => {
             // Through the daemon first: an unknown workspace is its `not_found`, not a new file.
-            client.call("workspaces.status", id_params(id)).await?;
+            client.call("workspaces.show", id_params(id)).await?;
             let path = edit_path(&shimmer_proto::paths::shimmer_home(), id, file.as_deref())?;
             if *path_only {
                 return Ok(path.display().to_string());
@@ -483,7 +492,7 @@ pub async fn run(client: &mut Client, cmd: &WorkspacesCmd, json: bool, prompt: &
             }
             editor::open(&path)?;
             // The daemon reads the file fresh on every request, so this checks what was saved.
-            let data = client.call("workspaces.status", id_params(id)).await?;
+            let data = client.call("workspaces.show", id_params(id)).await?;
             Ok(out(&data, edited(id, &data)))
         }
         WorkspacesCmd::Remove { id } => {
@@ -523,7 +532,7 @@ pub async fn run(client: &mut Client, cmd: &WorkspacesCmd, json: bool, prompt: &
         }
         WorkspacesCmd::ForceRelaunch { id, yes, wait, first } => {
             if !*yes {
-                let current = client.call("workspaces.status", id_params(id)).await?;
+                let current = client.call("workspaces.show", id_params(id)).await?;
                 let question = "Launch it anyway, without cleaning up?";
                 if !confirm(prompt, false, "force a relaunch of", question, id, &current)? {
                     return Ok(format!("{id} was not relaunched"));
@@ -632,12 +641,12 @@ pub async fn run(client: &mut Client, cmd: &WorkspacesCmd, json: bool, prompt: &
             if let Some(label) = label {
                 params["label"] = json!(label);
             }
-            let data = client.call("workspaces.create", params).await.map_err(|e| how_to_answer(e, prompt))?;
+            let data = client.call("workspaces.new", params).await.map_err(|e| how_to_answer(e, prompt))?;
             Ok(out(&data, created(id, template)))
         }
         WorkspacesCmd::Reset { id, yes } => {
             if !*yes {
-                let current = client.call("workspaces.status", id_params(id)).await?;
+                let current = client.call("workspaces.show", id_params(id)).await?;
                 // Say what's at stake: whatever the failed launch started keeps running, and nothing
                 // will stop it later.
                 let question = "Reset it to ready without running its cleanup script? Anything its \
@@ -721,7 +730,7 @@ async fn queued(
             (false, Some(_)) => first_message(kind, id, task, handle["position"].as_u64().unwrap_or(0)),
         });
     }
-    let look = format!("shimmer workspaces status {id}");
+    let look = format!("shimmer workspaces show {id}");
     match follow(client, task, !json, &look).await {
         Ok(Followed::Finished(result)) => {
             Ok(if json { render::json(&result) } else { with_log(kind.done(id), &result) })
@@ -779,7 +788,7 @@ fn first_message(kind: Queued, id: &str, task: &str, position: u64) -> String {
 }
 
 fn queued_message(kind: Queued, id: &str, task: &str) -> String {
-    format!("queued the {} of {id} (task {task})\ncheck on it with: shimmer workspaces status {id}", kind.what())
+    format!("queued the {} of {id} (task {task})\ncheck on it with: shimmer workspaces show {id}", kind.what())
 }
 
 /// For people: a dirty workspace's error says where to look and what to do (§10.3), instead
@@ -1173,6 +1182,20 @@ fn created(id: &str, template: &str) -> String {
 
 // ---------------------------------------------------------------- output
 
+/// `list --removed`: each removed workspace, and how to bring it back or delete it for good.
+fn removed_list(data: &Value) -> String {
+    let all = data["workspaces"].as_array().cloned().unwrap_or_default();
+    if all.is_empty() {
+        return "no removed workspaces".into();
+    }
+    let rows: Vec<Vec<String>> = all.iter().map(|w| vec![cell(&w["id"]), cell(&w["label"])]).collect();
+    let mut text = table(&["ID".into(), "LABEL".into()], &rows);
+    text.push_str(
+        "\nbring one back: shimmer workspaces restore NAME; delete for good: shimmer workspaces purge [NAME]",
+    );
+    text
+}
+
 /// `workspaces.list` as a table. Everything shown comes from the daemon (§2).
 pub fn list(data: &Value) -> String {
     let items = data["workspaces"].as_array().map(Vec::as_slice).unwrap_or_default();
@@ -1191,12 +1214,12 @@ pub fn list(data: &Value) -> String {
         .collect();
     let mut out = table(&["ID".into(), "STATE".into(), "LABEL".into(), "WHY".into()], &rows);
     if items.iter().any(|w| matches!(w["state"].as_str(), Some("dirty" | "invalid"))) {
-        out.push_str("\n\nmore detail: shimmer workspaces status NAME");
+        out.push_str("\n\nmore detail: shimmer workspaces show NAME");
     }
     out
 }
 
-/// `workspaces.status` in full.
+/// `workspaces.show` in full.
 pub fn status(data: &Value) -> String {
     let id = data["id"].as_str().unwrap_or_default();
     let mut out = format!("{}  ({})", paint(Role::Name, id), crate::style::state(&cell(&data["state"])));
@@ -1308,8 +1331,10 @@ mod tests {
     fn commands_parse() {
         assert_eq!(parse_words(&[]).unwrap(), WorkspacesCmd::Help);
         assert_eq!(parse_words(&["help"]).unwrap(), WorkspacesCmd::Help);
-        assert_eq!(parse_words(&["list"]).unwrap(), WorkspacesCmd::List);
-        assert_eq!(parse_words(&["status", "deep-work"]).unwrap(), WorkspacesCmd::Status { id: "deep-work".into() });
+        assert_eq!(parse_words(&["list"]).unwrap(), WorkspacesCmd::List { removed: false });
+        assert_eq!(parse_words(&["list", "--removed"]).unwrap(), WorkspacesCmd::List { removed: true });
+        assert!(parse_words(&["show", "x", "--removed"]).is_err(), "--removed is list's only");
+        assert_eq!(parse_words(&["show", "deep-work"]).unwrap(), WorkspacesCmd::Show { id: "deep-work".into() });
         assert_eq!(
             parse_words(&["reset", "deep-work"]).unwrap(),
             WorkspacesCmd::Reset { id: "deep-work".into(), yes: false }
@@ -1364,9 +1389,9 @@ mod tests {
         for (words, expected) in [
             (&["activate", "x", "--yes"][..], "'workspaces activate' takes --yes only with --first"),
             (&["reset", "x", "--first"], "'workspaces reset' takes no --first"),
-            (&["status", "x", "--first"], "'workspaces status' takes no --first"),
+            (&["show", "x", "--first"], "'workspaces show' takes no --first"),
             (&["reset", "x", "--wait"], "'workspaces reset' takes no --wait"),
-            (&["status", "x", "--wait"], "'workspaces status' takes no --wait"),
+            (&["show", "x", "--wait"], "'workspaces show' takes no --wait"),
             (&["force_relaunch", "x"], "unknown workspaces command 'force_relaunch'"),
         ] {
             let e = parse_words(words).unwrap_err();
@@ -1394,7 +1419,7 @@ mod tests {
         let m = queued_message(Queued::ForceRelaunch, "deep-work", "01TASK");
         assert_eq!(
             m,
-            "queued the forced relaunch of deep-work (task 01TASK)\ncheck on it with: shimmer workspaces status deep-work"
+            "queued the forced relaunch of deep-work (task 01TASK)\ncheck on it with: shimmer workspaces show deep-work"
         );
         assert!(!m.contains("--wait"), "{m}");
     }
@@ -1424,8 +1449,8 @@ mod tests {
     #[test]
     fn misuse_is_explained() {
         let cases: [(&[&str], &str); 6] = [
-            (&["status"], "usage: shimmer workspaces status NAME"),
-            (&["status", "a", "b"], "usage: shimmer workspaces status NAME"),
+            (&["show"], "usage: shimmer workspaces show NAME"),
+            (&["show", "a", "b"], "usage: shimmer workspaces show NAME"),
             (&["list", "x"], "'workspaces list' takes no arguments"),
             (&["list", "--yes"], "'workspaces list' takes no --yes"),
             (&["reset", "x", "--force"], "unknown option '--force'"),
@@ -1453,7 +1478,7 @@ mod tests {
         assert_eq!(lines[1], "broken     invalid  -          broken/workspace.toml: TOML parse error");
         assert_eq!(lines[2], "deep-work  dirty    Deep Work  step 1/3 setup: exit code 1");
         assert_eq!(lines[3], "focus      ready    Focus      ");
-        assert_eq!(lines.last().unwrap(), &"more detail: shimmer workspaces status NAME");
+        assert_eq!(lines.last().unwrap(), &"more detail: shimmer workspaces show NAME");
     }
 
     #[test]
@@ -1568,7 +1593,7 @@ mod tests {
             WorkspacesCmd::Edit { id: "site".into(), file: Some("steps/01-check.sh".into()), path_only: true }
         );
         assert!(parse_words(&["edit"]).unwrap_err().contains("usage"));
-        assert!(parse_words(&["status", "site", "--path"]).unwrap_err().contains("unknown option"));
+        assert!(parse_words(&["show", "site", "--path"]).unwrap_err().contains("unknown option"));
 
         let home = std::path::Path::new("/home/me/.local/share/shimmer");
         assert_eq!(
@@ -1852,7 +1877,7 @@ mod tests {
         // a cleanup script is unknown, so no ways out are offered; the message names `status`.
         let lagged = Error::new(
             ErrorCode::WorkspaceDirty,
-            "step 1 failed (some events were dropped, so details may be missing: see 'shimmer workspaces status s')",
+            "step 1 failed (some events were dropped, so details may be missing: see 'shimmer workspaces show s')",
         );
         let e = explain(lagged.clone(), "s");
         assert_eq!((e.code, &e.message), (ErrorCode::WorkspaceDirty, &lagged.message));

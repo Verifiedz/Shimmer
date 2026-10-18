@@ -887,7 +887,7 @@ label = "Anime Tropes"
 
 [alias]
 "ikuzo"  = "workspaces.activate"
-"nani"   = "workspaces.status"
+"nani"   = "workspaces.show"
 "yatta"  = "records.complete"
 
 [anim]

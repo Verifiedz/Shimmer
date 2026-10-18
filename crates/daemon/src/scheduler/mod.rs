@@ -360,11 +360,12 @@ impl Scheduler {
     pub fn handle(&self, op: &str, params: Value) -> Result<Value> {
         match op {
             "scheduler.list" => self.list(params),
-            "scheduler.get" => self.get(&self.resolve(&trigger_id(params)?)?),
+            "scheduler.show" => self.get(&self.resolve(&trigger_id(params)?)?),
             "scheduler.add" => self.add(params),
+            "scheduler.edit" => self.edit(params),
             "scheduler.remove" => self.remove(&self.resolve(&trigger_id(params)?)?),
-            "scheduler.pause" => self.set_paused(&self.resolve(&trigger_id(params)?)?, true),
-            "scheduler.resume" => self.set_paused(&self.resolve(&trigger_id(params)?)?, false),
+            "scheduler.disable" => self.set_enabled(&self.resolve(&trigger_id(params)?)?, false),
+            "scheduler.enable" => self.set_enabled(&self.resolve(&trigger_id(params)?)?, true),
             "scheduler.restore" => self.restore(&trigger_id(params)?),
             "scheduler.purge" => self.purge(params),
             _ => Err(Error::unknown_op(format!("no such scheduler op '{op}'"))),
@@ -424,7 +425,7 @@ impl Scheduler {
     }
 
     /// One trigger, in exactly the shape a `scheduler.list` entry has (#76) — `queue show`
-    /// uses `queue.task` and `workspaces status` uses `workspaces.status`; this was the odd
+    /// uses `queue.show` and `workspaces show` uses `workspaces.show`; this was the odd
     /// one out, picking its one trigger out of the full list instead.
     fn get(&self, id: &str) -> Result<Value> {
         let st = self.lock();
@@ -433,28 +434,8 @@ impl Scheduler {
     }
 
     fn add(&self, params: Value) -> Result<Value> {
-        // `catch_up` has no default: guessing wrong sends duplicate emails (§6.3).
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Add {
-            schedule: Schedule,
-            op: String,
-            #[serde(default)]
-            params: Value,
-            catch_up: CatchUp,
-            lane: Option<LaneId>,
-            fallback: Option<Fallback>,
-        }
-        let a: Add = serde_json::from_value(params).map_err(|e| Error::invalid_params(e.to_string()))?;
-        let spec = TriggerSpec {
-            id: TriggerId::new(format!("usr-{}", ulid::Ulid::new().to_string().to_lowercase())),
-            schedule: a.schedule,
-            catch_up: a.catch_up,
-            op: a.op,
-            params: a.params,
-            lane: a.lane,
-            fallback: a.fallback,
-        };
+        let id = TriggerId::new(format!("usr-{}", ulid::Ulid::new().to_string().to_lowercase()));
+        let spec = spec_from(params, id)?;
         self.check_target(&spec)?;
         let parsed = Parsed::parse(&spec.schedule, self.local_tz)?;
         let stored = Stored {
@@ -472,11 +453,39 @@ impl Scheduler {
         Ok(json!({ "trigger_id": id }))
     }
 
+    /// Replace a person's schedule with a new one, keeping its id, whether it's on, and when it
+    /// last ran (ADR 0038 §6). Before, changing a time meant remove and add: a new id, and a
+    /// removed copy left behind. It counts from now, like `enable`.
+    fn edit(&self, mut params: Value) -> Result<Value> {
+        let written = match params.as_object_mut().and_then(|m| m.remove("trigger_id")) {
+            Some(Value::String(id)) => id,
+            _ => return Err(Error::invalid_params("missing field `trigger_id`")),
+        };
+        let id = self.resolve(&written)?;
+        let spec = spec_from(params, TriggerId::new(id.as_str()))?;
+        self.check_target(&spec)?;
+        let parsed = Parsed::parse(&spec.schedule, self.local_tz)?;
+        let mut st = self.lock();
+        let e = st.get_mut(&id).ok_or_else(|| Error::not_found(format!("no trigger '{id}'")))?;
+        if let Source::Module { id: owner } = &e.stored.source {
+            return Err(Error::conflict(format!("trigger '{id}' is declared by module '{owner}'; it can't be edited")));
+        }
+        let mut next = e.stored.clone();
+        next.spec = spec;
+        next.next_due = parsed.first_due(self.clock.now());
+        next.done = false;
+        next.zone = parsed.is_local().then(|| self.local_tz.name().to_owned());
+        self.write(&next, Some(("scheduler.trigger.edited", added_payload(&next))))?;
+        e.stored = next;
+        e.parsed = parsed;
+        Ok(trigger_view(&e.stored))
+    }
+
     fn remove(&self, id: &str) -> Result<Value> {
         let mut st = self.lock();
         let e = st.get(id).ok_or_else(|| Error::not_found(format!("no trigger '{id}'")))?;
         if let Source::Module { id: owner } = &e.stored.source {
-            return Err(Error::conflict(format!("trigger '{id}' is declared by module '{owner}'; pause it instead")));
+            return Err(Error::conflict(format!("trigger '{id}' is declared by module '{owner}'; disable it instead")));
         }
         // Moved aside, not deleted: `scheduler.restore` brings it back (ADR 0038 §3). Only the
         // latest removal of an id is kept, like records and workspaces.
@@ -571,32 +580,61 @@ impl Scheduler {
         Ok(json!({"purged": triggers}))
     }
 
-    fn set_paused(&self, id: &str, paused: bool) -> Result<Value> {
+    /// `scheduler.enable` / `disable` (ADR 0038 §6). On disk a trigger keeps its `paused` flag;
+    /// on the wire it's `enabled`, as automations' rules are.
+    fn set_enabled(&self, id: &str, enabled: bool) -> Result<Value> {
+        let paused = !enabled;
         let mut st = self.lock();
         let e = st.get_mut(id).ok_or_else(|| Error::not_found(format!("no trigger '{id}'")))?;
         if e.stored.paused == paused {
-            return Ok(json!({ "paused": paused, "trigger_id": id }));
+            return Ok(json!({ "enabled": enabled, "trigger_id": id }));
         }
         let mut next = e.stored.clone();
         next.paused = paused;
         if !paused && !next.done && !matches!(next.spec.schedule, Schedule::Once(_)) {
-            // Time spent paused is not "missed": resume from now instead of replaying it.
+            // Time spent off is not "missed": enabling counts from now instead of replaying it.
             next.next_due = e.parsed.next_after(self.clock.now());
         }
-        let topic = if paused { "scheduler.trigger.paused" } else { "scheduler.trigger.resumed" };
+        let topic = if paused { "scheduler.trigger.disabled" } else { "scheduler.trigger.enabled" };
         self.write(&next, Some((topic, json!({"trigger_id": id}))))?;
         e.stored = next;
-        Ok(json!({ "paused": paused, "trigger_id": id }))
+        Ok(json!({ "enabled": enabled, "trigger_id": id }))
     }
 }
 
 /// The wire shape of one trigger, shared by `scheduler.list` (one per entry) and
-/// `scheduler.get` (one, by id) so they can never drift apart.
+/// `scheduler.show` (one, by id) so they can never drift apart.
 fn trigger_view(s: &Stored) -> Value {
     json!({"id": s.spec.id, "source": s.source, "schedule": s.spec.schedule, "op": s.spec.op,
            "params": s.spec.params, "catch_up": s.spec.catch_up, "lane": s.spec.lane,
            "fallback": s.spec.fallback, "next_due": s.next_due, "last_run": s.last_run,
-           "paused": s.paused, "done": s.done})
+           "enabled": !s.paused, "done": s.done})
+}
+
+/// `scheduler.add`'s and `scheduler.edit`'s schedule, read the same way. `catch_up` has no
+/// default: guessing wrong sends duplicate emails (§6.3).
+fn spec_from(params: Value, id: TriggerId) -> Result<TriggerSpec> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Spec {
+        schedule: Schedule,
+        op: String,
+        #[serde(default)]
+        params: Value,
+        catch_up: CatchUp,
+        lane: Option<LaneId>,
+        fallback: Option<Fallback>,
+    }
+    let s: Spec = serde_json::from_value(params).map_err(|e| Error::invalid_params(e.to_string()))?;
+    Ok(TriggerSpec {
+        id,
+        schedule: s.schedule,
+        catch_up: s.catch_up,
+        op: s.op,
+        params: s.params,
+        lane: s.lane,
+        fallback: s.fallback,
+    })
 }
 
 fn trigger_id(params: Value) -> Result<String> {

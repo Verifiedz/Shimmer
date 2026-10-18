@@ -153,7 +153,7 @@ async fn a_firing_enqueues_a_scheduled_task_with_scheduler_origin_and_stamped_pa
         json!({"x": 1, "scheduled_for": iso(3600)}),
         "the op receives its params plus the period it is for"
     );
-    let t = c.call("queue.task", json!({"task_id": task_id})).await.unwrap();
+    let t = c.call("queue.show", json!({"task_id": task_id})).await.unwrap();
     assert_eq!(t["priority"], "scheduled");
     assert_eq!(t["origin"], json!({"type": "scheduler", "trigger_id": id}));
     stop(d).await;
@@ -385,26 +385,26 @@ async fn pause_resume_and_remove() {
     c.subscribe(&["scheduler.trigger.*"]).await;
     let id = add(&mut c, json!({"every": DAY}), "demo.echo", "backfill").await;
 
-    assert_eq!(c.call("scheduler.pause", json!({"trigger_id": id})).await.unwrap()["paused"], true);
+    assert_eq!(c.call("scheduler.disable", json!({"trigger_id": id})).await.unwrap()["enabled"], false);
     advance(&env, 5 * DAY);
     settle(&mut c).await;
     assert_eq!(count(&c, "scheduler.trigger.fired", &id), 0, "paused triggers do not fire");
     let t = trigger(&mut c, &id).await.unwrap();
-    assert_eq!((t["paused"].clone(), t["next_due"].clone()), (json!(true), json!(iso(DAY))));
+    assert_eq!((t["enabled"].clone(), t["next_due"].clone()), (json!(false), json!(iso(DAY))));
 
     // Time spent paused is not replayed as missed work, even under `backfill`.
-    assert_eq!(c.call("scheduler.resume", json!({"trigger_id": id})).await.unwrap()["paused"], false);
+    assert_eq!(c.call("scheduler.enable", json!({"trigger_id": id})).await.unwrap()["enabled"], true);
     assert_eq!(trigger(&mut c, &id).await.unwrap()["next_due"], iso(6 * DAY));
     settle(&mut c).await;
     assert_eq!(count(&c, "scheduler.trigger.fired", &id), 0);
-    assert_eq!(count(&c, "scheduler.trigger.paused", &id), 1);
-    assert_eq!(count(&c, "scheduler.trigger.resumed", &id), 1);
+    assert_eq!(count(&c, "scheduler.trigger.disabled", &id), 1);
+    assert_eq!(count(&c, "scheduler.trigger.enabled", &id), 1);
 
     assert_eq!(c.call("scheduler.remove", json!({"trigger_id": id})).await.unwrap()["removed"], true);
     assert!(trigger(&mut c, &id).await.is_none());
     assert!(!env.home.path().join(format!("data/scheduler/triggers/{id}.json")).exists());
     assert!(env.home.path().join(format!("data/scheduler/removed/{id}.json")).exists(), "kept to restore (ADR 0038)");
-    for op in ["scheduler.remove", "scheduler.pause", "scheduler.resume", "scheduler.get"] {
+    for op in ["scheduler.remove", "scheduler.disable", "scheduler.enable", "scheduler.show"] {
         assert_eq!(c.call(op, json!({"trigger_id": id})).await.unwrap_err().code, ErrorCode::NotFound, "{op}");
     }
     assert_eq!(c.call("scheduler.frobnicate", json!({})).await.unwrap_err().code, ErrorCode::UnknownOp);
@@ -462,6 +462,38 @@ async fn remove_restore_and_purge() {
     stop(d).await;
 }
 
+/// ADR 0038 §6: `edit` changes a schedule and keeps its id, whether it's on, and its last run.
+#[tokio::test]
+async fn edit_keeps_the_id_and_state_and_counts_from_now() {
+    let env = Env::fake_clock();
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    c.subscribe(&["scheduler.trigger.*"]).await;
+    let id = add(&mut c, json!({"every": DAY}), "demo.echo", "backfill").await;
+    c.call("scheduler.disable", json!({"trigger_id": id})).await.unwrap();
+    advance(&env, 3 * DAY);
+
+    let ending = &id[id.len() - 6..];
+    let edit = json!({"trigger_id": ending, "schedule": {"every": 2 * DAY}, "op": "demo.echo",
+                      "params": {"x": 2}, "catch_up": "skip"});
+    let t = c.call("scheduler.edit", edit).await.unwrap();
+    assert_eq!(t["id"], id, "same id");
+    assert_eq!((t["enabled"].clone(), t["catch_up"].clone()), (json!(false), json!("skip")), "still off");
+    assert_eq!((t["schedule"].clone(), t["params"]["x"].clone()), (json!({"every": 2 * DAY}), json!(2)));
+    assert_eq!(t["next_due"], iso(5 * DAY), "counts from now");
+    assert_eq!(trigger(&mut c, &id).await.unwrap()["params"]["x"], 2, "saved");
+    settle(&mut c).await;
+    assert_eq!(count(&c, "scheduler.trigger.edited", &id), 1);
+    assert_eq!(count(&c, "scheduler.trigger.added", &id), 1, "only the original add: an edit is not a new schedule");
+
+    let unknown = json!({"trigger_id": "usr-nope", "schedule": {"every": DAY}, "op": "demo.echo", "catch_up": "skip"});
+    assert_eq!(c.call("scheduler.edit", unknown).await.unwrap_err().code, ErrorCode::NotFound);
+    let bad_op = json!({"trigger_id": id, "schedule": {"every": DAY}, "op": "demo.nope", "catch_up": "skip"});
+    assert_eq!(c.call("scheduler.edit", bad_op).await.unwrap_err().code, ErrorCode::UnknownOp);
+    assert_eq!(trigger(&mut c, &id).await.unwrap()["params"]["x"], 2, "a refused edit changes nothing");
+    stop(d).await;
+}
+
 /// ADR 0038: a restored schedule never overwrites one with the same id that exists again.
 #[tokio::test]
 async fn restore_never_overwrites_a_live_trigger() {
@@ -491,11 +523,11 @@ async fn get_returns_one_trigger_in_the_list_shape_or_not_found() {
     let mut c = Client::connect(&env.sock).await;
     let id = add(&mut c, json!({"every": DAY}), "demo.echo", "backfill").await;
 
-    let got = c.call("scheduler.get", json!({"trigger_id": id})).await.unwrap();
+    let got = c.call("scheduler.show", json!({"trigger_id": id})).await.unwrap();
     let listed = trigger(&mut c, &id).await.unwrap();
-    assert_eq!(got, listed, "scheduler.get must return exactly the shape its scheduler.list entry has");
+    assert_eq!(got, listed, "scheduler.show must return exactly the shape its scheduler.list entry has");
 
-    assert_eq!(c.call("scheduler.get", json!({"trigger_id": "nope"})).await.unwrap_err().code, ErrorCode::NotFound);
+    assert_eq!(c.call("scheduler.show", json!({"trigger_id": "nope"})).await.unwrap_err().code, ErrorCode::NotFound);
     stop(d).await;
 }
 

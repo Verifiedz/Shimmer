@@ -777,7 +777,7 @@ impl Groups {
             // The ones you added, as `scheduler list` shows (#244), for anything you can only do to
             // your own. Pausing is the one thing you can do to a module's schedule, so pause and
             // resume offer every one (#249's review).
-            .filter(|t| matches!(command, "pause" | "resume") || t["source"]["type"] == "user")
+            .filter(|t| matches!(command, "disable" | "enable") || t["source"]["type"] == "user")
             .cloned()
             .collect();
         // The same short endings `scheduler list` shows, which every scheduler command accepts.
@@ -790,7 +790,7 @@ impl Groups {
     /// Removed schedules, for `scheduler restore` and `purge` (ADR 0038).
     async fn removed_triggers(&mut self, source: &mut impl Source) {
         let Some(data) = source.call("scheduler.list", json!({"removed": true})).await else { return };
-        // Only a person's own schedule is ever removed (a module's can only be paused).
+        // Only a person's own schedule is ever removed (a module's can only be disabled).
         let all: Vec<Value> = data["triggers"]
             .as_array()
             .into_iter()
@@ -1167,7 +1167,7 @@ mod tests {
         };
         let offered = got(complete(&at("scheduler add daily 09:00 "), &cx, &mut daemon()).await);
         assert!(offered.contains(&"wgo".to_owned()), "workspaces activate's alias: {offered:?}");
-        assert!(!offered.contains(&"wst".to_owned()), "workspaces status can't be scheduled");
+        assert!(!offered.contains(&"wshow".to_owned()), "workspaces show can't be scheduled");
         assert_eq!(got(complete(&at("scheduler add daily 09:00 wgo "), &cx, &mut daemon()).await), ["site"]);
     }
 
@@ -1195,7 +1195,7 @@ mod tests {
         assert_eq!(words("records templates ").await, ["practice"]);
         assert_eq!(words("scheduler remove ").await, ["VWXYZ0"], "the short ending lists show, not the whole id");
         assert_eq!(words("scheduler restore ").await, ["VWXYZ0"], "from scheduler list --removed");
-        let pause = words("scheduler pause ").await;
+        let pause = words("scheduler disable ").await;
         assert!(pause.contains(&"VWXYZ0".to_owned()) && pause.contains(&"notify.flush".to_owned()), "{pause:?}");
         assert_eq!(words("call ").await, ["core.ping"]);
         assert!(words("packs use ").await.contains(&"none".to_owned()));

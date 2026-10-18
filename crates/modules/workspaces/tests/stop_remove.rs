@@ -128,7 +128,9 @@ async fn remove_and_restore_bring_it_back_exactly() {
     assert!(file(&env, ".removed/site/workspace.toml").is_some());
     let list = w.handle("workspaces.list", json!({}), &env.ctx).await.unwrap();
     assert_eq!(list["workspaces"], json!([]), "a removed workspace isn't listed");
-    assert_eq!(call(&w, &env, "workspaces.status").await.unwrap_err().code, ErrorCode::NotFound);
+    let removed = w.handle("workspaces.list", json!({"removed": true}), &env.ctx).await.unwrap();
+    assert_eq!(removed["workspaces"], json!([{"id": "site", "label": "Site"}]), "but list --removed shows it");
+    assert_eq!(call(&w, &env, "workspaces.show").await.unwrap_err().code, ErrorCode::NotFound);
 
     let back = call(&w, &env, "workspaces.restore").await.unwrap();
     assert_eq!(back["state"], "ready");

@@ -69,7 +69,7 @@ async fn every_built_in_creates_a_workspace_that_launches() {
         let id = t["id"].as_str().unwrap();
         let env = TestEnv::new("workspaces");
         let w = Workspaces::default();
-        let created = call(&w, &env, "workspaces.create", json!({"id": "mine", "template": id, "values": answers(id)}))
+        let created = call(&w, &env, "workspaces.new", json!({"id": "mine", "template": id, "values": answers(id)}))
             .await
             .unwrap_or_else(|e| panic!("{id}: {}", e.message));
         assert_eq!(created["state"], "ready", "{id}");
@@ -111,7 +111,7 @@ async fn answers_become_env_and_the_label_can_be_set() {
     let created = call(
         &w,
         &env,
-        "workspaces.create",
+        "workspaces.new",
         json!({"id": "site", "template": "web-project", "values": values, "label": "My site"}),
     )
     .await
@@ -132,16 +132,16 @@ async fn create_never_overwrites_and_checks_everything_first() {
     let w = Workspaces::default();
     let create = |id: &str, template: &str, values: Value| json!({"id": id, "template": template, "values": values});
 
-    let e = call(&w, &env, "workspaces.create", create("site", "web-project", json!({}))).await.unwrap_err();
+    let e = call(&w, &env, "workspaces.new", create("site", "web-project", json!({}))).await.unwrap_err();
     assert_eq!(e.code, ErrorCode::InvalidParams);
     assert!(e.message.contains("PROJECT_DIR (Project folder) is required"), "{}", e.message);
-    let e = call(&w, &env, "workspaces.create", create("site", "web-project", json!({"PROJECT_DIR": "~/site"})))
+    let e = call(&w, &env, "workspaces.new", create("site", "web-project", json!({"PROJECT_DIR": "~/site"})))
         .await
         .unwrap_err();
     assert!(e.message.contains("absolute path"), "{}", e.message);
-    let e = call(&w, &env, "workspaces.create", create("Site!", "smoke-test", json!({}))).await.unwrap_err();
+    let e = call(&w, &env, "workspaces.new", create("Site!", "smoke-test", json!({}))).await.unwrap_err();
     assert!(e.message.contains("not a valid workspace id"), "{}", e.message);
-    let e = call(&w, &env, "workspaces.create", create("site", "nope", json!({}))).await.unwrap_err();
+    let e = call(&w, &env, "workspaces.new", create("site", "nope", json!({}))).await.unwrap_err();
     assert_eq!(e.code, ErrorCode::NotFound);
     assert!(
         e.message.contains(
@@ -153,7 +153,7 @@ async fn create_never_overwrites_and_checks_everything_first() {
     assert!(env.backend.events().is_empty(), "nothing written");
 
     env.ctx.store.write("site/notes.txt", "mine").unwrap();
-    let e = call(&w, &env, "workspaces.create", create("site", "smoke-test", json!({}))).await.unwrap_err();
+    let e = call(&w, &env, "workspaces.new", create("site", "smoke-test", json!({}))).await.unwrap_err();
     assert_eq!(e.code, ErrorCode::Conflict);
     assert_eq!(file(&env, "site/notes.txt").as_deref(), Some("mine"));
     assert!(file(&env, "site/workspace.toml").is_none());
@@ -248,7 +248,7 @@ async fn the_vm_template_never_takes_a_password_only_a_keychain_entry_name() {
     let w = Workspaces::default();
     let values = json!({"VM_SOFTWARE": "utm", "VM_NAME": "Debian", "ON_STOP": "suspend", "VM_HOST": "auto", "SSH_USER": "me",
                         "SSH_PASSWORD_ITEM": "shimmer-vm-debian", "REMOTE_EDITOR": "cursor"});
-    w.handle("workspaces.create", json!({"id": "dev-vm", "template": "vm", "values": values}), &env.ctx).await.unwrap();
+    w.handle("workspaces.new", json!({"id": "dev-vm", "template": "vm", "values": values}), &env.ctx).await.unwrap();
     let text = file(&env, "dev-vm/workspace.toml").unwrap();
     assert!(text.contains("SSH_PASSWORD_ITEM = \"shimmer-vm-debian\""), "{text}");
     assert!(file(&env, "dev-vm/lib/shimmer-vm.sh").is_some(), "the vm helper is copied");
@@ -259,7 +259,7 @@ async fn the_vm_template_never_takes_a_password_only_a_keychain_entry_name() {
 
     let e = w
         .handle(
-            "workspaces.create",
+            "workspaces.new",
             json!({"id": "x", "template": "vm", "values": {"VM_SOFTWARE": "hyperv", "VM_NAME": "a"}}),
             &env.ctx,
         )

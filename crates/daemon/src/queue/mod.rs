@@ -28,7 +28,7 @@ use tokio_util::task::TaskTracker;
 use crate::backend::Backend;
 use state::LaneState;
 
-/// Finished tasks kept for `queue.task` lookups.
+/// Finished tasks kept for `queue.show` lookups.
 const HISTORY: usize = 1000;
 const SOURCE: &str = "queue";
 

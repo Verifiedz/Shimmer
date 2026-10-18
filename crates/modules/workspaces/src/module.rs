@@ -91,8 +91,13 @@ impl Module for Workspaces {
         let id = json!({"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}});
         let queued = || Execution::Queued { lane: LANE.into() };
         [
-            ("workspaces.list", "List workspaces and their state", json!({"type": "object"}), Execution::Inline),
-            ("workspaces.status", "Show one workspace in full", id.clone(), Execution::Inline),
+            (
+                "workspaces.list",
+                "List workspaces and their state, or with removed the removed ones",
+                json!({"type": "object", "properties": {"removed": {"type": "boolean"}}}),
+                Execution::Inline,
+            ),
+            ("workspaces.show", "Show one workspace in full", id.clone(), Execution::Inline),
             ("workspaces.activate", "Launch a workspace's steps in order", id.clone(), queued()),
             ("workspaces.cleanup", "Run a dirty workspace's cleanup script", id.clone(), queued()),
             ("workspaces.force_relaunch", "Launch a dirty workspace anyway (logged as forced)", id.clone(), queued()),
@@ -133,7 +138,7 @@ impl Module for Workspaces {
                 Execution::Inline,
             ),
             (
-                "workspaces.create",
+                "workspaces.new",
                 "Create a workspace from a template and your answers",
                 json!({"type": "object", "required": ["id", "template"], "properties": {
                     "id": {"type": "string"}, "template": {"type": "string"},
@@ -172,8 +177,8 @@ impl Module for Workspaces {
 
     async fn handle(&self, op: &str, params: Value, ctx: &Ctx) -> Result<Value> {
         match op {
-            "workspaces.list" => self.list(ctx),
-            "workspaces.status" => self.status(ctx, &decode::<Target>(params)?.id),
+            "workspaces.list" => self.list(ctx, decode::<ListParams>(params)?),
+            "workspaces.show" => self.status(ctx, &decode::<Target>(params)?.id),
             "workspaces.reset" => self.reset(ctx, &decode::<Target>(params)?.id),
             "workspaces.activate" => self.activate(ctx, &decode::<Target>(params)?.id).await,
             "workspaces.force_relaunch" => self.force_relaunch(ctx, &decode::<Target>(params)?.id).await,
@@ -185,7 +190,7 @@ impl Module for Workspaces {
             "workspaces.rename" => self.rename(ctx, decode(params)?),
             "workspaces.copy" => self.copy(ctx, decode(params)?),
             "workspaces.templates" => templates(decode(params)?),
-            "workspaces.create" => self.create(ctx, decode(params)?),
+            "workspaces.new" => self.create(ctx, decode(params)?),
             "workspaces.answers" => self.answers(ctx, &decode::<Target>(params)?.id),
             "workspaces.reconfigure" => self.reconfigure(ctx, decode(params)?),
             "workspaces.health" => self.health(ctx),
@@ -197,6 +202,13 @@ impl Module for Workspaces {
 #[derive(Deserialize)]
 struct Target {
     id: String,
+}
+
+/// `workspaces.list`: the live workspaces, or with `removed` the removed ones (ADR 0038 §6).
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct ListParams {
+    removed: bool,
 }
 
 /// `workspaces.purge` (ADR 0038): one removed workspace, or all of them.
@@ -248,7 +260,7 @@ struct Rename {
 /// Where a workspace records the template it was made from (ADR 0025 §9).
 const TEMPLATE_FILE: &str = ".template";
 
-/// `workspaces.create` (ADR 0025 §7).
+/// `workspaces.new` (ADR 0025 §7).
 #[derive(Deserialize)]
 struct Create {
     id: String,
@@ -293,7 +305,10 @@ fn templates(which: Which) -> Result<Value> {
 impl Workspaces {
     /// Every workspace, by id. A broken one is listed as `invalid` with the reason; it never
     /// hides the others (ADR 0012 §6).
-    fn list(&self, ctx: &Ctx) -> Result<Value> {
+    fn list(&self, ctx: &Ctx, p: ListParams) -> Result<Value> {
+        if p.removed {
+            return self.list_removed(ctx);
+        }
         let mut out = Vec::new();
         for (id, folder) in folders(ctx)? {
             let mut entry = Map::new();
@@ -305,6 +320,25 @@ impl Workspaces {
             match saved {
                 Some(saved) if errors.is_empty() => add_state(&mut entry, &saved.state),
                 _ => add_invalid(&mut entry, &errors),
+            }
+            out.push(Value::Object(entry));
+        }
+        Ok(json!({"workspaces": out}))
+    }
+
+    /// The removed workspaces you can restore or purge (ADR 0038 §6), by id, with their label when
+    /// their `workspace.toml` can be read.
+    fn list_removed(&self, ctx: &Ctx) -> Result<Value> {
+        let mut out = Vec::new();
+        for id in removed_ids(ctx)? {
+            let mut entry = Map::new();
+            entry.insert("id".into(), json!(id));
+            let text = ctx.store.read_string(&format!("{}/workspace.toml", removed_path(&id)))?;
+            let label = text
+                .and_then(|t| t.parse::<toml::Table>().ok())
+                .and_then(|t| t.get("workspace")?.get("label")?.as_str().map(str::to_owned));
+            if let Some(label) = label {
+                entry.insert("label".into(), json!(label));
             }
             out.push(Value::Object(entry));
         }

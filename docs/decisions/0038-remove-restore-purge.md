@@ -1,7 +1,8 @@
-# 0038. Remove, restore and purge: one rule for everything a person makes
+# 0038. Remove, restore and purge, and one set of command words for every feature
 
-Status: proposed · Raised by Dev B · Needs sign-off: Dev A (§3 changes the scheduler, daemon code)
-· Dev C notified (new ops and topics, §4) · No `core` or `proto` change · Follows #258's
+Status: proposed · Raised by Dev B · Needs sign-off: Dev A (§3 and §6 change the scheduler and queue,
+daemon code; §6 renames two `proto` op constants and bumps the protocol to v2) · Dev C notified
+(renamed and new ops and topics, §4, §6) · No `core` change · Follows #258's
 convention 2 ("created and changed through ops and the CLI: new / edit / remove / restore")
 
 ## Context
@@ -90,6 +91,37 @@ workspaces and automations already do).
 scheduler restore ID`, `shimmer scheduler purge [ID] [--yes]`, `shimmer scheduler list --removed`.
 Each gets an alias in every built-in pack (ADR 0013, 0029), Tab completion and help.
 
+### 6. Command conventions (amended 2026-10-18)
+
+The same idea for the words themselves: each meaning has one word, and that word is the same in the
+CLI, the op and the docs. Nothing depends on the old names yet (no dogfooding, no outside clients),
+so they're renamed outright rather than kept as second names.
+
+| Meaning | Word | Was |
+|---|---|---|
+| Show one thing in full | `show` (op `<feature>.show`) | `records get`, `workspaces status NAME`; ops `records.get`, `workspaces.status`, `scheduler.get`, `notify.get`, `queue.task` |
+| The whole feature's state | `status` (no argument) | (`notify status`, `automations status`, unchanged) |
+| Make a definition | `new` (op `<feature>.new`) | ops `records.create_collection`, `workspaces.create`, `automations.create` |
+| Put an entry into something, change an entry | `add` (records, schedules) or `send` (notify); `update` changes a record's fields | unchanged |
+| Change a definition | `edit` | **new: `scheduler edit TRIGGER WHEN … COMMAND…`** (keeps the id, whether it's on, and its last run; was remove and add, which gave a new id and left a removed copy) |
+| Switch a thing off and on | `disable` / `enable` (a thing shows `enabled`) | `scheduler pause` / `resume` (`paused`); topics `scheduler.trigger.paused` / `.resumed` → `.disabled` / `.enabled`. Notify's `pause` / `resume` stays: it's do-not-disturb for a while, not switching a thing off |
+| See what's removed | `list --removed` (op `<feature>.list {"removed": true}`) | `records trash COLLECTION` (op `records.trash`), automations mixing removed ones into `list`; **new for workspaces** |
+| Rename / copy a named thing | `rename` / `copy` | records and workspaces had them; **new for automations** |
+| Reorder | `move` (op `queue.move`) | op `queue.reorder` |
+| Problems for `shimmer doctor` | op `<feature>.health` (ADR 0033) | records, workspaces, automations had it; **new: `notify.health`** |
+| Purged records | topic `records.item.purged` | `records.trash.purged` |
+
+- **The CLI word is always the op's verb** (with `_` as `-`). The CLI's list of exceptions (ADR
+  0015 §1) is now empty, and a test keeps it that way.
+- **Ids:** named things (collections, records, workspaces, rules) are typed by name; things
+  Shimmer names (schedules, tasks, messages) take a unique ending of their id (ADR 0031 §4).
+- **Every command** takes `--json`; anything that can't be undone asks first and takes `--yes`.
+- **Templates** (`templates`, `peek`, `new --from`) follow #202.
+- **The protocol goes to v2**, since ops were renamed (protocol.md lists the changes). `queue.task`
+  and `queue.reorder` are constants in `proto`; that and the version are the only `proto` changes.
+- **Fetchers** follows this in #277 (`show`, `enable` / `disable`, `list --removed`, `health`); it
+  lives on `integration/fetchers`, not in this PR.
+
 ## Not chosen
 
 - **One shared `core` helper for move-aside, restore and purge.** It would stop a fourth copy of the
@@ -99,6 +131,10 @@ Each gets an alias in every built-in pack (ADR 0013, 0029), Tab completion and h
 - **A trash for notify and the queue** (§2).
 - **Purge without asking for a named id.** One id is still for good; the same confirmation as a
   bulk purge keeps it from being one keystroke.
+- **Keeping the old command words as second names** (§6). It would add a second word for every
+  meaning, the opposite of the point, to protect scripts that don't exist yet.
+- **`pause` / `resume` everywhere instead of `enable` / `disable`.** Notify's pause means "hold
+  everything for a while", with a time; a schedule or a rule is simply on or off.
 
 ## Consequences
 
@@ -107,3 +143,6 @@ Each gets an alias in every built-in pack (ADR 0013, 0029), Tab completion and h
 - Four new ops (`workspaces.purge`, `automations.purge`, `scheduler.restore`, `scheduler.purge`), four
   new topics, a `removed/` folder in the scheduler's namespace, and four aliases per pack.
 - protocol.md documents each op and topic, and that `scheduler.remove` now keeps the trigger.
+- §6: one word per meaning across every feature, the same in the CLI and the protocol; `scheduler
+  edit`, `workspaces list --removed`, automations `rename` / `copy` and `notify.health` fill the
+  gaps; packs, completion, help and docs follow; the protocol is v2.

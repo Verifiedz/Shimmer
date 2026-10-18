@@ -268,8 +268,8 @@ mod tests {
     #[test]
     fn global_flags_before_the_alias_are_kept_and_skipped() {
         assert_eq!(
-            rewritten(&["--json", "--socket", "/s", "wst", "x"]),
-            args(&["--json", "--socket", "/s", "workspaces", "status", "x"])
+            rewritten(&["--json", "--socket", "/s", "wshow", "x"]),
+            args(&["--json", "--socket", "/s", "workspaces", "show", "x"])
         );
         assert_eq!(rewritten(&["--socket=/s", "up"]), args(&["--socket=/s", "ping"]));
         assert_eq!(rewritten(&["-h", "wgo"]), args(&["-h", "workspaces", "activate"]));
@@ -414,7 +414,7 @@ mod tests {
         let lines: Vec<&str> = help.lines().collect();
         assert_eq!(lines[0], "aliases (short pack; 'shimmer --help --canonical' hides these):");
         assert_eq!(lines[1].trim_end(), "  up        shimmer ping");
-        assert_eq!(lines[34].trim_end(), "  wreset    shimmer workspaces reset");
+        assert_eq!(lines[33].trim_end(), "  wreset    shimmer workspaces reset");
         assert_eq!(lines[55].trim_end(), "  sdel      shimmer scheduler remove");
         assert_eq!(lines.len(), crate::packs::pack::TARGETS.len() + 2, "a line per alias, a heading and a blank");
     }
