@@ -186,8 +186,10 @@ after = "3d"                      # 30m, 2h, 3d, 1w, 60d…
 3. **The filter operators:** records' matcher (`crates/modules/records/src/query.rs`) is
    schema-aware. `core::filter` holds the **same operators over plain JSON values** (numbers compare
    as numbers, dates as ISO text, `has`/`contains` ignore case as in records); records keeps its
-   schema checks on top and calls it, with behaviour and tests unchanged. Without a schema, enums
-   compare as text, so rules use `in` for enum values.
+   schema checks on top and calls it, with behaviour and tests unchanged. The top-level `or` of
+   alternatives moves with them, so rule `when` clauses and today's `{"or": [...]}` record
+   filters both have it. Without a schema, enums compare as text, so rules use `in` for enum
+   values.
 4. **The text renderer:** records' `{field}` / `[optional part]` renderer (`render_title`,
    `title_parts`, `plain_parts` in `crates/modules/records/src/schema.rs`) moves to `core::text` as
    `Template::parse(&str)` / `Template::render(&Map<String, Value>)`. Records calls it, unchanged.
@@ -347,13 +349,15 @@ params = { id = "{workspace}" }
 ```toml
 # 3: the record closes → the workspace stops (its cleanup runs; it stays in your list)
 on = "records.item.updated"
-when = { collection = "jobs", "item.stage" = { in = ["offer", "rejected", "withdrawn"] } }
+when = { collection = "jobs", "item.stage" = { in = ["offer", "rejected", "withdrawn"] }, changed = "stage" }
 [[do]]
 op = "workspaces.stop"
 params = { id = "{id}-prep" }
 ```
 
-Rule 3 **stops** the workspace rather than removing it: `workspaces.remove` refuses a workspace
+Rule 2 opens **any** new workspace made from that workspace template, one you make yourself
+included; the template says so when you create it. Rule 3 **stops** the workspace rather than
+removing it: `workspaces.remove` refuses a workspace
 that's active (ADR 0026), and rule 2 has opened it, so a remove would fail every time. A rule's
 actions start together, so "stop, then remove" can't be one rule; a fourth rule removing any
 stopped `*-prep` workspace was considered and rejected, since it would also remove one you stop by
@@ -380,7 +384,10 @@ optional starting points; built-in rules are always there.
 
 - **The fields they match exist on the event:** `queue.task.failed` carries `code` (protocol.md's
   error codes) and `fallback` (ADR 0032 §4) besides CLAUDE.md §11.1's summary of task id, lane,
-  origin, error and attempts.
+  origin, error and attempts. `workspaces.session.dirty` carries `recovered: true` when it reports a
+  launch the daemon never finished (found at start-up); that came with notify (ADR 0032 §4, #245).
+  Like every built-in that messages you, `workspace-half-launched` loads only once notify is
+  installed, so it never runs without the field.
 - **Notify's own work is never alerted on:** notify's tasks run in the `notify` lane, so the first
   three add `lane ≠ notify`, as notify's alert code did (ADR 0032 §4).
 - **The exact fix in the message:** workspaces' `workspace_dirty` detail gains `fix`, the command
