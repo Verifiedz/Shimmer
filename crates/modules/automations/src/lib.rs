@@ -82,13 +82,10 @@ impl Automations {
                 Err(e) => problems.push((path.clone(), e)),
             }
         }
-        let (depth, off) = match settings(ctx) {
-            Ok(s) => s,
-            Err(e) => {
-                problems.push((SETTINGS.to_owned(), e));
-                (DEPTH, Vec::new())
-            }
-        };
+        let (depth, off, problem) = settings(ctx);
+        if let Some(e) = problem {
+            problems.push((SETTINGS.to_owned(), e));
+        }
         for (id, key, text) in builtin::RULES {
             // A file of yours with a built-in rule's id is reported, not run: the built-in wins.
             if rules.remove(id).is_some() {
@@ -429,9 +426,11 @@ impl Automations {
         let topic = if on { "automations.rule.enabled" } else { "automations.rule.disabled" };
         if let Some((key, _)) = builtin::find(id).filter(|_| current.builtin) {
             // A built-in rule is switched in the settings (§7): its text isn't yours to change.
-            let text = ctx.store.read_string(SETTINGS)?.unwrap_or_default();
-            let mut doc = text.parse::<toml_edit::DocumentMut>().unwrap_or_default();
-            if doc.get("builtin").is_none() {
+            let mut doc = editable_settings(ctx)?;
+            if !doc.get("builtin").is_some_and(toml_edit::Item::is_table) {
+                // Missing, or hand-edited into something else (`builtin = true`): a table again,
+                // rather than a panic indexing into it (#255's review).
+                doc.remove("builtin");
                 doc["builtin"] = toml_edit::table();
             }
             doc["builtin"][key] = toml_edit::value(on);
@@ -510,8 +509,7 @@ impl Automations {
             return Err(Error::invalid_params(format!("depth is {} to {}", DEPTH_RANGE.start(), DEPTH_RANGE.end())));
         }
         let _g = self.write.lock();
-        let text = ctx.store.read_string(SETTINGS)?.unwrap_or_default();
-        let mut doc = text.parse::<toml_edit::DocumentMut>().unwrap_or_default();
+        let mut doc = editable_settings(ctx)?;
         doc["depth"] = toml_edit::value(depth as i64);
         ctx.store.transaction(|tx| {
             tx.put(SETTINGS, doc.to_string())?;
@@ -769,9 +767,18 @@ fn removed(ctx: &Ctx) -> Vec<String> {
 
 /// `settings.toml`: the depth limit (the default when there's no file or no `depth`), and the
 /// `[builtin]` keys switched off (§7).
-fn settings(ctx: &Ctx) -> std::result::Result<(usize, Vec<String>), String> {
-    let Some(text) = ctx.store.read_string(SETTINGS).map_err(|e| e.message)? else { return Ok((DEPTH, Vec::new())) };
-    let table: toml::Table = toml::from_str(&text).map_err(|e| format!("not a settings file: {}", e.message()))?;
+/// The depth limit, the built-ins switched off, and what's wrong with the file, if anything. A bad
+/// `depth` falls back alone: the switched-off built-ins are still read (#255's review).
+fn settings(ctx: &Ctx) -> (usize, Vec<String>, Option<String>) {
+    let text = match ctx.store.read_string(SETTINGS) {
+        Ok(Some(text)) => text,
+        Ok(None) => return (DEPTH, Vec::new(), None),
+        Err(e) => return (DEPTH, Vec::new(), Some(e.message)),
+    };
+    let table: toml::Table = match toml::from_str(&text) {
+        Ok(t) => t,
+        Err(e) => return (DEPTH, Vec::new(), Some(format!("not a settings file: {}", e.message()))),
+    };
     let off: Vec<String> = table
         .get("builtin")
         .and_then(toml::Value::as_table)
@@ -780,14 +787,24 @@ fn settings(ctx: &Ctx) -> std::result::Result<(usize, Vec<String>), String> {
         .filter(|(_, on)| on.as_bool() == Some(false))
         .map(|(k, _)| k.clone())
         .collect();
-    let depth = match table.get("depth") {
-        None => DEPTH,
+    match table.get("depth") {
+        None => (DEPTH, off, None),
         Some(v) => match v.as_integer().and_then(|n| usize::try_from(n).ok()) {
-            Some(n) if DEPTH_RANGE.contains(&n) => n,
-            _ => return Err(format!("depth is {} to {}, using {DEPTH}", DEPTH_RANGE.start(), DEPTH_RANGE.end())),
+            Some(n) if DEPTH_RANGE.contains(&n) => (n, off, None),
+            _ => {
+                (DEPTH, off, Some(format!("depth is {} to {}, using {DEPTH}", DEPTH_RANGE.start(), DEPTH_RANGE.end())))
+            }
         },
-    };
-    Ok((depth, off))
+    }
+}
+
+/// `settings.toml` to change, comments kept. One that doesn't parse is refused, never replaced:
+/// it's hand-editable, and writing a fresh one would lose the person's other settings (#255's
+/// review).
+fn editable_settings(ctx: &Ctx) -> Result<toml_edit::DocumentMut> {
+    let text = ctx.store.read_string(SETTINGS)?.unwrap_or_default();
+    text.parse::<toml_edit::DocumentMut>()
+        .map_err(|e| Error::invalid_params(format!("{SETTINGS} doesn't parse: {}; fix it first", e.to_string().trim())))
 }
 
 /// The history, oldest first. A broken file reads as empty: it's a convenience, the event log

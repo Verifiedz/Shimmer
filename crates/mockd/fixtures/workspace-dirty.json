@@ -162,7 +162,8 @@
               "failed_step": "3/7 tmux-session",
               "failed_at": "2026-09-16T09:12:44Z",
               "log": "logs/focus-01JD2U.log",
-              "has_cleanup_script": true
+              "has_cleanup_script": true,
+              "fix": "shimmer workspaces cleanup focus"
             },
             "retryable": false,
             "attempts": 1
