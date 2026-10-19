@@ -1,19 +1,37 @@
 //! `shimmer fetchers …`: sources that reach outward for new items (ADR 0028). Every command is
 //! one of the `fetchers` module's own ops; nothing here decides anything (CLAUDE.md §2).
 
+use std::path::{Path, PathBuf};
+
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use shimmer_core::{Error, ErrorCode, Result};
 
 use crate::client::Client;
+use crate::editor;
 use crate::flags::Flags;
 use crate::render::{self, table};
+use crate::style::{paint, Role};
 use crate::when;
+use crate::workspaces::Prompt;
 
 pub const USAGE: &str = "usage: shimmer fetchers <command>
 
 commands:
-  list                 every known source and its configured state
+  list [--removed]      every known source and its configured state; --removed: the ones you
+                        removed, to restore or purge
+  show SOURCE           one source in full, with its file text
+  new SOURCE [--file FILE]    a source from FILE, or opened in your editor to write from scratch
+  edit SOURCE [--file FILE]   open its file in your editor, or replace it with FILE; a broken
+                        source is refused and the old one kept
+  remove SOURCE         remove a source (restore brings it back)
+  restore SOURCE        bring a removed source back
+  purge [SOURCE] [--yes]      delete a removed source for good, or every removed one (asks first)
+  enable SOURCE         switch a source on
+  disable SOURCE        switch a source off
+  rename SOURCE NEW     give a source a new id; its dedup state and last-run time follow it
+  copy SOURCE NEW [--label TEXT]
+                        a new source like SOURCE, switched off until you enable it
   status               per-source last-run time and whether it is running
   test SOURCE [FILTER]   fetch one page and show its parsed items; never saves or marks anything seen
   run SOURCE [--wait] [FILTER]  fetch one source now
@@ -24,15 +42,22 @@ FILTER (test and run only):
   --contains W,W,...    keep only a title containing at least one of these (case-insensitive)
   --excludes W,W,...    drop a title containing any of these, even one --contains would keep
 
-When given to test or run, each of these replaces -- never merges with -- whatever
-config.toml's own [modules.fetchers.sources.<id>] entry configures, for that one call only.
+When given to test or run, each of these replaces -- never merges with -- whatever the source's
+own file configures, for that one call only.
 
 items' own --contains/--excludes are a separate, client-side narrowing of what's already
 been found and saved.
 
-A source is either one of the built-in ones (hn-whoishiring, weworkremotely) or a configured
-kind configured under [modules.fetchers.sources.<id>] in config.toml. Add --json to any
-command for raw output.";
+A source is a file in your data folder, data/fetchers/sources/SOURCE.toml:
+
+  [source]
+  enabled = true
+  interval = \"daily\"             # a preset (hourly, daily, weekly) or a number of seconds
+  kind = \"rss\"                   # absent: SOURCE must be one of the built-in ones
+  [kind]
+  url = \"https://example.test/feed.xml\"
+
+Add --json to any command for raw output.";
 
 /// `core.events.list`'s own query limit for `items` -- generous enough to cover several runs
 /// across every source before filtering down to one, well under the daemon's own cap
@@ -42,11 +67,65 @@ const ITEMS_QUERY_LIMIT: usize = 200;
 #[derive(Clone, Debug, PartialEq)]
 pub enum FetchersCmd {
     Help,
-    List,
+    /// `removed`: the removed sources instead (ADR 0038 §6).
+    List {
+        removed: bool,
+    },
+    Show {
+        id: String,
+    },
+    New {
+        id: String,
+        file: Option<PathBuf>,
+    },
+    Edit {
+        id: String,
+        file: Option<PathBuf>,
+    },
+    Remove {
+        id: String,
+    },
+    Restore {
+        id: String,
+    },
+    /// `id`: one removed source; `None` is every one (ADR 0038).
+    Purge {
+        id: Option<String>,
+        yes: bool,
+    },
+    Enable {
+        id: String,
+    },
+    Disable {
+        id: String,
+    },
+    Rename {
+        id: String,
+        to: String,
+    },
+    /// A new source from another, switched off; `label` its own.
+    Copy {
+        id: String,
+        to: String,
+        label: Option<String>,
+    },
     Status,
-    Test { source: String, title_contains: Option<Vec<String>>, title_excludes: Option<Vec<String>> },
-    Run { source: String, wait: bool, title_contains: Option<Vec<String>>, title_excludes: Option<Vec<String>> },
-    Items { source: Option<String>, title_contains: Option<Vec<String>>, title_excludes: Option<Vec<String>> },
+    Test {
+        source: String,
+        title_contains: Option<Vec<String>>,
+        title_excludes: Option<Vec<String>>,
+    },
+    Run {
+        source: String,
+        wait: bool,
+        title_contains: Option<Vec<String>>,
+        title_excludes: Option<Vec<String>>,
+    },
+    Items {
+        source: Option<String>,
+        title_contains: Option<Vec<String>>,
+        title_excludes: Option<Vec<String>>,
+    },
 }
 
 /// `--contains a, b ,c` (or `--excludes`) as a term list -- comma-separated, each term
@@ -75,12 +154,12 @@ fn title_matches(title: &str, contains: &[String], excludes: &[String]) -> bool 
 /// `words` are what follows `shimmer fetchers`.
 pub fn parse(words: Vec<String>) -> std::result::Result<FetchersCmd, String> {
     let mut words = words.into_iter();
-    let Some(sub) = words.next() else { return Ok(FetchersCmd::Help) };
+    let Some(sub) = words.next() else { return Ok(FetchersCmd::List { removed: false }) };
     let rest: Vec<String> = words.collect();
     match sub.as_str() {
         "help" => Ok(FetchersCmd::Help),
-        "list" if rest.is_empty() => Ok(FetchersCmd::List),
-        "list" => Err("'fetchers list' takes no arguments".into()),
+        "list" | "show" | "new" | "edit" | "remove" | "restore" | "purge" | "enable" | "disable" | "rename"
+        | "copy" => parse_source_command(&sub, rest),
         "status" if rest.is_empty() => Ok(FetchersCmd::Status),
         "status" => Err("'fetchers status' takes no arguments".into()),
         "test" => {
@@ -128,12 +207,186 @@ pub fn parse(words: Vec<String>) -> std::result::Result<FetchersCmd, String> {
     }
 }
 
-pub async fn run(client: &mut Client, cmd: &FetchersCmd, json_out: bool) -> Result<String> {
+/// `list`/`show`/`new`/`edit`/`remove`/`restore`/`purge`/`enable`/`disable`/`rename`/`copy` --
+/// the source-definition commands (ADR 0038 §3/§6), split out of [`parse`] since they share no
+/// flags with `test`/`run`/`items`'s own `--contains`/`--excludes`.
+fn parse_source_command(sub: &str, rest: Vec<String>) -> std::result::Result<FetchersCmd, String> {
+    let options: &[&str] = match sub {
+        "new" | "edit" => &["--file"],
+        "copy" => &["--label"],
+        _ => &[],
+    };
+    let switches: &[&str] = match sub {
+        "purge" => &["--yes"],
+        "list" => &["--removed"],
+        _ => &[],
+    };
+    let flags = Flags::split(rest, options, switches).map_err(|e| format!("fetchers {sub}: {e}"))?;
+    let usage = |what: &str| format!("usage: shimmer fetchers {sub} {what}");
+    let id = |what: &str| match flags.positional.as_slice() {
+        [id] => Ok(id.clone()),
+        _ => Err(usage(what)),
+    };
+    let file = flags.value("--file").map(PathBuf::from);
+    Ok(match sub {
+        "list" => match flags.positional.as_slice() {
+            [] => FetchersCmd::List { removed: flags.has("--removed") },
+            _ => return Err("'fetchers list' takes no arguments".into()),
+        },
+        "show" => FetchersCmd::Show { id: id("SOURCE")? },
+        "new" => FetchersCmd::New { id: id("SOURCE [--file FILE]")?, file },
+        "edit" => FetchersCmd::Edit { id: id("SOURCE [--file FILE]")?, file },
+        "remove" => FetchersCmd::Remove { id: id("SOURCE")? },
+        "restore" => FetchersCmd::Restore { id: id("REMOVED")? },
+        "purge" => match flags.positional.as_slice() {
+            [] => FetchersCmd::Purge { id: None, yes: flags.has("--yes") },
+            [id] => FetchersCmd::Purge { id: Some(id.clone()), yes: flags.has("--yes") },
+            _ => return Err(usage("[REMOVED] [--yes]")),
+        },
+        "enable" => FetchersCmd::Enable { id: id("SOURCE")? },
+        "disable" => FetchersCmd::Disable { id: id("SOURCE")? },
+        "rename" | "copy" => {
+            let [id, to]: [String; 2] = flags.positional.clone().try_into().map_err(|_| match sub {
+                "rename" => usage("SOURCE NEW"),
+                _ => usage("SOURCE NEW [--label TEXT]"),
+            })?;
+            match sub {
+                "rename" => FetchersCmd::Rename { id, to },
+                _ => FetchersCmd::Copy { id, to, label: flags.value("--label").map(str::to_owned) },
+            }
+        }
+        _ => unreachable!("parse_source_command only called for its own listed subcommands"),
+    })
+}
+
+pub async fn run(client: &mut Client, cmd: &FetchersCmd, json_out: bool, prompt: &mut impl Prompt) -> Result<String> {
+    let one = |id: &str| json!({ "id": id });
     match cmd {
         FetchersCmd::Help => Ok(USAGE.into()),
-        FetchersCmd::List => {
+        FetchersCmd::List { removed: false } => {
             let data = client.call("fetchers.list", json!({})).await?;
             Ok(if json_out { render::json(&data) } else { list(&data) })
+        }
+        FetchersCmd::List { removed: true } => {
+            let data = client.call("fetchers.list", json!({"removed": true})).await?;
+            Ok(if json_out { render::json(&data) } else { removed_list(&data) })
+        }
+        FetchersCmd::Show { id } => {
+            let data = client.call("fetchers.show", one(id)).await?;
+            Ok(if json_out { render::json(&data) } else { show(&data) })
+        }
+        FetchersCmd::New { id, file: Some(file) } => {
+            let data = client.call("fetchers.new", json!({"id": id, "text": read(file)?})).await?;
+            Ok(if json_out { render::json(&data) } else { format!("✓ made source {}", source_summary(&data)) })
+        }
+        FetchersCmd::New { id, file: None } => {
+            if json_out || !prompt.interactive() {
+                return Err(Error::invalid_params(format!(
+                    "fetchers new needs a terminal; give its file instead: shimmer fetchers new {id} --file FILE"
+                )));
+            }
+            edit_loop(client, "fetchers.new", id, STARTER.to_owned(), prompt).await.map(|saved| match saved {
+                true => format!("✓ made source {id}; it's switched off until: shimmer fetchers enable {id}"),
+                false => format!("nothing made: {id} was left unchanged from the starter"),
+            })
+        }
+        FetchersCmd::Edit { id, file: Some(file) } => {
+            let data = client.call("fetchers.edit", json!({"id": id, "text": read(file)?})).await?;
+            Ok(if json_out { render::json(&data) } else { format!("✓ saved source {}", source_summary(&data)) })
+        }
+        FetchersCmd::Edit { id, file: None } => {
+            let text = data_text(client, id).await?;
+            if !prompt.interactive() {
+                return Err(Error::invalid_params(format!(
+                    "fetchers edit needs a terminal; replace the source from a file instead: \
+                     shimmer fetchers edit {id} --file FILE"
+                )));
+            }
+            edit_loop(client, "fetchers.edit", id, text, prompt).await.map(|saved| match saved {
+                true => format!("✓ saved source {id}"),
+                false => format!("no changes to {id}"),
+            })
+        }
+        FetchersCmd::Remove { id } => {
+            let data = client.call("fetchers.remove", one(id)).await?;
+            Ok(if json_out {
+                render::json(&data)
+            } else {
+                format!("✓ removed source {id}\n  bring it back with: shimmer fetchers restore {id}")
+            })
+        }
+        FetchersCmd::Restore { id } => {
+            let data = client.call("fetchers.restore", one(id)).await?;
+            Ok(if json_out {
+                render::json(&data)
+            } else {
+                match data["problem"].as_str() {
+                    None => format!("✓ restored source {}", source_summary(&data["source"])),
+                    Some(problem) => format!(
+                        "✓ restored {id}, but it can't run: {problem}\n  fix it with: shimmer fetchers edit {id}"
+                    ),
+                }
+            })
+        }
+        FetchersCmd::Purge { id, yes } => {
+            let mut params = json!({});
+            if let Some(id) = id {
+                params["id"] = json!(id);
+            }
+            let data = match client.call("fetchers.purge", params.clone()).await {
+                Err(e) if e.code == ErrorCode::ConfirmationRequired => {
+                    let what = match id {
+                        Some(id) => format!("the removed source '{id}'"),
+                        None => "every removed source".to_owned(),
+                    };
+                    if !crate::records::confirm_purge(prompt, *yes, &what, &e.message)? {
+                        return Ok("nothing purged".into());
+                    }
+                    params["confirm"] = e.detail.unwrap_or_default();
+                    client.call("fetchers.purge", params).await?
+                }
+                other => other?,
+            };
+            Ok(if json_out {
+                render::json(&data)
+            } else {
+                match (data["purged"].as_u64().unwrap_or(0), id) {
+                    (0, _) => "no removed sources to purge".to_owned(),
+                    (_, Some(id)) => format!("✓ {id} is deleted for good"),
+                    (n, None) => format!("✓ {n} removed source(s) deleted for good"),
+                }
+            })
+        }
+        FetchersCmd::Enable { id } | FetchersCmd::Disable { id } => {
+            let on = matches!(cmd, FetchersCmd::Enable { .. });
+            let op = if on { "fetchers.enable" } else { "fetchers.disable" };
+            let data = client.call(op, one(id)).await?;
+            Ok(if json_out {
+                render::json(&data)
+            } else if on {
+                format!("✓ {id} is on")
+            } else {
+                format!("✓ {id} is off: it won't run until enabled")
+            })
+        }
+        FetchersCmd::Rename { id, to } => {
+            let data = client.call("fetchers.rename", json!({"id": id, "to": to})).await?;
+            Ok(if json_out { render::json(&data) } else { format!("✓ {id} is now {to}") })
+        }
+        FetchersCmd::Copy { id, to, label } => {
+            let mut params = json!({"id": id, "to": to});
+            if let Some(label) = label {
+                params["label"] = json!(label);
+            }
+            let data = client.call("fetchers.copy", params).await?;
+            Ok(if json_out {
+                render::json(&data)
+            } else {
+                format!(
+                    "✓ made {to} from {id}, switched off so the same schedule doesn't fire both\n  \
+                     turn it on when it's ready: shimmer fetchers enable {to}"
+                )
+            })
         }
         FetchersCmd::Status => {
             let data = client.call("fetchers.status", json!({})).await?;
@@ -188,6 +441,128 @@ pub async fn run(client: &mut Client, cmd: &FetchersCmd, json_out: bool) -> Resu
             Ok(if json_out { render::json(&json!({"items": matching})) } else { items(source.as_deref(), &matching) })
         }
     }
+}
+
+/// Opened in the editor for `fetchers new SOURCE` with no `--file`: a disabled source with
+/// both tables present but nothing filled in, so there's something to delete rather than
+/// something to remember the shape of.
+const STARTER: &str = "[source]
+enabled = false
+interval = \"daily\"            # a preset (hourly, daily, weekly) or a number of seconds
+# kind = \"rss\"                # omit entirely for a built-in source (hn-whoishiring, weworkremotely)
+
+[kind]
+# url = \"https://example.test/feed.xml\"
+";
+
+fn read(file: &Path) -> Result<String> {
+    std::fs::read_to_string(file).map_err(|e| Error::invalid_params(format!("can't read {}: {e}", file.display())))
+}
+
+async fn data_text(client: &mut Client, id: &str) -> Result<String> {
+    let data = client.call("fetchers.show", json!({ "id": id })).await?;
+    Ok(data["text"].as_str().unwrap_or_default().to_owned())
+}
+
+/// Edit a copy of `text` in the editor and send it with `op` (`fetchers.new` or
+/// `fetchers.edit`); a refused source can be edited again with your text kept, the same
+/// pattern `automations new`/`edit` use. `Ok(true)` when something was actually saved.
+async fn edit_loop(client: &mut Client, op: &str, id: &str, text: String, prompt: &mut impl Prompt) -> Result<bool> {
+    let path = new_private_file(id, &text)?;
+    loop {
+        editor::open(&path)?;
+        let edited = read(&path)?;
+        if edited == text {
+            let _ = std::fs::remove_file(&path);
+            return Ok(false);
+        }
+        match client.call(op, json!({"id": id, "text": edited})).await {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&path);
+                return Ok(true);
+            }
+            Err(e) if e.code == ErrorCode::InvalidParams => {
+                eprintln!("{} {}", paint(Role::Error, "✗ not saved:"), e.message);
+                if !prompt.confirm("Edit it again?") {
+                    return Err(Error::invalid_params(format!(
+                        "{id} not saved (the old source is unchanged); your text is in {}",
+                        path.display()
+                    )));
+                }
+            }
+            // Whatever went wrong (the source removed meanwhile, the daemon restarted), the
+            // edit isn't lost: say where it is (same reasoning as automations' own #253 review).
+            Err(e) => {
+                return Err(Error::new(
+                    e.code,
+                    format!("{}; {id} not saved, your text is in {}", e.message, path.display()),
+                ))
+            }
+        }
+    }
+}
+
+/// A new file in the temp folder holding `text`, readable only by you, at a name nobody else
+/// can have made first: it's created with `create_new`, so a file or link someone planted
+/// there is refused rather than written through (same reasoning as automations' own #253
+/// review).
+fn new_private_file(id: &str, text: &str) -> Result<PathBuf> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let path = std::env::temp_dir().join(format!("shimmer-source-{id}-{}-{stamp}.toml", std::process::id()));
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| Error::internal(format!("can't create {}: {e}", path.display())))?;
+    f.write_all(text.as_bytes()).map_err(|e| Error::internal(format!("can't write {}: {e}", path.display())))?;
+    Ok(path)
+}
+
+/// `id` (kind): enabled/disabled, for a one-line confirmation after `new`/`edit`/`restore`.
+fn source_summary(source: &Value) -> String {
+    format!(
+        "{} ({}): {}",
+        full(&source["id"]),
+        source["kind"].as_str().unwrap_or("built in"),
+        if source["enabled"] == true { "on" } else { "off" }
+    )
+}
+
+/// A value in full, for sentences; `render::cell` shortens, for table cells.
+fn full(v: &Value) -> String {
+    match v {
+        Value::Null => "-".to_owned(),
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// One source in full: its state and its file text.
+fn show(s: &Value) -> String {
+    let mut out =
+        format!("{}  ({})\n", paint(Role::Name, &full(&s["id"])), if s["enabled"] == true { "on" } else { "off" });
+    let mut line = |label: &str, value: String| out.push_str(&format!("  {}{value}\n", crate::style::label(label, 12)));
+    line("kind", s["kind"].as_str().unwrap_or("built in").to_owned());
+    line("label", full(&s["label"]));
+    line("interval", s["interval_s"].as_u64().map(when::format_duration).unwrap_or_else(|| "-".into()));
+    out.push('\n');
+    out.push_str(s["text"].as_str().unwrap_or_default().trim_end());
+    out
+}
+
+/// `list --removed`: each removed source's id, and how to bring it back or delete it for good.
+fn removed_list(data: &Value) -> String {
+    let ids = data["removed"].as_array().cloned().unwrap_or_default();
+    if ids.is_empty() {
+        return "no removed sources".into();
+    }
+    let rows: Vec<Vec<String>> = ids.iter().map(|id| vec![render::cell(id)]).collect();
+    let mut out = table(&["SOURCE".into()], &rows);
+    out.push_str("\nbring one back: shimmer fetchers restore SOURCE; delete for good: shimmer fetchers purge [SOURCE]");
+    out
 }
 
 /// `fetchers.run`/`fetchers.test`'s params: `source`, plus `title_contains`/
@@ -383,9 +758,31 @@ mod tests {
 
     #[test]
     fn commands_parse() {
-        assert_eq!(p(&[]), Ok(FetchersCmd::Help));
-        assert_eq!(p(&["list"]), Ok(FetchersCmd::List));
+        assert_eq!(p(&[]), Ok(FetchersCmd::List { removed: false }));
+        assert_eq!(p(&["list"]), Ok(FetchersCmd::List { removed: false }));
+        assert_eq!(p(&["list", "--removed"]), Ok(FetchersCmd::List { removed: true }));
         assert_eq!(p(&["status"]), Ok(FetchersCmd::Status));
+        assert_eq!(p(&["show", "blog"]), Ok(FetchersCmd::Show { id: "blog".into() }));
+        assert_eq!(p(&["new", "blog"]), Ok(FetchersCmd::New { id: "blog".into(), file: None }));
+        assert_eq!(
+            p(&["new", "blog", "--file", "s.toml"]),
+            Ok(FetchersCmd::New { id: "blog".into(), file: Some("s.toml".into()) })
+        );
+        assert_eq!(p(&["edit", "blog"]), Ok(FetchersCmd::Edit { id: "blog".into(), file: None }));
+        assert_eq!(p(&["remove", "blog"]), Ok(FetchersCmd::Remove { id: "blog".into() }));
+        assert_eq!(p(&["restore", "blog"]), Ok(FetchersCmd::Restore { id: "blog".into() }));
+        assert_eq!(p(&["purge"]), Ok(FetchersCmd::Purge { id: None, yes: false }));
+        assert_eq!(p(&["purge", "blog", "--yes"]), Ok(FetchersCmd::Purge { id: Some("blog".into()), yes: true }));
+        assert_eq!(p(&["enable", "blog"]), Ok(FetchersCmd::Enable { id: "blog".into() }));
+        assert_eq!(p(&["disable", "blog"]), Ok(FetchersCmd::Disable { id: "blog".into() }));
+        assert_eq!(
+            p(&["rename", "blog", "team-blog"]),
+            Ok(FetchersCmd::Rename { id: "blog".into(), to: "team-blog".into() })
+        );
+        assert_eq!(
+            p(&["copy", "blog", "blog-2", "--label", "Blog copy"]),
+            Ok(FetchersCmd::Copy { id: "blog".into(), to: "blog-2".into(), label: Some("Blog copy".into()) })
+        );
         assert_eq!(
             p(&["test", "hn-whoishiring"]),
             Ok(FetchersCmd::Test { source: "hn-whoishiring".into(), title_contains: None, title_excludes: None })

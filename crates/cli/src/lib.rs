@@ -320,7 +320,7 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
         return workspaces::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
     }
     if let Command::Fetchers(cmd) = &args.command {
-        return fetchers::run(&mut client, cmd, args.json).await.map(Some);
+        return fetchers::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
     }
     if let Command::Call { op, params, first: Some(yes) } = &args.command {
         return call_first(&mut client, op, params.clone(), *yes).await.map(|data| Some(output(args, &data)));

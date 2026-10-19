@@ -99,6 +99,16 @@ belongs to this machine, so copying your Shimmer folder elsewhere doesn't bring 
 | fetchers test | `teisatsu` | `smoke-test` | `trial-run` | `ftest` |
 | fetchers run | `shutsugeki` | `poll` | `deep-scan` | `frun` |
 | fetchers items | `shuukaku` | `feed` | `haul` | `fitems` |
+| fetchers show | `shoukai` | `inspect-source` | `sensor-report` | `fshow` |
+| fetchers new | `souzou` | `add-source` | `chart-source` | `fnew` |
+| fetchers edit | `shuusei` | `edit-source` | `retune-sensor` | `fedit` |
+| fetchers remove | `haijo` | `drop-source` | `unchart` | `frm` |
+| fetchers restore | `sosei` | `restore-source` | `rechart` | `fundo` |
+| fetchers purge | `shoukyo` | `gc-sources` | `vent-sector` | `fpurge` |
+| fetchers enable | `kidou` | `source-on` | `power-on` | `fon` |
+| fetchers disable | `teishi` | `source-off` | `power-down` | `foff` |
+| fetchers rename | `tsukekae` | `relabel-source` | `retag-source` | `fmv` |
+| fetchers copy | `utsushi` | `clone-source` | `duplicate-source` | `fcp` |
 | automations list | `keikaku` | `hooks` | `protocols` | `alist` |
 | automations show | `dore` | `inspect-hook` | `briefing` | `aget` |
 | automations new | `tsukuru` | `add-hook` | `standing-order` | `anew` |
