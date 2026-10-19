@@ -198,6 +198,83 @@ and a `steps/` folder of scripts. [`CLAUDE.md`](CLAUDE.md) §10 shows an example
 has every rule. `shimmer workspaces --help`, `shimmer queue --help` and
 `shimmer scheduler --help` cover the rest.
 
+### Notifications
+
+```sh
+shimmer notify test                        # check that messages reach you (a desktop notification)
+shimmer notify send "Build finished" --body "v1.4 is live" --priority high
+shimmer notify list                        # your messages, newest first; --unread, --from automations, --text …
+shimmer notify show 0A3F6K                 # one in full (the ending list shows is enough)
+shimmer notify quiet 22:00-08:00           # quiet hours: low and normal messages wait, then one summary
+shimmer notify pause 2h                    # do not disturb for a while; shimmer notify resume to stop
+shimmer notify remove --read               # clean up (asks first)
+shimmer schedule weekdays 08:45 --catch-up skip notify send "Standup in 15"
+```
+
+Every message lands in an inbox first (`$SHIMMER_HOME/data/notify/inbox/`), then appears as a
+desktop notification: `notify-send` on Linux (the `libnotify-bin` package), `osascript` on macOS.
+Nothing is lost if it can't be shown. Normal and high priority pop up; on GNOME, low priority goes
+straight to the notification list without popping up (on macOS every priority pops up the same). Shimmer also tells you by itself when a workspace couldn't
+launch or a scheduled task failed: built-in rules (see Automations below). On a machine with no screen,
+`[desktop] show = false` in `config.toml` logs notifications instead. ADR 0032 has the details;
+`shimmer notify --help` lists every command.
+
+### Automations
+
+Rules: when something happens, run a command. A rule is a small file you can read and edit:
+
+```toml
+# data/automations/rules/solved.toml
+[rule]
+on = "records.item.completed"              # an event: shimmer automations events lists them
+when = { collection = "leetcode" }         # conditions, as in records' filters
+[[do]]
+op = "notify.send"                         # any command
+params = { title = "Solved: {title}" }     # {field} is filled from the event
+[[do]]
+op = "notify.send"
+params = { title = "Time to redo: {title}" }
+after = "60d"                              # wait first: it becomes a schedule
+```
+
+```sh
+shimmer automations templates              # ready-made rules
+shimmer automations new solved --from notify-on-complete   # asks a few questions, shows the rule, makes it
+shimmer automations                        # your rules (and the built-in ones), on or off, last fired
+shimmer automations test solved --event sample.json        # what it would do, without doing it
+shimmer automations history                # what your rules did
+shimmer automations disable workspace-dirty                # switch a built-in rule off
+```
+
+A rule never sets itself off forever: a chain of rules stops at 3 (`shimmer automations depth`),
+and a rule never fires twice in one chain. Rules only run while the daemon runs. ADR 0035 has the
+details.
+
+**Try it: a job hunt.** With a jobs collection (`shimmer records new jobs --from job-applications`):
+
+```sh
+shimmer automations new new-posting --from notify-on-add --set COLLECTION=jobs
+shimmer automations new follow-up --from follow-up-reminder --set COLLECTION=jobs --set DAYS=3
+shimmer automations new prep --from stage-creates-workspace   # interviewing: its own prep workspace
+shimmer automations new offer --from stage-message --set COLLECTION=jobs --set FIELD=stage --set VALUE=offer
+```
+
+A posting is added → you're told. You apply (`records complete`) → three days later, a reminder to
+follow up. It reaches interviewing → a prep workspace is made for it and opened; it closes → that
+workspace stops. An offer → you're told, loudly.
+
+**Try it: LeetCode.** Practice every weekday morning, and redo what you solved:
+
+```sh
+shimmer schedule weekdays 09:00 --catch-up skip workspaces activate practice
+shimmer automations new solved --from notify-on-complete --set COLLECTION=leetcode --set PRIORITY=low
+shimmer automations new redo --from spaced-review --set COLLECTION=leetcode --set DAYS=60
+shimmer automations new stuck --from field-threshold --set COLLECTION=leetcode --set FIELD=attempts --set OVER=3
+```
+
+The morning workspace is a schedule (rules react to events, not times). A problem solved → a quiet
+"Solved"; 60 days later → "time to redo it"; more than three attempts → "this one's giving you trouble".
+
 ### Command packs
 
 A command pack gives the commands themed names, each standing for `shimmer` and a whole command:

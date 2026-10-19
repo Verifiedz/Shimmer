@@ -1,0 +1,86 @@
+[template]
+label = "A workspace for each record that reaches a stage"
+description = "When a record reaches a stage, makes it its own workspace from a workspace template and opens it; stops it when the record closes"
+category = "workspaces"
+good_to_know = [
+    "Makes three rules: one makes the workspace, one opens it, one stops it",
+    "The workspace is called <record id>-<workspace template>, e.g. acme-interview-prep",
+    "Opening runs its launch steps; stopping runs its cleanup, and it stays in your workspaces list to look back at or remove",
+    "The second rule opens any workspace made from that workspace template, also ones you make yourself",
+]
+
+[[question]]
+name = "COLLECTION"
+prompt = "Which collection (its id)"
+kind = "name"
+required = true
+
+[[question]]
+name = "FIELD"
+prompt = "Which field (e.g. stage)"
+kind = "name"
+required = true
+
+[[question]]
+name = "VALUE"
+prompt = "When it becomes (e.g. interviewing)"
+kind = "text"
+required = true
+
+[[question]]
+name = "TEMPLATE"
+prompt = "Which workspace template to make it from ('shimmer workspaces templates' lists them)"
+kind = "name"
+required = true
+
+[[question]]
+name = "CLOSED"
+prompt = "Stop the workspace when the field becomes one of (e.g. offer, rejected, withdrawn)"
+kind = "list"
+required = true
+
+[[question]]
+name = "ANSWERS"
+prompt = "The workspace template's answers, from the record (e.g. COMPANY=title, JOB_URL=item.url)"
+kind = "pairs"
+help = "QUESTION=field pairs, separated by commas. Leave empty if the workspace template asks nothing required."
+
+[[rule]]
+suffix = "make"
+text = '''
+[rule]
+label = "Make a ${TEMPLATE} workspace when ${FIELD} becomes ${VALUE} in ${COLLECTION}"
+on = "records.item.updated"
+when = { collection = "${COLLECTION}", "item.${FIELD}" = "${VALUE}", changed = "${FIELD}" }
+
+[[do]]
+op = "workspaces.create"
+params = { id = "{id}-${TEMPLATE}", template = "${TEMPLATE}" } # unless ANSWERS
+params = { id = "{id}-${TEMPLATE}", template = "${TEMPLATE}", values = { ${ANSWERS} } } # if ANSWERS
+'''
+
+[[rule]]
+suffix = "open"
+text = '''
+[rule]
+label = "Open each new ${TEMPLATE} workspace"
+on = "workspaces.workspace.created"
+when = { template = "${TEMPLATE}" }
+
+[[do]]
+op = "workspaces.activate"
+params = { id = "{workspace}" }
+'''
+
+[[rule]]
+suffix = "stop"
+text = '''
+[rule]
+label = "Stop its ${TEMPLATE} workspace when ${FIELD} closes in ${COLLECTION}"
+on = "records.item.updated"
+when = { collection = "${COLLECTION}", "item.${FIELD}" = { in = [${CLOSED}] }, changed = "${FIELD}" }
+
+[[do]]
+op = "workspaces.stop"
+params = { id = "{id}-${TEMPLATE}" }
+'''
