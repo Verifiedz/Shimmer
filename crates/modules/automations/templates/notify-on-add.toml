@@ -1,0 +1,33 @@
+[template]
+label = "Tell me when a record is added"
+description = "A message whenever a record is added to a collection"
+category = "messages"
+good_to_know = [
+    "It only sends a message: nothing else changes",
+    "Records you add yourself count too, not only ones added by other rules",
+]
+
+[[question]]
+name = "COLLECTION"
+prompt = "Which collection (its id, as 'shimmer records collections' shows it)"
+kind = "name"
+required = true
+
+[[question]]
+name = "PRIORITY"
+prompt = "How loud"
+kind = "choice"
+choices = ["low", "normal", "high"]
+default = "normal"
+
+[[rule]]
+text = '''
+[rule]
+label = "Tell me when something is added to ${COLLECTION}"
+on = "records.item.created"
+when = { collection = "${COLLECTION}" }
+
+[[do]]
+op = "notify.send"
+params = { title = "New in ${COLLECTION}: {title}", priority = "${PRIORITY}", from = "automation:${RULE}" }
+'''

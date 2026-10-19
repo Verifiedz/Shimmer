@@ -81,3 +81,13 @@ fn every_topic_it_emits_is_in_its_manifest() {
         assert!(emitted.contains(topic), "{topic} is in the manifest but never emitted");
     }
 }
+
+/// `shimmer automations events` shows each topic with a line on it (ADR 0035 §5.5).
+#[test]
+fn every_topic_has_a_description() {
+    let m = module().manifest();
+    for topic in &m.topics {
+        let line = m.topic_descriptions.get(topic).map(String::as_str).unwrap_or("");
+        assert!(!line.is_empty(), "{topic} has no description");
+    }
+}

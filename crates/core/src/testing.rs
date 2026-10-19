@@ -13,9 +13,10 @@ use crate::desktop::{Desktop, DesktopBackend, DesktopNote};
 use crate::error::{Error, Result};
 use crate::event::Event;
 use crate::http::{HttpBackend, HttpGateway, HttpResponse};
-use crate::ids::{ModuleId, TaskId};
+use crate::ids::{ModuleId, TaskId, TriggerId};
 use crate::launcher::{LaunchBackend, LaunchStep, Launcher, StepOutcome};
 use crate::queue::{EnqueueRequest, QueueHandle, TaskHandle, TaskSubmitter};
+use crate::schedules::{OneTime, ScheduleBackend, Schedules};
 use crate::store::{validate_path, StoreBackend, TxPlan, Write};
 
 /// In-memory store that is also the event sink. Committed events are inspectable.
@@ -131,6 +132,29 @@ impl LaunchBackend for FakeLauncher {
     }
 }
 
+/// Records the one-time schedules modules add (ADR 0035 §5.6). Nothing fires: a test that wants
+/// a schedule to run calls the module's op itself.
+#[derive(Default)]
+pub struct FakeSchedules {
+    pub added: Mutex<Vec<(ModuleId, TriggerId, OneTime)>>,
+}
+
+impl ScheduleBackend for FakeSchedules {
+    fn add_once(&self, module: &ModuleId, once: OneTime) -> Result<TriggerId> {
+        let mut added = self.added.lock().unwrap();
+        let id = TriggerId::new(format!("{module}-{}", added.len() + 1));
+        added.push((module.clone(), id.clone(), once));
+        Ok(id)
+    }
+
+    fn remove(&self, module: &ModuleId, id: &TriggerId) -> Result<bool> {
+        let mut added = self.added.lock().unwrap();
+        let before = added.len();
+        added.retain(|(m, i, _)| !(m == module && i == id));
+        Ok(added.len() < before)
+    }
+}
+
 /// `ctx.desktop` for tests (ADR 0032 §1): shows nothing, records every note, and fails with
 /// `fail`'s message while it's set.
 #[derive(Default)]
@@ -157,6 +181,7 @@ pub struct TestEnv {
     pub queue: Arc<StubQueue>,
     pub http: Arc<StubHttp>,
     pub launcher: Arc<FakeLauncher>,
+    pub schedules: Arc<FakeSchedules>,
     pub desktop: Arc<FakeDesktop>,
     pub clock: Clock,
 }
@@ -182,9 +207,11 @@ impl TestEnv {
             id,
         );
         ctx.launcher = Launcher::new(launcher.clone());
+        let schedules = Arc::new(FakeSchedules::default());
+        ctx.schedules = Schedules::new(ctx.module_id.clone(), schedules.clone());
         let desktop = Arc::new(FakeDesktop::default());
         ctx.desktop = Desktop::new(desktop.clone());
-        Self { ctx, backend, queue, http, launcher, desktop, clock }
+        Self { ctx, backend, queue, http, launcher, schedules, desktop, clock }
     }
 }
 

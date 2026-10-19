@@ -421,12 +421,6 @@
                 "execution": "inline"
               },
               {
-                "op": "notify.builtin_alerts",
-                "summary": "Show or switch the built-in alerts",
-                "params_schema": {},
-                "execution": "inline"
-              },
-              {
                 "op": "notify.cap",
                 "summary": "Show or set how many messages the inbox keeps",
                 "params_schema": {},

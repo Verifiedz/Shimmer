@@ -99,6 +99,25 @@ belongs to this machine, so copying your Shimmer folder elsewhere doesn't bring 
 | fetchers test | `teisatsu` | `smoke-test` | `trial-run` | `ftest` |
 | fetchers run | `shutsugeki` | `poll` | `deep-scan` | `frun` |
 | fetchers items | `shuukaku` | `feed` | `haul` | `fitems` |
+| automations list | `keikaku` | `hooks` | `protocols` | `alist` |
+| automations show | `dore` | `inspect-hook` | `briefing` | `aget` |
+| automations new | `tsukuru` | `add-hook` | `standing-order` | `anew` |
+| automations edit | `naoshite` | `edit-hook` | `revise-orders` | `aedit` |
+| automations remove | `bye-bye` | `unhook` | `belay-that` | `arm` |
+| automations restore | `modotte` | `rehook` | `reinstate` | `aundo` |
+| automations purge | `zetsumetsu` | `gc-hooks` | `incinerate` | `apurge` |
+| automations rename | `namae-kae` | `relabel` | `rechristen` | `amv` |
+| automations copy | `fukusei` | `spin-off` | `clone-ship` | `acp` |
+| automations enable | `tsukete` | `flag-on` | `arm-systems` | `aon` |
+| automations disable | `tomete` | `flag-off` | `disarm` | `aoff` |
+| automations test | `tameshi` | `dry-run` | `simulation` | `atest` |
+| automations events | `dekigoto` | `triggers` | `sensor-log` | `aevents` |
+| automations history | `kioku` | `audit-log` | `captains-log` | `alog` |
+| automations status | `choushi` | `status-page` | `status-report` | `ast` |
+| automations depth | `fukasa` | `blast-radius` | `chain-of-command` | `adepth` |
+| automations reload | `saikidou` | `hot-reload` | `power-cycle` | `areload` |
+| automations templates | `jutsu` | `playbooks` | `battle-plans` | `atpl` |
+| automations peek | `chira` | `read-playbook` | `review-plan` | `apeek` |
 | notify list | `tegami` | `inbox` | `message-log` | `nlist` |
 | notify show | `kore` | `deep-dive` | `decode` | `nshow` |
 | notify count | `ikutsu` | `badge` | `signal-count` | `ncount` |
@@ -112,7 +131,6 @@ belongs to this machine, so copying your Shimmer folder elsewhere doesn't bring 
 | notify resume | `okite` | `unsnooze` | `open-channel` | `nresume` |
 | notify quiet | `shizuka-ni` | `focus-time` | `night-watch` | `nquiet` |
 | notify status | `genki` | `dashboard` | `bridge-report` | `nst` |
-| notify builtin-alerts | `keikoku` | `alerting` | `red-alert` | `nalerts` |
 | notify cap | `genkai` | `retention` | `memory-banks` | `ncap` |
 
 ## Writing your own
@@ -150,7 +168,8 @@ On the right of each alias goes the command it runs, by its op name:
 | `scheduler.list`, `.show`, `.add`, `.edit`, `.disable`, `.enable`, `.remove`, `.restore`, `.purge` | `shimmer scheduler <verb>` |
 | `fetchers.list`, `.status`, `.test`, `.run`, `.items` | `shimmer fetchers <verb>` |
 | `notify.list`, `.show`, `.count`, `.remove`, `.send`, `.test`, `.resend`, `.pause`, `.resume`, `.quiet`, `.status`, `.cap` | `shimmer notify <verb>` |
-| `notify.mark_read`, `.mark_unread`, `.builtin_alerts` | `shimmer notify mark-read`, `mark-unread`, `builtin-alerts` |
+| `notify.mark_read`, `.mark_unread` | `shimmer notify mark-read`, `mark-unread` |
+| `automations.list`, `.show`, `.new`, `.edit`, `.remove`, `.restore`, `.purge`, `.rename`, `.copy`, `.enable`, `.disable`, `.test`, `.events`, `.history`, `.status`, `.depth`, `.reload`, `.templates`, `.peek` | `shimmer automations <verb>` |
 
 `shimmer packs --help` prints the same list. Your own pack names as many or as few as you like;
 the built-in packs name every one.

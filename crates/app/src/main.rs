@@ -100,6 +100,7 @@ async fn run_daemon() -> ExitCode {
         Arc::new(shimmer_records::Records::default()),
         Arc::new(shimmer_workspaces::Workspaces::default()),
         Arc::new(shimmer_fetchers::Fetchers::default()),
+        Arc::new(shimmer_automations::Automations::default()),
         Arc::new(shimmer_notify::Notify::default()),
     ];
     let mut config = DaemonConfig::from_env();

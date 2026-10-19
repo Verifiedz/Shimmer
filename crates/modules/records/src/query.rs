@@ -7,6 +7,7 @@ use std::cmp::Ordering;
 use chrono::{DateTime, NaiveDate, Utc};
 use chrono_tz::Tz;
 use serde_json::{Map, Value};
+use shimmer_core::filter::{is_set, plain_date, relative_date, Op};
 use shimmer_core::{Error, Result};
 
 use crate::schema::{Collection, FieldType};
@@ -96,21 +97,6 @@ enum Kind {
     Field(FieldType, Vec<String>),
     /// A list field, by the type of its items (ADR 0024 §2).
     List(FieldType, Vec<String>),
-}
-
-#[derive(Debug)]
-enum Op {
-    Eq(Value),
-    Ne(Value),
-    Lt(Value),
-    Lte(Value),
-    Gt(Value),
-    Gte(Value),
-    In(Vec<Value>),
-    Set(bool),
-    Contains(String),
-    /// The list holds this item (strings ignoring case).
-    Has(Value),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -248,28 +234,11 @@ fn op(c: &Collection, key: &str, kind: &Kind, name: &str, arg: &Value, now: &Now
     if !allowed {
         return Err(bad(key, &format!("'{name}' doesn't apply to {}", describe(kind))));
     }
-    let value = |v: &Value| -> Result<Value> {
+    // The argument's shape is core's (ADR 0035 §5.3); its values must fit the field.
+    Op::parse(name, arg).map_err(|m| bad(key, &m))?.try_map(|v| {
         let v = stored(key, kind, v, now)?;
         check_value(c, key, kind, &v)?;
         Ok(v)
-    };
-    Ok(match name {
-        "eq" => Op::Eq(value(arg)?),
-        "ne" => Op::Ne(value(arg)?),
-        "lt" => Op::Lt(value(arg)?),
-        "lte" => Op::Lte(value(arg)?),
-        "gt" => Op::Gt(value(arg)?),
-        "gte" => Op::Gte(value(arg)?),
-        "in" => match arg.as_array() {
-            Some(list) if !list.is_empty() => Op::In(list.iter().map(value).collect::<Result<_>>()?),
-            _ => return Err(bad(key, "'in' takes a non-empty list")),
-        },
-        "set" => Op::Set(arg.as_bool().ok_or_else(|| bad(key, "'set' takes true or false"))?),
-        "has" => Op::Has(value(arg)?),
-        _ => match arg.as_str() {
-            Some(s) if !s.is_empty() => Op::Contains(s.to_lowercase()),
-            _ => return Err(bad(key, "'contains' takes some text")),
-        },
     })
 }
 
@@ -303,7 +272,7 @@ fn check_value(c: &Collection, key: &str, kind: &Kind, v: &Value) -> Result<()> 
 fn stored(key: &str, kind: &Kind, v: &Value, now: &Now) -> Result<Value> {
     // `today`, `today+7`, `today-30` (ADR 0024 §5): a date, in the configured timezone.
     if let (Kind::Field(FieldType::Date | FieldType::Datetime, _), Some(s)) = (kind, v.as_str()) {
-        if let Some(day) = relative_date(s, now).map_err(|m| bad(key, &m))? {
+        if let Some(day) = relative_date(s, now.today()).map_err(|m| bad(key, &m))? {
             return Ok(Value::String(day.format("%Y-%m-%d").to_string()));
         }
     }
@@ -313,30 +282,6 @@ fn stored(key: &str, kind: &Kind, v: &Value, now: &Now) -> Result<Value> {
         }
         _ => Ok(v.clone()),
     }
-}
-
-/// `today`, `today+N` or `today-N` (days) as a date; `None` for anything else.
-fn relative_date(s: &str, now: &Now) -> std::result::Result<Option<NaiveDate>, String> {
-    let Some(rest) = s.trim().strip_prefix("today") else { return Ok(None) };
-    let rest = rest.trim();
-    if rest.is_empty() {
-        return Ok(Some(now.today()));
-    }
-    let (sign, n) = match (rest.strip_prefix('+'), rest.strip_prefix('-')) {
-        (Some(n), _) => (1, n),
-        (_, Some(n)) => (-1, n),
-        _ => return Err(format!("'{s}': write today, today+N or today-N (days)")),
-    };
-    let days: i64 = n.trim().parse().map_err(|_| format!("'{s}': write today, today+N or today-N (days)"))?;
-    now.today()
-        .checked_add_signed(chrono::Duration::days(sign * days))
-        .map(Some)
-        .ok_or_else(|| format!("'{s}' is too far away"))
-}
-
-/// Set means a value other than `null`, `""` or `[]` (ADR 0017's rule, ADR 0024 §2).
-fn is_set(v: &Value) -> bool {
-    !crate::schema::is_unset(v) && v.as_str() != Some("")
 }
 
 /// The text in a value: a string, or a list's string items.
@@ -359,23 +304,7 @@ fn holds(kind: &Kind, op: &Op, got: &Value, tz: &Tz) -> bool {
         }
         Some(sort_value(kind, got, tz)?.cmp(&sort_value(kind, want, tz)?))
     };
-    match op {
-        Op::Eq(want) => got == want,
-        // Unset matches: "stage is not rejected" includes records with no stage yet.
-        Op::Ne(want) => got != want,
-        Op::Lt(want) => cmp(want) == Some(Ordering::Less),
-        Op::Lte(want) => matches!(cmp(want), Some(Ordering::Less | Ordering::Equal)),
-        Op::Gt(want) => cmp(want) == Some(Ordering::Greater),
-        Op::Gte(want) => matches!(cmp(want), Some(Ordering::Greater | Ordering::Equal)),
-        Op::In(list) => is_set(got) && list.contains(got),
-        Op::Set(want) => is_set(got) == *want,
-        Op::Contains(needle) => got.as_str().is_some_and(|s| s.to_lowercase().contains(needle)),
-        Op::Has(want) => got.as_array().is_some_and(|items| items.iter().any(|i| values::same(i, want))),
-    }
-}
-
-fn plain_date(s: &str) -> Option<NaiveDate> {
-    NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
+    op.holds(got, cmp)
 }
 
 /// A value as something that orders the way its type should: ints by number, dates by date,

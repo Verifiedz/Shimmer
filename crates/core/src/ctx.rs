@@ -14,14 +14,16 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::bus::Emitter;
+use crate::catalog::Catalog;
 use crate::clock::Clock;
 use crate::desktop::Desktop;
 use crate::error::{Error, Result};
 use crate::http::HttpGateway;
-use crate::ids::ModuleId;
+use crate::ids::{ModuleId, TaskId};
 use crate::launcher::Launcher;
 use crate::queue::QueueHandle;
 use crate::retry::RetryPolicy;
+use crate::schedules::Schedules;
 use crate::store::NamespacedStore;
 use crate::time::LocalTimezone;
 
@@ -73,6 +75,12 @@ pub struct Ctx {
     /// separate change once ADR 0010 is signed off. Modules must never call
     /// `std::process::Command` directly (§12 rule 4).
     pub launcher: Launcher,
+    /// Add a one-time schedule, or remove one this module added (ADR 0035 §5.6). Every module
+    /// gets the daemon's; [`Schedules::unavailable`] until it's wired in.
+    pub schedules: Schedules,
+    /// Every op and topic in the daemon, read-only, fixed at start (ADR 0035 §5.7). Empty until
+    /// the daemon fills it.
+    pub catalog: Arc<Catalog>,
     /// Show a desktop notification (ADR 0032 §1). Defaults to [`Desktop::unavailable`]; the
     /// daemon gives the real one only to a module whose manifest declares `"desktop"`.
     pub desktop: Desktop,
@@ -105,6 +113,8 @@ impl Ctx {
             clock,
             local_tz,
             launcher: Launcher::unavailable(),
+            schedules: Schedules::unavailable(module_id.clone()),
+            catalog: Arc::default(),
             desktop: Desktop::unavailable(),
             cancel,
             config,
@@ -113,9 +123,17 @@ impl Ctx {
         }
     }
 
-    /// A copy for running one queued task: its own cancellation token and progress sink.
-    pub fn for_task(&self, cancel: CancellationToken, progress: ProgressFn) -> Self {
-        Self { cancel, progress: Some(progress), ..self.clone() }
+    /// A copy for running queued task `task`: its own cancellation token and progress sink, and
+    /// every event it emits, through `bus` or a store transaction, carries `task` as its cause
+    /// (ADR 0035 §5.1).
+    pub fn for_task(&self, task: TaskId, cancel: CancellationToken, progress: ProgressFn) -> Self {
+        Self {
+            cancel,
+            progress: Some(progress),
+            bus: self.bus.for_task(task),
+            store: self.store.for_task(task),
+            ..self.clone()
+        }
     }
 
     /// Report progress from inside a queued task. No-op when running inline.
@@ -217,9 +235,28 @@ mod tests {
         env.ctx.progress(0.5, "ignored");
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let s = seen.clone();
-        let ctx =
-            env.ctx.for_task(CancellationToken::new(), Arc::new(move |f, n| s.lock().unwrap().push((f, n.to_owned()))));
+        let progress: ProgressFn = Arc::new(move |f, n| s.lock().unwrap().push((f, n.to_owned())));
+        let ctx = env.ctx.for_task(TaskId::new(), CancellationToken::new(), progress);
         ctx.progress(2.0, "page 2");
         assert_eq!(*seen.lock().unwrap(), [(1.0, "page 2".to_owned())]);
+    }
+
+    #[test]
+    fn events_from_a_task_carry_its_id_by_bus_and_transaction() {
+        let env = TestEnv::new("records");
+        let task = TaskId::new();
+        let ctx = env.ctx.for_task(task, CancellationToken::new(), Arc::new(|_, _| {}));
+        ctx.bus.emit("records.item.updated", Value::Null).unwrap();
+        ctx.store.transaction(|tx| tx.emit("records.item.created", Value::Null)).unwrap();
+        env.ctx.bus.emit("records.item.removed", Value::Null).unwrap();
+        let causes: Vec<_> = env.backend.events().iter().map(|e| (e.topic.clone(), e.cause)).collect();
+        assert_eq!(
+            causes,
+            [
+                ("records.item.updated".to_owned(), Some(task)),
+                ("records.item.created".to_owned(), Some(task)),
+                ("records.item.removed".to_owned(), None),
+            ]
+        );
     }
 }

@@ -1,0 +1,38 @@
+[template]
+label = "Tell me when a number goes over a limit"
+description = "A message when a record's number field changes to more than a limit (attempts over 3)"
+category = "messages"
+good_to_know = [
+    "It only sends a message: nothing else changes",
+    "Only when that field changes: editing something else on the record doesn't send it again",
+]
+
+[[question]]
+name = "COLLECTION"
+prompt = "Which collection (its id)"
+kind = "name"
+required = true
+
+[[question]]
+name = "FIELD"
+prompt = "Which number field (e.g. attempts)"
+kind = "name"
+required = true
+
+[[question]]
+name = "OVER"
+prompt = "When it's more than"
+kind = "number"
+required = true
+
+[[rule]]
+text = '''
+[rule]
+label = "Tell me when ${FIELD} goes over ${OVER} in ${COLLECTION}"
+on = "records.item.updated"
+when = { collection = "${COLLECTION}", "item.${FIELD}" = { gt = ${OVER} }, changed = "${FIELD}" }
+
+[[do]]
+op = "notify.send"
+params = { title = "{title}: ${FIELD} is {item.${FIELD}}", body = "That's more than ${OVER}.", from = "automation:${RULE}" }
+'''
