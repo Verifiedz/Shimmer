@@ -86,24 +86,24 @@ pub async fn run(client: &mut Client, cmd: &QueueCmd, json: bool) -> Result<Stri
             Ok(if json { render::json(&data) } else { list(&data, now) })
         }
         QueueCmd::Show { id } => {
-            let data = client.call("queue.task", json!({ "task_id": id })).await?;
+            let data = client.call("queue.show", json!({ "task_id": id })).await?;
             Ok(if json { render::json(&data) } else { task(&data, now) })
         }
         QueueCmd::Cancel { id } => {
             // Find it first, then act on its full id, and say which one it was (#183's review).
-            let t = client.call("queue.task", json!({ "task_id": id })).await?;
+            let t = client.call("queue.show", json!({ "task_id": id })).await?;
             let full = render::cell(&t["task_id"]);
             let data = client.call("queue.cancel", json!({ "task_id": full })).await?;
             Ok(if json { render::json(&data) } else { cancelled(&named(&t), &data) })
         }
         QueueCmd::Move { id, before } => {
-            // The lane comes from the task itself; `queue.reorder` needs it, and the lane's current
+            // The lane comes from the task itself; `queue.move` needs it, and the lane's current
             // `queue_version`, so a move based on a stale view is refused rather than misplaced.
-            let t = client.call("queue.task", json!({ "task_id": id })).await?;
+            let t = client.call("queue.show", json!({ "task_id": id })).await?;
             let lane = t["lane"].as_str().ok_or_else(|| Error::internal("task has no lane"))?.to_string();
             let full = render::cell(&t["task_id"]);
             let other = match before {
-                Some(b) => Some(client.call("queue.task", json!({ "task_id": b })).await?),
+                Some(b) => Some(client.call("queue.show", json!({ "task_id": b })).await?),
                 None => None,
             };
             let lanes = client.call("queue.list", json!({ "lane": lane })).await?;
@@ -111,7 +111,7 @@ pub async fn run(client: &mut Client, cmd: &QueueCmd, json: bool) -> Result<Stri
             let before_id = other.as_ref().map(|o| render::cell(&o["task_id"]));
             let data = client
                 .call(
-                    "queue.reorder",
+                    "queue.move",
                     json!({"lane": lane, "task_id": full, "before": before_id, "queue_version": version}),
                 )
                 .await?;

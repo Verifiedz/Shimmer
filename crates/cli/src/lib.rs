@@ -12,6 +12,7 @@ mod complete;
 mod csv;
 mod doctor;
 mod editor;
+mod fetchers;
 mod first;
 mod flags;
 mod follow;
@@ -23,6 +24,7 @@ mod render;
 mod schedule;
 mod scheduler;
 mod schedules;
+mod startup;
 mod style;
 mod when;
 mod workspaces;
@@ -37,6 +39,7 @@ use shimmer_proto::ops;
 pub use args::{Args, Command, USAGE};
 pub use automations::AutomationsCmd;
 pub use client::{Client, ConnectError};
+pub use fetchers::FetchersCmd;
 pub use queue::QueueCmd;
 pub use records::RecordsCmd;
 pub use scheduler::SchedulerCmd;
@@ -132,7 +135,7 @@ async fn run_line(alias: Option<String>, args: Vec<String>) -> ExitCode {
         }
     }
     let args = packs::active::rewrite(line, active.pack.as_ref());
-    // `shimmer schedule WHEN … ALIAS …`: the alias where the scheduled command starts, too.
+    // `shimmer scheduler add WHEN … ALIAS …`: the alias where the scheduled command starts, too.
     let args = schedule::rewrite_inner(args, active.pack.as_ref());
 
     let usage = usage_for(&args);
@@ -206,10 +209,11 @@ fn usage_for(args: &[String]) -> &'static str {
             "queue" => return queue::USAGE,
             "scheduler" => return scheduler::USAGE,
             "automations" => return automations::USAGE,
-            "schedule" => return schedule::USAGE,
+            "fetchers" => return fetchers::USAGE,
             "packs" => return packs::cmd::USAGE,
             "notify" => return notify::USAGE,
             "doctor" => return doctor::USAGE,
+            "startup" => return startup::USAGE,
             _ => return USAGE,
         }
     }
@@ -225,16 +229,21 @@ fn prints_data(cmd: &Command) -> bool {
         Command::Call { .. }
             | Command::Records(
                 RecordsCmd::List { .. }
-                    | RecordsCmd::Get { .. }
+                    | RecordsCmd::Show { .. }
                     | RecordsCmd::Export { .. }
-                    | RecordsCmd::Trash { .. }
+                    | RecordsCmd::ListRemoved { .. }
                     | RecordsCmd::Collections
                     | RecordsCmd::Check { .. }
                     | RecordsCmd::Peek { file: true, .. }
             )
-            | Command::Workspaces(WorkspacesCmd::List | WorkspacesCmd::Status { .. })
+            | Command::Workspaces(WorkspacesCmd::List { .. } | WorkspacesCmd::Show { .. })
             | Command::Queue(QueueCmd::List { .. } | QueueCmd::Show { .. })
-            | Command::Scheduler(SchedulerCmd::List | SchedulerCmd::Show { .. })
+            | Command::Scheduler(
+                SchedulerCmd::List { .. }
+                    | SchedulerCmd::Show { .. }
+                    | SchedulerCmd::Add(_)
+                    | SchedulerCmd::Edit { .. }
+            )
             // Every reply that can carry a rule's label, which is the person's text (#253's review).
             | Command::Automations(
                 AutomationsCmd::List { .. }
@@ -250,11 +259,23 @@ fn prints_data(cmd: &Command) -> bool {
                     | AutomationsCmd::Status
                     | AutomationsCmd::Reload
             )
-            | Command::Schedule(_)
             | Command::Notify(
                 notify::NotifyCmd::List { .. } | notify::NotifyCmd::Show { .. } | notify::NotifyCmd::Send { .. }
             )
     )
+}
+
+/// Once, the first time something that only runs while the daemon runs is made (ADR 0034 §7). Only
+/// to a person at a terminal: never with `--json`, and never into a script's output.
+fn nudge_startup(json: bool, what: &str) {
+    use std::io::IsTerminal as _;
+    if json || !std::io::stderr().is_terminal() {
+        return;
+    }
+    let os = startup::Env::from_process().os;
+    if let Some(note) = startup::nudge(packs::settings::path().as_deref(), os, what) {
+        eprintln!("{}", style::paint_err(style::Role::Hint, &note));
+    }
 }
 
 /// `help` is the top-level help: [`USAGE`], plus the active pack's aliases unless `--canonical`.
@@ -266,10 +287,12 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
         Command::Queue(QueueCmd::Help) => return Ok(Some(queue::USAGE.into())),
         Command::Scheduler(SchedulerCmd::Help) => return Ok(Some(scheduler::USAGE.into())),
         Command::Automations(AutomationsCmd::Help) => return Ok(Some(automations::USAGE.into())),
-        Command::Schedule(schedule::ScheduleCmd::Help) => return Ok(Some(schedule::USAGE.into())),
+        Command::Fetchers(FetchersCmd::Help) => return Ok(Some(fetchers::USAGE.into())),
         Command::DoctorHelp => return Ok(Some(doctor::USAGE.into())),
         // Packs live entirely in the client: no daemon needed.
         Command::Packs(cmd) => return packs::cmd::run(cmd, &packs::cmd::Env::from_process()).map(Some),
+        // The login service is the operating system's, not the daemon's (ADR 0034).
+        Command::Startup(cmd) => return startup::run(cmd, &startup::Env::from_process(), &mut startup::Real).map(Some),
         _ => {}
     }
     let Some(mut client) = connect(args).await? else { return Ok(None) };
@@ -284,7 +307,11 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
         return queue::run(&mut client, cmd, args.json).await.map(Some);
     }
     if let Command::Scheduler(cmd) = &args.command {
-        return scheduler::run(&mut client, cmd, args.json).await.map(Some);
+        let out = scheduler::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await?;
+        if matches!(cmd, SchedulerCmd::Add(_)) {
+            nudge_startup(args.json, "schedules");
+        }
+        return Ok(Some(out));
     }
     if let Command::Automations(cmd) = &args.command {
         return automations::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
@@ -292,8 +319,8 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
     if let Command::Workspaces(cmd) = &args.command {
         return workspaces::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
     }
-    if let Command::Schedule(cmd) = &args.command {
-        return schedule::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
+    if let Command::Fetchers(cmd) = &args.command {
+        return fetchers::run(&mut client, cmd, args.json).await.map(Some);
     }
     if let Command::Call { op, params, first: Some(yes) } = &args.command {
         return call_first(&mut client, op, params.clone(), *yes).await.map(|data| Some(output(args, &data)));
@@ -311,9 +338,10 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
         | Command::Queue(_)
         | Command::Scheduler(_)
         | Command::Automations(_)
-        | Command::Schedule(_)
+        | Command::Fetchers(_)
         | Command::Packs(_)
-        | Command::Notify(_) => {
+        | Command::Notify(_)
+        | Command::Startup(_) => {
             unreachable!("handled above")
         }
     };
@@ -382,9 +410,10 @@ fn output(args: &Args, data: &Value) -> String {
         | Command::Queue(_)
         | Command::Scheduler(_)
         | Command::Automations(_)
-        | Command::Schedule(_)
+        | Command::Fetchers(_)
         | Command::Packs(_)
-        | Command::Notify(_) => render::json(data),
+        | Command::Notify(_)
+        | Command::Startup(_) => render::json(data),
     }
 }
 
@@ -419,10 +448,10 @@ mod tests {
         let cmd = |words: &[&str]| Args::parse(words.iter().map(|w| w.to_string())).unwrap().command;
         for words in [
             &["records", "list", "lc"][..],
-            &["records", "get", "lc/x"],
+            &["records", "show", "lc/x"],
             &["records", "export", "lc"],
             &["records", "collections"],
-            &["workspaces", "status", "site"],
+            &["workspaces", "show", "site"],
             &["scheduler", "list"],
             &["call", "core.ping"],
             &["automations", "new", "x", "--file", "rule.toml"],
@@ -441,7 +470,7 @@ mod tests {
     #[test]
     fn usage_follows_the_command_word() {
         assert_eq!(usage(&["workspaces", "activate", "x", "--bogus"]), workspaces::USAGE);
-        assert_eq!(usage(&["--json", "--socket", "/tmp/s", "workspaces", "status"]), workspaces::USAGE);
+        assert_eq!(usage(&["--json", "--socket", "/tmp/s", "workspaces", "show"]), workspaces::USAGE);
         assert_eq!(usage(&["records", "list", "--limit", "x"]), records::USAGE);
         assert_eq!(usage(&["call"]), USAGE);
         assert_eq!(usage(&["--bogus"]), USAGE);

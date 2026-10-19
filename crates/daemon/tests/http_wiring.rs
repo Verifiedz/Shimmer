@@ -50,7 +50,9 @@ async fn a_module_with_the_capability_can_actually_fetch() {
         if let Ok((mut stream, _)) = listener.accept() {
             let mut buf = [0u8; 1024];
             let _ = stream.read(&mut buf);
-            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            // One response, then the connection closes: say so, as the gateway's own TestServer
+            // does (#134).
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok");
         }
     });
 

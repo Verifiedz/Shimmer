@@ -466,8 +466,9 @@ $SHIMMER_HOME/
   data/records/trash/<collection>/<id>.toml  Removed records, until restored or purged (ADR 0020).
   data/records/removed-collections/<id>/  Removed collections, until restored (ADR 0021).
   data/workspaces/<name>/  workspace.toml + steps/ + cleanup script + state.toml (ADRs 0010, 0012).
-  data/workspaces/.removed/<name>/  Removed workspaces, until restored (ADR 0026).
+  data/workspaces/.removed/<name>/  Removed workspaces, until restored or purged (ADRs 0026, 0038).
   data/scheduler/triggers/<id>.json  One per trigger, JSON because params are JSON (ADR 0004).
+  data/scheduler/removed/<id>.json   Removed schedules, until restored or purged (ADR 0038).
   data/automations/rules/<id>.toml  One per rule; settings.toml, history.json, removed/ (ADR 0035).
   data/notify/             Notify's inbox (inbox/<id>.toml, one file per message), settings.toml,
                            and held/ markers (ADR 0032). A message no sink could deliver stays in
@@ -493,6 +494,12 @@ transfer story.
 
 Client settings are not in `$SHIMMER_HOME`: the CLI keeps its own (the active command pack,
 §15.1) in `~/.config/shimmer/cli.toml`, which only the CLI reads and writes (ADR 0013).
+
+Secrets are not in `$SHIMMER_HOME` either, for the same reason inverted — that directory is
+meant to be copied between machines and committed to git, so nothing secret may ever live in
+it. An outbound credential's *value* lives in `~/.config/shimmer/secrets.toml`, mode `0600`,
+read only by the daemon (ADR 0036). `config.toml` holds only the *binding* — which module, host
+and header a credential named there may be used for — never the secret itself.
 
 ### 7.1 Atomicity: all or nothing
 
@@ -883,7 +890,7 @@ label = "Anime Tropes"
 
 [alias]
 "ikuzo"  = "workspaces.activate"
-"nani"   = "workspaces.status"
+"nani"   = "workspaces.show"
 "yatta"  = "records.complete"
 
 [anim]

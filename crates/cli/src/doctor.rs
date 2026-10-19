@@ -15,6 +15,7 @@ use shimmer_proto::ops;
 use crate::args::Args;
 use crate::client::Client;
 use crate::packs::pack;
+use crate::style::{paint, Role};
 use crate::{autostart, render};
 
 pub const USAGE: &str = "usage: shimmer doctor [--json]
@@ -202,6 +203,15 @@ fn is_plain(word: &str) -> bool {
     !word.is_empty() && word.chars().all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c))
 }
 
+/// The colour a check's label is shown in: ok green, warn yellow, FAIL red, as states are (#189).
+fn status_role(status: Status) -> Role {
+    match status {
+        Status::Ok => Role::Success,
+        Status::Warn => Role::Warning,
+        Status::Fail => Role::Error,
+    }
+}
+
 pub fn report(checks: &[Check]) -> String {
     let width = checks.iter().map(|c| c.area.len()).max().unwrap_or(0);
     let mut out = String::new();
@@ -211,12 +221,14 @@ pub fn report(checks: &[Check]) -> String {
             Status::Warn => "warn",
             Status::Fail => "FAIL",
         };
+        // Padded first, so the colour codes never count towards the column width.
+        let label = paint(status_role(c.status), &format!("{label:4}"));
         // A message can run over several lines (a TOML parse error does): keep them in its column.
         let indent = " ".repeat(4 + 2 + width + 2);
         let message = c.message.trim_end().replace('\n', &format!("\n{indent}"));
-        let _ = writeln!(out, "{label:4}  {:width$}  {message}", c.area);
+        let _ = writeln!(out, "{label}  {:width$}  {message}", c.area);
         if let Some(fix) = &c.fix {
-            let _ = writeln!(out, "{indent}→ {fix}");
+            let _ = writeln!(out, "{indent}{}", paint(Role::Hint, &format!("→ {fix}")));
         }
     }
     let count = |s: Status| checks.iter().filter(|c| c.status == s).count();
@@ -225,8 +237,11 @@ pub fn report(checks: &[Check]) -> String {
         out,
         "\n{}",
         match (count(Status::Fail), count(Status::Warn)) {
-            (0, 0) => "Everything looks fine.".to_owned(),
-            (f, w) => format!("{}, {}.", plural(f, "problem", "problems"), plural(w, "warning", "warnings")),
+            (0, 0) => paint(Role::Success, "Everything looks fine."),
+            (f, w) => paint(
+                if f > 0 { Role::Error } else { Role::Warning },
+                &format!("{}, {}.", plural(f, "problem", "problems"), plural(w, "warning", "warnings")),
+            ),
         }
     );
     out
@@ -259,6 +274,13 @@ pub fn parse(rest: Vec<String>) -> std::result::Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_label_is_coloured_by_what_it_means() {
+        assert_eq!(status_role(Status::Ok), Role::Success);
+        assert_eq!(status_role(Status::Warn), Role::Warning);
+        assert_eq!(status_role(Status::Fail), Role::Error);
+    }
 
     #[test]
     fn module_answers_become_lines_with_their_fix_as_a_command() {

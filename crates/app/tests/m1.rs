@@ -105,7 +105,7 @@ fn a_broken_collection_file_breaks_only_itself() {
     // The daemon restarts (init must survive the bad file) and leetcode still works.
     assert!(ok(&["records", "list", "leetcode"]).contains("two-sum"));
     ok(&["records", "complete", "leetcode/two-sum"]);
-    assert!(ok(&["records", "get", "leetcode/two-sum"]).contains("(done)"));
+    assert!(ok(&["records", "show", "leetcode/two-sum"]).contains("(done)"));
 
     let collections = ok(&["records", "collections"]);
     assert!(collections.contains("leetcode  LeetCode"), "{collections}");
@@ -149,7 +149,7 @@ fn an_unreadable_record_file_never_blocks_the_others() {
     let list = ok(&["records", "list", "leetcode"]);
     assert!(list.contains("two-sum") && list.contains("lru-cache"), "{list}");
     assert!(list.contains("skipped: record file 'garbled.toml'"), "{list}");
-    let shown = ok(&["records", "trash", "leetcode"]);
+    let shown = ok(&["records", "list", "leetcode", "--removed"]);
     assert!(shown.contains("gone") && shown.contains("skipped: record file 'garbled-too.toml'"), "{shown}");
 
     // Renaming a field renames everywhere it can and says which files keep the old name.

@@ -61,7 +61,7 @@ fn templates_list_and_peek_show_what_they_make() {
     }
     let peek = ok(&home, &["automations", "peek", "stage-creates-workspace"]);
     assert!(peek.contains("── RULE-make ──") && peek.contains("── RULE-stop ──"), "{peek}");
-    assert!(peek.contains("runs: workspaces.activate, workspaces.create, workspaces.stop"), "{peek}");
+    assert!(peek.contains("runs: workspaces.activate, workspaces.new, workspaces.stop"), "{peek}");
 }
 
 #[test]
@@ -99,7 +99,7 @@ fn stage_opens_workspace_runs_the_workspace_when_the_field_changes() {
     ok(&home, &["records", "update", "jobs/acme", "--title", "Acme Inc"]);
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(std::fs::read_to_string(ws.join("opened")).unwrap(), "opened\n");
-    let status = json(&home, &["workspaces", "status", "prep"]);
+    let status = json(&home, &["workspaces", "show", "prep"]);
     assert_eq!(status["state"], "active", "{status}");
 }
 
@@ -129,7 +129,7 @@ fn stage_creates_workspace_makes_opens_and_stops_one_per_record() {
     // No `fail` on the record: FAIL_AT is empty, so smoke-test takes its default and launches.
     ok(&home, &["records", "add", "jobs", "--title", "Acme", "--stage", "applied"]);
     ok(&home, &["records", "update", "jobs/acme", "--stage", "interviewing"]);
-    let state = || json(&home, &["workspaces", "status", "acme-smoke-test"])["state"].as_str().unwrap_or("").to_owned();
+    let state = || json(&home, &["workspaces", "show", "acme-smoke-test"])["state"].as_str().unwrap_or("").to_owned();
     let made = || {
         json(&home, &["workspaces", "list"])["workspaces"]
             .as_array()

@@ -1,5 +1,6 @@
 //! The CLI's own settings file, `cli.toml` (ADR 0013 §3): which pack is active, where bare
-//! commands are linked, and which links Shimmer made. It lives outside `$SHIMMER_HOME`, which
+//! commands are linked, which links Shimmer made, and the login service `shimmer startup on`
+//! wrote (ADR 0034 §6). It lives outside `$SHIMMER_HOME`, which
 //! belongs to the daemon (CLAUDE.md §1.6, §7), and only the CLI reads or writes it.
 //!
 //! A broken `cli.toml` must never break a command, so problems here are reported and the caller
@@ -25,6 +26,19 @@ pub struct Settings {
     pub link_dir: Option<PathBuf>,
     /// The links Shimmer made: the only names it will ever remove from `link_dir`.
     pub linked: Vec<String>,
+    /// The login service `shimmer startup on` wrote: the only one `off` will remove.
+    pub startup: Option<Startup>,
+    /// Told once that `shimmer startup on` exists, when a schedule was made (ADR 0034 §7).
+    pub told_startup: bool,
+}
+
+/// `startup = { file = "…", target = "…" }`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Startup {
+    /// The service file it wrote: a systemd unit or a launchd plist.
+    pub file: PathBuf,
+    /// When it starts: `graphical-session.target` or `default.target` (systemd), `login` (launchd).
+    pub target: String,
 }
 
 /// Settings read from `cli.toml`, plus warnings to show for keys this version doesn't know.
@@ -82,6 +96,20 @@ pub fn save(path: &Path, settings: &Settings) -> std::io::Result<()> {
     } else {
         table.insert("linked".into(), Value::Array(settings.linked.iter().cloned().map(Value::String).collect()))
     };
+    let _ = match &settings.startup {
+        Some(s) => {
+            let mut t = Table::new();
+            t.insert("file".into(), Value::String(s.file.display().to_string()));
+            t.insert("target".into(), Value::String(s.target.clone()));
+            table.insert("startup".into(), Value::Table(t))
+        }
+        None => table.remove("startup"),
+    };
+    let _ = if settings.told_startup {
+        table.insert("told_startup".into(), Value::Boolean(true))
+    } else {
+        table.remove("told_startup")
+    };
     let text = toml::to_string(&table).map_err(std::io::Error::other)?;
 
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
@@ -134,6 +162,20 @@ pub fn parse(file: &str, text: &str) -> Result<Loaded, Vec<String>> {
                     }
                 }
             }
+            ("startup", Value::Table(t)) => {
+                match (t.get("file").and_then(Value::as_str), t.get("target").and_then(Value::as_str)) {
+                    // `off` removes this file, so it must be a full path (and `off` checks it's its own).
+                    (Some(f), Some(target)) if Path::new(f).is_absolute() => {
+                        loaded.settings.startup = Some(Startup { file: PathBuf::from(f), target: target.to_owned() })
+                    }
+                    _ => problems.push(format!("{file}: startup must be {{ file = \"<full path>\", target = \"…\" }}")),
+                }
+            }
+            ("told_startup", Value::Boolean(b)) => loaded.settings.told_startup = *b,
+            ("startup", _) => {
+                problems.push(format!("{file}: startup must be {{ file = \"<full path>\", target = \"…\" }}"))
+            }
+            ("told_startup", _) => problems.push(format!("{file}: told_startup must be true or false")),
             ("pack" | "link_dir", _) => problems.push(format!("{file}: {key} must be a string")),
             ("linked", _) => problems.push(format!("{file}: linked must be a list of names")),
             _ => loaded.warnings.push(format!("{file}: unknown key '{key}' ignored")),
@@ -167,6 +209,7 @@ mod tests {
                 pack: Some("anime-tropes".into()),
                 link_dir: Some("/home/me/bin".into()),
                 linked: vec!["ikuzo".into(), "nani".into()],
+                ..Settings::default()
             }
         );
         assert!(loaded.warnings.is_empty());
@@ -222,6 +265,11 @@ mod tests {
             pack: Some("short".into()),
             link_dir: Some("/opt/bin".into()),
             linked: vec!["up".into(), "down".into()],
+            startup: Some(Startup {
+                file: "/home/me/.config/systemd/user/shimmer.service".into(),
+                target: "default.target".into(),
+            }),
+            told_startup: true,
         };
         save(&path, &s).unwrap();
         assert_eq!(load(&path).unwrap(), s);
@@ -232,6 +280,20 @@ mod tests {
         let leftovers: Vec<_> =
             std::fs::read_dir(path.parent().unwrap()).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(leftovers, ["cli.toml"], "no temp file left behind");
+    }
+
+    #[test]
+    fn the_startup_service_is_recorded_by_full_path() {
+        let loaded = ok("told_startup = true\n[startup]\nfile = \"/home/me/x.service\"\ntarget = \"default.target\"\n");
+        assert_eq!(
+            loaded.settings.startup,
+            Some(Startup { file: "/home/me/x.service".into(), target: "default.target".into() })
+        );
+        assert!(loaded.settings.told_startup);
+        for bad in ["startup = 3", "[startup]\nfile = \"x.service\"\ntarget = \"t\"", "[startup]\nfile = \"/x\""] {
+            assert!(problems(bad)[0].contains("startup must be"), "{bad}");
+        }
+        assert!(problems("told_startup = \"yes\"")[0].contains("true or false"));
     }
 
     #[test]

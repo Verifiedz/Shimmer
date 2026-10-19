@@ -1,7 +1,7 @@
 {
   "responses": [
     {
-      "op": "fetchers.fetch",
+      "op": "fetchers.run",
       "params": {
         "source": "linkedin"
       },
@@ -23,7 +23,7 @@
           "payload": {
             "task_id": "01JD2S00000000000000000001",
             "lane": "fetchers",
-            "op": "fetchers.fetch",
+            "op": "fetchers.run",
             "displaced": [
               "01JD2P00000000000000000002",
               "01JD2P00000000000000000003",
@@ -34,7 +34,7 @@
       ]
     },
     {
-      "op": "fetchers.fetch",
+      "op": "fetchers.run",
       "params": {
         "source": "linkedin"
       },
@@ -50,17 +50,17 @@
           "would_displace": [
             {
               "task_id": "01JD2P00000000000000000002",
-              "op": "fetchers.fetch",
+              "op": "fetchers.run",
               "priority": "scheduled"
             },
             {
               "task_id": "01JD2P00000000000000000003",
-              "op": "fetchers.fetch",
+              "op": "fetchers.run",
               "priority": "scheduled"
             },
             {
               "task_id": "01JD2P00000000000000000004",
-              "op": "fetchers.fetch",
+              "op": "fetchers.run",
               "priority": "scheduled"
             }
           ]
@@ -68,7 +68,7 @@
       }
     },
     {
-      "op": "fetchers.fetch",
+      "op": "fetchers.run",
       "params": {
         "source": "linkedin"
       },

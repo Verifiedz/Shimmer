@@ -199,9 +199,17 @@ fn schedules(home: &Home) -> Vec<Value> {
         .collect()
 }
 
+/// A trigger for `op` (read-only ops included, which `scheduler add` refuses), made the way ADR
+/// 0031 §6 leaves for that: `shimmer call scheduler.add`. Its id.
 fn schedule(home: &Home, op: &str, params: &str, every: &str) -> String {
-    let out = ok(home, &["scheduler", "add", op, params, "--every", every, "--catch-up", "skip"]);
-    out["✓ added trigger ".len()..].split(':').next().unwrap().to_owned()
+    let secs: u64 = match every {
+        "1d" => 86_400,
+        "2d" => 172_800,
+        other => panic!("add {other} to schedule()"),
+    };
+    let add = format!(r#"{{"schedule":{{"every":{secs}}},"op":"{op}","params":{params},"catch_up":"skip"}}"#);
+    let out: Value = serde_json::from_str(&ok(home, &["call", "scheduler.add", &add, "--json"])).unwrap();
+    out["trigger_id"].as_str().unwrap().to_owned()
 }
 
 #[test]
@@ -211,8 +219,8 @@ fn renaming_moves_schedules_only_with_a_yes_and_removing_says_what_will_fail() {
     ok(&home, &["records", "new", "leetcode", "--from", "leetcode"]);
     ok(&home, &["records", "add", "jobs", "amazon-sde", "--position", "SDE Intern", "--company", "Amazon"]);
     schedule(&home, "records.list", r#"{"collection":"jobs"}"#, "1d");
-    let get = schedule(&home, "records.get", r#"{"collection":"jobs","id":"amazon-sde"}"#, "2d");
-    ok(&home, &["scheduler", "pause", &get]);
+    let get = schedule(&home, "records.show", r#"{"collection":"jobs","id":"amazon-sde"}"#, "2d");
+    ok(&home, &["scheduler", "disable", &get]);
     let other = schedule(&home, "records.list", r#"{"collection":"leetcode"}"#, "1d");
     let collection_of = |id: &str| -> Vec<(String, String)> {
         let mut found: Vec<(String, String)> = schedules(&home)
@@ -238,7 +246,7 @@ fn renaming_moves_schedules_only_with_a_yes_and_removing_says_what_will_fail() {
         ),
         "{out}"
     );
-    assert!(out.contains("records.get, every 172800s (paused)"), "{out}");
+    assert!(out.contains("records.show, every 172800s (off)"), "{out}");
     assert!(
         out.contains("they'll fail until moved: run 'shimmer records rename jobs/amazon amazon-sde' to undo"),
         "{out}"
@@ -250,8 +258,8 @@ fn renaming_moves_schedules_only_with_a_yes_and_removing_says_what_will_fail() {
     let out = ok(&home, &["records", "rename", "jobs/amazon-sde", "amazon", "--move-schedules"]);
     assert_eq!(out.matches("\n  moved usr-").count(), 1, "{out}");
     assert_eq!(collection_of("jobs"), [("jobs".into(), "".into()), ("jobs".into(), "amazon".into())]);
-    let moved = schedules(&home).into_iter().find(|t| t["op"] == "records.get").unwrap();
-    assert_eq!((moved["paused"].as_bool(), moved["schedule"]["every"].as_u64()), (Some(true), Some(172_800)));
+    let moved = schedules(&home).into_iter().find(|t| t["op"] == "records.show").unwrap();
+    assert_eq!((moved["enabled"].as_bool(), moved["schedule"]["every"].as_u64()), (Some(false), Some(172_800)));
     assert_ne!(moved["id"], get.as_str(), "added again, the old one removed");
 
     // A collection: both its schedules, never the other collection's.
@@ -268,7 +276,7 @@ fn renaming_moves_schedules_only_with_a_yes_and_removing_says_what_will_fail() {
         1
     );
     // The moved schedules work: their ops find what they name.
-    ok(&home, &["call", "records.get", r#"{"collection":"apps","id":"amazon"}"#]);
+    ok(&home, &["call", "records.show", r#"{"collection":"apps","id":"amazon"}"#]);
 
     // --json stays JSON: the rename's own reply, nothing appended.
     let o = home.shimmer(&["records", "rename-collection", "leetcode", "lc", "--json"]);
@@ -282,7 +290,7 @@ fn renaming_moves_schedules_only_with_a_yes_and_removing_says_what_will_fail() {
     assert!(out.contains("they'll fail until you restore it (shimmer records restore-collection apps)"), "{out}");
     assert_eq!(schedules(&home).len(), 3, "nothing removed");
     ok(&home, &["records", "restore-collection", "apps"]);
-    ok(&home, &["call", "records.get", r#"{"collection":"apps","id":"amazon"}"#]);
+    ok(&home, &["call", "records.show", r#"{"collection":"apps","id":"amazon"}"#]);
     // A removal nothing names says nothing about schedules.
     ok(&home, &["records", "new", "spare", "--from", "documents"]);
     assert!(!ok(&home, &["records", "remove-collection", "spare", "--yes"]).contains("schedule"));
@@ -331,7 +339,7 @@ fn a_copied_collection_is_independent_of_its_original_and_survives_a_restart() {
     assert_eq!(out.trim(), "✓ copied jobs to backup with 2 record(s)");
     let list = |c: &str| json(&home, &["records", "list", c])["items"].clone();
     assert_eq!(list("backup"), list("jobs"));
-    assert!(ok(&home, &["records", "trash", "backup"]).contains("nothing in backup's trash"));
+    assert!(ok(&home, &["records", "list", "backup", "--removed"]).contains("nothing in backup's trash"));
     let collections = json(&home, &["records", "collections"]);
     let label =
         collections["collections"].as_array().unwrap().iter().find(|c| c["id"] == "backup").unwrap()["label"].clone();
@@ -340,8 +348,8 @@ fn a_copied_collection_is_independent_of_its_original_and_survives_a_restart() {
     // Independent: changing the copy leaves the original alone, and the other way round.
     ok(&home, &["records", "update", "backup/shopify", "--stage", "interviewing"]);
     ok(&home, &["records", "remove", "jobs/amazon"]);
-    assert_eq!(json(&home, &["records", "get", "jobs/shopify"])["stage"], Value::Null);
-    assert_eq!(json(&home, &["records", "get", "backup/amazon"])["status"], "done");
+    assert_eq!(json(&home, &["records", "show", "jobs/shopify"])["stage"], Value::Null);
+    assert_eq!(json(&home, &["records", "show", "backup/amazon"])["status"], "done");
 
     // Logged: the copy, then one created per record, in the copy.
     let events = logged(&home);
@@ -365,7 +373,7 @@ fn a_copied_collection_is_independent_of_its_original_and_survives_a_restart() {
     // Files are the truth: after a restart it's all still there.
     ok(&home, &["shutdown"]);
     common::wait_gone(&home.socket());
-    assert_eq!(json(&home, &["records", "get", "backup/shopify"])["stage"], "interviewing");
+    assert_eq!(json(&home, &["records", "show", "backup/shopify"])["stage"], "interviewing");
     assert_eq!(list("jobs-2027"), serde_json::json!([]));
 }
 

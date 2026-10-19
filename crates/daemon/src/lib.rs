@@ -20,6 +20,7 @@ mod launcher;
 mod queue;
 mod registry;
 mod scheduler;
+mod secrets;
 
 use std::fs::{self, File};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -43,6 +44,10 @@ use crate::scheduler::Scheduler;
 
 /// In-flight connections and tasks get this long to finish after shutdown is requested.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// How long a starting daemon waits for a busy `.daemon.lock`. Covers the last instants of a
+/// daemon that's just shut down (#243); a daemon that's really running is still refused.
+const LOCK_WAIT: Duration = Duration::from_secs(2);
+const LOCK_POLL: Duration = Duration::from_millis(20);
 
 pub struct DaemonConfig {
     /// `$SHIMMER_HOME`.
@@ -87,13 +92,14 @@ impl Daemon {
     pub async fn start(config: DaemonConfig, modules: Vec<Arc<dyn Module>>) -> Result<Self> {
         let store = Arc::new(Store::open(&config.home)?);
         // One writer: a second daemon on the same home would corrupt the ordering guarantees.
-        let lock = lock_home(store.home())?;
+        let lock = lock_home(store.home()).await?;
         let recovered = store.recover()?;
         if recovered != Default::default() {
             tracing::info!(?recovered, "recovered interrupted transactions");
         }
 
         let cfg = config::Config::load(store.home())?;
+        let (secrets, secrets_problem) = secrets::load_chain();
         let registry = Registry::build(modules)?;
         let lanes = registry.lanes(&cfg)?;
         let declared: Vec<_> = registry
@@ -107,12 +113,25 @@ impl Daemon {
         let shutdown = CancellationToken::new();
         let bus = Bus::new();
         let backend = Arc::new(Backend { store: store.clone(), bus: bus.clone() });
-        let core = Core::new(registry, lanes, &cfg, backend, config.clock.clone(), shutdown.clone(), &config.socket);
+        // Opened before `Core::new` so `core.events.list` (`crates/daemon/src/core.rs`) has a
+        // handle to query from the moment the daemon starts answering requests.
+        let index = indexer::open(store.clone()).await?;
+        let core = Core::new(
+            registry,
+            lanes,
+            &cfg,
+            backend,
+            config.clock.clone(),
+            shutdown.clone(),
+            &config.socket,
+            secrets,
+            secrets_problem,
+            index.clone(),
+        );
         let tracker = TaskTracker::new();
 
         // Subscribe before init so events a module emits while initialising are not missed.
         let receivers: Vec<_> = core.registry.entries.iter().map(|_| bus.subscribe()).collect();
-        let index = indexer::open(store.clone()).await?;
         tracker.spawn(indexer::run(index, store.clone(), bus.subscribe(), shutdown.clone()));
 
         for (entry, mut rx) in core.registry.entries.iter().zip(receivers) {
@@ -185,31 +204,48 @@ impl Daemon {
     }
 
     /// Resolves after shutdown is requested and connections and tasks have drained (or the
-    /// grace period expired). Removes the socket file.
+    /// grace period expired). Removes the socket file, then releases `.daemon.lock`.
+    ///
+    /// The order is what makes a restart safe (#243). Everything is torn down first (the index
+    /// closes when `core` drops), so the socket going away means the daemon really is done. The
+    /// lock is released right after, not whenever the process exits: anything that sees the
+    /// socket gone and starts a new daemon finds the lock free. Releasing it *before* removing
+    /// the socket would let a new daemon bind first and have its socket deleted by this one.
     pub async fn wait(self) {
-        self.core.shutdown.cancelled().await;
-        self.tracker.close();
-        self.core.queue.tracker.close();
+        let Daemon { core, socket, tracker, _lock: lock } = self;
+        core.shutdown.cancelled().await;
+        tracker.close();
+        core.queue.tracker.close();
         let drain = async {
-            self.tracker.wait().await;
-            self.core.queue.tracker.wait().await;
+            tracker.wait().await;
+            core.queue.tracker.wait().await;
         };
         if tokio::time::timeout(SHUTDOWN_GRACE, drain).await.is_err() {
             tracing::warn!("shutdown grace period expired with work still running");
         }
-        let _ = fs::remove_file(&self.socket);
+        drop(core);
+        let _ = fs::remove_file(&socket);
+        let _ = lock.unlock();
     }
 }
 
-/// Exclusive, advisory, released by the OS when the process dies.
-fn lock_home(home: &Path) -> Result<File> {
+/// Exclusive and advisory. `Daemon::wait` releases it on shutdown, and the OS when the process
+/// dies. A busy lock is retried for [`LOCK_WAIT`]: a daemon that has just removed its socket
+/// may not have released the lock yet (#243), and refusing then fails a quick restart.
+async fn lock_home(home: &Path) -> Result<File> {
     let file = File::create(home.join(".daemon.lock"))?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(fs::TryLockError::WouldBlock) => {
-            Err(Error::conflict(format!("another daemon already owns {}", home.display())))
+    let deadline = tokio::time::Instant::now() + LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(fs::TryLockError::WouldBlock) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(LOCK_POLL).await;
+            }
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(Error::conflict(format!("another daemon already owns {}", home.display())));
+            }
+            Err(fs::TryLockError::Error(e)) => return Err(e.into()),
         }
-        Err(fs::TryLockError::Error(e)) => Err(e.into()),
     }
 }
 

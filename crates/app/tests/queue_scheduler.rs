@@ -5,7 +5,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{ok, stderr, Home};
+use common::{fails, ok, stderr, Home};
 
 /// Poll `shimmer args…` until its output contains `want`, for up to 10 s.
 fn wait_for(home: &Home, args: &[&str], want: &str) -> String {
@@ -18,6 +18,15 @@ fn wait_for(home: &Home, args: &[&str], want: &str) -> String {
         assert!(Instant::now() < deadline, "{args:?} never showed {want:?}; last output:\n{out}");
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// A trigger for an op no command covers (`records.list`), made as ADR 0031 §6 says: through
+/// `shimmer call scheduler.add`. Its id.
+fn raw_trigger(home: &Home, op: &str, params: &str, every_secs: u64) -> String {
+    let add = format!(r#"{{"schedule":{{"every":{every_secs}}},"op":"{op}","params":{params},"catch_up":"skip"}}"#);
+    let out = ok(home, &["call", "scheduler.add", &add, "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    v["trigger_id"].as_str().unwrap().to_owned()
 }
 
 /// A workspace whose one step runs for a while, so its launch holds the `workspaces` lane.
@@ -47,7 +56,8 @@ fn shown(id: &str) -> &str {
 fn bare_words_show_help() {
     let home = Home::with_leetcode();
     assert!(ok(&home, &["queue"]).starts_with("usage: shimmer queue <command>"));
-    assert!(ok(&home, &["scheduler", "--help"]).contains("--catch-up says what happens"));
+    assert!(ok(&home, &["scheduler", "--help"]).contains("add WHEN [--catch-up WHAT]"));
+    assert!(ok(&home, &["scheduler", "add"]).contains("--catch-up says what happens"), "add's own help");
     let help = ok(&home, &["--help"]);
     assert!(help.contains("queue …") && help.contains("scheduler …"), "{help}");
 }
@@ -111,15 +121,9 @@ fn real_launches_wait_in_the_queue_and_can_be_moved_and_cancelled() {
 }
 
 #[test]
-fn a_trigger_fires_and_can_be_paused_resumed_and_removed() {
+fn a_trigger_fires_and_can_be_disabled_enabled_and_removed() {
     let home = Home::with_leetcode();
-    let out = ok(
-        &home,
-        &["scheduler", "add", "records.list", r#"{"collection":"leetcode"}"#, "--every", "1s", "--catch-up", "skip"],
-    );
-    assert!(out.starts_with("✓ added trigger usr-") && out.contains(": records.list every 1s, catch-up skip"), "{out}");
-    assert!(out.contains("\n  first run: "), "{out}");
-    let id = out["✓ added trigger ".len()..].split(':').next().unwrap().to_string();
+    let id = raw_trigger(&home, "records.list", r#"{"collection":"leetcode"}"#, 1);
 
     let list = ok(&home, &["scheduler", "list"]);
     let row = list.lines().find(|l| l.starts_with(shown(&id))).unwrap_or_else(|| panic!("{list}"));
@@ -129,10 +133,13 @@ fn a_trigger_fires_and_can_be_paused_resumed_and_removed() {
         row.contains(r#"records.list {"collection":"leetcode"}"#)
             && row.contains("every 1s")
             && row.contains("skip")
-            && row.contains("active")
-            && row.ends_with("you"),
-        "{row}"
+            && row.trim_end().ends_with(" on")
+            && !row.ends_with("you"),
+        "{row}: no FROM column without --all, every row is yours (#244)"
     );
+    let all = ok(&home, &["scheduler", "list", "--all"]);
+    let row = all.lines().find(|l| l.starts_with(shown(&id))).unwrap_or_else(|| panic!("{all}"));
+    assert!(row.ends_with("you"), "--all says where each came from: {row}");
 
     // The scheduler ticks every second: it fires, and its task runs through the queue.
     let show = wait_for(&home, &["scheduler", "show", &id], "  last run  20"); // a date, not "never"
@@ -140,24 +147,63 @@ fn a_trigger_fires_and_can_be_paused_resumed_and_removed() {
 
     // Each reply names the trigger by the ending the list shows, and what it runs.
     let what = format!("{} (records.list, every 1s)", shown(&id));
-    assert!(ok(&home, &["scheduler", "pause", &id]).starts_with(&format!("✓ paused {what}")));
-    assert!(ok(&home, &["scheduler", "show", &id]).starts_with(&format!("{id}  (paused)")));
-    assert!(ok(&home, &["scheduler", "resume", &id]).starts_with(&format!("✓ resumed {what}")));
-    assert!(ok(&home, &["scheduler", "show", &id]).starts_with(&format!("{id}  (active)")));
-    assert_eq!(ok(&home, &["scheduler", "remove", &id]).trim(), format!("✓ removed {what}"));
-    // Gone; only modules' own remain (notify's hourly `notify.flush`).
+    assert!(ok(&home, &["scheduler", "disable", &id]).starts_with(&format!("✓ {what} is off")));
+    assert!(ok(&home, &["scheduler", "show", &id]).starts_with(&format!("{id}  (off)")));
+    assert!(ok(&home, &["scheduler", "enable", &id]).starts_with(&format!("✓ {what} is on")));
+    assert!(ok(&home, &["scheduler", "show", &id]).starts_with(&format!("{id}  (on)")));
+    let undo = format!("✓ removed {what} (undo: shimmer scheduler restore {})", shown(&id));
+    assert_eq!(ok(&home, &["scheduler", "remove", &id]).trim(), undo);
+    // Gone; only modules' own remain (fetchers' heartbeat, ADR 0028 §5; notify's hourly
+    // `notify.flush`) -- #244 already hides every module-owned trigger from the default view.
     let left = ok(&home, &["scheduler", "list"]);
     assert!(!left.contains(shown(&id)) && !left.contains("records.list"), "{left}");
+
+    // Kept aside until restored or purged (ADR 0038).
+    assert!(ok(&home, &["scheduler", "list", "--removed"]).contains(shown(&id)));
+    assert!(ok(&home, &["scheduler", "restore", shown(&id)]).starts_with(&format!("✓ restored {what}")));
+    assert!(ok(&home, &["scheduler", "list"]).contains(shown(&id)));
+    // Edit keeps the id (ADR 0038 §6).
+    let edit =
+        ["scheduler", "edit", shown(&id), "every", "2d", "--catch-up", "skip", "records", "complete", "leetcode/x"];
+    let edited = ok(&home, &edit);
+    assert!(
+        edited.starts_with(&format!("✓ {} now runs records complete leetcode/x · every 2d", shown(&id))),
+        "{edited}"
+    );
+    // The same check as add: only a command that makes one change can be scheduled.
+    fails(
+        &home,
+        &["scheduler", "edit", shown(&id), "every", "2d", "--catch-up", "skip", "records", "list", "leetcode"],
+    );
+    assert!(ok(&home, &["scheduler", "show", &id]).contains("  schedule  every 2d"));
+    ok(&home, &["scheduler", "remove", &id]);
+    assert_eq!(ok(&home, &["scheduler", "purge", "--yes"]).trim(), "✓ 1 removed schedule(s) deleted for good");
+    assert_eq!(ok(&home, &["scheduler", "list", "--removed"]).trim(), "no removed schedules");
 }
 
 #[test]
 fn scheduler_mistakes_are_caught_before_or_by_the_daemon() {
     let home = Home::with_leetcode();
-    let o = home.shimmer(&["scheduler", "add", "records.list", "--every", "1d"]);
-    assert_eq!(o.status.code(), Some(2), "missing --catch-up is a usage error");
-    assert!(stderr(&o).contains("needs --catch-up: skip (drop missed runs)"), "{}", stderr(&o));
+    // ADR 0031 §6: the raw form and `shimmer schedule` went; each says what to type instead.
+    let o = home.shimmer(&["scheduler", "add", "records.list", "--every", "1d", "--catch-up", "skip"]);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(
+        stderr(&o).contains("the old way of scheduling") && stderr(&o).contains("shimmer call scheduler.add"),
+        "{}",
+        stderr(&o)
+    );
+    let o = home.shimmer(&["schedule", "daily", "09:00", "--catch-up", "skip", "records", "complete", "leetcode/x"]);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(stderr(&o).contains("'shimmer schedule' is now 'shimmer scheduler add'"), "{}", stderr(&o));
+    // The old flags first, and `schedule --help`, say the same (#249's review).
+    let o = home.shimmer(&["scheduler", "add", "--every", "1d", "--catch-up", "skip", "records.list"]);
+    assert!(stderr(&o).contains("the old way of scheduling"), "{}", stderr(&o));
+    let o = home.shimmer(&["schedule", "--help"]);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(stderr(&o).contains("'shimmer schedule' is now 'shimmer scheduler add'"), "{}", stderr(&o));
 
-    let o = home.shimmer(&["scheduler", "add", "nope.op", "--every", "1d", "--catch-up", "skip"]);
+    let add = r#"{"schedule":{"every":86400},"op":"nope.op","params":{},"catch_up":"skip"}"#;
+    let o = home.shimmer(&["call", "scheduler.add", add]);
     assert_eq!(o.status.code(), Some(1));
     assert!(stderr(&o).contains("unknown_op"), "the daemon checks the op: {}", stderr(&o));
 
@@ -183,11 +229,7 @@ fn a_pack_can_alias_the_new_commands() {
 fn a_trigger_or_task_is_reached_by_the_ending_its_list_shows() {
     // ADR 0031 §4: lists show a long id's unique ending, and that ending is accepted back.
     let home = Home::with_leetcode();
-    let out = ok(
-        &home,
-        &["scheduler", "add", "records.list", r#"{"collection":"leetcode"}"#, "--every", "1d", "--catch-up", "skip"],
-    );
-    let id = out["✓ added trigger ".len()..].split(':').next().unwrap().to_string();
+    let id = raw_trigger(&home, "records.list", r#"{"collection":"leetcode"}"#, 86_400);
     let end = shown(&id);
     assert!(ok(&home, &["scheduler", "list"]).lines().any(|l| l.starts_with(end)), "the list shows {end}");
     // Too short to be sure which one is meant, even when it ends only this one (#183's review).
@@ -195,8 +237,8 @@ fn a_trigger_or_task_is_reached_by_the_ending_its_list_shows() {
     assert_eq!(o.status.code(), Some(1));
     assert!(stderr(&o).contains("invalid_params") && stderr(&o).contains("at least 4"), "{}", stderr(&o));
     assert!(ok(&home, &["scheduler", "list"]).lines().any(|l| l.starts_with(end)), "still there");
-    ok(&home, &["scheduler", "pause", end]);
-    assert!(ok(&home, &["scheduler", "show", &end.to_uppercase()]).contains("(paused)"), "any case");
+    ok(&home, &["scheduler", "disable", end]);
+    assert!(ok(&home, &["scheduler", "show", &end.to_uppercase()]).contains("(off)"), "any case");
     ok(&home, &["scheduler", "remove", end]);
     let o = home.shimmer(&["scheduler", "show", end]);
     assert!(stderr(&o).contains("not_found"), "{}", stderr(&o));
@@ -208,17 +250,31 @@ fn schedule_runs_a_normal_command_in_plain_words() {
     // op + params running it sends, an alias as its canonical command, and it fires for real.
     let home = Home::with_leetcode();
     ok(&home, &["records", "add", "leetcode", "two-sum", "--title", "Two Sum"]);
-    let out = ok(&home, &["schedule", "every", "1s", "--catch-up", "skip", "records", "complete", "leetcode/two-sum"]);
+    let out = ok(
+        &home,
+        &["scheduler", "add", "every", "1s", "--catch-up", "skip", "records", "complete", "leetcode/two-sum"],
+    );
     assert!(out.starts_with("✓ scheduled records complete leetcode/two-sum · every 1s"), "{out}");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while !ok(&home, &["records", "get", "leetcode/two-sum"]).contains("(done)") {
+    while !ok(&home, &["records", "show", "leetcode/two-sum"]).contains("(done)") {
         assert!(std::time::Instant::now() < deadline, "the scheduled complete never ran");
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
     let local = ok(
         &home,
-        &["--json", "schedule", "weekdays", "09:00", "--catch-up", "skip", "records", "reopen", "leetcode/two-sum"],
+        &[
+            "--json",
+            "scheduler",
+            "add",
+            "weekdays",
+            "09:00",
+            "--catch-up",
+            "skip",
+            "records",
+            "reopen",
+            "leetcode/two-sum",
+        ],
     );
     let id: serde_json::Value = serde_json::from_str(&local).unwrap();
     let t = ok(&home, &["--json", "scheduler", "show", id["trigger_id"].as_str().unwrap()]);
@@ -235,19 +291,31 @@ fn schedule_runs_a_normal_command_in_plain_words() {
     );
 
     // Never a guessed catch-up, and only commands that make one change.
-    let o = home.shimmer(&["schedule", "daily", "09:00", "records", "add", "leetcode", "x"]);
+    let o = home.shimmer(&["scheduler", "add", "daily", "09:00", "records", "add", "leetcode", "x"]);
     assert!(!o.status.success() && stderr(&o).contains("--catch-up skip, run-once or backfill"), "{}", stderr(&o));
-    let o = home.shimmer(&["schedule", "daily", "09:00", "--catch-up", "skip", "records", "list", "leetcode"]);
+    let o = home.shimmer(&["scheduler", "add", "daily", "09:00", "--catch-up", "skip", "records", "list", "leetcode"]);
     assert!(stderr(&o).contains("can't be scheduled"), "{}", stderr(&o));
     // `--first` (#222) can't ride on a trigger, so it's refused rather than dropped.
-    let o =
-        home.shimmer(&["schedule", "daily", "09:00", "--catch-up", "skip", "workspaces", "activate", "x", "--first"]);
+    let o = home.shimmer(&[
+        "scheduler",
+        "add",
+        "daily",
+        "09:00",
+        "--catch-up",
+        "skip",
+        "workspaces",
+        "activate",
+        "x",
+        "--first",
+    ]);
     assert!(stderr(&o).contains("--first jumps the queue"), "{}", stderr(&o));
 
     // A typo is refused when it's scheduled, not every day after (#185's review).
-    let o = home.shimmer(&["schedule", "daily", "09:00", "--catch-up", "skip", "records", "complete", "nosuch/x"]);
+    let o =
+        home.shimmer(&["scheduler", "add", "daily", "09:00", "--catch-up", "skip", "records", "complete", "nosuch/x"]);
     assert!(stderr(&o).contains("no collection 'nosuch'"), "{}", stderr(&o));
-    let o = home.shimmer(&["schedule", "daily", "09:00", "--catch-up", "skip", "workspaces", "activate", "nope"]);
+    let o =
+        home.shimmer(&["scheduler", "add", "daily", "09:00", "--catch-up", "skip", "workspaces", "activate", "nope"]);
     assert!(stderr(&o).contains("not_found"), "{}", stderr(&o));
     assert!(!ok(&home, &["scheduler", "list"]).contains("nope"), "nothing stored for either");
 }

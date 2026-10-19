@@ -29,11 +29,11 @@ fn workspace(home: &Home, id: &str, files: &[(&str, &str)]) {
 const DEEP_WORK: &str =
     "[workspace]\nlabel = \"Deep Work\"\n\n[[step]]\nname = \"setup\"\nmode = \"supervised\"\ntimeout_s = 30\n";
 
-/// Poll `queue.task` until the task has finished.
+/// Poll `queue.show` until the task has finished.
 fn finished_task(home: &Home, task_id: &str) -> Value {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let t = call(home, "queue.task", json!({"task_id": task_id}));
+        let t = call(home, "queue.show", json!({"task_id": task_id}));
         if !matches!(t["status"].as_str(), Some("queued" | "running")) {
             return t;
         }
@@ -52,7 +52,7 @@ fn workspaces_are_registered_with_their_lane() {
         ops,
         [
             "workspaces.list",
-            "workspaces.status",
+            "workspaces.show",
             "workspaces.activate",
             "workspaces.cleanup",
             "workspaces.force_relaunch",
@@ -60,10 +60,11 @@ fn workspaces_are_registered_with_their_lane() {
             "workspaces.reset",
             "workspaces.remove",
             "workspaces.restore",
+            "workspaces.purge",
             "workspaces.copy",
             "workspaces.rename",
             "workspaces.templates",
-            "workspaces.create",
+            "workspaces.new",
             "workspaces.answers",
             "workspaces.reconfigure",
             "workspaces.health"
@@ -87,7 +88,7 @@ fn list_and_status_read_real_folders_and_a_broken_one_hides_nothing() {
     assert!(list[0]["error"].as_str().unwrap().starts_with("broken/workspace.toml: "));
     assert_eq!(list[1], json!({"id": "deep-work", "label": "Deep Work", "state": "ready"}));
 
-    let status = call(&home, "workspaces.status", json!({"id": "deep-work"}));
+    let status = call(&home, "workspaces.show", json!({"id": "deep-work"}));
     assert_eq!(status["steps"][0], json!({"index": 1, "name": "setup", "mode": "supervised", "timeout_s": 30}));
     assert_eq!(status["last_session"], Value::Null);
 }
@@ -105,7 +106,7 @@ fn activate_runs_the_real_script_and_the_result_survives_a_restart() {
     assert_eq!(task["status"], "succeeded", "{task}");
 
     // The script really ran: active, and that survives a restart.
-    let state = |home: &Home| call(home, "workspaces.status", json!({"id": "deep-work"}))["state"].clone();
+    let state = |home: &Home| call(home, "workspaces.show", json!({"id": "deep-work"}))["state"].clone();
     assert_eq!(state(&home), "active");
     assert!(home.shimmer(&["shutdown"]).status.success());
     wait_gone(&home.socket());
@@ -139,12 +140,12 @@ fn the_cli_lists_and_shows_workspaces() {
     assert!(lines[1].starts_with("broken     invalid  -          broken/workspace.toml: "), "{out}");
     assert_eq!(lines[2].trim_end(), "deep-work  ready    Deep Work");
 
-    let (code, out, _) = shimmer(&home, &["workspaces", "status", "deep-work"]);
+    let (code, out, _) = shimmer(&home, &["workspaces", "show", "deep-work"]);
     assert_eq!(code, 0);
     assert!(out.starts_with("deep-work  (ready)  Deep Work\n  steps:\n    1  setup  supervised, timeout 30s"), "{out}");
     assert!(out.contains("last session: none yet"), "{out}");
 
-    let (code, _, err) = shimmer(&home, &["workspaces", "status", "nope"]);
+    let (code, _, err) = shimmer(&home, &["workspaces", "show", "nope"]);
     assert_eq!(code, 1);
     assert!(err.contains("not_found: no workspace 'nope'"), "{err}");
 
@@ -162,7 +163,7 @@ fn the_cli_queues_and_follows_a_launch() {
     let (code, out, _) = shimmer(&home, &["workspaces", "activate", "deep-work"]);
     assert_eq!(code, 0);
     assert!(out.starts_with("queued the launch of deep-work (task "), "{out}");
-    assert!(out.ends_with("check on it with: shimmer workspaces status deep-work\n"), "{out}");
+    assert!(out.ends_with("check on it with: shimmer workspaces show deep-work\n"), "{out}");
 
     // With --wait: followed to the end. The real backend runs the script, which succeeds.
     let (code, out, err) = shimmer(&home, &["workspaces", "activate", "deep-work", "--wait"]);
@@ -170,7 +171,7 @@ fn the_cli_queues_and_follows_a_launch() {
     assert!(err.contains("step 1/1 setup"), "{err}");
     // The last step is supervised, so its output follows (ADR 0025, update-everything's summary).
     assert_eq!(out.trim_end(), "✓ deep-work is active\n  hi");
-    assert_eq!(call(&home, "workspaces.status", json!({"id": "deep-work"}))["state"], "active");
+    assert_eq!(call(&home, "workspaces.show", json!({"id": "deep-work"}))["state"], "active");
 }
 
 #[test]
@@ -197,9 +198,9 @@ fn the_cli_explains_a_dirty_workspace_and_guards_the_overrides() {
         assert_eq!(code, 1, "{args:?}");
         assert!(err.contains("without confirmation; pass --yes"), "{args:?}: {err}");
     }
-    assert_eq!(call(&home, "workspaces.status", json!({"id": "deep-work"}))["state"], "dirty", "nothing changed");
+    assert_eq!(call(&home, "workspaces.show", json!({"id": "deep-work"}))["state"], "dirty", "nothing changed");
 
     let (code, out, _) = shimmer(&home, &["workspaces", "reset", "deep-work", "--yes"]);
     assert_eq!((code, out.trim()), (0, "✓ deep-work reset to ready"));
-    assert_eq!(call(&home, "workspaces.status", json!({"id": "deep-work"}))["state"], "ready");
+    assert_eq!(call(&home, "workspaces.show", json!({"id": "deep-work"}))["state"], "ready");
 }

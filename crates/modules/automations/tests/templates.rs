@@ -9,7 +9,7 @@ use shimmer_automations::Automations;
 use shimmer_core::testing::TestEnv;
 use shimmer_core::{Catalog, CommandSpec, ErrorCode, Execution, Module};
 
-const OPS: [&str; 5] = ["notify.send", "workspaces.activate", "workspaces.create", "workspaces.stop", "records.update"];
+const OPS: [&str; 5] = ["notify.send", "workspaces.activate", "workspaces.new", "workspaces.stop", "records.update"];
 const TOPICS: [&str; 5] = [
     "records.item.created",
     "records.item.updated",

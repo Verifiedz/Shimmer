@@ -34,7 +34,7 @@ pub struct Workspaces {
 }
 
 /// Every topic workspaces emits, with a line on it for `automations events` (ADR 0035 §5.5).
-const TOPICS: [(&str, &str); 13] = [
+const TOPICS: [(&str, &str); 14] = [
     ("workspaces.session.launched", "a workspace launched: every step succeeded"),
     ("workspaces.session.dirty", "a workspace launch failed part-way and needs cleaning up"),
     ("workspaces.session.forced", "a dirty workspace was force-relaunched"),
@@ -45,6 +45,7 @@ const TOPICS: [(&str, &str); 13] = [
     ("workspaces.session.stopped", "a running workspace was stopped"),
     ("workspaces.workspace.removed", "a workspace was removed (it can be restored)"),
     ("workspaces.workspace.restored", "a removed workspace came back"),
+    ("workspaces.workspace.purged", "a removed workspace was deleted for good"),
     ("workspaces.workspace.copied", "a workspace was made from another"),
     ("workspaces.workspace.renamed", "a workspace was given a new id"),
     ("workspaces.workspace.reconfigured", "a workspace's answers were changed"),
@@ -92,8 +93,13 @@ impl Module for Workspaces {
         let id = json!({"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}});
         let queued = || Execution::Queued { lane: LANE.into() };
         [
-            ("workspaces.list", "List workspaces and their state", json!({"type": "object"}), Execution::Inline),
-            ("workspaces.status", "Show one workspace in full", id.clone(), Execution::Inline),
+            (
+                "workspaces.list",
+                "List workspaces and their state, or with removed the removed ones",
+                json!({"type": "object", "properties": {"removed": {"type": "boolean"}}}),
+                Execution::Inline,
+            ),
+            ("workspaces.show", "Show one workspace in full", id.clone(), Execution::Inline),
             ("workspaces.activate", "Launch a workspace's steps in order", id.clone(), queued()),
             ("workspaces.cleanup", "Run a dirty workspace's cleanup script", id.clone(), queued()),
             ("workspaces.force_relaunch", "Launch a dirty workspace anyway (logged as forced)", id.clone(), queued()),
@@ -106,6 +112,12 @@ impl Module for Workspaces {
                 Execution::Inline,
             ),
             ("workspaces.restore", "Bring a removed workspace back", id.clone(), Execution::Inline),
+            (
+                "workspaces.purge",
+                "Delete a removed workspace for good, or every one; asks first (ADR 0038)",
+                json!({"type": "object", "properties": {"id": {"type": "string"}, "confirm": {"type": "object"}}}),
+                Execution::Inline,
+            ),
             (
                 "workspaces.copy",
                 "Make a new workspace from an existing one, optionally with some answers changed",
@@ -128,7 +140,7 @@ impl Module for Workspaces {
                 Execution::Inline,
             ),
             (
-                "workspaces.create",
+                "workspaces.new",
                 "Create a workspace from a template and your answers",
                 json!({"type": "object", "required": ["id", "template"], "properties": {
                     "id": {"type": "string"}, "template": {"type": "string"},
@@ -167,8 +179,8 @@ impl Module for Workspaces {
 
     async fn handle(&self, op: &str, params: Value, ctx: &Ctx) -> Result<Value> {
         match op {
-            "workspaces.list" => self.list(ctx),
-            "workspaces.status" => self.status(ctx, &decode::<Target>(params)?.id),
+            "workspaces.list" => self.list(ctx, decode::<ListParams>(params)?),
+            "workspaces.show" => self.status(ctx, &decode::<Target>(params)?.id),
             "workspaces.reset" => self.reset(ctx, &decode::<Target>(params)?.id),
             "workspaces.activate" => self.activate(ctx, &decode::<Target>(params)?.id).await,
             "workspaces.force_relaunch" => self.force_relaunch(ctx, &decode::<Target>(params)?.id).await,
@@ -176,10 +188,11 @@ impl Module for Workspaces {
             "workspaces.stop" => self.stop(ctx, &decode::<Target>(params)?.id).await,
             "workspaces.remove" => self.remove(ctx, &decode::<Target>(params)?.id),
             "workspaces.restore" => self.restore_removed(ctx, &decode::<Target>(params)?.id),
+            "workspaces.purge" => self.purge(ctx, decode(params)?),
             "workspaces.rename" => self.rename(ctx, decode(params)?),
             "workspaces.copy" => self.copy(ctx, decode(params)?),
             "workspaces.templates" => templates(decode(params)?),
-            "workspaces.create" => self.create(ctx, decode(params)?),
+            "workspaces.new" => self.create(ctx, decode(params)?),
             "workspaces.answers" => self.answers(ctx, &decode::<Target>(params)?.id),
             "workspaces.reconfigure" => self.reconfigure(ctx, decode(params)?),
             "workspaces.health" => self.health(ctx),
@@ -191,6 +204,21 @@ impl Module for Workspaces {
 #[derive(Deserialize)]
 struct Target {
     id: String,
+}
+
+/// `workspaces.list`: the live workspaces, or with `removed` the removed ones (ADR 0038 §6).
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct ListParams {
+    removed: bool,
+}
+
+/// `workspaces.purge` (ADR 0038): one removed workspace, or all of them.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Purge {
+    id: Option<String>,
+    confirm: Option<Value>,
 }
 
 /// `workspaces.reconfigure` (ADR 0025 §9): new answers, by question name.
@@ -234,7 +262,7 @@ struct Rename {
 /// Where a workspace records the template it was made from (ADR 0025 §9).
 const TEMPLATE_FILE: &str = ".template";
 
-/// `workspaces.create` (ADR 0025 §7).
+/// `workspaces.new` (ADR 0025 §7).
 #[derive(Deserialize)]
 struct Create {
     id: String,
@@ -279,7 +307,10 @@ fn templates(which: Which) -> Result<Value> {
 impl Workspaces {
     /// Every workspace, by id. A broken one is listed as `invalid` with the reason; it never
     /// hides the others (ADR 0012 §6).
-    fn list(&self, ctx: &Ctx) -> Result<Value> {
+    fn list(&self, ctx: &Ctx, p: ListParams) -> Result<Value> {
+        if p.removed {
+            return self.list_removed(ctx);
+        }
         let mut out = Vec::new();
         for (id, folder) in folders(ctx)? {
             let mut entry = Map::new();
@@ -291,6 +322,25 @@ impl Workspaces {
             match saved {
                 Some(saved) if errors.is_empty() => add_state(&mut entry, &saved.state),
                 _ => add_invalid(&mut entry, &errors),
+            }
+            out.push(Value::Object(entry));
+        }
+        Ok(json!({"workspaces": out}))
+    }
+
+    /// The removed workspaces you can restore or purge (ADR 0038 §6), by id, with their label when
+    /// their `workspace.toml` can be read.
+    fn list_removed(&self, ctx: &Ctx) -> Result<Value> {
+        let mut out = Vec::new();
+        for id in removed_ids(ctx)? {
+            let mut entry = Map::new();
+            entry.insert("id".into(), json!(id));
+            let text = ctx.store.read_string(&format!("{}/workspace.toml", removed_path(&id)))?;
+            let label = text
+                .and_then(|t| t.parse::<toml::Table>().ok())
+                .and_then(|t| t.get("workspace")?.get("label")?.as_str().map(str::to_owned));
+            if let Some(label) = label {
+                entry.insert("label".into(), json!(label));
             }
             out.push(Value::Object(entry));
         }
@@ -667,6 +717,53 @@ impl Workspaces {
         self.status(ctx, id)
     }
 
+    /// Delete removed workspaces for good: `p.id`'s, or every one, after the caller confirms how
+    /// many it was shown, as `records.purge` asks (ADR 0038 §1). The one workspaces op that can't
+    /// be undone, so it never runs on a guess.
+    fn purge(&self, ctx: &Ctx, p: Purge) -> Result<Value> {
+        let _g = self.write.lock();
+        let ids: Vec<String> = match &p.id {
+            Some(id) => {
+                if !manifest::valid_name(id) || ctx.store.list(&removed_path(id))?.is_empty() {
+                    return Err(Error::not_found(format!("no removed workspace '{id}'")));
+                }
+                vec![id.clone()]
+            }
+            None => removed_ids(ctx)?,
+        };
+        let workspaces = ids.len();
+        if workspaces == 0 {
+            return Ok(json!({"purged": 0}));
+        }
+        let expected = json!({"workspaces": workspaces});
+        if p.confirm.as_ref() != Some(&expected) {
+            let what = match &p.id {
+                Some(id) => format!("the removed workspace '{id}'"),
+                None => format!("all {workspaces} removed workspace(s)"),
+            };
+            return Err(Error::new(
+                shimmer_core::ErrorCode::ConfirmationRequired,
+                format!("purging permanently deletes {what}; confirm with {{\"workspaces\": {workspaces}}}"),
+            )
+            .with_detail(expected));
+        }
+        let mut files = Vec::new();
+        for id in &ids {
+            files.extend(ctx.store.list(&removed_path(id))?);
+        }
+        let mut event = json!({"workspaces": workspaces});
+        if let Some(id) = &p.id {
+            event["workspace"] = json!(id);
+        }
+        ctx.store.transaction(|tx| {
+            for path in &files {
+                tx.delete(path)?;
+            }
+            tx.emit("workspaces.workspace.purged", event)
+        })?;
+        Ok(json!({"purged": workspaces}))
+    }
+
     /// `dirty → ready` without running cleanup (§10.3: the last resort when there is no
     /// cleanup script). Also clears a `state.toml` Shimmer can't read, which is the one way to
     /// recover from a hand-edit gone wrong.
@@ -773,6 +870,18 @@ pub(crate) fn folder(ctx: &Ctx, id: &str) -> Result<Folder> {
 /// Where a removed workspace waits to be restored (ADR 0026 §2).
 fn removed_path(id: &str) -> String {
     format!(".removed/{id}")
+}
+
+/// Every removed workspace's id, sorted.
+fn removed_ids(ctx: &Ctx) -> Result<Vec<String>> {
+    let mut ids: Vec<String> = ctx
+        .store
+        .list(".removed")?
+        .iter()
+        .filter_map(|p| p.strip_prefix(".removed/")?.split('/').next().map(str::to_owned))
+        .collect();
+    ids.dedup();
+    Ok(ids)
 }
 
 pub(crate) fn state_path(id: &str) -> String {

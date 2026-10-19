@@ -18,9 +18,7 @@ fn file(env: &TestEnv, path: &str) -> String {
 /// A web-project workspace "site", answered.
 async fn site(w: &Workspaces, env: &TestEnv) {
     let values = json!({"PROJECT_DIR": "/home/me/code/site", "CODE_EDITOR": "vscode", "LINKS": "https://a.dev"});
-    call(w, env, "workspaces.create", json!({"id": "site", "template": "web-project", "values": values}))
-        .await
-        .unwrap();
+    call(w, env, "workspaces.new", json!({"id": "site", "template": "web-project", "values": values})).await.unwrap();
 }
 
 #[tokio::test]
@@ -76,7 +74,7 @@ async fn reconfigure_rewrites_only_env_and_keeps_hand_edits() {
     assert_eq!(r["changed"], json!([]));
     assert_eq!(env.backend.events().len(), events_before + 1);
     // And it still launches: the status reads the rewritten file.
-    assert_eq!(call(&w, &env, "workspaces.status", json!({"id": "site"})).await.unwrap()["state"], "ready");
+    assert_eq!(call(&w, &env, "workspaces.show", json!({"id": "site"})).await.unwrap()["state"], "ready");
 }
 
 #[tokio::test]
