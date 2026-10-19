@@ -1,7 +1,7 @@
-# 0039. One socket per Shimmer folder: which folder a daemon serves, short socket paths, and its working folder
+# 0039. One socket per Shimmer folder: which folder a daemon serves, and short socket paths
 
-Status: proposed · Raised by Dev B (#266, findings 1, 2, 3 and 6) · Needs sign-off: Dev A (`proto`'s
-default socket path and its `welcome` frame, the daemon's handshake and start-up, `shimmer daemon`'s
+Status: proposed · Raised by Dev B (#266, findings 1, 2 and 6) · Needs sign-off: Dev A (`proto`'s
+default socket path and its `welcome` frame, the daemon's handshake, `shimmer daemon`'s
 exit 3 from ADR 0034 §5) · Dev C notified (an additive `welcome` field; no version bump) · No `core` change
 
 ## Context
@@ -27,15 +27,12 @@ dogfooding that's all three of us, and the failure is silent: the real data chan
 macOS already keeps the socket inside the folder (`$SHIMMER_HOME/daemon.sock`), and two users get
 two `$XDG_RUNTIME_DIR`s, so neither has this problem.
 
-Two smaller start-up problems sit in the same code (#266):
+A smaller start-up problem sits in the same code (#266, finding 2):
 
-- **A long folder path stops the daemon starting (finding 2).** A Unix socket path is limited to
+- **A long folder path stops the daemon starting.** A Unix socket path is limited to
   about 104 bytes on macOS and 108 on Linux. Where the socket is `$SHIMMER_HOME/daemon.sock` (macOS,
   and Linux without `XDG_RUNTIME_DIR`), a deep folder or a long username passes it. The daemon says
   `path must be shorter than SUN_LEN`; an auto-starting command only says `cannot connect`.
-- **The daemon keeps the working folder of whatever command started it (finding 3).** Run your first
-  command from a USB drive's folder and the drive can't be unmounted ("target is busy") while the
-  daemon runs. Anything it starts without setting a folder inherits it too.
 
 ## Decision
 
@@ -94,13 +91,7 @@ An explicit `SHIMMER_SOCKET` that's too long is never shortened (scripts rely on
 and the daemon both say exactly that: "SHIMMER_SOCKET is 131 bytes; a socket path can be at most
 103 here".
 
-### 6. The daemon runs in `/`
-
-The daemon changes its working folder to `/` as it starts, and auto-start spawns it with
-`current_dir("/")` too, so it never holds onto the folder a command happened to run in.
-Workspace steps get their own folder separately (#269, finding 2).
-
-### 7. Startup installs from before this
+### 6. Startup installs from before this
 
 `shimmer startup on` writes the resolved `SHIMMER_SOCKET` into the unit (ADR 0034 §2), so a unit
 written before this change still pins the old shared path, while commands now look at the new one.
@@ -130,9 +121,9 @@ rewrites the unit. Nobody outside the team has run `startup on` yet, so there's 
   protocol.md documents both; no version bump.
 - A long folder path no longer stops the daemon starting; an explicit `SHIMMER_SOCKET` that's too
   long fails with a message that says so.
-- The daemon never keeps a command's folder busy.
-- Not covered here: the daemon's environment (`PATH`, #266 finding 4), start failures reaching the log
-  (finding 5), and log size (finding 7).
+- Not covered here: the daemon's working folder (#266 finding 3, its own small PR, no ADR needed),
+  its environment (`PATH`, finding 4), start failures reaching the log (finding 5), and log size
+  (finding 7).
 
 ## Tests
 
@@ -144,5 +135,4 @@ rewrites the unit. Nobody outside the team has run `startup on` yet, so there's 
 - A folder whose `daemon.sock` would be too long gets `/tmp/shimmer-<uid>/<id>.sock`, and the daemon
   starts and answers there; a `/tmp/shimmer-<uid>` owned by someone else is refused; a too-long
   `SHIMMER_SOCKET` gives the message from §5.
-- A daemon auto-started from a temporary folder has `/` as its working folder.
 - `startup status` warns about a unit pinning a different socket.
