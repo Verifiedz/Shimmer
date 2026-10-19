@@ -123,7 +123,7 @@ shimmer records collections                  # list collections and their fields
 shimmer records add leetcode two-sum --title "Two Sum" --difficulty easy
 shimmer records list leetcode --status todo  # --FIELD VALUE filters on an exact value
 shimmer records complete leetcode/two-sum    # mark done; stamps last_solved with today's date
-shimmer records get leetcode/two-sum
+shimmer records show leetcode/two-sum
 shimmer records update leetcode/two-sum --url https://leetcode.com/problems/two-sum/
 shimmer records remove leetcode/two-sum
 ```
@@ -133,7 +133,7 @@ You can write a record as `leetcode/two-sum` or `leetcode two-sum`. There is mor
 - **Finding records:** `list` filters (`--filter "difficulty=hard"`, `--or`, `--has`,
   `--missing`, dates like `today+7`), searches (`--search`), sorts (`--sort -last_solved`) and
   pages (`--limit`, `--offset`).
-- **Undo:** `remove` moves a record to the trash; `restore` brings it back, `trash` lists it, and
+- **Undo:** `remove` moves a record to the trash; `restore` brings it back, `list --removed` lists it, and
   `purge` deletes it for good (it asks first). `reopen` makes a done record todo again.
 - **Moving data:** `import` from CSV or JSON, `export` to either.
 - **Changing a collection:** `edit` opens its file; `check`, `rename-field`, `rename-collection`,
@@ -186,7 +186,7 @@ shimmer workspaces peek web-project        # what one does before you use it
 shimmer workspaces new site --from web-project
 shimmer workspaces list                    # every workspace and its state (ready, active, dirty)
 shimmer workspaces activate site           # run its steps in order; add --wait to follow along
-shimmer workspaces status site             # steps, last session, and why it's dirty if it is
+shimmer workspaces show site               # steps, last session, and why it's dirty if it is
 shimmer workspaces stop site               # stop what it started
 shimmer queue list                     # what is running and waiting, per lane
 shimmer scheduler list                 # your schedules, when each next fires and its state (--all: modules' too)
@@ -240,6 +240,8 @@ pack and how to make your own.
 shimmer manifest              # registered modules, their operations and lanes
 shimmer call OP '{...}'       # send any operation with JSON params, e.g. shimmer call queue.list
 shimmer shutdown              # stop the daemon
+shimmer startup on            # start the daemon every time you log in, so schedules run after a restart
+shimmer startup status        # whether it's on; 'shimmer startup off' turns it off
 shimmer daemon                # run the daemon in the foreground with its logs (stop any running one first)
 shimmer --help                # every command
 ```

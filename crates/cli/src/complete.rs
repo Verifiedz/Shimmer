@@ -28,7 +28,7 @@ use crate::style::{Palette, Role};
 const DAEMON_WAIT: Duration = Duration::from_millis(500);
 
 /// The modules with their own help page, by the command word that opens it.
-fn modules() -> [(&'static str, &'static str); 7] {
+fn modules() -> [(&'static str, &'static str); 8] {
     [
         ("records", crate::records::USAGE),
         ("workspaces", crate::workspaces::USAGE),
@@ -37,6 +37,7 @@ fn modules() -> [(&'static str, &'static str); 7] {
         ("packs", crate::packs::cmd::USAGE),
         ("fetchers", crate::fetchers::USAGE),
         ("notify", crate::notify::USAGE),
+        ("startup", crate::startup::USAGE),
     ]
 }
 
@@ -1142,7 +1143,8 @@ mod tests {
             assert!(top.contains(&word.to_owned()), "{word} missing from {top:?}");
         }
         // Each module's commands, as the pack targets know them: the same list, read twice.
-        for (module, usage) in modules().into_iter().filter(|(m, _)| *m != "packs") {
+        // `packs` and `startup` run in the client alone: no op for an alias to name.
+        for (module, usage) in modules().into_iter().filter(|(m, _)| *m != "packs" && *m != "startup") {
             let read: Vec<String> = commands(usage).into_iter().map(|c| c.word).collect();
             let targets: std::collections::BTreeSet<&str> = crate::packs::pack::TARGETS
                 .iter()
