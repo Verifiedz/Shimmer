@@ -39,6 +39,7 @@ impl Module for Demo {
             version: "0.0.1".into(),
             namespace: "demo".into(),
             topics: vec!["demo.item.saved".into()],
+            topic_descriptions: Default::default(),
             capabilities: vec![],
         }
     }
@@ -68,6 +69,10 @@ impl Module for Demo {
             spec("demo.bad", slow()),
             spec("demo.dirty", slow()),
             spec("demo.spin", slow()),
+            spec("demo.put_queued", slow()),
+            spec("demo.later", Execution::Inline),
+            spec("demo.cancel", Execution::Inline),
+            spec("demo.catalog", Execution::Inline),
         ]
     }
 
@@ -81,6 +86,30 @@ impl Module for Demo {
                     tx.emit("demo.item.saved", json!({"key": key}))
                 })?;
                 Ok(json!({"saved": key}))
+            }
+            // `demo.put` as a queued task, so its event carries the task as its cause.
+            "demo.put_queued" => {
+                ctx.bus.emit("demo.item.saved", json!({"by": "bus"}))?;
+                ctx.store.transaction(|tx| tx.emit("demo.item.saved", json!({"by": "transaction"})))?;
+                Ok(json!("put"))
+            }
+            // A one-time schedule (ADR 0035 §5.6): `{at, op, label}`.
+            "demo.later" => {
+                let at = params["at"].as_str().unwrap_or("").parse().map_err(|_| Error::invalid_params("at"))?;
+                let (op, label) = (params["op"].as_str().unwrap_or(""), params["label"].as_str().unwrap_or(""));
+                let id = ctx.schedules.add_once(op, json!({"from": "later"}), at, label)?;
+                Ok(json!({"trigger_id": id}))
+            }
+            // What `ctx.catalog` says (ADR 0035 §5.7).
+            "demo.catalog" => {
+                let topics: serde_json::Map<String, Value> =
+                    ctx.catalog.topics().map(|(t, d)| (t.to_owned(), json!(d))).collect();
+                let ops: Vec<&str> = ctx.catalog.ops().map(|c| c.op.as_str()).collect();
+                Ok(json!({"ops": ops, "topics": topics}))
+            }
+            "demo.cancel" => {
+                let id = shimmer_core::TriggerId::new(params["trigger_id"].as_str().unwrap_or(""));
+                Ok(json!({"removed": ctx.schedules.remove(&id)?}))
             }
             "demo.get" => {
                 let key = params["key"].as_str().unwrap_or("k");
@@ -134,6 +163,7 @@ impl Module for Notify {
             version: "0.0.1".into(),
             namespace: "notify".into(),
             topics: vec![],
+            topic_descriptions: Default::default(),
             capabilities: vec![],
         }
     }
@@ -176,6 +206,7 @@ impl Module for ProcessUser {
             version: "0.0.1".into(),
             namespace: "procuser".into(),
             topics: vec![],
+            topic_descriptions: Default::default(),
             capabilities: if self.declares_capability { vec!["process".into()] } else { vec![] },
         }
     }
@@ -222,6 +253,7 @@ impl Module for DesktopUser {
             version: "0.0.1".into(),
             namespace: "deskuser".into(),
             topics: vec![],
+            topic_descriptions: Default::default(),
             capabilities: if self.declares_capability { vec!["desktop".into()] } else { vec![] },
         }
     }
@@ -266,6 +298,7 @@ impl Module for NetworkUser {
             version: "0.0.1".into(),
             namespace: "netuser".into(),
             topics: vec![],
+            topic_descriptions: Default::default(),
             capabilities: if self.declares_capability { vec!["network".into()] } else { vec![] },
         }
     }

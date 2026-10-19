@@ -42,9 +42,14 @@ An alias stands for shimmer plus a whole command. In pack.toml it names one of t
   scheduler.list  scheduler.show  scheduler.add  scheduler.edit  scheduler.disable
   scheduler.enable  scheduler.remove  scheduler.restore  scheduler.purge
   fetchers.list  fetchers.status  fetchers.test  fetchers.run  fetchers.items
+  automations.list  automations.show  automations.new  automations.edit  automations.remove
+  automations.restore  automations.purge  automations.rename  automations.copy
+  automations.enable  automations.disable  automations.test
+  automations.events  automations.history  automations.status  automations.depth  automations.reload
+  automations.templates  automations.peek
   notify.list  notify.show  notify.count  notify.mark_read  notify.mark_unread  notify.remove
   notify.send  notify.test  notify.resend  notify.pause  notify.resume  notify.quiet
-  notify.status  notify.builtin_alerts  notify.cap
+  notify.status  notify.cap
 
 Your own packs go in packs/<name>/pack.toml in your Shimmer folder (see docs/packs/README.md).
 The active pack is kept in ~/.config/shimmer/cli.toml; aliases are linked into ~/.local/bin.";
@@ -491,8 +496,8 @@ mod tests {
     #[test]
     fn no_link_switches_without_commands_and_clears_old_ones() {
         let t = t();
-        let n = TARGETS.len();
         run_ok(&t, PacksCmd::Use { name: "short".into(), link: true });
+        let n = TARGETS.len();
         let out = run_ok(&t, PacksCmd::Use { name: "starship".into(), link: false });
         assert!(out.contains(&format!("removed {n}")) && out.ends_with("try it: shimmer comms"), "{out}");
         assert_eq!((saved(&t).pack.as_deref(), links(&t)), (Some("starship"), vec![]));

@@ -298,7 +298,7 @@ pub fn parse(words: Vec<String>) -> std::result::Result<WorkspacesCmd, String> {
 }
 
 /// `--set QUESTION=ANSWER`'s value, split.
-fn set_answer(value: &str) -> std::result::Result<(String, String), String> {
+pub(crate) fn set_answer(value: &str) -> std::result::Result<(String, String), String> {
     match value.split_once('=') {
         Some((q, a)) if !q.trim().is_empty() => Ok((q.trim().to_owned(), a.to_owned())),
         _ => Err(format!("--set takes QUESTION=ANSWER, e.g. --set PROJECT_DIR=~/code/site, got '{value}'")),
@@ -845,13 +845,13 @@ fn edited(id: &str, data: &Value) -> String {
 // ---------------------------------------------------------------- templates (ADR 0025)
 
 /// Where `~` and relative paths point: only the client knows (ADR 0025 §8).
-struct Paths {
+pub(crate) struct Paths {
     home: Option<String>,
     cwd: Option<String>,
 }
 
 impl Paths {
-    fn from_env() -> Self {
+    pub(crate) fn from_env() -> Self {
         Self { home: std::env::var("HOME").ok(), cwd: std::env::current_dir().ok().map(|d| d.display().to_string()) }
     }
 
@@ -876,7 +876,7 @@ impl Paths {
 /// The answers to send: `--set` ones first, then, at a terminal, each question not answered yet
 /// (an empty answer takes the template's default). Without a terminal nothing is asked
 /// (CLAUDE.md §15.1); the daemon then names any required answer that is missing.
-fn answers(
+pub(crate) fn answers(
     questions: &Value,
     set: &[(String, String)],
     prompt: &mut dyn Prompt,
@@ -936,7 +936,7 @@ fn answers(
 }
 
 /// Without a terminal, a missing required answer should say how to give it.
-fn how_to_answer(e: Error, prompt: &dyn Prompt) -> Error {
+pub(crate) fn how_to_answer(e: Error, prompt: &dyn Prompt) -> Error {
     if e.code == ErrorCode::InvalidParams && e.message.contains(" is required") && !prompt.interactive() {
         let name = e.message.split(' ').next().unwrap_or("QUESTION");
         return Error::new(

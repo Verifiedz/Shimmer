@@ -5,6 +5,7 @@
 //! [`packs`]: aliases are rewritten to canonical command words here and never reach the wire.
 
 mod args;
+mod automations;
 mod autostart;
 mod client;
 mod complete;
@@ -36,6 +37,7 @@ use shimmer_core::{Error, Result};
 use shimmer_proto::ops;
 
 pub use args::{Args, Command, USAGE};
+pub use automations::AutomationsCmd;
 pub use client::{Client, ConnectError};
 pub use fetchers::FetchersCmd;
 pub use queue::QueueCmd;
@@ -206,6 +208,7 @@ fn usage_for(args: &[String]) -> &'static str {
             "workspaces" => return workspaces::USAGE,
             "queue" => return queue::USAGE,
             "scheduler" => return scheduler::USAGE,
+            "automations" => return automations::USAGE,
             "fetchers" => return fetchers::USAGE,
             "packs" => return packs::cmd::USAGE,
             "notify" => return notify::USAGE,
@@ -241,6 +244,21 @@ fn prints_data(cmd: &Command) -> bool {
                     | SchedulerCmd::Add(_)
                     | SchedulerCmd::Edit { .. }
             )
+            // Every reply that can carry a rule's label, which is the person's text (#253's review).
+            | Command::Automations(
+                AutomationsCmd::List { .. }
+                    | AutomationsCmd::Show { .. }
+                    | AutomationsCmd::New { .. }
+                    | AutomationsCmd::Edit { .. }
+                    | AutomationsCmd::Remove { .. }
+                    | AutomationsCmd::Restore { .. }
+                    | AutomationsCmd::Enable { .. }
+                    | AutomationsCmd::Disable { .. }
+                    | AutomationsCmd::Test { .. }
+                    | AutomationsCmd::History { .. }
+                    | AutomationsCmd::Status
+                    | AutomationsCmd::Reload
+            )
             | Command::Notify(
                 notify::NotifyCmd::List { .. } | notify::NotifyCmd::Show { .. } | notify::NotifyCmd::Send { .. }
             )
@@ -268,6 +286,7 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
         Command::Workspaces(WorkspacesCmd::Help) => return Ok(Some(workspaces::USAGE.into())),
         Command::Queue(QueueCmd::Help) => return Ok(Some(queue::USAGE.into())),
         Command::Scheduler(SchedulerCmd::Help) => return Ok(Some(scheduler::USAGE.into())),
+        Command::Automations(AutomationsCmd::Help) => return Ok(Some(automations::USAGE.into())),
         Command::Fetchers(FetchersCmd::Help) => return Ok(Some(fetchers::USAGE.into())),
         Command::DoctorHelp => return Ok(Some(doctor::USAGE.into())),
         // Packs live entirely in the client: no daemon needed.
@@ -294,6 +313,9 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
         }
         return Ok(Some(out));
     }
+    if let Command::Automations(cmd) = &args.command {
+        return automations::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
+    }
     if let Command::Workspaces(cmd) = &args.command {
         return workspaces::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
     }
@@ -315,6 +337,7 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
         | Command::Workspaces(_)
         | Command::Queue(_)
         | Command::Scheduler(_)
+        | Command::Automations(_)
         | Command::Fetchers(_)
         | Command::Packs(_)
         | Command::Notify(_)
@@ -386,6 +409,7 @@ fn output(args: &Args, data: &Value) -> String {
         | Command::Workspaces(_)
         | Command::Queue(_)
         | Command::Scheduler(_)
+        | Command::Automations(_)
         | Command::Fetchers(_)
         | Command::Packs(_)
         | Command::Notify(_)
@@ -430,6 +454,9 @@ mod tests {
             &["workspaces", "show", "site"],
             &["scheduler", "list"],
             &["call", "core.ping"],
+            &["automations", "new", "x", "--file", "rule.toml"],
+            &["automations", "edit", "x"],
+            &["automations", "restore", "x"],
         ] {
             assert!(prints_data(&cmd(words)), "{words:?}");
         }

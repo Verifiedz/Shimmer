@@ -130,6 +130,26 @@ pub const TARGETS: &[Target] = &[
     // `items` has no op of its own -- it reads `core.events.list` -- so it's named like
     // `records.peek`/`workspaces.edit` above.
     Target { op: "fetchers.items", words: &["fetchers", "items"] },
+    // ADR 0035 §8: automations.
+    Target { op: "automations.list", words: &["automations", "list"] },
+    Target { op: "automations.show", words: &["automations", "show"] },
+    Target { op: "automations.new", words: &["automations", "new"] },
+    Target { op: "automations.edit", words: &["automations", "edit"] },
+    Target { op: "automations.remove", words: &["automations", "remove"] },
+    Target { op: "automations.restore", words: &["automations", "restore"] },
+    Target { op: "automations.purge", words: &["automations", "purge"] },
+    Target { op: "automations.rename", words: &["automations", "rename"] },
+    Target { op: "automations.copy", words: &["automations", "copy"] },
+    Target { op: "automations.enable", words: &["automations", "enable"] },
+    Target { op: "automations.disable", words: &["automations", "disable"] },
+    Target { op: "automations.test", words: &["automations", "test"] },
+    Target { op: "automations.events", words: &["automations", "events"] },
+    Target { op: "automations.history", words: &["automations", "history"] },
+    Target { op: "automations.status", words: &["automations", "status"] },
+    Target { op: "automations.depth", words: &["automations", "depth"] },
+    Target { op: "automations.reload", words: &["automations", "reload"] },
+    Target { op: "automations.templates", words: &["automations", "templates"] },
+    Target { op: "automations.peek", words: &["automations", "peek"] },
     Target { op: "notify.list", words: &["notify", "list"] },
     Target { op: "notify.show", words: &["notify", "show"] },
     Target { op: "notify.count", words: &["notify", "count"] },
@@ -143,7 +163,6 @@ pub const TARGETS: &[Target] = &[
     Target { op: "notify.resume", words: &["notify", "resume"] },
     Target { op: "notify.quiet", words: &["notify", "quiet"] },
     Target { op: "notify.status", words: &["notify", "status"] },
-    Target { op: "notify.builtin_alerts", words: &["notify", "builtin-alerts"] },
     Target { op: "notify.cap", words: &["notify", "cap"] },
 ];
 
@@ -454,7 +473,7 @@ label = "My Pack"
 
     #[test]
     fn every_target_is_an_op_with_its_command_words() {
-        assert_eq!(TARGETS.len(), 77);
+        assert_eq!(TARGETS.len(), 95);
         // Every command's word is its op's verb (ADR 0038 §6): no exceptions are left.
         for t in TARGETS {
             let (module, verb) = t.op.split_once('.').unwrap();

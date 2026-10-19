@@ -160,6 +160,10 @@ pub struct ModuleInfo {
     pub namespace: String,
     pub commands: Vec<CommandSpec>,
     pub topics: Vec<String>,
+    /// Topic → one line on it (ADR 0035 §5.5). Absent from older daemons; a topic left out has
+    /// none.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub topic_descriptions: std::collections::BTreeMap<String, String>,
 }
 
 /// One frame as a line: compact JSON plus `\n`. Never contains another newline.

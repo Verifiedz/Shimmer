@@ -38,6 +38,13 @@ pub struct Fetchers {
     write: WriteLock,
 }
 
+/// Every topic fetchers emits, with a line on it for `shimmer automations events` (ADR 0035 §5.5).
+const TOPICS: [(&str, &str); 3] = [
+    ("fetchers.item.found", "a source found a new item"),
+    ("fetchers.fetch.finished", "a fetch of a source finished"),
+    ("fetchers.fetch.failed", "a fetch of a source failed"),
+];
+
 #[async_trait]
 impl Module for Fetchers {
     fn manifest(&self) -> Manifest {
@@ -45,9 +52,8 @@ impl Module for Fetchers {
             id: "fetchers".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             namespace: "fetchers".into(),
-            topics: ["fetchers.item.found", "fetchers.fetch.finished", "fetchers.fetch.failed"]
-                .map(String::from)
-                .to_vec(),
+            topics: TOPICS.iter().map(|(t, _)| t.to_string()).collect(),
+            topic_descriptions: TOPICS.iter().map(|(t, d)| (t.to_string(), d.to_string())).collect(),
             // hn-whoishiring (ADR 0028 §10) needs the real ctx.http.
             capabilities: vec!["network".into()],
         }
@@ -1105,8 +1111,9 @@ mod tests {
         let progress = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let p = progress.clone();
         let ctx = env.ctx.for_task(
+            shimmer_core::TaskId::new(),
             env.ctx.cancel.clone(),
-            std::sync::Arc::new(move |f, n| p.lock().unwrap().push((f, n.to_owned()))),
+            std::sync::Arc::new(move |f: f32, n: &str| p.lock().unwrap().push((f, n.to_owned()))),
         );
         let fetchers = Fetchers::default();
 

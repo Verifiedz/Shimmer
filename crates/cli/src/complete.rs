@@ -28,12 +28,13 @@ use crate::style::{Palette, Role};
 const DAEMON_WAIT: Duration = Duration::from_millis(500);
 
 /// The modules with their own help page, by the command word that opens it.
-fn modules() -> [(&'static str, &'static str); 8] {
+fn modules() -> [(&'static str, &'static str); 9] {
     [
         ("records", crate::records::USAGE),
         ("workspaces", crate::workspaces::USAGE),
         ("queue", crate::queue::USAGE),
         ("scheduler", crate::scheduler::USAGE),
+        ("automations", crate::automations::USAGE),
         ("packs", crate::packs::cmd::USAGE),
         ("fetchers", crate::fetchers::USAGE),
         ("notify", crate::notify::USAGE),
@@ -233,6 +234,12 @@ fn is_placeholder(token: &str) -> bool {
 }
 
 fn merge(into: &mut Cmd, from: Cmd) {
+    // Both summaries, so a second usage line's description (`new RULE --from TEMPLATE`) isn't
+    // lost (#254's review).
+    if !from.summary.is_empty() && !into.summary.contains(&from.summary) {
+        into.summary =
+            if into.summary.is_empty() { from.summary } else { format!("{}; {}", into.summary, from.summary) };
+    }
     for (i, alternatives) in from.positionals.into_iter().enumerate() {
         match into.positionals.get_mut(i) {
             Some(existing) => {
@@ -675,8 +682,8 @@ impl Groups {
                     self.add("fields", "fields", f["name"].as_str().unwrap_or_default(), field_type(&f));
                 }
             }
-            ("records" | "workspaces", "TEMPLATE") => self.templates(module, source).await,
-            ("records" | "workspaces", "CATEGORY") => self.categories(module, source).await,
+            ("records" | "workspaces" | "automations", "TEMPLATE") => self.templates(module, source).await,
+            ("records" | "workspaces" | "automations", "CATEGORY") => self.categories(module, source).await,
             ("workspaces", "NAME") if command != "new" => self.workspaces(source).await,
             ("packs", "NAME") | ("", "NAME") => self.packs(cx),
             ("packs", "NAME|FOLDER") => {
@@ -690,6 +697,9 @@ impl Groups {
             ("scheduler", "REMOVED") => self.removed_triggers(source).await,
             ("workspaces", "REMOVED") => self.removed_workspaces(source).await,
             ("fetchers", "SOURCE") => self.sources(source).await,
+            ("automations", "RULE") => self.rules(false, source).await,
+            ("automations", "REMOVED") => self.rules(true, source).await,
+            ("automations", "FILE") => self.files(),
             ("notify", "ID") => self.messages(source).await,
             ("scheduler" | "", "OP") => self.ops(source).await,
             ("scheduler", "WHAT") => {
@@ -803,16 +813,26 @@ impl Groups {
             .or_else(|| data.as_array())
             .into_iter()
             .flatten()
-            // The ones you added, as `scheduler list` shows (#244), for anything you can only do to
-            // your own. Pausing is the one thing you can do to a module's schedule, so pause and
-            // resume offer every one (#249's review).
-            .filter(|t| matches!(command, "disable" | "enable") || t["source"]["type"] == "user")
+            // The ones `scheduler list` shows (#244): yours, and modules' one-time ones (ADR 0035 §4),
+            // for anything you can't do to a module's declared schedule. Switching one off is the
+            // one thing you can, so disable and enable offer every one (#249's review).
+            .filter(|t| matches!(command, "disable" | "enable") || t["source"]["type"] != "module")
             .cloned()
             .collect();
         // The same short endings `scheduler list` shows, which every scheduler command accepts.
         let ids: Vec<String> = all.iter().map(|t| text(&t["id"])).collect();
         for (t, short) in all.iter().zip(crate::render::short_ids(&ids)) {
             self.add("triggers", "triggers", short, text(&t["op"]));
+        }
+    }
+
+    /// Your rules, or with `removed` the removed ones `restore` and `purge` take (ADR 0038 §6).
+    async fn rules(&mut self, removed: bool, source: &mut impl Source) {
+        let params = if removed { json!({"removed": true}) } else { json!({}) };
+        let Some(data) = source.call("automations.list", params).await else { return };
+        let title = if removed { "removed rules" } else { "rules" };
+        for r in data["rules"].as_array().into_iter().flatten() {
+            self.add("rules", title, text(&r["id"]), text(&r["label"]));
         }
     }
 
@@ -865,12 +885,12 @@ impl Groups {
     /// Removed schedules, for `scheduler restore` and `purge` (ADR 0038).
     async fn removed_triggers(&mut self, source: &mut impl Source) {
         let Some(data) = source.call("scheduler.list", json!({"removed": true})).await else { return };
-        // Only a person's own schedule is ever removed (a module's can only be disabled).
+        // A person's own, or a module's one-time schedule they removed; never a module's declared one.
         let all: Vec<Value> = data["triggers"]
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|t| t["source"]["type"] == "user")
+            .filter(|t| t["source"]["type"] != "module")
             .cloned()
             .collect();
         let ids: Vec<String> = all.iter().map(|t| text(&t["id"])).collect();
@@ -1088,6 +1108,14 @@ mod tests {
                 json!({"triggers": [
                     {"id": "usr-01JABCDEFGHJKMNPQRSTVWXYZ0", "op": "records.list", "source": {"type": "user"}},
                     {"id": "notify.flush", "op": "notify.flush", "source": {"type": "module", "id": "notify"}}]}),
+            ),
+            ("automations.list", json!({"rules": [{"id": "solved", "label": "Solved"}]})),
+            ("automations.list removed", json!({"rules": [{"id": "old", "label": "Old"}]})),
+            (
+                "automations.templates",
+                json!({"categories": [{"id": "messages", "label": "Tell me"}],
+                       "templates": [{"id": "notify-on-add", "description": "A message", "questions": [
+                           {"name": "COLLECTION", "prompt": "Which collection"}]}]}),
             ),
             (
                 "core.manifest",
@@ -1308,6 +1336,13 @@ mod tests {
         let pause = words("scheduler disable ").await;
         assert!(pause.contains(&"VWXYZ0".to_owned()) && pause.contains(&"notify.flush".to_owned()), "{pause:?}");
         assert_eq!(words("call ").await, ["core.ping"]);
+        assert_eq!(words("automations disable ").await, ["solved"]);
+        assert_eq!(words("automations restore ").await, ["old"], "only removed rules come back");
+        assert_eq!(words("automations new x --from ").await, ["notify-on-add"]);
+        assert_eq!(words("automations peek ").await, ["notify-on-add"]);
+        assert_eq!(words("automations templates ").await, ["messages"]);
+        assert!(words("automations ").await.contains(&"history".to_owned()));
+        assert!(words("automations test solved --").await.contains(&"--event".to_owned()));
         assert!(words("packs use ").await.contains(&"none".to_owned()));
         assert!(words("packs use ").await.contains(&"short".to_owned()));
         assert!(words("--pack ").await.contains(&"starship".to_owned()));
@@ -1322,6 +1357,11 @@ mod tests {
         assert!(words("workspaces new site --set ").await.is_empty(), "no template yet: nothing to offer");
         assert_eq!(words("workspaces copy site site-2 --set ").await, ["PROJECT_DIR="], "the workspace's own template");
         assert_eq!(words("workspaces reconfigure site --set ").await, ["PROJECT_DIR="]);
+        assert_eq!(
+            words("automations new mine --from notify-on-add --set ").await,
+            ["COLLECTION="],
+            "rule templates too"
+        );
     }
 
     #[tokio::test]
