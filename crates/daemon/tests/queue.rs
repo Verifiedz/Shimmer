@@ -595,3 +595,20 @@ async fn events_a_queued_task_emits_carry_it_as_their_cause() {
     assert_eq!(c.event("demo.item.saved").await.cause, None, "answered inline: no task");
     stop(d).await;
 }
+
+/// #251's review: the queue's own events about a task carry that task as their cause, so a rule
+/// on `queue.task.*` set off by its own action continues the chain and the loop guard stops it.
+#[tokio::test]
+async fn the_queues_events_about_a_task_carry_it_as_their_cause() {
+    let env = Env::new();
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    c.subscribe(&["queue.task.*"]).await;
+    let task = task_id(&c.call("demo.put_queued", json!({})).await.unwrap());
+    for topic in ["queue.task.enqueued", "queue.task.started", "queue.task.finished"] {
+        let ev = c.event(topic).await;
+        assert_eq!(ev.payload["task_id"], task.as_str(), "{topic}");
+        assert_eq!(ev.cause.map(|t| t.to_string()), Some(task.clone()), "{topic}: {:?}", ev.payload);
+    }
+    stop(d).await;
+}
