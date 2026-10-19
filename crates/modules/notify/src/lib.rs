@@ -1,6 +1,7 @@
 //! The `notify` module (ADR 0032): every message lands in an inbox first, then goes to each way
 //! of reaching the user (a [`Sink`]). Quiet hours and pause hold back what isn't urgent until
-//! they end, and two built-in alerts say when a workspace went dirty or a scheduled task failed.
+//! they end. Saying when a workspace went dirty or a scheduled task failed is automations' job,
+//! with its built-in rules (ADR 0035 §10).
 //!
 //! Notify decides *how* to reach you, never *when*: that's the caller's (a fallback, an alert, a
 //! schedule, or later an automation, ADR 0035).
@@ -9,10 +10,9 @@
 //! - `inbox/<id>.toml`: one message, the id a ULID (so names sort oldest first);
 //! - `held/<id>`: an empty marker per held message, so `notify.flush` finds them without
 //!   reading the inbox, written and removed in the same transaction as the message's state;
-//! - `settings.toml`: cap, quiet hours, pause and the built-in alerts (§3), changed by the ops;
+//! - `settings.toml`: cap, quiet hours and pause (§3), changed by the ops;
 //! - `removed.toml`: how many unread messages the cap has removed.
 
-mod alerts;
 mod filter;
 mod inbox;
 mod message;
@@ -35,7 +35,6 @@ use shimmer_core::{
     CommandSpec, Ctx, Error, ErrorCode, Event, Execution, LaneConfig, Manifest, Module, Result, TriggerId, WriteLock,
 };
 
-pub use alerts::Alerts;
 pub use message::{Delivery, Message, Priority, State};
 pub use sink::{DesktopSink, Sink};
 
@@ -284,7 +283,6 @@ impl Module for Notify {
             ),
             ("notify.resume", "Stop holding messages and send what waited", Execution::Inline),
             ("notify.quiet", "Show or set quiet hours", Execution::Inline),
-            ("notify.builtin_alerts", "Show or switch the built-in alerts", Execution::Inline),
             ("notify.cap", "Show or set how many messages the inbox keeps", Execution::Inline),
             ("notify.status", "Notify at a glance: settings, pause, counts", Execution::Inline),
         ]
@@ -313,25 +311,18 @@ impl Module for Notify {
             "notify.pause" => self.pause(&params, ctx),
             "notify.resume" => self.resume(ctx).await,
             "notify.quiet" => self.quiet(&params, ctx),
-            "notify.builtin_alerts" => self.builtin_alerts(&params, ctx),
             "notify.cap" => self.cap(&params, ctx),
             "notify.status" => self.status(ctx),
             other => Err(Error::unknown_op(format!("notify has no op '{other}'"))),
         }
     }
 
-    /// The built-in alerts, and one flush once quiet hours or a pause are over. Never reacts to
-    /// notify's own topics; [`alerts::alert`] also skips notify's own tasks.
+    /// One flush once quiet hours or a pause are over. Never reacts to notify's own topics.
     async fn on_event(&self, ev: &Event, ctx: &Ctx) -> Result<()> {
         if ev.topic.starts_with("notify.") {
             return Ok(());
         }
         let (s, _) = settings(ctx)?;
-        // Enqueued, never sent inline: a slow popup must not hold up the bus, and every send
-        // shows in the queue (ADR 0032 §4).
-        if let Some(params) = alerts::alert(ev, &s.alerts) {
-            ctx.queue.enqueue("notify.send", params).await?;
-        }
         if !holds(&s, ctx, Priority::Normal)
             && !self.flush_queued.load(Ordering::Acquire)
             && !held_ids(ctx)?.is_empty()
@@ -798,23 +789,6 @@ impl Notify {
         Ok(json!({"quiet": file.quiet, "quiet_now": quiet_now(&s, ctx)}))
     }
 
-    /// `notify.builtin_alerts`: `{}` shows; `{"name", "on"}` switches one.
-    fn builtin_alerts(&self, params: &Value, ctx: &Ctx) -> Result<Value> {
-        let show = |a: &Alerts| json!({"alerts": {"workspace_dirty": a.workspace_dirty, "scheduled_task_failed": a.scheduled_task_failed}});
-        let Some(name) = params.get("name").and_then(Value::as_str) else {
-            return Ok(show(&settings(ctx)?.0.alerts));
-        };
-        let on =
-            params.get("on").and_then(Value::as_bool).ok_or_else(|| Error::invalid_params("on is true or false"))?;
-        let file = self.write_settings(ctx, |file| {
-            let mut alerts = file.builtin_alerts.unwrap_or_default();
-            alerts.set(name, on).map_err(Error::invalid_params)?;
-            file.builtin_alerts = Some(alerts);
-            Ok(vec![("notify.settings.changed", json!({"builtin_alerts": alerts}))])
-        })?;
-        Ok(show(&file.builtin_alerts.unwrap_or_default()))
-    }
-
     /// `notify.cap`: `{}` shows; `{"max": N}` sets it (at least 100) and applies it at once.
     fn cap(&self, params: &Value, ctx: &Ctx) -> Result<Value> {
         let Some(max) = params.get("max").filter(|v| !v.is_null()) else {
@@ -847,7 +821,6 @@ impl Notify {
             "paused": pause_now(&s, ctx),
             "quiet": quiet,
             "quiet_now": quiet_now(&s, ctx),
-            "builtin_alerts": s.alerts,
             "cap": s.cap,
             "counts": counts(&all_messages(ctx)?),
             "removed_unread": removed_unread(ctx)?,

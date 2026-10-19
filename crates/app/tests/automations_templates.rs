@@ -1,7 +1,6 @@
 //! Every rule template on the real binary and daemon (ADR 0035 §9; the template safety rules of
-//! ADR 0025 §6a). The two workspace templates run for real. The message templates need the notify
-//! module, which this daemon doesn't have yet, so they must say so and make nothing; the rules
-//! they make are checked in the module's own tests.
+//! ADR 0025 §6a). The two workspace templates run for real here; the message templates fire for
+//! real in automations_notify.rs.
 
 mod common;
 
@@ -63,24 +62,6 @@ fn templates_list_and_peek_show_what_they_make() {
     let peek = ok(&home, &["automations", "peek", "stage-creates-workspace"]);
     assert!(peek.contains("── RULE-make ──") && peek.contains("── RULE-stop ──"), "{peek}");
     assert!(peek.contains("runs: workspaces.activate, workspaces.create, workspaces.stop"), "{peek}");
-}
-
-#[test]
-fn message_templates_say_they_need_notify_and_make_nothing() {
-    let home = home();
-    for t in [
-        "notify-on-add",
-        "notify-on-complete",
-        "notify-on-failure",
-        "stage-message",
-        "field-threshold",
-        "follow-up-reminder",
-        "spaced-review",
-    ] {
-        let err = fails(&home, &["automations", "new", "x", "--from", t, "--set", "COLLECTION=jobs", "--yes"]);
-        assert!(err.contains("needs notify.send from the notify module"), "{t}: {err}");
-    }
-    assert!(ok(&home, &["automations"]).contains("no rules yet"));
 }
 
 #[test]

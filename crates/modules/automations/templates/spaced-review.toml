@@ -28,6 +28,6 @@ when = { collection = "${COLLECTION}" }
 
 [[do]]
 op = "notify.send"
-params = { title = "Time to redo: {title}", priority = "low" }
+params = { title = "Time to redo: {title}", priority = "low", from = "automation:${RULE}" }
 after = "${DAYS}d"
 '''

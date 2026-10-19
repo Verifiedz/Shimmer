@@ -14,7 +14,7 @@ use shimmer_core::Catalog;
 /// At most this many actions in one rule: enough for any real rule, a cap on a pasted mistake.
 pub const MAX_ACTIONS: usize = 10;
 /// The longest wait an action may have (§4).
-const MAX_AFTER_DAYS: i64 = 366;
+pub(crate) const MAX_AFTER_DAYS: i64 = 366;
 /// Your rules can't react to these, nor run these ops (§3, §6).
 const OWN: &str = "automations.";
 

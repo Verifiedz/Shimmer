@@ -1,5 +1,5 @@
 //! The notify module against an in-memory `Ctx` (CLAUDE.md §12 rule 13): the inbox and its ops,
-//! delivery to sinks, quiet hours, pause and the summary after them, settings, and the alerts.
+//! delivery to sinks, quiet hours, pause and the summary after them, settings.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -227,7 +227,10 @@ async fn the_inbox_lists_newest_first_with_filters_and_counts() {
     t.send("standup notes").await;
     t.later(86_400);
     let alert = t
-        .call("notify.send", json!({"title": "site couldn't launch", "priority": "high", "alert": "workspace_dirty"}))
+        .call(
+            "notify.send",
+            json!({"title": "site couldn't launch", "priority": "high", "from": "automation:workspace-dirty"}),
+        )
         .await;
     t.later(1);
     t.send("Acme interview").await;
@@ -236,7 +239,7 @@ async fn the_inbox_lists_newest_first_with_filters_and_counts() {
     assert_eq!(titles(&all), ["Acme interview", "site couldn't launch", "standup notes"]);
     assert_eq!(all["counts"], json!({"total": 3, "unread": 3, "high": 1, "held": 0, "failed": 0}));
     assert_eq!(titles(&t.call("notify.list", json!({"limit": 1})).await), ["Acme interview"]);
-    assert_eq!(titles(&t.call("notify.list", json!({"from": "alerts"})).await), ["site couldn't launch"]);
+    assert_eq!(titles(&t.call("notify.list", json!({"from": "automations"})).await), ["site couldn't launch"]);
     assert_eq!(titles(&t.call("notify.list", json!({"text": "ACME"})).await), ["Acme interview"]);
     assert_eq!(titles(&t.call("notify.list", json!({"since": "2024-10-05"})).await).len(), 2);
     assert_eq!(titles(&t.call("notify.list", json!({"before": "2024-10-05"})).await), ["standup notes"]);
@@ -244,7 +247,7 @@ async fn the_inbox_lists_newest_first_with_filters_and_counts() {
     let c = t.call("notify.count", json!({"priority": "high"})).await;
     assert_eq!((c["count"].as_u64(), c["unread"].as_u64()), (Some(1), Some(3)));
     let one = t.call("notify.get", json!({"id": alert["id"]})).await;
-    assert_eq!(one["source"], "alert:workspace_dirty");
+    assert_eq!(one["source"], "automation:workspace-dirty");
     assert!(t.fails("notify.get", json!({"id": "01JD2T0000000000000000000A"})).await.message.contains("no message"));
     assert_eq!(
         t.fails("notify.get", json!({"id": "../x"})).await.code,
@@ -371,8 +374,10 @@ async fn test_and_resend_try_the_sinks_again() {
     assert!(t.fails("notify.resend", json!({})).await.message.contains("say which messages"));
 }
 
+/// Saying a task failed is automations' job now (ADR 0035 §10): notify reacts to nothing but its
+/// own flush.
 #[tokio::test]
-async fn alerts_are_enqueued_never_sent_inline_and_can_be_switched_off() {
+async fn a_failed_task_is_left_to_automations() {
     let t = setup();
     let failed = Event::new(
         ModuleId::new("queue"),
@@ -382,24 +387,8 @@ async fn alerts_are_enqueued_never_sent_inline_and_can_be_switched_off() {
         t.env.clock.now(),
     );
     t.notify.on_event(&failed, &t.env.ctx).await.unwrap();
-    let sent: Vec<(String, Value)> =
-        t.env.queue.requests.lock().unwrap().iter().map(|r| (r.op.clone(), r.params["alert"].clone())).collect();
-    assert_eq!(sent, [("notify.send".to_owned(), json!("scheduled_task_failed"))]);
-    assert!(t.desktop.got().is_empty(), "the queue sends it, as a task");
-
-    let own = Event::new(ModuleId::new("notify"), "notify.message.sent", json!({}), t.env.clock.now());
-    t.notify.on_event(&own, &t.env.ctx).await.unwrap();
-    assert_eq!(t.enqueued("notify.send"), 1, "never reacts to its own topics");
-
-    let a = t.call("notify.builtin_alerts", json!({"name": "scheduled-task-failed", "on": false})).await;
-    assert_eq!(a["alerts"], json!({"workspace_dirty": true, "scheduled_task_failed": false}));
-    t.notify.on_event(&failed, &t.env.ctx).await.unwrap();
-    assert_eq!(t.enqueued("notify.send"), 1, "switched off");
-    assert!(t
-        .fails("notify.builtin_alerts", json!({"name": "disk-full", "on": true}))
-        .await
-        .message
-        .contains("workspace-dirty"));
+    assert_eq!(t.enqueued("notify.send"), 0);
+    assert!(t.fails("notify.builtin_alerts", json!({})).await.message.contains("builtin_alerts"));
 }
 
 #[tokio::test]
@@ -424,7 +413,7 @@ async fn status_says_it_all() {
     assert_eq!((s["cap"].as_u64(), s["counts"]["held"].as_u64()), (Some(2000), Some(1)));
     assert_eq!(s["sinks"], json!(["desktop"]));
     assert!(s["paused"].is_null() && s["settings_problem"].is_null());
-    assert_eq!(s["builtin_alerts"]["workspace_dirty"], true);
+    assert!(s.get("builtin_alerts").is_none(), "they're automations' built-in rules now");
 }
 
 #[tokio::test]
@@ -458,7 +447,7 @@ async fn the_manifest_declares_its_lane_trigger_and_ops() {
     assert_eq!(notify.lanes()[0].max_concurrent, 2);
     let t = &notify.triggers()[0];
     assert_eq!((t.id.as_str(), t.op.as_str()), ("notify.flush", "notify.flush"));
-    assert_eq!(notify.commands().len(), 16);
+    assert_eq!(notify.commands().len(), 15);
     assert_eq!(notify.manifest().capabilities, ["desktop"], "the real ctx.desktop, nothing more");
     for topic in notify.manifest().topics {
         assert!(topic.starts_with("notify."), "{topic}");

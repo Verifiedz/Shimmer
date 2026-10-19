@@ -26,5 +26,5 @@ when = { collection = "${COLLECTION}" }
 
 [[do]]
 op = "notify.send"
-params = { title = "Done: {title}", priority = "${PRIORITY}" }
+params = { title = "Done: {title}", priority = "${PRIORITY}", from = "automation:${RULE}" }
 '''

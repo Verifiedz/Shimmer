@@ -13,7 +13,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use shimmer_core::params::decode;
 use shimmer_core::{local_date, CommandSpec, Ctx, Error, Event, Execution, Manifest, Module, Result, WriteLock};
@@ -26,6 +26,8 @@ const RULES: &str = "rules";
 const REMOVED: &str = "removed";
 const SETTINGS: &str = "settings.toml";
 const HISTORY: &str = "history.json";
+/// Renamed rules, so a delayed action set before a rename still finds its rule (#287's review).
+const RENAMED: &str = "renamed.toml";
 /// Firings kept in `history.json`, oldest dropped; the event log keeps them all (§8).
 const HISTORY_KEPT: usize = 300;
 /// After the loop guard reports stopping a rule, further stops of it are quiet this long.
@@ -37,11 +39,14 @@ const DEPTH_RANGE: std::ops::RangeInclusive<usize> = 1..=10;
 const LABEL_CHARS: usize = 150;
 
 /// Every topic automations emits, with a line on it for `automations events` (§5.5).
-const TOPICS: [(&str, &str); 9] = [
+const TOPICS: [(&str, &str); 12] = [
     ("automations.rule.created", "a rule was created"),
     ("automations.rule.edited", "a rule was changed"),
     ("automations.rule.removed", "a rule was removed (it can be restored)"),
     ("automations.rule.restored", "a removed rule came back"),
+    ("automations.rule.purged", "removed rules were deleted for good"),
+    ("automations.rule.renamed", "a rule was given a new id"),
+    ("automations.rule.copied", "a new rule was made from another (switched off)"),
     ("automations.rule.enabled", "a rule was switched on"),
     ("automations.rule.disabled", "a rule was switched off"),
     ("automations.rule.fired", "a rule reacted to an event"),
@@ -182,7 +187,7 @@ impl Automations {
                     // delay never starts a fresh chain the loop guard can't see, even across a
                     // restart (ADR 0035 §3, #238's review).
                     let at = ctx.clock.now() + wait;
-                    let deferred = json!({"rule": rule.id, "op": action.op, "params": params, "chain": chain});
+                    let deferred = json!({"rule": rule.id, "op": action.op, "params": params, "chain": chain, "made_at": ctx.clock.now()});
                     match ctx.schedules.add_once(DEFERRED, deferred, at, &label(rule)) {
                         Ok(id) => scheduled.push(json!({"op": action.op, "trigger_id": id, "at": at})),
                         Err(e) => failed.push(json!({"op": action.op, "error": e.message})),
@@ -204,7 +209,17 @@ impl Automations {
 
     /// A delayed action's time has come: queue its op, continuing the chain that scheduled it. A
     /// rule removed or switched off meanwhile has nothing left to do.
-    async fn deferred(&self, ctx: &Ctx, d: Deferred) -> Result<Value> {
+    async fn deferred(&self, ctx: &Ctx, mut d: Deferred) -> Result<Value> {
+        // Renamed since it was set: it belongs to the rule under its new id. A rule given the old
+        // id later is a different rule, and keeps only its own delayed actions. A renamed.toml
+        // that doesn't parse fails the task rather than skipping it under the old id (#287's
+        // review): the failure is seen, and the built-in scheduled-task-failed alert says so.
+        for r in renames(ctx)? {
+            if r.from == d.rule && d.made_at.is_none_or(|made| made < r.at) {
+                d.chain.rules.iter_mut().filter(|id| **id == r.from).for_each(|id| id.clone_from(&r.to));
+                d.rule = r.to;
+            }
+        }
         let on = self.state().rules.get(&d.rule).is_some_and(|r| r.enabled);
         if !on {
             return Ok(json!({"skipped": format!("rule '{}' was removed or switched off", d.rule)}));
@@ -234,10 +249,93 @@ impl Automations {
 
     // ------------------------------------------------------------------ ops
 
-    fn list(&self, ctx: &Ctx) -> Value {
+    /// The rules, or with `removed` the removed ones you can restore or purge (ADR 0038 §6).
+    fn list(&self, ctx: &Ctx, p: ListParams) -> Value {
+        if p.removed {
+            let rules: Vec<Value> = removed(ctx)
+                .into_iter()
+                .map(|id| {
+                    let text = ctx.store.read_string(&removed_path(&id)).ok().flatten();
+                    let label = text
+                        .and_then(|t| t.parse::<toml::Table>().ok())
+                        .and_then(|t| t.get("rule")?.get("label")?.as_str().map(str::to_owned));
+                    json!({"id": id, "label": label})
+                })
+                .collect();
+            return json!({"rules": rules});
+        }
         let history = history(ctx);
         let rules: Vec<Value> = self.state().rules.values().map(|r| view(r, &history)).collect();
-        json!({"rules": rules, "problems": self.problems(), "removed": removed(ctx)})
+        json!({"rules": rules, "problems": self.problems()})
+    }
+
+    /// Give a rule a new id (ADR 0038 §6). Its history moves with it, and a delayed action it set
+    /// that is still waiting follows it: `renamed.toml` records the rename, and `deferred` reads it
+    /// (#287's review). Entries older than the longest `after` are dropped on the next rename. An
+    /// action whose run was put off past that (the computer off for months, or its schedule
+    /// switched off and on much later) misses its rename and is skipped; rare enough to leave.
+    fn rename(&self, ctx: &Ctx, p: MoveParams) -> Result<Value> {
+        let _g = self.write.lock();
+        let rule = self.rule(&p.id)?;
+        let text = self.free_copy_target(ctx, &rule, &p.to)?;
+        let renamed = Rule::parse(&p.to, &text, &ctx.catalog, false).map_err(Error::invalid_params)?;
+        let now = ctx.clock.now();
+        let oldest = now - chrono::Duration::days(rule::MAX_AFTER_DAYS);
+        let mut renames: Vec<Renamed> = renames(ctx)?.into_iter().filter(|r| r.at >= oldest).collect();
+        renames.push(Renamed { from: p.id.clone(), to: p.to.clone(), at: now });
+        let renames = toml::to_string(&RenamedFile { renamed: renames }).map_err(|e| Error::internal(e.to_string()))?;
+        let mut entries = history(ctx);
+        for e in entries.iter_mut().filter(|e| e["rule"] == p.id.as_str()) {
+            e["rule"] = json!(p.to);
+        }
+        let moved = serde_json::to_vec_pretty(&entries).map_err(|e| Error::internal(e.to_string()))?;
+        ctx.store.transaction(|tx| {
+            tx.put(&path(&p.to), text.as_str())?;
+            tx.delete(&path(&p.id))?;
+            tx.put(RENAMED, renames)?;
+            tx.put(HISTORY, moved)?;
+            tx.emit("automations.rule.renamed", json!({"from": p.id, "to": p.to}))
+        })?;
+        let mut st = self.state();
+        st.rules.remove(&p.id);
+        st.rules.insert(p.to.clone(), renamed.clone());
+        drop(st);
+        Ok(view(&renamed, &entries))
+    }
+
+    /// A new rule from another's text, switched off so the same event doesn't fire both before
+    /// you change it (ADR 0038 §6). `label`: the copy's own.
+    fn copy(&self, ctx: &Ctx, p: CopyParams) -> Result<Value> {
+        let _g = self.write.lock();
+        let rule = self.rule(&p.id)?;
+        let text = self.free_copy_target(ctx, &rule, &p.to)?;
+        let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|e| Error::internal(e.to_string()))?;
+        doc["rule"]["enabled"] = toml_edit::value(false);
+        if let Some(label) = &p.label {
+            doc["rule"]["label"] = toml_edit::value(label.as_str());
+        }
+        let text = doc.to_string();
+        let copy = Rule::parse(&p.to, &text, &ctx.catalog, false).map_err(Error::invalid_params)?;
+        ctx.store.transaction(|tx| {
+            tx.put(&path(&p.to), text.as_str())?;
+            tx.emit("automations.rule.copied", json!({"from": p.id, "to": p.to}))
+        })?;
+        self.state().rules.insert(p.to.clone(), copy.clone());
+        Ok(view(&copy, &history(ctx)))
+    }
+
+    /// `rule`'s file text, if `to` can be a new rule's id: not built in, not taken, not the same.
+    fn free_copy_target(&self, ctx: &Ctx, rule: &Rule, to: &str) -> Result<String> {
+        if rule.builtin {
+            return Err(Error::conflict(format!("'{}' is built in: it has no file to rename or copy", rule.id)));
+        }
+        if to == rule.id {
+            return Err(Error::invalid_params(format!("'{to}' is already its id")));
+        }
+        if builtin::find(to).is_some() || ctx.store.read(&path(to))?.is_some() {
+            return Err(Error::conflict(format!("a rule '{to}' exists: pick another id")));
+        }
+        ctx.store.read_string(&path(&rule.id))?.ok_or_else(|| Error::not_found(format!("no rule '{}'", rule.id)))
     }
 
     fn problems(&self) -> Vec<Value> {
@@ -405,6 +503,46 @@ impl Automations {
         st.rules.remove(id);
         st.problems.retain(|(file, _)| *file != path(id));
         Ok(json!({"removed": true, "rule": id}))
+    }
+
+    /// Delete removed rules for good: `p.id`'s, or every one, after the caller confirms how many it
+    /// was shown, as `records.purge` asks (ADR 0038 §1).
+    fn purge(&self, ctx: &Ctx, p: Purge) -> Result<Value> {
+        let _g = self.write.lock();
+        let ids = match &p.id {
+            Some(id) if ctx.store.read(&removed_path(id))?.is_none() => {
+                return Err(Error::not_found(format!("no removed rule '{id}'")));
+            }
+            Some(id) => vec![id.clone()],
+            None => removed(ctx),
+        };
+        let rules = ids.len();
+        if rules == 0 {
+            return Ok(json!({"purged": 0}));
+        }
+        let expected = json!({"rules": rules});
+        if p.confirm.as_ref() != Some(&expected) {
+            let what = match &p.id {
+                Some(id) => format!("the removed rule '{id}'"),
+                None => format!("all {rules} removed rule(s)"),
+            };
+            return Err(Error::new(
+                shimmer_core::ErrorCode::ConfirmationRequired,
+                format!("purging permanently deletes {what}; confirm with {{\"rules\": {rules}}}"),
+            )
+            .with_detail(expected));
+        }
+        let mut event = json!({"rules": rules});
+        if let Some(id) = &p.id {
+            event["rule"] = json!(id);
+        }
+        ctx.store.transaction(|tx| {
+            for id in &ids {
+                tx.delete(&removed_path(id))?;
+            }
+            tx.emit("automations.rule.purged", event)
+        })?;
+        Ok(json!({"purged": rules}))
     }
 
     /// Bring a removed rule back, as it was. One that no longer checks (an op it names is gone) is
@@ -591,12 +729,12 @@ impl Module for Automations {
         [
             (
                 "automations.list",
-                "Every rule: on or off, what it reacts to, when it last fired",
-                json!({"type": "object"}),
+                "Every rule: on or off, what it reacts to, when it last fired; with removed, the removed ones",
+                json!({"type": "object", "properties": {"removed": {"type": "boolean"}}}),
             ),
-            ("automations.get", "One rule, and its file's text", id()),
+            ("automations.show", "One rule, and its file's text", id()),
             (
-                "automations.create",
+                "automations.new",
                 "Make a rule from its text, from a template's answers, or a starter rule (switched off) to edit",
                 json!({"type": "object", "required": ["id"], "properties": {
                     "id": {"type": "string"}, "text": {"type": "string"}, "label": {"type": "string"},
@@ -608,13 +746,30 @@ impl Module for Automations {
                 json!({"type": "object", "properties": {"id": {"type": "string"}}}),
             ),
             (
-                "automations.save",
+                "automations.edit",
                 "Replace a rule's text; a broken rule is refused and the old one kept",
                 json!({"type": "object", "required": ["id", "text"], "properties": {
                     "id": {"type": "string"}, "text": {"type": "string"}}}),
             ),
             ("automations.remove", "Remove a rule; it can be restored", id()),
             ("automations.restore", "Bring a removed rule back", id()),
+            (
+                "automations.rename",
+                "Give a rule a new id; its history and waiting delayed actions follow it",
+                json!({"type": "object", "required": ["id", "to"], "properties": {
+                    "id": {"type": "string"}, "to": {"type": "string"}}}),
+            ),
+            (
+                "automations.copy",
+                "Make a new rule from another, switched off, optionally with its own label",
+                json!({"type": "object", "required": ["id", "to"], "properties": {
+                    "id": {"type": "string"}, "to": {"type": "string"}, "label": {"type": "string"}}}),
+            ),
+            (
+                "automations.purge",
+                "Delete a removed rule for good, or every one; asks first (ADR 0038)",
+                json!({"type": "object", "properties": {"id": {"type": "string"}, "confirm": {"type": "object"}}}),
+            ),
             ("automations.enable", "Switch a rule on", id()),
             ("automations.disable", "Switch a rule off", id()),
             ("automations.reload", "Re-read the rule files after editing them by hand", json!({"type": "object"})),
@@ -663,12 +818,15 @@ impl Module for Automations {
 
     async fn handle(&self, op: &str, params: Value, ctx: &Ctx) -> Result<Value> {
         match op {
-            "automations.list" => Ok(self.list(ctx)),
-            "automations.get" => self.get(ctx, &decode::<Id>(params)?.id),
-            "automations.create" => self.create(ctx, decode(params)?),
-            "automations.save" => self.save(ctx, decode(params)?),
+            "automations.list" => Ok(self.list(ctx, decode(params)?)),
+            "automations.rename" => self.rename(ctx, decode(params)?),
+            "automations.copy" => self.copy(ctx, decode(params)?),
+            "automations.show" => self.get(ctx, &decode::<Id>(params)?.id),
+            "automations.new" => self.create(ctx, decode(params)?),
+            "automations.edit" => self.save(ctx, decode(params)?),
             "automations.remove" => self.remove(ctx, &decode::<Id>(params)?.id),
             "automations.restore" => self.restore(ctx, &decode::<Id>(params)?.id),
+            "automations.purge" => self.purge(ctx, decode(params)?),
             "automations.enable" => self.set_enabled(ctx, &decode::<Id>(params)?.id, true),
             "automations.disable" => self.set_enabled(ctx, &decode::<Id>(params)?.id, false),
             "automations.reload" => {
@@ -705,12 +863,54 @@ struct Deferred {
     #[serde(default)]
     params: Value,
     chain: Chain,
+    /// When the rule set it, to tell it from one set by a later rule of the same id. Missing on
+    /// one set before renames were followed: it follows them all.
+    #[serde(default)]
+    made_at: Option<DateTime<Utc>>,
+}
+
+/// `renamed.toml`: one `[[renamed]]` per rename, oldest first.
+#[derive(Default, Deserialize, Serialize)]
+struct RenamedFile {
+    #[serde(default)]
+    renamed: Vec<Renamed>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct Renamed {
+    from: String,
+    to: String,
+    at: DateTime<Utc>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Id {
     id: String,
+}
+
+/// `automations.list`: the rules, or with `removed` the removed ones (ADR 0038 §6).
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct ListParams {
+    removed: bool,
+}
+
+/// `automations.rename`: `id` becomes `to`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MoveParams {
+    id: String,
+    to: String,
+}
+
+/// `automations.copy`: a new rule `to` from `id`'s text, with its own `label` if given.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CopyParams {
+    id: String,
+    to: String,
+    label: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -767,6 +967,14 @@ struct HistoryParams {
 #[serde(deny_unknown_fields)]
 struct DepthParams {
     depth: Option<usize>,
+}
+
+/// `automations.purge` (ADR 0038): one removed rule, or all of them.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Purge {
+    id: Option<String>,
+    confirm: Option<Value>,
 }
 
 // ---------------------------------------------------------------------- helpers
@@ -833,6 +1041,15 @@ fn editable_settings(ctx: &Ctx) -> Result<toml_edit::DocumentMut> {
 
 /// The history, oldest first. A broken file reads as empty: it's a convenience, the event log
 /// has everything.
+/// The renames, oldest first. One that doesn't parse is refused rather than replaced, as
+/// settings.toml is: it's the only record of where a waiting delayed action's rule went.
+fn renames(ctx: &Ctx) -> Result<Vec<Renamed>> {
+    let Some(text) = ctx.store.read_string(RENAMED)? else { return Ok(Vec::new()) };
+    let file: RenamedFile = toml::from_str(&text)
+        .map_err(|e| Error::conflict(format!("{RENAMED} doesn't parse: {}; fix it first", e.message())))?;
+    Ok(file.renamed)
+}
+
 fn history(ctx: &Ctx) -> Vec<Value> {
     ctx.store
         .read_string(HISTORY)

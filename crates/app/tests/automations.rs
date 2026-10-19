@@ -41,7 +41,7 @@ when = { collection = "leetcode" }
 op = "records.update"
 params = { collection = "leetcode", id = "{id}", fields = { url = "https://x.test/{id}" } }
 "#;
-    call(&home, "automations.create", json!({"id": "fill-url", "text": rule}));
+    call(&home, "automations.new", json!({"id": "fill-url", "text": rule}));
 
     call(&home, "records.update", json!({"collection": "leetcode", "id": "two-sum", "fields": {"difficulty": "easy"}}));
     let status = until(&home, "automations.status", json!({}), |s| !s["stopped"].as_array().unwrap().is_empty());
@@ -85,8 +85,8 @@ op = "records.update"
 params = {{ collection = "leetcode", id = "two-sum", fields = {{ url = "https://x.test/{{task_id}}" }} }}
 "#
     );
-    call(&home, "automations.create", json!({"id": "kick", "text": kick}));
-    call(&home, "automations.create", json!({"id": "looping", "text": looping}));
+    call(&home, "automations.new", json!({"id": "kick", "text": kick}));
+    call(&home, "automations.new", json!({"id": "looping", "text": looping}));
 
     call(&home, "records.update", json!({"collection": "leetcode", "id": "two-sum", "fields": {"difficulty": "easy"}}));
     let status = until(&home, "automations.status", json!({}), |s| {
@@ -130,11 +130,13 @@ op = "records.reopen"
 params = { collection = "{collection}", id = "{id}" }
 after = "60d"
 "#;
-    call(&home, "automations.create", json!({"id": "redo", "text": rule}));
+    call(&home, "automations.new", json!({"id": "redo", "text": rule}));
     call(&home, "records.complete", json!({"collection": "leetcode", "id": "two-sum"}));
 
-    let listed = until(&home, "scheduler.list", json!({}), |l| !l["triggers"].as_array().unwrap().is_empty());
-    let t = &listed["triggers"][0];
+    // Other schedules may be there too (notify declares its own): find the one the rule added.
+    let added = |l: &Value| l["triggers"].as_array().unwrap().iter().find(|t| t["source"]["type"] == "added").cloned();
+    let listed = until(&home, "scheduler.list", json!({}), |l| added(l).is_some());
+    let t = &added(&listed).unwrap();
     assert_eq!(t["source"], json!({"type": "added", "id": "automations", "label": "rule redo: Redo it later"}));
     // It waits as automations' own op, carrying the action and its chain (ADR 0035 §4).
     assert_eq!(t["op"], "automations.deferred");

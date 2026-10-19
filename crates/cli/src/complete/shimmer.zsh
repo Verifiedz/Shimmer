@@ -11,7 +11,8 @@ _shimmer() {
         if [[ $entry == '>'* ]]; then
             if [[ -n $tag ]]; then
                 (( $#group )) && _describe -t "$tag" "$title" group && ret=0
-                # `lc/`: a collection, its record still to come; no space after it.
+                # `lc/` (a collection, its record still to come) or `QUESTION=` (its answer still
+                # to come): no space after it.
                 (( $#slashed )) && _describe -t "$tag" "$title" slashed -S '' && ret=0
             fi
             group=() slashed=()
@@ -27,7 +28,7 @@ _shimmer() {
         word=${entry%%$'\t'*} desc=''
         [[ $entry == *$'\t'* ]] && desc=${entry#*$'\t'}
         word=${word//:/\\:}
-        if [[ $word == */ ]]; then
+        if [[ $word == */ || $word == *= ]]; then
             slashed+=("$word${desc:+:$desc}")
         else
             group+=("$word${desc:+:$desc}")

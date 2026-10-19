@@ -62,13 +62,13 @@ async fn built_ins_are_always_there_switched_but_never_removed_or_edited() {
     let ids: Vec<&str> = listed["rules"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
     assert_eq!(ids, IDS);
     assert!(listed["rules"].as_array().unwrap().iter().all(|r| r["builtin"] == true && r["enabled"] == true));
-    let shown = call("automations.get", json!({"id": "workspace-dirty"})).await.unwrap();
+    let shown = call("automations.show", json!({"id": "workspace-dirty"})).await.unwrap();
     assert!(shown["text"].as_str().unwrap().contains("Then: {detail.fix}"), "{shown}");
 
     for (op, params) in [
         ("automations.remove", json!({"id": "loop-stopped"})),
-        ("automations.save", json!({"id": "loop-stopped", "text": "x"})),
-        ("automations.create", json!({"id": "loop-stopped", "text": "x"})),
+        ("automations.edit", json!({"id": "loop-stopped", "text": "x"})),
+        ("automations.new", json!({"id": "loop-stopped", "text": "x"})),
     ] {
         assert_eq!(call(op, params).await.unwrap_err().code, ErrorCode::Conflict, "{op}");
     }
