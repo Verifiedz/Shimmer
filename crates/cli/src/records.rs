@@ -1248,7 +1248,7 @@ fn export(items: &[Value], schema: &Value, format: Format) -> String {
 
 /// Whether to go ahead with purging, given the daemon's message saying what goes. There is no
 /// undo, so without a person there it needs --yes.
-fn confirm_purge(prompt: &mut dyn Prompt, yes: bool, what: &str, message: &str) -> Result<bool> {
+pub(crate) fn confirm_purge(prompt: &mut dyn Prompt, yes: bool, what: &str, message: &str) -> Result<bool> {
     if yes {
         return Ok(true);
     }

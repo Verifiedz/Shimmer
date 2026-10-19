@@ -6,6 +6,8 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
+use crate::automations::{self, AutomationsCmd};
+use crate::notify::{self, NotifyCmd};
 use crate::packs::cmd::{self as packs, PacksCmd};
 use crate::queue::{self, QueueCmd};
 use crate::records::{self, RecordsCmd};
@@ -24,6 +26,8 @@ commands:
                         run a command on a schedule, e.g. shimmer schedule weekdays 09:00
                         workspaces activate site (shimmer schedule --help)
   scheduler …           list, pause, resume and remove schedules (shimmer scheduler --help)
+  automations …         rules: when something happens, run a command (shimmer automations --help)
+  notify …              your messages: the inbox, quiet hours, pause (shimmer notify --help)
   packs …               command packs: themed aliases for these commands (shimmer packs --help)
   doctor                check everything and say how to fix what's wrong
   call OP [PARAMS]      send any op; PARAMS is a JSON object (default {});
@@ -63,8 +67,10 @@ pub enum Command {
     Workspaces(WorkspacesCmd),
     Queue(QueueCmd),
     Scheduler(SchedulerCmd),
+    Automations(AutomationsCmd),
     Schedule(crate::schedule::ScheduleCmd),
     Packs(PacksCmd),
+    Notify(NotifyCmd),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -106,8 +112,10 @@ impl Args {
             (true, Some("workspaces")) => Command::Workspaces(WorkspacesCmd::Help),
             (true, Some("queue")) => Command::Queue(QueueCmd::Help),
             (true, Some("scheduler")) => Command::Scheduler(SchedulerCmd::Help),
+            (true, Some("automations")) => Command::Automations(AutomationsCmd::Help),
             (true, Some("schedule")) => Command::Schedule(crate::schedule::ScheduleCmd::Help),
             (true, Some("packs")) => Command::Packs(PacksCmd::Help),
+            (true, Some("notify")) => Command::Notify(NotifyCmd::Help),
             (true, Some("doctor")) => Command::DoctorHelp,
             (true, _) => Command::Help,
             (false, _) => command(words)?,
@@ -132,8 +140,14 @@ fn command(words: Vec<String>) -> Result<Command, String> {
     if word == "scheduler" {
         return scheduler::parse(rest).map(Command::Scheduler);
     }
+    if word == "automations" {
+        return automations::parse(rest).map(Command::Automations);
+    }
     if word == "schedule" {
         return crate::schedule::parse(rest).map(Command::Schedule);
+    }
+    if word == "notify" {
+        return notify::parse(rest).map(Command::Notify);
     }
     if word == "packs" {
         return packs::parse(rest).map(Command::Packs);

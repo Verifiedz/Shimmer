@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use crate::bus::Emitter;
 use crate::catalog::Catalog;
 use crate::clock::Clock;
+use crate::desktop::Desktop;
 use crate::error::{Error, Result};
 use crate::http::HttpGateway;
 use crate::ids::{ModuleId, TaskId};
@@ -80,6 +81,9 @@ pub struct Ctx {
     /// Every op and topic in the daemon, read-only, fixed at start (ADR 0035 §5.7). Empty until
     /// the daemon fills it.
     pub catalog: Arc<Catalog>,
+    /// Show a desktop notification (ADR 0032 §1). Defaults to [`Desktop::unavailable`]; the
+    /// daemon gives the real one only to a module whose manifest declares `"desktop"`.
+    pub desktop: Desktop,
     /// Cooperative cancellation. Long tasks must poll this.
     pub cancel: CancellationToken,
     pub config: ModuleConfig,
@@ -111,6 +115,7 @@ impl Ctx {
             launcher: Launcher::unavailable(),
             schedules: Schedules::unavailable(module_id.clone()),
             catalog: Arc::default(),
+            desktop: Desktop::unavailable(),
             cancel,
             config,
             module_id,

@@ -366,6 +366,7 @@ async fn a_workspace_left_launching_comes_back_dirty_after_a_restart() {
     let ev = env.backend.events().pop().unwrap();
     assert_eq!(ev.topic, "workspaces.session.dirty");
     assert_eq!(ev.payload["failed_step"], "2/2 editor");
+    assert_eq!(ev.payload["recovered"], true, "no task failed to report it (ADR 0032 §4)");
 
     // A dirty workspace blocks activation until cleanup or reset (§10.3); reset works here.
     let w = Workspaces::default();

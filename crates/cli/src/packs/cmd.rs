@@ -39,6 +39,14 @@ An alias stands for shimmer plus a whole command. In pack.toml it names one of t
   workspaces.edit  workspaces.templates  workspaces.peek  workspaces.create
   queue.list  queue.task  queue.cancel  queue.reorder
   scheduler.list  scheduler.get  scheduler.add  scheduler.pause  scheduler.resume  scheduler.remove
+  automations.list  automations.show  automations.new  automations.edit  automations.remove
+  automations.restore  automations.purge  automations.rename  automations.copy
+  automations.enable  automations.disable  automations.test
+  automations.events  automations.history  automations.status  automations.depth  automations.reload
+  automations.templates  automations.peek
+  notify.list  notify.get  notify.count  notify.mark_read  notify.mark_unread  notify.remove
+  notify.send  notify.test  notify.resend  notify.pause  notify.resume  notify.quiet
+  notify.status  notify.cap
 
 Your own packs go in packs/<name>/pack.toml in your Shimmer folder (see docs/packs/README.md).
 The active pack is kept in ~/.config/shimmer/cli.toml; aliases are linked into ~/.local/bin.";
@@ -461,20 +469,24 @@ mod tests {
     #[test]
     fn use_turns_a_pack_on_links_it_and_switching_swaps_the_links() {
         let t = t();
+        let n = TARGETS.len();
         let out = run_ok(&t, PacksCmd::Use { name: "short".into(), link: true });
-        assert!(out.starts_with("✓ active pack: short (Short)\n  linked 54 commands into"), "{out}");
+        assert!(
+            out.starts_with(&format!("✓ active pack: short (Short)\n  linked {} commands into", TARGETS.len())),
+            "{out}"
+        );
         assert!(out.ends_with("try it: up"), "{out}");
         assert_eq!(saved(&t).pack.as_deref(), Some("short"));
-        assert_eq!(links(&t).len(), 54);
+        assert_eq!(links(&t).len(), TARGETS.len());
         assert!(links(&t).contains(&"wgo".to_string()));
 
         let out = run_ok(&t, PacksCmd::Use { name: "ship-it".into(), link: true });
-        assert!(out.contains("linked 54") && out.contains("removed 54"), "{out}");
+        assert!(out.contains(&format!("linked {n}")) && out.contains(&format!("removed {n}")), "{out}");
         assert!(links(&t).contains(&"deploy".to_string()) && !links(&t).contains(&"wgo".to_string()));
-        assert_eq!(saved(&t).linked.len(), 54);
+        assert_eq!(saved(&t).linked.len(), TARGETS.len());
 
         let out = run_ok(&t, PacksCmd::Use { name: "none".into(), link: true });
-        assert!(out.starts_with("✓ packs off") && out.contains("removed 54"), "{out}");
+        assert!(out.starts_with("✓ packs off") && out.contains(&format!("removed {n}")), "{out}");
         assert_eq!((saved(&t), links(&t)), (Settings::default(), vec![]));
     }
 
@@ -482,12 +494,13 @@ mod tests {
     fn no_link_switches_without_commands_and_clears_old_ones() {
         let t = t();
         run_ok(&t, PacksCmd::Use { name: "short".into(), link: true });
+        let n = TARGETS.len();
         let out = run_ok(&t, PacksCmd::Use { name: "starship".into(), link: false });
-        assert!(out.contains("removed 54") && out.ends_with("try it: shimmer comms"), "{out}");
+        assert!(out.contains(&format!("removed {n}")) && out.ends_with("try it: shimmer comms"), "{out}");
         assert_eq!((saved(&t).pack.as_deref(), links(&t)), (Some("starship"), vec![]));
         // `packs link` adds them later; `unlink` takes them away and keeps the pack.
-        assert!(run_ok(&t, PacksCmd::Link).contains("linked 54"));
-        assert!(run_ok(&t, PacksCmd::Unlink).contains("removed 54"));
+        assert!(run_ok(&t, PacksCmd::Link).contains(&format!("linked {n}")));
+        assert!(run_ok(&t, PacksCmd::Unlink).contains(&format!("removed {n}")));
         assert_eq!((saved(&t).pack.as_deref(), links(&t)), (Some("starship"), vec![]));
     }
 
@@ -507,7 +520,7 @@ mod tests {
         .unwrap();
         let e = run(&PacksCmd::Use { name: "mine".into(), link: true }, &t.env).unwrap_err();
         assert!(e.message.contains("has 1 problem") && e.message.contains("is a shimmer command word"), "{e}");
-        assert_eq!((saved(&t).pack.as_deref(), links(&t).len()), (Some("short"), 54), "nothing changed");
+        assert_eq!((saved(&t).pack.as_deref(), links(&t).len()), (Some("short"), TARGETS.len()), "nothing changed");
     }
 
     #[test]
@@ -524,7 +537,7 @@ mod tests {
         assert!(e.message.starts_with("couldn't save"), "{e}");
         assert_eq!(links(&t), before, "the old pack's links are back, the new pack's are gone");
         assert_eq!(saved(&t).pack.as_deref(), Some("short"));
-        assert_eq!(saved(&t).linked.len(), 54);
+        assert_eq!(saved(&t).linked.len(), TARGETS.len());
     }
 
     #[test]
