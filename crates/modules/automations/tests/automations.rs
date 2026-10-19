@@ -517,6 +517,16 @@ async fn a_hand_edited_settings_file_is_never_lost_or_a_panic() {
     let text = env.ctx.store.read_string("settings.toml").unwrap().unwrap();
     assert!(text.contains("[builtin]") && text.contains("scheduled_task_failed = false"), "{text}");
 
+    // A `builtin` written on one line is still a table: switching another built-in keeps it.
+    env.ctx.store.write("settings.toml", "builtin = { workspace_dirty = false }\n").unwrap();
+    call(&m, &env.ctx, "automations.disable", json!({"id": "scheduled-task-failed"})).await.unwrap();
+    let text = env.ctx.store.read_string("settings.toml").unwrap().unwrap();
+    assert!(text.contains("workspace_dirty = false") && text.contains("scheduled_task_failed = false"), "{text}");
+    call(&m, &env.ctx, "automations.reload", json!({})).await.unwrap();
+    let listed = call(&m, &env.ctx, "automations.list", json!({})).await.unwrap();
+    let rule = listed["rules"].as_array().unwrap().iter().find(|r| r["id"] == "workspace-dirty").unwrap().clone();
+    assert_eq!(rule["enabled"], false, "still off after a reload: {rule}");
+
     // A bad depth doesn't switch built-ins back on.
     env.ctx.store.write("settings.toml", "depth = 99\n[builtin]\nscheduled_task_failed = false\n").unwrap();
     call(&m, &env.ctx, "automations.reload", json!({})).await.unwrap();

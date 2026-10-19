@@ -576,9 +576,10 @@ impl Automations {
         if let Some((key, _)) = builtin::find(id).filter(|_| current.builtin) {
             // A built-in rule is switched in the settings (§7): its text isn't yours to change.
             let mut doc = editable_settings(ctx)?;
-            if !doc.get("builtin").is_some_and(toml_edit::Item::is_table) {
+            if !doc.get("builtin").is_some_and(toml_edit::Item::is_table_like) {
                 // Missing, or hand-edited into something else (`builtin = true`): a table again,
-                // rather than a panic indexing into it (#255's review).
+                // rather than a panic indexing into it (#255's review). A one-line
+                // `builtin = { … }` is a table too, and is kept.
                 doc.remove("builtin");
                 doc["builtin"] = toml_edit::table();
             }
