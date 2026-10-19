@@ -177,6 +177,36 @@ async fn a_matching_event_queues_its_actions_and_schedules_the_delayed_one() {
     assert!(listed["rules"][0]["last_fired"].is_string());
 }
 
+/// A rule's stop is reported once per 10 minutes, so the built-in alert it sets off (a new task,
+/// a fresh chain) can't restart the loop and alert again forever. Stopped every time all the same.
+#[tokio::test]
+async fn a_rules_stop_is_reported_once_in_a_while_not_every_time() {
+    let env = env();
+    let m = started(&env).await;
+    let ctx = &env.ctx;
+    let rule = "[rule]\non = \"records.item.updated\"\n[[do]]\nop = \"records.update\"\n";
+    call(&m, ctx, "automations.create", json!({"id": "again", "text": rule})).await.unwrap();
+    let stops = |env: &TestEnv| topics(env).iter().filter(|t| *t == "automations.chain.stopped").count();
+
+    // Fresh chain, fire, then its own update comes back: stopped. Twice, from two fresh chains.
+    for round in 0..2 {
+        m.on_event(&event("records.item.updated", json!({}), None), ctx).await.unwrap();
+        let task: TaskId =
+            serde_json::from_value(last(&env, "automations.rule.fired")["queued"][0]["task_id"].clone()).unwrap();
+        m.on_event(&event("records.item.updated", json!({}), Some(task)), ctx).await.unwrap();
+        assert_eq!(stops(&env), 1, "round {round}: reported once");
+    }
+    assert_eq!(env.queue.requests.lock().unwrap().len(), 2, "each round fired once and was stopped");
+
+    // After the quiet time, a stop is reported again.
+    env.clock.advance(std::time::Duration::from_secs(11 * 60));
+    m.on_event(&event("records.item.updated", json!({}), None), ctx).await.unwrap();
+    let task: TaskId =
+        serde_json::from_value(last(&env, "automations.rule.fired")["queued"][0]["task_id"].clone()).unwrap();
+    m.on_event(&event("records.item.updated", json!({}), Some(task)), ctx).await.unwrap();
+    assert_eq!(stops(&env), 2);
+}
+
 /// §3: "when a record is updated, update a record" re-triggers itself; A → B → A too.
 #[tokio::test]
 async fn the_loop_guard_stops_cycles_and_deep_chains() {
