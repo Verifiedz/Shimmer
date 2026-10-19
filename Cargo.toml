@@ -11,6 +11,7 @@ members = [
     "crates/modules/records",
     "crates/modules/workspaces",
     "crates/modules/fetchers",
+    "crates/modules/automations",
     "crates/modules/notify",
     "crates/app",
 ]

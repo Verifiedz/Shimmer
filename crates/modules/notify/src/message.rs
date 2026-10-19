@@ -70,7 +70,7 @@ pub struct Message {
     pub title: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub body: String,
-    /// `send`, `schedule`, `fallback`, `alert:<name>` or `automation:<rule>` (ADR 0032 §3).
+    /// `send`, `schedule`, `fallback` or `automation:<rule>` (ADR 0032 §3, ADR 0035 §10).
     pub source: String,
     pub state: State,
     #[serde(default)]
@@ -106,7 +106,6 @@ pub struct Draft {
 pub fn draft(params: &Value) -> Result<Draft> {
     let text = |key: &str| params.get(key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
     let fallback = params.get("failure_code").is_some() || params.get("failure_reason").is_some();
-    let alert = text("alert");
     let title = match (text("title"), fallback) {
         (Some(title), _) => title.to_owned(),
         (None, true) => {
@@ -120,16 +119,15 @@ pub fn draft(params: &Value) -> Result<Draft> {
         None | Some(Value::Null) => Priority::Normal,
         Some(v) => match v.as_str().and_then(Priority::parse) {
             Some(p) => p,
-            None if fallback || alert.is_some() => Priority::High,
+            None if fallback => Priority::High,
             None => return Err(Error::invalid_params(format!("priority is low, normal or high, not {v}"))),
         },
     };
-    let source = match (alert, fallback, text("from")) {
-        (Some(name), _, _) => format!("alert:{name}"),
-        (None, true, _) => "fallback".to_owned(),
-        (None, false, None) => "send".to_owned(),
-        (None, false, Some("schedule")) => "schedule".to_owned(),
-        (None, false, Some(from)) => match from.strip_prefix("automation:") {
+    let source = match (fallback, text("from")) {
+        (true, _) => "fallback".to_owned(),
+        (false, None) => "send".to_owned(),
+        (false, Some("schedule")) => "schedule".to_owned(),
+        (false, Some(from)) => match from.strip_prefix("automation:") {
             Some(rule) if !rule.is_empty() && rule.chars().all(|c| c.is_ascii_alphanumeric() || "-_".contains(c)) => {
                 from.to_owned()
             }
@@ -153,7 +151,7 @@ mod tests {
             priority: Priority::High,
             title: "site couldn't launch".into(),
             body: "Step 2/5 failed".into(),
-            source: "alert:workspace_dirty".into(),
+            source: "automation:workspace-dirty".into(),
             state: State::Delivered,
             read: false,
             deliveries: vec![Delivery {
@@ -187,7 +185,7 @@ mod tests {
             draft(&json!({"title": "x", "from": "automation:leet-solved"})).unwrap().source,
             "automation:leet-solved"
         );
-        assert!(draft(&json!({"title": "x", "from": "alert:fake"})).is_err(), "only notify writes alert:");
+        assert!(draft(&json!({"title": "x", "from": "alert:fake"})).is_err(), "only schedule or automation:<rule>");
     }
 
     #[test]

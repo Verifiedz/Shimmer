@@ -239,14 +239,15 @@ async fn purge(
 }
 
 /// Every trigger in one table, or a line saying there are none.
-/// The schedules a person added; with `all`, modules' own too, and a FROM column to tell them
-/// apart (#244). Modules' own are never secret: a footer says how many `--all` would add.
+/// The schedules a person added, and modules' one-time ones (an automation's delayed action is
+/// yours to see and remove, ADR 0035 §4); with `all`, modules' declared ones too, and a FROM column
+/// to tell them apart (#244). Those are never secret: a footer says how many `--all` would add.
 fn list(data: &Value, now: DateTime<Utc>, schemas: &Schemas, all: bool) -> String {
     let every = data["triggers"].as_array().cloned().unwrap_or_default();
     let (triggers, hidden): (Vec<Value>, usize) = if all {
         (every, 0)
     } else {
-        let mine: Vec<Value> = every.iter().filter(|t| t["source"]["type"] == "user").cloned().collect();
+        let mine: Vec<Value> = every.iter().filter(|t| t["source"]["type"] != "module").cloned().collect();
         let hidden = every.len() - mine.len();
         (mine, hidden)
     };
@@ -571,11 +572,13 @@ fn state(t: &Value) -> String {
     }
 }
 
-/// `you`, or `module <id>` for one a module declared (it can be disabled, not removed).
+/// `you`, `module <id>` for one a module declared, or `<id>: <label>` for a one-time schedule a
+/// module added (ADR 0035 §5.6). Module ones can be disabled, not removed.
 fn source(v: &Value) -> String {
     match v["type"].as_str() {
         Some("user") => "you".into(),
         Some("module") => format!("module {}", v["id"].as_str().unwrap_or("?")),
+        Some("added") => format!("{}: {}", v["id"].as_str().unwrap_or("?"), v["label"].as_str().unwrap_or("")),
         _ => render::cell(v),
     }
 }
@@ -585,6 +588,24 @@ mod tests {
     use chrono::Duration;
 
     use super::*;
+
+    /// ADR 0035 §4 (Wasay on #251): an automation's delayed action shows by default, beside yours;
+    /// only modules' declared schedules wait for `--all`.
+    #[test]
+    fn the_default_list_shows_yours_and_automations_delayed_actions() {
+        let now = Utc::now();
+        let t = |id: &str, source: Value| {
+            json!({"id": id, "source": source, "schedule": {"every": 3600}, "op": "records.list",
+                   "params": {}, "catch_up": "skip", "next_due": null, "last_run": null, "enabled": true, "done": false})
+        };
+        let data = json!({"triggers": [
+            t("usr-1", json!({"type": "user"})),
+            t("aut-1", json!({"type": "added", "module": "automations", "label": "Redo two-sum"})),
+            t("notify.flush", json!({"type": "module", "id": "notify"}))]});
+        let out = list(&data, now, &schemas(), false);
+        assert!(out.contains("usr-1") && out.contains("aut-1"), "{out}");
+        assert!(!out.contains("notify.flush") && out.contains("+ 1 built-in schedule"), "{out}");
+    }
 
     fn p(s: &[&str]) -> std::result::Result<SchedulerCmd, String> {
         parse(s.iter().map(|w| w.to_string()).collect())
@@ -689,6 +710,12 @@ mod tests {
             "no triggers yet; add one with: shimmer scheduler add WHEN COMMAND (shimmer scheduler add --help)\n+ 1 built-in schedule (shimmer scheduler list --all)"
         );
         assert!(!list(&sample(now), now, &Schemas::new(), true).contains("built-in schedule"), "--all hides nothing");
+    }
+
+    #[test]
+    fn a_modules_one_time_schedule_shows_who_added_it_and_why() {
+        let added = json!({"type": "added", "id": "automations", "label": "follow up on acme (rule nudge)"});
+        assert_eq!(source(&added), "automations: follow up on acme (rule nudge)");
     }
 
     fn schemas() -> Schemas {

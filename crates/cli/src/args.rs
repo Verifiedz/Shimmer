@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
+use crate::automations::{self, AutomationsCmd};
 use crate::fetchers::{self, FetchersCmd};
 use crate::notify::{self, NotifyCmd};
 use crate::packs::cmd::{self as packs, PacksCmd};
@@ -26,6 +27,7 @@ commands:
   scheduler …           run commands on a schedule, and list, disable or remove them
                         (shimmer scheduler --help)
   fetchers …            sources that reach outward for new items (shimmer fetchers --help)
+  automations …         rules: when something happens, run a command (shimmer automations --help)
   notify …              your messages: the inbox, quiet hours, pause (shimmer notify --help)
   packs …               command packs: themed aliases for these commands (shimmer packs --help)
   doctor                check everything and say how to fix what's wrong
@@ -67,6 +69,7 @@ pub enum Command {
     Workspaces(WorkspacesCmd),
     Queue(QueueCmd),
     Scheduler(SchedulerCmd),
+    Automations(AutomationsCmd),
     Fetchers(FetchersCmd),
     Packs(PacksCmd),
     Notify(NotifyCmd),
@@ -112,6 +115,7 @@ impl Args {
             (true, Some("workspaces")) => Command::Workspaces(WorkspacesCmd::Help),
             (true, Some("queue")) => Command::Queue(QueueCmd::Help),
             (true, Some("scheduler")) => Command::Scheduler(SchedulerCmd::Help),
+            (true, Some("automations")) => Command::Automations(AutomationsCmd::Help),
             (true, Some("fetchers")) => Command::Fetchers(FetchersCmd::Help),
             // `schedule --help` is what muscle memory types: the same pointer as `schedule …`.
             (true, Some("schedule")) => command(words.clone())?,
@@ -141,6 +145,9 @@ fn command(words: Vec<String>) -> Result<Command, String> {
     }
     if word == "scheduler" {
         return scheduler::parse(rest).map(Command::Scheduler);
+    }
+    if word == "automations" {
+        return automations::parse(rest).map(Command::Automations);
     }
     if word == "fetchers" {
         return fetchers::parse(rest).map(Command::Fetchers);

@@ -7,6 +7,7 @@ use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use shimmer_core::ids::is_valid_name;
+use shimmer_core::text::{text_of, Template};
 use shimmer_core::{Error, Result};
 
 use crate::item::toml_to_json;
@@ -224,18 +225,9 @@ impl Collection {
         }
         if let Some(title) = &file.collection.title {
             let names: BTreeSet<&str> = file.field.iter().map(|f| f.name.as_str()).collect();
-            for part in title_parts(title).map_err(|m| bad(format!("title: {m}")))? {
-                let inner = match part {
-                    Part::Optional(inner) => inner,
-                    other => vec![other],
-                };
-                for part in inner {
-                    if let Part::Field(name) = part {
-                        if !names.contains(name) {
-                            return Err(bad(format!("title: '{{{name}}}' is not a field")));
-                        }
-                    }
-                }
+            let template = Template::parse(title).map_err(|m| bad(format!("title: {m}")))?;
+            if let Some(name) = template.fields().into_iter().find(|n| !names.contains(n)) {
+                return Err(bad(format!("title: '{{{name}}}' is not a field")));
             }
         }
         let extra = match file.extra {
@@ -299,53 +291,8 @@ impl Collection {
     /// The rendered title, or `None` when there is no template or none of its fields is set.
     /// Also what a generated record id is made from (ADR 0018 §1).
     pub fn render_title(&self, fields: &BTreeMap<String, Value>) -> Option<String> {
-        let parts = title_parts(self.title.as_deref()?).ok()?;
-        let value = |name: &str| match fields.get(name) {
-            None | Some(Value::Null) => None,
-            Some(Value::String(s)) if s.is_empty() => None,
-            Some(Value::String(s)) => Some(s.clone()),
-            // A list reads as its items (ADR 0024 §2).
-            Some(Value::Array(items)) if items.is_empty() => None,
-            Some(Value::Array(items)) => Some(
-                items
-                    .iter()
-                    .map(|i| i.as_str().map_or_else(|| i.to_string(), str::to_owned))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            ),
-            Some(other) => Some(other.to_string()),
-        };
-        let mut any_set = false;
-        let mut out = String::new();
-        for part in &parts {
-            match part {
-                Part::Text(t) => out.push_str(t),
-                Part::Field(name) => {
-                    if let Some(v) = value(name) {
-                        any_set = true;
-                        out.push_str(&v);
-                    }
-                }
-                // Only when every field inside is set (ADR 0024 §5).
-                Part::Optional(inner) => {
-                    let all_set = inner.iter().all(|p| !matches!(p, Part::Field(name) if value(name).is_none()));
-                    if all_set {
-                        for p in inner {
-                            match p {
-                                Part::Field(name) => {
-                                    any_set = true;
-                                    out.push_str(&value(name).unwrap_or_default());
-                                }
-                                Part::Text(t) => out.push_str(t),
-                                Part::Optional(_) => {}
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let out = out.trim();
-        (any_set && !out.is_empty()).then(|| out.to_owned())
+        // The renderer is `core::text`, shared with automations (ADR 0035 §5.4).
+        Template::parse(self.title.as_deref()?).ok()?.render_with(|name| fields.get(name).and_then(text_of))
     }
 
     /// Every set field with `role = "deadline"`, as `{field: date}` (ADR 0017 §7).
@@ -478,68 +425,6 @@ impl Field {
         };
         Err(Error::invalid_params(format!("field '{}' must be {want}, got {value}", self.name)))
     }
-}
-
-/// A piece of a `title` template.
-#[derive(Debug, PartialEq)]
-enum Part<'a> {
-    Text(&'a str),
-    Field(&'a str),
-    /// `[ by {author}]`: left out unless every field inside is set (ADR 0024 §5).
-    Optional(Vec<Part<'a>>),
-}
-
-/// Split a `title` template into text, `{field}` and `[optional]` parts. A bracket or brace that
-/// isn't part of that syntax is an error: there is no escaping (ADR 0017 §2, ADR 0024 §5).
-fn title_parts(template: &str) -> std::result::Result<Vec<Part<'_>>, String> {
-    let mut parts = Vec::new();
-    let mut rest = template;
-    while let Some(open) = rest.find(['[', ']']) {
-        if rest[open..].starts_with(']') {
-            return Err(format!("unmatched ']' in \"{template}\""));
-        }
-        parts.extend(plain_parts(&rest[..open], template)?);
-        let after = &rest[open + 1..];
-        let close = after.find(']').ok_or_else(|| format!("unmatched '[' in \"{template}\""))?;
-        let inner = &after[..close];
-        if inner.contains('[') {
-            return Err(format!("optional parts can't be nested in \"{template}\""));
-        }
-        let inner = plain_parts(inner, template)?;
-        if !inner.iter().any(|p| matches!(p, Part::Field(_))) {
-            return Err(format!("an optional part needs a {{field}} inside in \"{template}\""));
-        }
-        parts.push(Part::Optional(inner));
-        rest = &after[close + 1..];
-    }
-    parts.extend(plain_parts(rest, template)?);
-    Ok(parts)
-}
-
-/// Text and `{field}` parts of a piece of a template with no brackets.
-fn plain_parts<'a>(piece: &'a str, template: &str) -> std::result::Result<Vec<Part<'a>>, String> {
-    let mut parts = Vec::new();
-    let mut rest = piece;
-    while let Some(open) = rest.find(['{', '}']) {
-        if rest[open..].starts_with('}') {
-            return Err(format!("unmatched '}}' in \"{template}\""));
-        }
-        if open > 0 {
-            parts.push(Part::Text(&rest[..open]));
-        }
-        let after = &rest[open + 1..];
-        let close = after.find('}').ok_or_else(|| format!("unmatched '{{' in \"{template}\""))?;
-        let name = &after[..close];
-        if name.contains('{') || !is_valid_name(name) {
-            return Err(format!("'{{{name}}}' is not a field name"));
-        }
-        parts.push(Part::Field(name));
-        rest = &after[close + 1..];
-    }
-    if !rest.is_empty() {
-        parts.push(Part::Text(rest));
-    }
-    Ok(parts)
 }
 
 #[cfg(test)]

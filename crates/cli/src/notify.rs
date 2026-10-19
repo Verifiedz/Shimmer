@@ -20,7 +20,7 @@ pub const USAGE: &str = "usage: shimmer notify <command>
 commands:
   list [--limit N]                     your messages, newest first, one line each
        [--unread] [--read] [--failed] [--held]
-       [--from alerts|schedules|fallbacks|automations|send]
+       [--from automations|schedules|fallbacks|send]
        [--priority low|normal|high] [--since DATE] [--before DATE] [--text WORDS]
   show ID                              one message in full (marks it read)
   count [list options]                 how many unread (or match), e.g. for a status bar
@@ -40,7 +40,6 @@ commands:
   quiet [RANGE|off] [--weekdays RANGE] [--weekends RANGE] [--days DAYS RANGE]
                                        quiet hours, e.g. quiet 22:00-08:00, quiet --weekends 00:00-10:00
   status                               notify at a glance
-  builtin-alerts [on|off] [NAME]       the built-in alerts: workspace-dirty, scheduled-task-failed
   cap [N]                              how many messages the inbox keeps (default 2000)
 
 DATE is 2026-10-01 or \"2026-10-01 14:00\", in your local time; DAYS is like mon,wed,fri.
@@ -122,7 +121,6 @@ pub enum NotifyCmd {
     Resume,
     Quiet(QuietSet),
     Status,
-    BuiltinAlerts(Option<(bool, String)>),
     Cap(Option<u64>),
 }
 
@@ -220,11 +218,6 @@ pub fn parse(rest: Vec<String>) -> std::result::Result<NotifyCmd, String> {
         "resume" => none(&rest).map(|()| NotifyCmd::Resume),
         "quiet" => parse_quiet(rest).map(NotifyCmd::Quiet),
         "status" => none(&rest).map(|()| NotifyCmd::Status),
-        "builtin-alerts" => match rest.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
-            [] => Ok(NotifyCmd::BuiltinAlerts(None)),
-            [state @ ("on" | "off"), name] => Ok(NotifyCmd::BuiltinAlerts(Some((*state == "on", name.to_string())))),
-            _ => Err("'notify builtin-alerts' lists them, or: builtin-alerts on|off NAME".into()),
-        },
         "cap" => match rest.as_slice() {
             [] => Ok(NotifyCmd::Cap(None)),
             [n] => n.parse().map(|n| NotifyCmd::Cap(Some(n))).map_err(|_| format!("the cap is a number, not '{n}'")),
@@ -378,14 +371,6 @@ pub async fn run(client: &mut Client, cmd: &NotifyCmd, json: bool, prompt: &mut 
             let data = client.call("notify.status", json!({})).await?;
             Ok(out(data, &|d| status(d, Utc::now())))
         }
-        NotifyCmd::BuiltinAlerts(change) => {
-            let params = match change {
-                None => json!({}),
-                Some((on, name)) => json!({"name": name, "on": on}),
-            };
-            let data = client.call("notify.builtin_alerts", params).await?;
-            Ok(out(data, &alerts))
-        }
         NotifyCmd::Cap(n) => {
             let params = n.map_or(json!({}), |n| json!({"max": n}));
             let data = client.call("notify.cap", params).await?;
@@ -473,7 +458,6 @@ fn plural<'a>(n: u64, one: &'a str, many: &'a str) -> &'a str {
 
 fn from(source: &str) -> &str {
     match source.split(':').next().unwrap_or(source) {
-        "alert" => "alert",
         "automation" => "automation",
         "schedule" => "schedule",
         "fallback" => "fallback",
@@ -689,14 +673,6 @@ fn status(d: &Value, now: DateTime<Utc>) -> String {
         format!("{}{now_note}", ranges.join(", "))
     };
     let _ = write!(out, "\nquiet      {quiet}");
-    let a = &d["builtin_alerts"];
-    let on = |k: &str| if a[k] == false { "off" } else { "on" };
-    let _ = write!(
-        out,
-        "\nalerts     workspace-dirty {}, scheduled-task-failed {}",
-        on("workspace_dirty"),
-        on("scheduled_task_failed")
-    );
     let sinks: Vec<&str> = d["sinks"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
     let sinks = if sinks.is_empty() { "none yet: messages stay in the inbox".to_owned() } else { sinks.join(", ") };
     let _ = write!(out, "\nreaches    {sinks}");
@@ -704,20 +680,6 @@ fn status(d: &Value, now: DateTime<Utc>) -> String {
         let _ = write!(out, "\n{}", paint(Role::Error, &format!("settings problem: {p}")));
     }
     out
-}
-
-fn alerts(d: &Value) -> String {
-    let a = &d["alerts"];
-    let row = |name: &str, key: &str, what: &str| {
-        let state = if a[key] == false { paint(Role::Warning, "off") } else { paint(Role::Success, "on ") };
-        format!("{name:<22} {state}  {what}")
-    };
-    format!(
-        "{}\n{}\n{}",
-        row("workspace-dirty", "workspace_dirty", "a workspace couldn't launch"),
-        row("scheduled-task-failed", "scheduled_task_failed", "a scheduled task failed"),
-        paint(Role::Hint, "switch one: shimmer notify builtin-alerts off workspace-dirty")
-    )
 }
 
 fn cap(d: &Value, changed: bool) -> String {
@@ -768,9 +730,9 @@ mod tests {
     fn list_and_count_take_the_filters() {
         assert_eq!(p(&["list"]), Ok(NotifyCmd::List { filters: Filters::default(), limit: None }));
         assert_eq!(
-            p(&["list", "--unread", "--from", "alerts", "--since", "2026-10-01", "--limit", "5"]),
+            p(&["list", "--unread", "--from", "automations", "--since", "2026-10-01", "--limit", "5"]),
             Ok(NotifyCmd::List {
-                filters: filters(json!({"unread": true, "from": "alerts", "since": "2026-10-01"})),
+                filters: filters(json!({"unread": true, "from": "automations", "since": "2026-10-01"})),
                 limit: Some(5)
             })
         );
@@ -834,10 +796,6 @@ mod tests {
             ])))
         );
         assert!(p(&["quiet", "--days", "someday", "01:00-02:00"]).unwrap_err().contains("isn't a day"));
-        assert_eq!(
-            p(&["builtin-alerts", "off", "workspace-dirty"]),
-            Ok(NotifyCmd::BuiltinAlerts(Some((false, "workspace-dirty".into()))))
-        );
         assert_eq!(p(&["cap", "500"]), Ok(NotifyCmd::Cap(Some(500))));
         assert!(p(&["cap", "lots"]).unwrap_err().contains("a number"));
         assert!(p(&["frobnicate"]).unwrap_err().contains("unknown notify command"));
@@ -854,7 +812,7 @@ mod tests {
         let now: DateTime<Utc> = "2026-10-16T14:02:00Z".parse().unwrap();
         let data = json!({
             "items": [
-                msg("01JD2T00000000000000000A3F", "site couldn't launch", "Step 2/5 install failed. Log: logs/site-01JD2T.log and some more words to cut", false, "high", "alert:workspace_dirty", "failed"),
+                msg("01JD2T00000000000000000A3F", "site couldn't launch", "Step 2/5 install failed. Log: logs/site-01JD2T.log and some more words to cut", false, "high", "automation:workspace-dirty", "failed"),
                 msg("01JD2T00000000000000000B81", "Standup", "", true, "normal", "schedule", "delivered"),
             ],
             "counts": {"total": 2, "unread": 1, "held": 0, "failed": 1},
@@ -862,7 +820,7 @@ mod tests {
         let out = list(&data, false, now);
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines[0].contains("ID") && lines[0].contains("MESSAGE"), "{out}");
-        assert!(lines[1].starts_with("●!") && lines[1].contains("2m ago") && lines[1].contains("alert"), "{out}");
+        assert!(lines[1].starts_with("●!") && lines[1].contains("2m ago") && lines[1].contains("automation"), "{out}");
         assert!(
             lines[1].contains("site couldn't launch — Step 2/5")
                 && lines[1].contains('…')
@@ -908,13 +866,13 @@ mod tests {
         let s = status(
             &json!({"counts": {"total": 3, "unread": 2, "held": 1, "failed": 0}, "cap": 2000, "paused": null,
                     "quiet": {"every_day": "22:00-08:00"}, "quiet_now": false,
-                    "builtin_alerts": {"workspace_dirty": true, "scheduled_task_failed": false}, "sinks": [],
+                    "sinks": [],
                     "settings_problem": null}),
             now,
         );
         assert!(s.contains("inbox      3 messages (2 unread, 1 held, 0 failed), keeps at most 2000"), "{s}");
         assert!(s.contains("paused     no") && s.contains("quiet      every day 22:00-08:00"), "{s}");
-        assert!(s.contains("scheduled-task-failed off") && s.contains("none yet: messages stay in the inbox"), "{s}");
+        assert!(s.contains("none yet: messages stay in the inbox") && !s.contains("alerts"), "{s}");
         assert_eq!(quiet(&json!({"quiet": {}}), false), "no quiet hours (set some: shimmer notify quiet 22:00-08:00)");
         assert!(quiet(&json!({"quiet": {"weekends": "00:00-10:00"}, "quiet_now": true}), true)
             .contains("  weekends   00:00-10:00"));
