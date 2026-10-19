@@ -85,8 +85,8 @@ op = "records.update"
 params = {{ collection = "leetcode", id = "two-sum", fields = {{ url = "https://x.test/{{task_id}}" }} }}
 "#
     );
-    call(&home, "automations.create", json!({"id": "kick", "text": kick}));
-    call(&home, "automations.create", json!({"id": "looping", "text": looping}));
+    call(&home, "automations.new", json!({"id": "kick", "text": kick}));
+    call(&home, "automations.new", json!({"id": "looping", "text": looping}));
 
     call(&home, "records.update", json!({"collection": "leetcode", "id": "two-sum", "fields": {"difficulty": "easy"}}));
     let status = until(&home, "automations.status", json!({}), |s| {
