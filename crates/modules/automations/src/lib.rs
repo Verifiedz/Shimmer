@@ -211,8 +211,10 @@ impl Automations {
     /// rule removed or switched off meanwhile has nothing left to do.
     async fn deferred(&self, ctx: &Ctx, mut d: Deferred) -> Result<Value> {
         // Renamed since it was set: it belongs to the rule under its new id. A rule given the old
-        // id later is a different rule, and keeps only its own delayed actions.
-        for r in renames(ctx).unwrap_or_default() {
+        // id later is a different rule, and keeps only its own delayed actions. A renamed.toml
+        // that doesn't parse fails the task rather than skipping it under the old id (#287's
+        // review): the failure is seen, and the built-in scheduled-task-failed alert says so.
+        for r in renames(ctx)? {
             if r.from == d.rule && d.made_at.is_none_or(|made| made < r.at) {
                 d.chain.rules.iter_mut().filter(|id| **id == r.from).for_each(|id| id.clone_from(&r.to));
                 d.rule = r.to;
@@ -269,7 +271,9 @@ impl Automations {
 
     /// Give a rule a new id (ADR 0038 §6). Its history moves with it, and a delayed action it set
     /// that is still waiting follows it: `renamed.toml` records the rename, and `deferred` reads it
-    /// (#287's review). Entries older than the longest `after` can't matter and are dropped.
+    /// (#287's review). Entries older than the longest `after` are dropped on the next rename. An
+    /// action whose run was put off past that (the computer off for months, or its schedule
+    /// switched off and on much later) misses its rename and is skipped; rare enough to leave.
     fn rename(&self, ctx: &Ctx, p: MoveParams) -> Result<Value> {
         let _g = self.write.lock();
         let rule = self.rule(&p.id)?;
