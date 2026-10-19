@@ -102,7 +102,16 @@ async fn run_daemon() -> ExitCode {
         Arc::new(shimmer_fetchers::Fetchers::default()),
         Arc::new(shimmer_notify::Notify::default()),
     ];
-    let config = DaemonConfig::from_env();
+    let mut config = DaemonConfig::from_env();
+    // Run in `/`, never in the folder whatever started it was in (#266 finding 3): a drive the
+    // daemon sits in can't be unmounted. Its folder and socket are made absolute first, so a
+    // relative `SHIMMER_HOME` still means the folder it named.
+    let absolute = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    config.home = absolute(&config.home);
+    config.socket = absolute(&config.socket);
+    if let Err(e) = std::env::set_current_dir("/") {
+        tracing::warn!(error = %e, "couldn't change the daemon's working folder to /");
+    }
     let socket = config.socket.clone();
     let daemon = match Daemon::start(config, modules).await {
         Ok(d) => d,
