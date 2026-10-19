@@ -50,7 +50,7 @@ const TOPICS: [(&str, &str); 15] = [
     ("records.item.removed", "a record was moved to the trash"),
     ("records.collection.created", "a collection was made from a template"),
     ("records.collection.copied", "a collection was made from another"),
-    ("records.trash.purged", "trashed records were deleted for good"),
+    ("records.item.purged", "trashed records were deleted for good"),
     ("records.collection.purged", "a removed collection was deleted for good"),
 ];
 
@@ -93,15 +93,15 @@ impl Module for Records {
                 json!({"type": "object", "required": ["collection"], "properties": {
                     "collection": {"type": "string"}, "id": {"type": "string"}, "fields": {"type": "object"}}}),
             ),
-            ("records.get", "Get one record", with(json!({}))),
+            ("records.show", "Get one record", with(json!({}))),
             (
                 "records.list",
-                "List records in a collection",
+                "List records in a collection, or with removed its removed ones",
                 json!({"type": "object", "required": ["collection"], "properties": {
                     "collection": {"type": "string"}, "filter": {"type": "object"},
                     "search": {"type": "string"}, "sort": {"type": "array", "items": {"type": "string"}},
                     "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT},
-                    "offset": {"type": "integer", "minimum": 0}}}),
+                    "offset": {"type": "integer", "minimum": 0}, "removed": {"type": "boolean"}}}),
             ),
             ("records.update", "Set or unset (null) fields of a record", with(fields.clone())),
             (
@@ -127,17 +127,12 @@ impl Module for Records {
             ),
             ("records.restore", "Bring a removed record back from the trash", with(json!({}))),
             (
-                "records.trash",
-                "List a collection's removed records",
-                json!({"type": "object", "required": ["collection"], "properties": {"collection": {"type": "string"}}}),
-            ),
-            (
                 "records.templates",
                 "List the built-in collection templates",
                 json!({"type": "object", "properties": {"id": {"type": "string"}, "file": {"type": "boolean"}}}),
             ),
             (
-                "records.create_collection",
+                "records.new",
                 "Create a collection from a template",
                 json!({"type": "object", "required": ["id", "template"], "properties": {
                     "id": {"type": "string"}, "template": {"type": "string"}, "label": {"type": "string"}}}),
@@ -220,7 +215,7 @@ impl Module for Records {
                 false => self.collections(ctx),
             },
             "records.add" => self.add(ctx, decode(params)?),
-            "records.get" => {
+            "records.show" => {
                 let t: Target = decode(params)?;
                 let c = load_collection(ctx, &t.collection)?;
                 Ok(load_item(ctx, &c, &t.id)?.to_wire(&c))
@@ -232,10 +227,9 @@ impl Module for Records {
             "records.rename" => self.rename(ctx, decode(params)?),
             "records.remove" => self.remove(ctx, decode(params)?),
             "records.restore" => self.restore(ctx, decode(params)?),
-            "records.trash" => self.trash(ctx, decode(params)?),
             "records.check" => self.check(ctx, decode(params)?),
             "records.templates" => templates_of(decode(params)?),
-            "records.create_collection" => self.create_collection(ctx, decode(params)?),
+            "records.new" => self.create_collection(ctx, decode(params)?),
             "records.rename_field" => self.rename_field(ctx, decode(params)?),
             "records.rename_collection" => self.rename_collection(ctx, decode(params)?),
             "records.copy_collection" => self.copy_collection(ctx, decode(params)?),
@@ -448,6 +442,9 @@ struct ListParams {
     limit: Option<usize>,
     #[serde(default)]
     offset: usize,
+    /// The collection's removed records instead (ADR 0038 §6: `list --removed` everywhere).
+    #[serde(default)]
+    removed: bool,
 }
 
 impl Records {
@@ -528,6 +525,15 @@ impl Records {
     }
 
     fn list(&self, ctx: &Ctx, p: ListParams) -> Result<Value> {
+        if p.removed {
+            let narrowed = !p.filter.is_empty() || p.search.is_some() || !p.sort.is_empty();
+            if narrowed || p.limit.is_some() || p.offset != 0 {
+                return Err(Error::invalid_params(
+                    "removed lists the whole trash; it takes no filter, search, sort or paging",
+                ));
+            }
+            return self.trash(ctx, &p.collection);
+        }
         let c = load_collection(ctx, &p.collection)?;
         let query = query::Query::new(&c, &p.filter, p.search.as_deref(), &p.sort, &now(ctx))?;
         let limit = p.limit.unwrap_or(DEFAULT_LIMIT);
@@ -1128,7 +1134,7 @@ impl Records {
             for path in &paths {
                 tx.delete(path)?;
             }
-            tx.emit("records.trash.purged", event)
+            tx.emit("records.item.purged", event)
         })?;
         Ok(json!({"purged": records}))
     }
@@ -1205,8 +1211,8 @@ impl Records {
     }
 
     /// The removed records that could be restored, by id (ADR 0020 §4).
-    fn trash(&self, ctx: &Ctx, p: CollectionOnly) -> Result<Value> {
-        let c = load_collection(ctx, &p.collection)?;
+    fn trash(&self, ctx: &Ctx, collection: &str) -> Result<Value> {
+        let c = load_collection(ctx, collection)?;
         let dir = format!("trash/{}", c.id);
         let (mut items, mut skipped): (Vec<Value>, Vec<String>) = (Vec::new(), Vec::new());
         for path in ctx.store.list(&dir)? {

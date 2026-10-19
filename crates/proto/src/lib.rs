@@ -8,13 +8,13 @@ pub mod paths;
 pub mod topic;
 
 pub use frame::{
-    decode_client, decode_server, encode, ClientFrame, ManifestData, ModuleInfo, PingData, QueueControl, QueuePriority,
-    QueuedHandle, ServerFrame,
+    decode_client, decode_server, encode, ClientFrame, EventsListData, ManifestData, ModuleInfo, PingData,
+    QueueControl, QueuePriority, QueuedHandle, ServerFrame,
 };
 pub use topic::{is_valid_pattern, topic_matches};
 
 /// Bumped only on breaking changes. The daemon refuses any other value.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// A longer line is a protocol error and the daemon closes the connection.
 pub const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
@@ -28,9 +28,10 @@ pub mod ops {
     pub const CORE_MANIFEST: &str = "core.manifest";
     pub const CORE_SHUTDOWN: &str = "core.shutdown";
     pub const QUEUE_LIST: &str = "queue.list";
-    pub const QUEUE_TASK: &str = "queue.task";
+    pub const QUEUE_SHOW: &str = "queue.show";
     pub const QUEUE_CANCEL: &str = "queue.cancel";
-    pub const QUEUE_REORDER: &str = "queue.reorder";
+    pub const QUEUE_MOVE: &str = "queue.move";
+    pub const EVENTS_LIST: &str = "core.events.list";
 }
 
 /// Topics the daemon itself defines.

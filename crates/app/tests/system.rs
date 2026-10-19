@@ -20,7 +20,7 @@ fn json(home: &Home, args: &[&str]) -> Value {
 }
 
 fn state(home: &Home, id: &str) -> String {
-    json(home, &["workspaces", "status", id])["state"].as_str().unwrap_or_default().to_owned()
+    json(home, &["workspaces", "show", id])["state"].as_str().unwrap_or_default().to_owned()
 }
 
 /// Poll `cond` for up to 60 s (the scheduler ticks once a second, but a cold first run can be
@@ -55,8 +55,11 @@ fn wait_until(home: &Home, what: &str, mut cond: impl FnMut() -> bool) {
 }
 
 /// The trigger id in `scheduler add`'s reply: "✓ added trigger usr-…: …".
-fn added_trigger(out: &str) -> String {
-    out.trim_start_matches("✓ added trigger ").split(':').next().unwrap().trim().to_owned()
+/// A trigger made with `shimmer call scheduler.add` (ADR 0031 §6: the raw form went from
+/// `scheduler add`): its id.
+fn raw_trigger(home: &Home, add: &str) -> String {
+    let out: serde_json::Value = serde_json::from_str(&ok(home, &["call", "scheduler.add", add, "--json"])).unwrap();
+    out["trigger_id"].as_str().unwrap().to_owned()
 }
 
 /// `secs` from now as UTC RFC 3339, for `scheduler add --once`.
@@ -118,11 +121,10 @@ fn a_shimmer_folder_copied_elsewhere_keeps_working() {
     ok(&old, &["workspaces", "new", "smoke", "--from", "smoke-test", "--set", "FAIL_AT=none"]);
     ok(&old, &["workspaces", "activate", "smoke", "--wait"]);
     ok(&old, &["workspaces", "stop", "smoke", "--wait"]);
-    let trigger = ok(
+    let trigger = raw_trigger(
         &old,
-        &["scheduler", "add", "records.list", r#"{"collection":"jobs"}"#, "--every", "1d", "--catch-up", "skip"],
+        r#"{"schedule":{"every":86400},"op":"records.list","params":{"collection":"jobs"},"catch_up":"skip"}"#,
     );
-    let trigger = added_trigger(&trigger);
     ok(&old, &["shutdown"]);
     wait_gone(&old.socket());
 
@@ -136,7 +138,7 @@ fn a_shimmer_folder_copied_elsewhere_keeps_working() {
     assert!(stale.is_empty(), "files still naming the old folder: {stale:?}");
 
     // Records, with their status and stamp; and new writes work.
-    let acme = json(&new, &["records", "get", "jobs/acme"]);
+    let acme = json(&new, &["records", "show", "jobs/acme"]);
     assert_eq!((acme["status"].as_str(), acme["company"].as_str()), (Some("done"), Some("Acme")), "{acme}");
     assert!(acme["applied_on"].is_string(), "the completion stamp came along: {acme}");
     ok(&new, &["records", "add", "jobs", "globex", "--position", "SWE", "--company", "Globex"]);
@@ -163,12 +165,7 @@ fn a_schedule_launches_a_workspace_and_a_dirty_one_never_blocks_the_lane() {
 
     // A one-shot schedule a few seconds from now launches it (with room for a slow machine).
     let add = |id: &str| {
-        let params = format!(r#"{{"id":"{id}"}}"#);
-        let out = ok(
-            &home,
-            &["scheduler", "add", "workspaces.activate", &params, "--once", &utc_in(5), "--catch-up", "run-once"],
-        );
-        added_trigger(&out)
+        ok(&home, &["scheduler", "add", "once", &utc_in(5), "--catch-up", "run-once", "workspaces", "activate", id]);
     };
     add("smoke");
     wait_until(&home, "the scheduled launch of smoke", || state(&home, "smoke") == "active");
@@ -176,7 +173,7 @@ fn a_schedule_launches_a_workspace_and_a_dirty_one_never_blocks_the_lane() {
     // A scheduled launch that fails leaves that workspace dirty...
     add("broken");
     wait_until(&home, "the scheduled launch of broken to fail", || state(&home, "broken") == "dirty");
-    let status = ok(&home, &["workspaces", "status", "broken"]);
+    let status = ok(&home, &["workspaces", "show", "broken"]);
     assert!(status.contains("step 1/3 check"), "{status}");
 
     // ...and the workspaces lane goes straight on: the next launch runs.
@@ -255,14 +252,14 @@ fn reopen_and_purge_do_what_they_say_and_purge_cannot_be_undone() {
 
     // Reopen: done → todo, keeping the stamp unless asked to clear it.
     ok(&home, &["records", "complete", "lc/two-sum"]);
-    assert!(json(&home, &["records", "get", "lc/two-sum"])["last_solved"].is_string());
+    assert!(json(&home, &["records", "show", "lc/two-sum"])["last_solved"].is_string());
     ok(&home, &["records", "reopen", "lc/two-sum"]);
-    let kept = json(&home, &["records", "get", "lc/two-sum"]);
+    let kept = json(&home, &["records", "show", "lc/two-sum"]);
     assert_eq!(kept["status"], "todo");
     assert!(kept["last_solved"].is_string(), "plain reopen keeps the stamp: {kept}");
     ok(&home, &["records", "complete", "lc/two-sum"]);
     ok(&home, &["records", "reopen", "lc/two-sum", "--clear-stamp"]);
-    let cleared = json(&home, &["records", "get", "lc/two-sum"]);
+    let cleared = json(&home, &["records", "show", "lc/two-sum"]);
     assert_eq!((cleared["status"].as_str(), cleared["last_solved"].is_null()), (Some("todo"), true), "{cleared}");
 
     // Purge one record, then the whole trash; nothing purged comes back.
@@ -272,7 +269,7 @@ fn reopen_and_purge_do_what_they_say_and_purge_cannot_be_undone() {
     ok(&home, &["records", "purge", "lc/lru-cache", "--yes"]);
     assert!(fails(&home, &["records", "restore", "lc/lru-cache"]).contains("lru-cache"));
     ok(&home, &["records", "purge", "lc", "--yes"]);
-    assert!(ok(&home, &["records", "trash", "lc"]).contains("nothing in lc's trash"));
+    assert!(ok(&home, &["records", "list", "lc", "--removed"]).contains("nothing in lc's trash"));
     assert!(fails(&home, &["records", "restore", "lc/word-ladder"]).contains("word-ladder"));
     assert_eq!(json(&home, &["records", "list", "lc"])["total"], 1, "only two-sum is left");
 }
@@ -285,7 +282,7 @@ fn a_removed_workspace_comes_back_with_restore_and_still_launches() {
     assert!(out.contains("shimmer workspaces restore smoke"), "says how to undo: {out}");
     let list = ok(&home, &["workspaces", "list"]);
     assert!(!list.lines().any(|l| l.starts_with("smoke ")), "{list}");
-    fails(&home, &["workspaces", "status", "smoke"]);
+    fails(&home, &["workspaces", "show", "smoke"]);
 
     ok(&home, &["workspaces", "restore", "smoke"]);
     assert_eq!(state(&home, "smoke"), "ready");
@@ -294,4 +291,11 @@ fn a_removed_workspace_comes_back_with_restore_and_still_launches() {
     ok(&home, &["workspaces", "stop", "smoke", "--wait"]);
     // Restoring what isn't removed says so.
     fails(&home, &["workspaces", "restore", "smoke"]);
+
+    // Purge deletes a removed one for good; without a person there it needs --yes (ADR 0038).
+    ok(&home, &["workspaces", "remove", "smoke"]);
+    fails(&home, &["workspaces", "purge", "smoke"]);
+    assert_eq!(ok(&home, &["workspaces", "purge", "smoke", "--yes"]).trim(), "✓ smoke is deleted for good");
+    fails(&home, &["workspaces", "restore", "smoke"]);
+    assert_eq!(ok(&home, &["workspaces", "purge"]).trim(), "no removed workspaces to purge");
 }

@@ -28,7 +28,7 @@ use tokio_util::task::TaskTracker;
 use crate::backend::Backend;
 use state::LaneState;
 
-/// Finished tasks kept for `queue.task` lookups.
+/// Finished tasks kept for `queue.show` lookups.
 const HISTORY: usize = 1000;
 const SOURCE: &str = "queue";
 
@@ -166,12 +166,23 @@ impl QueueInner {
         self.submit(req, Some(promotion))
     }
 
-    fn submit(self: &Arc<Self>, req: EnqueueRequest, promotion: Option<Promotion>) -> Result<TaskHandle> {
+    /// The lane `req` would join, or why it can't be enqueued. Changes nothing: `finish` asks it
+    /// before reporting a failure, so `queue.task.failed`'s `fallback` is decided before the
+    /// fallback is enqueued, and its events come after the failure that caused it (#281's review).
+    fn admits(&self, req: &EnqueueRequest) -> Result<LaneId> {
         // Whatever the caller, an invalid fallback never reaches a lane (ADR 0005).
         fallback::validate(&req.op, req.fallback.as_ref())?;
         let declared =
             self.ops.get(&req.op).ok_or_else(|| Error::unknown_op(format!("no module registered op '{}'", req.op)))?;
-        let lane = req.lane.or_else(|| declared.clone()).unwrap_or_else(LaneId::default_lane);
+        let lane = req.lane.clone().or_else(|| declared.clone()).unwrap_or_else(LaneId::default_lane);
+        if !self.lock().lanes.contains_key(&lane) {
+            return Err(Error::lane_unknown(format!("no lane '{lane}'")));
+        }
+        Ok(lane)
+    }
+
+    fn submit(self: &Arc<Self>, req: EnqueueRequest, promotion: Option<Promotion>) -> Result<TaskHandle> {
+        let lane = self.admits(&req)?;
         let now = self.clock.now();
         // Identity is out of `core` (§1.5), so the promoter is recorded as the role, not a person.
         let priority = match promotion {
@@ -295,7 +306,7 @@ impl QueueInner {
     fn finish(self: &Arc<Self>, task: Task, token: &CancellationToken, result: Result<Value>) {
         // Only a task that ran and failed structurally can owe a fallback (§11.3).
         let mut fallback = None;
-        let (status, topic, payload) = if token.is_cancelled() {
+        let (status, topic, mut payload) = if token.is_cancelled() {
             (Status::Cancelled, "queue.task.cancelled", json!({"task_id": task.id, "lane": task.lane, "op": task.op}))
         } else {
             match result {
@@ -309,11 +320,9 @@ impl QueueInner {
                     (
                         Status::Failed(e.to_string()),
                         "queue.task.failed",
-                        // `fallback`: whether a fallback is being sent for this failure (ADR
-                        // 0032 §4), so notify's alerts never repeat its message.
                         json!({"task_id": task.id, "lane": task.lane, "op": task.op, "origin": task.origin,
                                "error": e.message, "code": e.code, "detail": e.detail,
-                               "retryable": e.is_retryable(), "attempts": 1, "fallback": fallback.is_some()}),
+                               "retryable": e.is_retryable(), "attempts": 1}),
                     )
                 }
             }
@@ -325,9 +334,18 @@ impl QueueInner {
             }
             record_finished(&mut st, task.id, status, self.clock.now());
         }
+        // `fallback` says whether one is really being sent (ADR 0032 §4): notify's alerts stay
+        // quiet only when it is (#276's review). Decided by asking the queue first, and the
+        // fallback is enqueued only after the failure is reported, so the log reads cause, then
+        // effect (#281's review). Shutting down sends none: nothing would start it.
+        let fallback = fallback.filter(|_| !self.shutdown.is_cancelled());
+        let admitted = fallback.as_ref().map(|request| self.admits(request));
+        if topic == "queue.task.failed" {
+            payload["fallback"] = json!(matches!(admitted, Some(Ok(_))));
+        }
         self.emit(task.id, topic, payload);
-        if let Some(request) = fallback {
-            self.enqueue_fallback(&task, request);
+        if let (Some(request), Some(admitted)) = (fallback, admitted) {
+            self.enqueue_fallback(&task, request, admitted);
         }
         self.pump(&task.lane);
     }
@@ -335,13 +353,9 @@ impl QueueInner {
     /// Degrade, don't drop (§11.3). The slot is already free and the failure already reported,
     /// so nothing here can hold the lane: a fallback that cannot be enqueued is one more event,
     /// never a stall and never a retry.
-    fn enqueue_fallback(self: &Arc<Self>, failed: &Task, request: EnqueueRequest) {
-        // Shutting down: pump refuses to start anything, so the notice would only sit there.
-        if self.shutdown.is_cancelled() {
-            return;
-        }
+    fn enqueue_fallback(self: &Arc<Self>, failed: &Task, request: EnqueueRequest, admitted: Result<LaneId>) {
         let op = request.op.clone();
-        match self.submit(request, None) {
+        match admitted.and_then(|_| self.submit(request, None)) {
             Ok(h) => self.emit(
                 failed.id,
                 "queue.fallback.enqueued",

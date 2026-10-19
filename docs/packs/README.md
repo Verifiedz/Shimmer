@@ -43,7 +43,7 @@ belongs to this machine, so copying your Shimmer folder elsewhere doesn't bring 
 | records collections | `iroiro` | `boards` | `fleets` | `rcol` |
 | records add | `kohai` | `ticket` | `waypoint` | `radd` |
 | records list | `mite` | `triage` | `logbook` | `rlist` |
-| records get | `naruhodo` | `blame` | `scan` | `rget` |
+| records show | `naruhodo` | `blame` | `scan` | `rshow` |
 | records update | `senpai` | `amend` | `retrofit` | `rset` |
 | records complete | `yatta` | `lgtm` | `landed` | `rdone` |
 | records reopen | `mou-ikkai` | `regression` | `re-entry` | `rreopen` |
@@ -51,23 +51,25 @@ belongs to this machine, so copying your Shimmer folder elsewhere doesn't bring 
 | records remove | `sayonara` | `wontfix` | `airlock` | `rrm` |
 | records restore | `okaeri` | `revert` | `salvage` | `rundo` |
 | workspaces list | `minna` | `envs` | `sectors` | `wlist` |
-| workspaces status | `nani` | `standup` | `diagnostics` | `wst` |
+| workspaces show | `nani` | `standup` | `diagnostics` | `wshow` |
 | workspaces activate | `ikuzo` | `deploy` | `engage` | `wgo` |
 | workspaces cleanup | `daijoubu` | `postmortem` | `damage-control` | `wclean` |
 | workspaces force-relaunch | `yatte-yaru` | `force-push` | `override` | `wforce` |
 | workspaces reset | `tadaima` | `rollback` | `cold-start` | `wreset` |
 | queue list | `mada-mada` | `pipeline` | `launch-queue` | `qlist` |
-| queue show | `misete` | `job-status` | `telemetry` | `qget` |
+| queue show | `misete` | `job-status` | `telemetry` | `qshow` |
 | queue cancel | `yamete` | `cancel-build` | `abort` | `qcancel` |
 | queue move | `hayaku` | `bump` | `clearance` | `qmove` |
 | scheduler list | `jaa-ne` | `cron-jobs` | `flight-schedule` | `slist` |
 | scheduler add | `kimeta` | `schedule-it` | `plot-course` | `sadd` |
-| scheduler pause | `chotto-matte` | `code-freeze` | `hold-position` | `spause` |
-| scheduler resume | `hajime` | `thaw` | `full-ahead` | `sresume` |
+| scheduler edit | `henkou` | `reschedule` | `change-course` | `sedit` |
+| scheduler disable | `chotto-matte` | `code-freeze` | `hold-position` | `sdisable` |
+| scheduler enable | `hajime` | `thaw` | `full-ahead` | `senable` |
 | scheduler remove | `mou-ii` | `deprecate` | `scrub-mission` | `sdel` |
+| scheduler restore | `fukkatsu` | `undeprecate` | `back-on-course` | `sundo` |
+| scheduler purge | `shuuryou` | `prune` | `vaporize` | `spurge` |
 | records templates | `sugoi` | `boilerplate` | `starcharts` | `rtpl` |
 | records new | `yosh` | `greenfield` | `commission` | `rnew` |
-| records trash | `gomen` | `graveyard` | `debris-field` | `rtrash` |
 | records purge | `itai` | `rm-rf` | `self-destruct` | `rpurge` |
 | records import | `irasshaimase` | `migrate` | `tractor-beam` | `rimport` |
 | records export | `ganbatte` | `dump` | `transmit` | `rexport` |
@@ -80,6 +82,7 @@ belongs to this machine, so copying your Shimmer folder elsewhere doesn't bring 
 | workspaces stop | `otsukare` | `eod` | `dock` | `wstop` |
 | workspaces remove | `mata-ne` | `decommission` | `stand-down` | `wrm` |
 | workspaces restore | `hisashiburi` | `cherry-pick` | `homecoming` | `wundo` |
+| workspaces purge | `bakuhatsu` | `nuke-env` | `space-junk` | `wpurge` |
 | workspaces rename | `dare-da` | `rename-env` | `callsign` | `wmv` |
 | workspaces copy | `bunshin` | `fork` | `sister-ship` | `wcp` |
 | workspaces reconfigure | `chotto` | `hotfix` | `refit` | `wset` |
@@ -87,10 +90,15 @@ belongs to this machine, so copying your Shimmer folder elsewhere doesn't bring 
 | workspaces templates | `kawaii` | `starter-kits` | `shipyard` | `wtpl` |
 | workspaces peek | `hontou` | `code-review` | `long-range-scan` | `wpeek` |
 | workspaces new | `yoroshiku` | `scaffold` | `maiden-voyage` | `wnew` |
-| scheduler show | `itsu` | `eta` | `countdown` | `sget` |
+| scheduler show | `itsu` | `eta` | `countdown` | `sshow` |
 | records peek | `hora` | `preview` | `probe` | `rpeek` |
 | records copy-collection | `futago` | `copy-pasta` | `twin-fleet` | `rcpcol` |
 | records edit | `kaizou` | `tweak-schema` | `drydock` | `redit` |
+| fetchers list | `sagasu` | `sources` | `scan-sector` | `flist` |
+| fetchers status | `machiawase` | `crawler-status` | `sensor-status` | `fstat` |
+| fetchers test | `teisatsu` | `smoke-test` | `trial-run` | `ftest` |
+| fetchers run | `shutsugeki` | `poll` | `deep-scan` | `frun` |
+| fetchers items | `shuukaku` | `feed` | `haul` | `fitems` |
 | automations list | `keikaku` | `hooks` | `protocols` | `alist` |
 | automations show | `dore` | `inspect-hook` | `briefing` | `aget` |
 | automations new | `tsukuru` | `add-hook` | `standing-order` | `anew` |
@@ -151,16 +159,16 @@ On the right of each alias goes the command it runs, by its op name:
 | Op | Runs |
 |---|---|
 | `core.ping`, `core.shutdown`, `core.manifest` | `shimmer ping`, `shutdown`, `manifest` |
-| `records.collections`, `.add`, `.list`, `.get`, `.update`, `.complete`, `.reopen`, `.rename`, `.remove`, `.restore`, `.trash`, `.purge`, `.import`, `.export`, `.check`, `.templates` | `shimmer records <verb>` |
-| `records.create_collection` | `shimmer records new` |
+| `records.collections`, `.add`, `.list`, `.show`, `.update`, `.complete`, `.reopen`, `.rename`, `.remove`, `.restore`, `.purge`, `.import`, `.export`, `.check`, `.templates`, `.new` | `shimmer records <verb>` |
 | `records.rename_field`, `.rename_collection`, `.remove_collection`, `.restore_collection`, `.purge_collection` | `shimmer records rename-field`, `rename-collection`, `remove-collection`, `restore-collection`, `purge-collection` |
 | `records.peek`, `.copy_collection`, `.edit` | `shimmer records peek`, `copy-collection`, `edit` |
-| `workspaces.list`, `.status`, `.activate`, `.cleanup`, `.reset`, `.stop`, `.remove`, `.restore`, `.rename`, `.copy`, `.reconfigure`, `.edit`, `.templates`, `.peek` | `shimmer workspaces <verb>` |
-| `workspaces.force_relaunch`, `workspaces.create` | `shimmer workspaces force-relaunch`, `new` |
-| `queue.list`, `.task`, `.cancel`, `.reorder` | `shimmer queue list`, `show`, `cancel`, `move` |
-| `scheduler.list`, `.get`, `.add`, `.pause`, `.resume`, `.remove` | `shimmer scheduler list`, `show`, `add`, `pause`, `resume`, `remove` |
-| `notify.list`, `.count`, `.remove`, `.send`, `.test`, `.resend`, `.pause`, `.resume`, `.quiet`, `.status`, `.cap` | `shimmer notify <verb>` |
-| `notify.get`, `.mark_read`, `.mark_unread` | `shimmer notify show`, `mark-read`, `mark-unread` |
+| `workspaces.list`, `.show`, `.activate`, `.cleanup`, `.reset`, `.stop`, `.remove`, `.restore`, `.purge`, `.rename`, `.copy`, `.reconfigure`, `.edit`, `.templates`, `.peek`, `.new` | `shimmer workspaces <verb>` |
+| `workspaces.force_relaunch` | `shimmer workspaces force-relaunch` |
+| `queue.list`, `.show`, `.cancel`, `.move` | `shimmer queue <verb>` |
+| `scheduler.list`, `.show`, `.add`, `.edit`, `.disable`, `.enable`, `.remove`, `.restore`, `.purge` | `shimmer scheduler <verb>` |
+| `fetchers.list`, `.status`, `.test`, `.run`, `.items` | `shimmer fetchers <verb>` |
+| `notify.list`, `.show`, `.count`, `.remove`, `.send`, `.test`, `.resend`, `.pause`, `.resume`, `.quiet`, `.status`, `.cap` | `shimmer notify <verb>` |
+| `notify.mark_read`, `.mark_unread` | `shimmer notify mark-read`, `mark-unread` |
 | `automations.list`, `.show`, `.new`, `.edit`, `.remove`, `.restore`, `.purge`, `.rename`, `.copy`, `.enable`, `.disable`, `.test`, `.events`, `.history`, `.status`, `.depth`, `.reload`, `.templates`, `.peek` | `shimmer automations <verb>` |
 
 `shimmer packs --help` prints the same list. Your own pack names as many or as few as you like;

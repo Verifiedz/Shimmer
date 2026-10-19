@@ -19,14 +19,23 @@ use shimmer_core::{
 use shimmer_core::{EnqueueRequest, TaskSubmitter};
 #[cfg(unix)]
 use shimmer_core::{LaunchBackend, Launcher};
-use shimmer_proto::{ops, ManifestData, ModuleInfo, PingData, QueueControl, QueuePriority, QueuedHandle};
+use shimmer_proto::{
+    ops, EventsListData, ManifestData, ModuleInfo, PingData, QueueControl, QueuePriority, QueuedHandle,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::Backend;
 use crate::config::Config;
+use crate::indexer::SharedIndex;
 use crate::queue::{OpRunner, Promotion, QueueFront, QueueInner};
 use crate::registry::Registry;
 use crate::scheduler::Scheduler;
+
+/// `core.events.list`'s own default and hard cap on `limit` -- generous enough for "what did
+/// the last run find," small enough that a client can't make one query hold the index's
+/// single connection (`Index`'s `Mutex`, `crate::indexer::SharedIndex`) for very long.
+const DEFAULT_EVENTS_LIMIT: usize = 100;
+const MAX_EVENTS_LIMIT: usize = 1000;
 
 pub struct Core {
     pub registry: Registry,
@@ -38,11 +47,14 @@ pub struct Core {
     pub shutdown: CancellationToken,
     /// Set once during startup, after modules are initialised.
     pub scheduler: OnceLock<Arc<Scheduler>>,
+    /// Backs `core.events.list` -- the same derived index the indexer task keeps current.
+    pub index: SharedIndex,
 }
 
 impl Core {
     /// Wire every module to its capabilities. Infallible: all validation happened when the
     /// registry and lanes were built.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         registry: Registry,
         lanes: Vec<LaneConfig>,
@@ -51,6 +63,9 @@ impl Core {
         clock: Clock,
         shutdown: CancellationToken,
         socket: &Path,
+        secrets: Arc<dyn crate::secrets::SecretStore>,
+        secrets_problem: Option<String>,
+        index: SharedIndex,
     ) -> Arc<Self> {
         // A module gets a populated, usable `Launcher` only if its manifest declares the
         // `"process"` capability (ADR 0010 §4); every other module keeps `Ctx::new`'s
@@ -77,6 +92,9 @@ impl Core {
                 backend.store.home().to_path_buf(),
                 config.http.clone(),
                 clock.clone(),
+                config.credentials.clone(),
+                secrets,
+                secrets_problem,
             )
             .expect("building the http client"),
         );
@@ -148,6 +166,7 @@ impl Core {
                 started: Instant::now(),
                 shutdown,
                 scheduler: OnceLock::new(),
+                index,
             }
         })
     }
@@ -170,9 +189,26 @@ impl Core {
                 let p: P = decode(params)?;
                 self.queue.list(p.lane.as_ref())
             }
-            ops::QUEUE_TASK => self.queue.task_view(self.queue.resolve(&task_id(params)?)?),
+            ops::QUEUE_SHOW => self.queue.task_view(self.queue.resolve(&task_id(params)?)?),
             ops::QUEUE_CANCEL => self.queue.cancel(self.queue.resolve(&task_id(params)?)?),
-            ops::QUEUE_REORDER => {
+            ops::EVENTS_LIST => {
+                #[derive(Deserialize, Default)]
+                #[serde(default)]
+                struct P {
+                    topic: Option<String>,
+                    limit: Option<usize>,
+                }
+                let p: P = decode(params)?;
+                let pattern = p.topic.as_deref().unwrap_or("*");
+                if !shimmer_proto::is_valid_pattern(pattern) {
+                    return Err(Error::invalid_params(format!("'{pattern}' is not a valid topic pattern")));
+                }
+                let limit = p.limit.unwrap_or(DEFAULT_EVENTS_LIMIT).clamp(1, MAX_EVENTS_LIMIT);
+                let events =
+                    self.index.lock().unwrap_or_else(|e| e.into_inner()).events_matching_recent(pattern, limit)?;
+                Ok(serde_json::to_value(EventsListData { events }).unwrap_or_default())
+            }
+            ops::QUEUE_MOVE => {
                 #[derive(Deserialize)]
                 struct P {
                     lane: LaneId,
@@ -287,7 +323,7 @@ impl OpRunner for Core {
 
 /// The daemon's own topics, which no module declares, with what they mean (`docs/protocol.md`).
 /// `queue.task.progress` is left out: it's streamed only, never logged or seen by modules.
-const SERVICE_TOPICS: [(&str, &str); 16] = [
+const SERVICE_TOPICS: [(&str, &str); 19] = [
     ("queue.task.enqueued", "a task joined the queue"),
     ("queue.task.started", "a task started running"),
     ("queue.task.finished", "a task finished"),
@@ -301,9 +337,12 @@ const SERVICE_TOPICS: [(&str, &str); 16] = [
     ("scheduler.trigger.fired", "a schedule came due and queued its task"),
     ("scheduler.trigger.missed", "a schedule came due while the computer was off"),
     ("scheduler.trigger.skipped", "a schedule came due but didn't run"),
-    ("scheduler.trigger.paused", "a schedule was paused"),
-    ("scheduler.trigger.resumed", "a schedule was resumed"),
-    ("scheduler.trigger.removed", "a schedule was removed"),
+    ("scheduler.trigger.edited", "a schedule was changed, keeping its id"),
+    ("scheduler.trigger.disabled", "a schedule was switched off"),
+    ("scheduler.trigger.enabled", "a schedule was switched back on"),
+    ("scheduler.trigger.removed", "a schedule was removed (it can be restored)"),
+    ("scheduler.trigger.restored", "a removed schedule came back"),
+    ("scheduler.trigger.purged", "removed schedules were deleted for good"),
 ];
 
 /// `ctx.catalog` (ADR 0035 §5.7): every module op, and every topic with its description.

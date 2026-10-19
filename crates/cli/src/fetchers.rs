@@ -1,0 +1,595 @@
+//! `shimmer fetchers …`: sources that reach outward for new items (ADR 0028). Every command is
+//! one of the `fetchers` module's own ops; nothing here decides anything (CLAUDE.md §2).
+
+use chrono::{DateTime, Utc};
+use serde_json::{json, Value};
+use shimmer_core::{Error, ErrorCode, Result};
+
+use crate::client::Client;
+use crate::flags::Flags;
+use crate::render::{self, table};
+use crate::when;
+
+pub const USAGE: &str = "usage: shimmer fetchers <command>
+
+commands:
+  list                 every known source and its configured state
+  status               per-source last-run time and whether it is running
+  test SOURCE [FILTER]   fetch one page and show its parsed items; never saves or marks anything seen
+  run SOURCE [--wait] [FILTER]  fetch one source now
+  items [SOURCE] [--contains W,W] [--excludes W,W]  items a real run has actually found and kept,
+                        most recent first
+
+FILTER (test and run only):
+  --contains W,W,...    keep only a title containing at least one of these (case-insensitive)
+  --excludes W,W,...    drop a title containing any of these, even one --contains would keep
+
+When given to test or run, each of these replaces -- never merges with -- whatever
+config.toml's own [modules.fetchers.sources.<id>] entry configures, for that one call only.
+
+items' own --contains/--excludes are a separate, client-side narrowing of what's already
+been found and saved.
+
+A source is either one of the built-in ones (hn-whoishiring, weworkremotely) or a configured
+kind configured under [modules.fetchers.sources.<id>] in config.toml. Add --json to any
+command for raw output.";
+
+/// `core.events.list`'s own query limit for `items` -- generous enough to cover several runs
+/// across every source before filtering down to one, well under the daemon's own cap
+/// (`MAX_EVENTS_LIMIT`, `crates/daemon/src/core.rs`).
+const ITEMS_QUERY_LIMIT: usize = 200;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum FetchersCmd {
+    Help,
+    List,
+    Status,
+    Test { source: String, title_contains: Option<Vec<String>>, title_excludes: Option<Vec<String>> },
+    Run { source: String, wait: bool, title_contains: Option<Vec<String>>, title_excludes: Option<Vec<String>> },
+    Items { source: Option<String>, title_contains: Option<Vec<String>>, title_excludes: Option<Vec<String>> },
+}
+
+/// `--contains a, b ,c` (or `--excludes`) as a term list -- comma-separated, each term
+/// trimmed. `None` means the flag was not given at all, not "given but empty" (`Flags`
+/// itself already rejects an empty value, e.g. `--contains=`).
+///
+/// An empty term is dropped rather than passed on (#126's review, B3): `--excludes senior,`
+/// used to send `["senior", ""]`, and `""` is a substring of every title, so a single stray
+/// comma excluded everything the source had. The daemon rejects empty terms too -- this just
+/// means the common typo quietly does the obvious thing instead of erroring.
+fn terms(value: Option<&str>) -> Option<Vec<String>> {
+    value.map(|s| s.split(',').map(|t| t.trim().to_owned()).filter(|t| !t.is_empty()).collect())
+}
+
+/// `items`' own `--contains`/`--excludes`, narrowing what's already been found rather than
+/// what a `Source` fetches. Same matching rule as `fetchers`' own `SourceConfig::matches_title`
+/// (case-insensitive substring, OR'd within each list) -- duplicated, not imported, since a
+/// client crate must not depend on a module crate (CLAUDE.md §3).
+fn title_matches(title: &str, contains: &[String], excludes: &[String]) -> bool {
+    let lower = title.to_lowercase();
+    let included = contains.is_empty() || contains.iter().any(|w| lower.contains(&w.to_lowercase()));
+    let excluded = excludes.iter().any(|w| lower.contains(&w.to_lowercase()));
+    included && !excluded
+}
+
+/// `words` are what follows `shimmer fetchers`.
+pub fn parse(words: Vec<String>) -> std::result::Result<FetchersCmd, String> {
+    let mut words = words.into_iter();
+    let Some(sub) = words.next() else { return Ok(FetchersCmd::Help) };
+    let rest: Vec<String> = words.collect();
+    match sub.as_str() {
+        "help" => Ok(FetchersCmd::Help),
+        "list" if rest.is_empty() => Ok(FetchersCmd::List),
+        "list" => Err("'fetchers list' takes no arguments".into()),
+        "status" if rest.is_empty() => Ok(FetchersCmd::Status),
+        "status" => Err("'fetchers status' takes no arguments".into()),
+        "test" => {
+            let flags =
+                Flags::split(rest, &["--contains", "--excludes"], &[]).map_err(|e| format!("fetchers test: {e}"))?;
+            let source = match flags.positional.as_slice() {
+                [s] => s.clone(),
+                _ => return Err("usage: shimmer fetchers test SOURCE [--contains W,W] [--excludes W,W]".into()),
+            };
+            Ok(FetchersCmd::Test {
+                source,
+                title_contains: terms(flags.value("--contains")),
+                title_excludes: terms(flags.value("--excludes")),
+            })
+        }
+        "run" => {
+            let flags = Flags::split(rest, &["--contains", "--excludes"], &["--wait"])
+                .map_err(|e| format!("fetchers run: {e}"))?;
+            let source = match flags.positional.as_slice() {
+                [s] => s.clone(),
+                _ => return Err("usage: shimmer fetchers run SOURCE [--wait] [--contains W,W] [--excludes W,W]".into()),
+            };
+            Ok(FetchersCmd::Run {
+                source,
+                wait: flags.has("--wait"),
+                title_contains: terms(flags.value("--contains")),
+                title_excludes: terms(flags.value("--excludes")),
+            })
+        }
+        "items" => {
+            let flags =
+                Flags::split(rest, &["--contains", "--excludes"], &[]).map_err(|e| format!("fetchers items: {e}"))?;
+            let source = match flags.positional.as_slice() {
+                [] => None,
+                [source] => Some(source.clone()),
+                _ => return Err("usage: shimmer fetchers items [SOURCE] [--contains W,W] [--excludes W,W]".into()),
+            };
+            Ok(FetchersCmd::Items {
+                source,
+                title_contains: terms(flags.value("--contains")),
+                title_excludes: terms(flags.value("--excludes")),
+            })
+        }
+        other => Err(format!("unknown fetchers command '{other}'; see 'shimmer fetchers --help'")),
+    }
+}
+
+pub async fn run(client: &mut Client, cmd: &FetchersCmd, json_out: bool) -> Result<String> {
+    match cmd {
+        FetchersCmd::Help => Ok(USAGE.into()),
+        FetchersCmd::List => {
+            let data = client.call("fetchers.list", json!({})).await?;
+            Ok(if json_out { render::json(&data) } else { list(&data) })
+        }
+        FetchersCmd::Status => {
+            let data = client.call("fetchers.status", json!({})).await?;
+            Ok(if json_out { render::json(&data) } else { status(&data, Utc::now()) })
+        }
+        FetchersCmd::Test { source, title_contains, title_excludes } => {
+            // Always follows: a dry run that returned immediately with just a task id would
+            // defeat its own point, unlike `run`, which has something useful to say either way.
+            client.subscribe(&["queue.task.*"]).await?;
+            let params = filter_params(source, title_contains, title_excludes);
+            let handle = client.call("fetchers.test", params).await?;
+            let task = task_id(&handle)?;
+            let result = follow(client, task).await?;
+            Ok(if json_out { render::json(&result) } else { test_items(source, &result) })
+        }
+        FetchersCmd::Run { source, wait, title_contains, title_excludes } => {
+            if *wait {
+                // Before the request, so not even the first event can be missed.
+                client.subscribe(&["queue.task.*"]).await?;
+            }
+            let params = filter_params(source, title_contains, title_excludes);
+            let handle = client.call("fetchers.run", params).await?;
+            let task = task_id(&handle)?;
+            if !*wait {
+                return Ok(if json_out {
+                    render::json(&handle)
+                } else {
+                    format!("queued a fetch of {source} (task {task})\ncheck on it with: shimmer fetchers status")
+                });
+            }
+            let result = follow(client, task).await?;
+            Ok(if json_out { render::json(&result) } else { fetched(source, &result) })
+        }
+        FetchersCmd::Items { source, title_contains, title_excludes } => {
+            // fetchers.item.found is a plain string literal, not an import from shimmer-fetchers
+            // -- a client crate must not depend on a module crate (CLAUDE.md §3's dependency
+            // rules), same reason every other op name in this file is also a literal.
+            let data = client
+                .call("core.events.list", json!({"topic": "fetchers.item.found", "limit": ITEMS_QUERY_LIMIT}))
+                .await?;
+            let events = data["events"].as_array().cloned().unwrap_or_default();
+            let contains = title_contains.clone().unwrap_or_default();
+            let excludes = title_excludes.clone().unwrap_or_default();
+            let matching: Vec<Value> = events
+                .into_iter()
+                .filter(|e| match source {
+                    None => true,
+                    Some(s) => e["payload"]["source_name"].as_str() == Some(s.as_str()),
+                })
+                .filter(|e| title_matches(e["payload"]["title"].as_str().unwrap_or_default(), &contains, &excludes))
+                .collect();
+            Ok(if json_out { render::json(&json!({"items": matching})) } else { items(source.as_deref(), &matching) })
+        }
+    }
+}
+
+/// `fetchers.run`/`fetchers.test`'s params: `source`, plus `title_contains`/
+/// `title_excludes` only when a `--contains`/`--excludes` flag was actually given --
+/// omitted entirely, not sent as an empty list, so the module falls back to the source's
+/// own configured filter (ADR 0028 §14) rather than overriding it with "nothing allowed."
+fn filter_params(source: &str, title_contains: &Option<Vec<String>>, title_excludes: &Option<Vec<String>>) -> Value {
+    let mut params = json!({"source": source});
+    if let Some(c) = title_contains {
+        params["title_contains"] = json!(c);
+    }
+    if let Some(e) = title_excludes {
+        params["title_excludes"] = json!(e);
+    }
+    params
+}
+
+fn task_id(handle: &Value) -> Result<&str> {
+    handle["task_id"].as_str().ok_or_else(|| Error::internal("no task_id in the queued response"))
+}
+
+fn fetched(source: &str, result: &Value) -> String {
+    let n = result["new_items"].as_u64().unwrap_or(0);
+    format!("✓ fetched {source}: {n} new item{}", if n == 1 { "" } else { "s" })
+}
+
+/// Follow a queued task over the subscription stream until it ends, the same pattern
+/// `workspaces::queued`'s `follow` uses for a launch -- `queue.task.finished`'s own event
+/// payload carries the handler's full return value, so this never needs the task's
+/// persisted record, which keeps no result at all for a succeeded task (only its error, for
+/// a failed one; see `finished_task`'s own note on the one path where that matters).
+async fn follow(client: &mut Client, task: &str) -> Result<Value> {
+    loop {
+        let ev = client.next_event().await?;
+        if ev.topic == "core.stream.lagged" {
+            // Events were dropped, maybe the one we wait for: ask directly instead.
+            if let Some(outcome) = finished_task(client, task).await? {
+                return outcome;
+            }
+            continue;
+        }
+        if ev.payload["task_id"] != task {
+            continue;
+        }
+        match ev.topic.as_str() {
+            "queue.task.finished" => return Ok(ev.payload["result"].clone()),
+            "queue.task.failed" => return Err(task_error(&ev.payload)),
+            "queue.task.cancelled" => return Err(Error::new(ErrorCode::ModuleError, "the task was cancelled")),
+            _ => {}
+        }
+    }
+}
+
+/// After `core.stream.lagged`: has the task ended? `None` while it is still queued or
+/// running. `queue.show`'s response has no `result` field for a succeeded task -- only
+/// `error` for a failed one (`crates/daemon/src/queue/mod.rs`'s `view`) -- so a succeeded
+/// outcome here is reported as a (rare) miss, honestly, rather than as a silent empty result.
+async fn finished_task(client: &mut Client, task: &str) -> Result<Option<Result<Value>>> {
+    let t = client.call("queue.show", json!({ "task_id": task })).await?;
+    Ok(match t["status"].as_str() {
+        Some("succeeded") => Some(Err(Error::new(
+            ErrorCode::Unavailable,
+            "the fetch finished, but its result was missed (events were dropped); see 'shimmer fetchers status'",
+        ))),
+        Some("failed") => {
+            Some(Err(Error::new(ErrorCode::ModuleError, t["error"].as_str().unwrap_or("the task failed").to_owned())))
+        }
+        Some("cancelled") => Some(Err(Error::new(ErrorCode::ModuleError, "the task was cancelled"))),
+        _ => None,
+    })
+}
+
+fn task_error(payload: &Value) -> Error {
+    let code: ErrorCode = serde_json::from_value(payload["code"].clone()).unwrap_or(ErrorCode::ModuleError);
+    Error::new(code, payload["error"].as_str().unwrap_or("the task failed").to_owned())
+}
+
+/// One table of every known source and its configured state, or a line saying there are none.
+fn list(data: &Value) -> String {
+    let sources = data["sources"].as_array().cloned().unwrap_or_default();
+    if sources.is_empty() {
+        return "no sources known".into();
+    }
+    let rows: Vec<Vec<String>> = sources
+        .iter()
+        .map(|s| {
+            vec![
+                render::cell(&s["id"]),
+                render::cell(&s["method"]),
+                s["kind"].as_str().unwrap_or("-").to_string(),
+                // on/off under STATE, coloured like every other feature's (ADR 0038 §6).
+                if s["enabled"].as_bool().unwrap_or(false) { "on".into() } else { "off".into() },
+                s["interval_s"].as_u64().map(when::format_duration).unwrap_or_else(|| "-".into()),
+            ]
+        })
+        .collect();
+    let header = ["ID", "METHOD", "KIND", "STATE", "INTERVAL"].map(String::from);
+    let n = sources.len();
+    format!("{}\n{n} source{}", table(&header, &rows), if n == 1 { "" } else { "s" })
+}
+
+/// One table of every known source's last-run time and whether it is currently running.
+fn status(data: &Value, now: DateTime<Utc>) -> String {
+    let sources = data["sources"].as_array().cloned().unwrap_or_default();
+    if sources.is_empty() {
+        return "no sources known".into();
+    }
+    let rows: Vec<Vec<String>> = sources
+        .iter()
+        .map(|s| {
+            let last_run = when::timestamp(&s["last_run_at"]);
+            vec![
+                render::cell(&s["id"]),
+                last_run.map_or("never".into(), |t| when::relative(t, now)),
+                if s["running"].as_bool().unwrap_or(false) { "running".into() } else { "idle".into() },
+            ]
+        })
+        .collect();
+    table(&["ID", "LAST RUN", "STATE"].map(String::from), &rows)
+}
+
+/// Every parsed item `fetchers.test` found, title and url, or a line saying it found none.
+fn test_items(source: &str, result: &Value) -> String {
+    let items = result["items"].as_array().cloned().unwrap_or_default();
+    if items.is_empty() {
+        return format!("{source}: no items parsed");
+    }
+    let rows: Vec<Vec<String>> = items
+        .iter()
+        .map(|item| {
+            // The url must survive copy/paste intact -- render::cell's truncation is fine for a
+            // title (a preview), but a truncated url is a different, invalid url, not a shorter
+            // version of the real one, and silently hands back a 404 instead of the job posting.
+            // Still goes through strip_control: a raw control character has no legitimate place
+            // in a url (RFC 3986 requires percent-encoding one), so dropping it changes nothing
+            // about where a real link points, but it is the one thing that bypasses render::cell
+            // and its own stripping.
+            vec![render::cell(&item["title"]), render::strip_control(item["url"].as_str().unwrap_or_default())]
+        })
+        .collect();
+    let n = items.len();
+    format!(
+        "{source}: {n} item{}\n{}",
+        if n == 1 { "" } else { "s" },
+        table(&["TITLE".to_owned(), "URL".to_owned()], &rows)
+    )
+}
+
+/// Every `fetchers.item.found` event matched, most recent first -- `core.events.list` itself
+/// returns oldest-first (the event-log's own convention), reversed here only for display,
+/// same reasoning as a feed or a log tail: what just happened belongs on top.
+fn items(source: Option<&str>, events: &[Value]) -> String {
+    if events.is_empty() {
+        return match source {
+            Some(s) => format!("{s}: no items found yet"),
+            None => "no items found yet".into(),
+        };
+    }
+    let n = events.len();
+    let summary = match source {
+        Some(s) => format!("{s}: {n} item{}", if n == 1 { "" } else { "s" }),
+        None => format!("{n} item{}", if n == 1 { "" } else { "s" }),
+    };
+    // Never truncated, same reasoning as test_items's own url handling.
+    let url = |p: &Value| render::strip_control(p["url"].as_str().unwrap_or_default());
+    let (header, rows): (Vec<String>, Vec<Vec<String>>) = match source {
+        Some(_) => (
+            ["TITLE", "URL"].map(String::from).to_vec(),
+            events.iter().rev().map(|ev| vec![render::cell(&ev["payload"]["title"]), url(&ev["payload"])]).collect(),
+        ),
+        None => (
+            ["SOURCE", "TITLE", "URL"].map(String::from).to_vec(),
+            events
+                .iter()
+                .rev()
+                .map(|ev| {
+                    let p = &ev["payload"];
+                    vec![p["source_name"].as_str().unwrap_or("?").to_owned(), render::cell(&p["title"]), url(p)]
+                })
+                .collect(),
+        ),
+    };
+    format!("{summary}\n{}", table(&header, &rows))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(s: &[&str]) -> std::result::Result<FetchersCmd, String> {
+        parse(s.iter().map(|w| w.to_string()).collect())
+    }
+
+    #[test]
+    fn commands_parse() {
+        assert_eq!(p(&[]), Ok(FetchersCmd::Help));
+        assert_eq!(p(&["list"]), Ok(FetchersCmd::List));
+        assert_eq!(p(&["status"]), Ok(FetchersCmd::Status));
+        assert_eq!(
+            p(&["test", "hn-whoishiring"]),
+            Ok(FetchersCmd::Test { source: "hn-whoishiring".into(), title_contains: None, title_excludes: None })
+        );
+        assert_eq!(
+            p(&["run", "hn-whoishiring"]),
+            Ok(FetchersCmd::Run {
+                source: "hn-whoishiring".into(),
+                wait: false,
+                title_contains: None,
+                title_excludes: None,
+            })
+        );
+        assert_eq!(
+            p(&["run", "hn-whoishiring", "--wait"]),
+            Ok(FetchersCmd::Run {
+                source: "hn-whoishiring".into(),
+                wait: true,
+                title_contains: None,
+                title_excludes: None,
+            })
+        );
+        assert_eq!(
+            p(&["run", "hn-whoishiring", "--contains", "junior, entry level", "--excludes", "senior,staff"]),
+            Ok(FetchersCmd::Run {
+                source: "hn-whoishiring".into(),
+                wait: false,
+                title_contains: Some(vec!["junior".into(), "entry level".into()]),
+                title_excludes: Some(vec!["senior".into(), "staff".into()]),
+            })
+        );
+        assert_eq!(
+            p(&["test", "hn-whoishiring", "--contains", "junior"]),
+            Ok(FetchersCmd::Test {
+                source: "hn-whoishiring".into(),
+                title_contains: Some(vec!["junior".into()]),
+                title_excludes: None,
+            })
+        );
+        assert_eq!(p(&["items"]), Ok(FetchersCmd::Items { source: None, title_contains: None, title_excludes: None }));
+        assert_eq!(
+            p(&["items", "jobbank-canada"]),
+            Ok(FetchersCmd::Items {
+                source: Some("jobbank-canada".into()),
+                title_contains: None,
+                title_excludes: None
+            })
+        );
+        assert_eq!(
+            p(&["items", "jobbank-canada", "--contains", "junior,entry level", "--excludes", "senior"]),
+            Ok(FetchersCmd::Items {
+                source: Some("jobbank-canada".into()),
+                title_contains: Some(vec!["junior".into(), "entry level".into()]),
+                title_excludes: Some(vec!["senior".into()]),
+            })
+        );
+    }
+
+    #[test]
+    fn mistakes_are_explained() {
+        assert!(p(&["list", "x"]).unwrap_err().contains("takes no arguments"));
+        assert!(p(&["status", "x"]).unwrap_err().contains("takes no arguments"));
+        assert!(p(&["test"]).unwrap_err().contains("usage: shimmer fetchers test SOURCE"));
+        assert!(p(&["run"]).unwrap_err().contains("usage: shimmer fetchers run SOURCE"));
+        assert!(p(&["run", "a", "--bogus"]).unwrap_err().contains("unknown option '--bogus'"));
+        assert!(p(&["items", "a", "b"]).unwrap_err().contains("usage: shimmer fetchers items"));
+        assert!(p(&["frob"]).unwrap_err().contains("unknown fetchers command 'frob'"));
+    }
+
+    #[test]
+    fn list_renders_a_table_with_a_count() {
+        let data = json!({"sources": [
+            {"id": "hn-whoishiring", "method": "api", "kind": null, "enabled": true, "interval_s": 86_400},
+            {"id": "my-team-blog", "method": "api", "kind": "rss", "enabled": false, "interval_s": null},
+        ]});
+        let out = list(&data);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0].split_whitespace().collect::<Vec<_>>(), ["ID", "METHOD", "KIND", "STATE", "INTERVAL"]);
+        assert!(lines[1].contains("hn-whoishiring") && lines[1].contains(" on ") && lines[1].contains("1d"), "{out}");
+        assert!(lines[2].contains("my-team-blog") && lines[2].contains("rss") && lines[2].contains(" off "), "{out}");
+        assert_eq!(lines[3], "2 sources");
+    }
+
+    #[test]
+    fn list_with_nothing_known_says_so() {
+        assert_eq!(list(&json!({"sources": []})), "no sources known");
+    }
+
+    #[test]
+    fn status_renders_last_run_and_running() {
+        let now = Utc::now();
+        let data = json!({"sources": [
+            {"id": "hn-whoishiring", "last_run_at": (now - chrono::Duration::seconds(90)).to_rfc3339(), "running": false},
+            {"id": "weworkremotely", "last_run_at": null, "running": true},
+        ]});
+        let out = status(&data, now);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[1].contains("hn-whoishiring") && lines[1].contains("ago") && lines[1].ends_with("idle"), "{out}");
+        assert!(
+            lines[2].contains("weworkremotely") && lines[2].contains("never") && lines[2].ends_with("running"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn test_items_lists_title_and_url_or_says_there_were_none() {
+        let data = json!({"source": "hn-whoishiring", "items": [{"title": "Acme is hiring", "url": "https://x/1"}]});
+        let out = test_items("hn-whoishiring", &data);
+        assert_eq!(out, "hn-whoishiring: 1 item\nTITLE           URL\nAcme is hiring  https://x/1");
+        assert_eq!(test_items("hn-whoishiring", &json!({"items": []})), "hn-whoishiring: no items parsed");
+    }
+
+    #[test]
+    fn test_items_never_truncates_the_url_even_when_the_title_does() {
+        // A truncated title is still a readable preview; a truncated url is a different,
+        // invalid url that 404s if anyone follows it -- the two must not be treated the same.
+        let long_title = "x".repeat(80);
+        let long_url = format!("https://www.jobbank.gc.ca/jobsearch/jobposting/{}", "1".repeat(80));
+        let data = json!({"items": [{"title": long_title, "url": long_url}]});
+        let out = test_items("jobbank-canada", &data);
+        assert!(out.ends_with(&long_url), "the full url must survive untouched:\n{out}");
+        assert!(out.contains('…'), "the long title should still be shortened for display");
+    }
+
+    #[test]
+    fn test_items_strips_control_characters_from_both_title_and_url() {
+        // Both are spec-valid ways a remote source can carry a raw control byte -- a JSON
+        // `\u001b` escape (decoded here directly, same as serde_json would) and a url that
+        // never legitimately contains one (RFC 3986 requires percent-encoding it).
+        let data = json!({"items": [{
+            "title": "Click here\u{1b}[8mhidden\u{1b}[0m",
+            "url": "https://x/1\u{1b}[2J",
+        }]});
+        let out = test_items("evil-source", &data);
+        assert!(!out.contains('\u{1b}'), "no raw control character must reach the rendered output:\n{out:?}");
+    }
+
+    fn found(source: &str, title: &str, url: &str) -> Value {
+        json!({"topic": "fetchers.item.found", "payload": {"source_name": source, "title": title, "url": url}})
+    }
+
+    #[test]
+    fn items_groups_by_source_when_none_is_given_and_shows_newest_first() {
+        let events = vec![
+            found("hn-whoishiring", "Acme hiring", "https://x/1"),
+            found("weworkremotely", "Rust role", "https://x/2"),
+        ];
+        let out = items(None, &events);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "2 items");
+        assert_eq!(lines[1], "SOURCE          TITLE        URL");
+        // events arrive oldest-first; display must flip to newest-first.
+        assert!(lines[2].contains("weworkremotely") && lines[2].contains("Rust role"), "{out}");
+        assert!(lines[3].contains("hn-whoishiring") && lines[3].contains("Acme hiring"), "{out}");
+    }
+
+    #[test]
+    fn items_for_one_source_omits_the_source_label() {
+        let events = vec![found("jobbank-canada", "Software Engineer", "https://x/1")];
+        let out = items(Some("jobbank-canada"), &events);
+        assert_eq!(out, "jobbank-canada: 1 item\nTITLE              URL\nSoftware Engineer  https://x/1");
+    }
+
+    #[test]
+    fn items_with_nothing_found_says_so_either_way() {
+        assert_eq!(items(None, &[]), "no items found yet");
+        assert_eq!(items(Some("jobbank-canada"), &[]), "jobbank-canada: no items found yet");
+    }
+
+    #[test]
+    fn fetched_pluralises_new_items() {
+        assert_eq!(fetched("hn-whoishiring", &json!({"new_items": 0})), "✓ fetched hn-whoishiring: 0 new items");
+        assert_eq!(fetched("hn-whoishiring", &json!({"new_items": 1})), "✓ fetched hn-whoishiring: 1 new item");
+    }
+
+    #[test]
+    fn terms_splits_and_trims_a_comma_list_or_is_none_when_the_flag_was_absent() {
+        assert_eq!(terms(None), None);
+        let expected: Vec<String> = ["junior", "entry level", "new grad"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(terms(Some("junior, entry level ,new grad")), Some(expected));
+        assert_eq!(terms(Some("junior")), Some(vec!["junior".to_string()]));
+    }
+
+    #[test]
+    fn title_matches_is_case_insensitive_and_excludes_win_over_contains() {
+        assert!(title_matches("Junior Rust Engineer", &[], &[]), "no filter at all keeps everything");
+        assert!(title_matches("Junior Rust Engineer", &["junior".into()], &[]));
+        assert!(!title_matches("Senior Rust Engineer", &["junior".into()], &[]), "contains must actually match");
+        assert!(
+            !title_matches("Junior Rust Engineer", &["junior".into()], &["engineer".into()]),
+            "an excludes match drops it even though contains would have kept it"
+        );
+    }
+
+    #[test]
+    fn filter_params_omits_a_field_entirely_when_its_flag_was_not_given() {
+        assert_eq!(filter_params("hn-whoishiring", &None, &None), json!({"source": "hn-whoishiring"}));
+        assert_eq!(
+            filter_params("hn-whoishiring", &Some(vec!["junior".into()]), &None),
+            json!({"source": "hn-whoishiring", "title_contains": ["junior"]})
+        );
+        assert_eq!(
+            filter_params("hn-whoishiring", &None, &Some(vec!["senior".into()])),
+            json!({"source": "hn-whoishiring", "title_excludes": ["senior"]})
+        );
+    }
+}

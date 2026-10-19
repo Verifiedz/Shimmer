@@ -47,7 +47,7 @@ params = { collection = "leetcode", id = "{id}", fields = { url = "https://x.tes
     let status = until(&home, "automations.status", json!({}), |s| !s["stopped"].as_array().unwrap().is_empty());
     assert_eq!(status["stopped"][0]["reason"], "cycle", "{status}");
 
-    let record = call(&home, "records.get", json!({"collection": "leetcode", "id": "two-sum"}));
+    let record = call(&home, "records.show", json!({"collection": "leetcode", "id": "two-sum"}));
     assert_eq!(record["url"], "https://x.test/two-sum", "the rule ran: {record}");
     let history = call(&home, "automations.history", json!({"id": "fill-url"}))["history"].clone();
     let kinds: Vec<&str> = history.as_array().unwrap().iter().filter_map(|e| e["kind"].as_str()).collect();

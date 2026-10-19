@@ -130,7 +130,7 @@ async fn activate_runs_every_step_in_order_and_goes_active() {
     let ev = env.backend.events().pop().unwrap();
     assert_eq!(ev.payload, json!({"workspace": "deep-work", "session_id": "01SESSION", "forced": false, "steps": 3}));
 
-    let status = call(&w, &env, "workspaces.status").await.unwrap();
+    let status = call(&w, &env, "workspaces.show").await.unwrap();
     assert_eq!(status["state"], "active");
     assert_eq!(status["last_session"]["outcome"], "launched");
     assert_eq!(status["last_session"]["forced"], false);
@@ -398,7 +398,7 @@ async fn force_relaunch_is_recorded_then_launches_a_dirty_workspace() {
     assert_eq!(forced.payload["prior"]["reason"], "exit code 1", "the dirty reason it overrode");
     assert_eq!(env.backend.events()[1].payload["forced"], true);
     assert_eq!(state_line(&env), "state = \"active\"");
-    assert_eq!(call(&w, &env, "workspaces.status").await.unwrap()["last_session"]["forced"], true);
+    assert_eq!(call(&w, &env, "workspaces.show").await.unwrap()["last_session"]["forced"], true);
 }
 
 #[tokio::test]

@@ -54,7 +54,7 @@ on = "records.item.updated"
 when = { collection = "${COLLECTION}", "item.${FIELD}" = "${VALUE}", changed = "${FIELD}" }
 
 [[do]]
-op = "workspaces.create"
+op = "workspaces.new"
 params = { id = "{id}-${TEMPLATE}", template = "${TEMPLATE}" } # unless ANSWERS
 params = { id = "{id}-${TEMPLATE}", template = "${TEMPLATE}", values = { ${ANSWERS} } } # if ANSWERS
 '''

@@ -126,7 +126,7 @@ fn the_built_in_rules_say_what_went_wrong_once() {
     call(&home, "workspaces.activate", json!({"id": "site"}));
     let m = message(&home, "site couldn't launch");
     assert_eq!(m["source"], "automation:workspace-dirty");
-    let full = call(&home, "notify.get", json!({"id": m["id"]}));
+    let full = call(&home, "notify.show", json!({"id": m["id"]}));
     assert!(full["body"].as_str().unwrap().ends_with("Then: shimmer workspaces cleanup site"), "{full}");
 
     // A rule that sets itself off: stopped, and loop-stopped says so.

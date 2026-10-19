@@ -52,6 +52,9 @@ pub struct Notify {
     write: WriteLock,
     /// A `notify.flush` is already queued: one is enough.
     flush_queued: AtomicBool,
+    /// Held while a flush runs: flushes go one at a time, so two never send the same summary
+    /// (#276's review).
+    flushing: tokio::sync::Mutex<()>,
     /// Ids in the order messages were sent, even several in one millisecond: the inbox and the
     /// summary read them in that order.
     ids: Mutex<ulid::Generator>,
@@ -71,6 +74,7 @@ impl Notify {
             sinks,
             write: WriteLock::default(),
             flush_queued: AtomicBool::new(false),
+            flushing: tokio::sync::Mutex::new(()),
             ids: Mutex::new(ulid::Generator::new()),
         }
     }
@@ -126,6 +130,47 @@ fn inbox_ids(ctx: &Ctx) -> Result<Vec<String>> {
 }
 
 /// Every message, oldest first. One that can't be read is skipped, never fatal to the rest.
+/// What `shimmer doctor` shows for notify (ADR 0033, ADR 0038 §6): a settings file it can't use,
+/// inbox files it can't read, messages no sink could deliver, and a pause left on. Writes nothing.
+fn health(ctx: &Ctx) -> Result<Value> {
+    let mut checks = Vec::new();
+    let (s, problem) = settings(ctx)?;
+    if let Some(problem) = problem {
+        checks.push(json!({"status": "warn", "subject": settings::FILE,
+            "message": format!("{} can't be used, so the defaults apply: {problem}", settings::FILE),
+            "fix": {"summary": format!("fix data/notify/{} by hand", settings::FILE)}}));
+    }
+    let (mut messages, mut damaged) = (Vec::new(), Vec::new());
+    for id in inbox_ids(ctx)? {
+        match read_message(ctx, &id) {
+            Ok(Some(m)) => messages.push(m),
+            Ok(None) => {}
+            Err(e) => damaged.push(e.message),
+        }
+    }
+    for problem in damaged {
+        checks.push(json!({"status": "warn", "message": problem,
+            "fix": {"summary": "fix or delete the file in data/notify/inbox/"}}));
+    }
+    let failed = messages.iter().filter(|m| m.state == State::Failed).count();
+    if failed > 0 {
+        checks.push(json!({"status": "warn",
+            "message": format!("{failed} message(s) couldn't be delivered by any way of notifying you; they're in the inbox"),
+            "fix": {"summary": "send them again", "op": "notify.resend", "params": {"state": "failed"}}}));
+    }
+    if let Some(p) = pause_now(&s, ctx) {
+        let until = p.until.map_or("until you resume".to_owned(), |t| format!("until {t}"));
+        checks.push(json!({"status": "warn", "message": format!("notifications are paused {until}"),
+            "fix": {"summary": "resume them", "op": "notify.resume", "params": {}}}));
+    }
+    if checks.is_empty() {
+        checks.push(
+            json!({"status": "ok", "message": format!("{} message(s) in the inbox, none failed", messages.len())}),
+        );
+    }
+    Ok(json!({"checks": checks}))
+}
+
 fn all_messages(ctx: &Ctx) -> Result<Vec<Message>> {
     Ok(inbox_ids(ctx)?.iter().filter_map(|id| read_message(ctx, id).ok().flatten()).collect())
 }
@@ -272,7 +317,7 @@ impl Module for Notify {
             ("notify.flush", "Send what quiet hours or a pause held back, as one summary", queued()),
             ("notify.list", "The inbox, newest first", Execution::Inline),
             ("notify.count", "How many messages match", Execution::Inline),
-            ("notify.get", "One message in full", Execution::Inline),
+            ("notify.show", "One message in full", Execution::Inline),
             ("notify.mark_read", "Mark messages read", Execution::Inline),
             ("notify.mark_unread", "Mark messages unread", Execution::Inline),
             ("notify.remove", "Delete messages", Execution::Inline),
@@ -285,6 +330,7 @@ impl Module for Notify {
             ("notify.quiet", "Show or set quiet hours", Execution::Inline),
             ("notify.cap", "Show or set how many messages the inbox keeps", Execution::Inline),
             ("notify.status", "Notify at a glance: settings, pause, counts", Execution::Inline),
+            ("notify.health", "Check notify for problems; changes nothing (ADR 0033)", Execution::Inline),
         ]
         .into_iter()
         .map(|(op, summary, execution)| CommandSpec {
@@ -304,7 +350,7 @@ impl Module for Notify {
             "notify.flush" => self.flush(ctx).await,
             "notify.list" => list(&params, ctx),
             "notify.count" => count(&params, ctx),
-            "notify.get" => get(&params, ctx),
+            "notify.show" => show(&params, ctx),
             "notify.mark_read" => self.mark(&params, ctx, true),
             "notify.mark_unread" => self.mark(&params, ctx, false),
             "notify.remove" => self.remove(&params, ctx),
@@ -313,6 +359,7 @@ impl Module for Notify {
             "notify.quiet" => self.quiet(&params, ctx),
             "notify.cap" => self.cap(&params, ctx),
             "notify.status" => self.status(ctx),
+            "notify.health" => health(ctx),
             other => Err(Error::unknown_op(format!("notify has no op '{other}'"))),
         }
     }
@@ -421,6 +468,9 @@ impl Notify {
     /// `notify.flush`: once quiet hours or a pause are over, what they held goes out as one
     /// summary. A pause that reached its end is cleared here.
     async fn flush(&self, ctx: &Ctx) -> Result<Value> {
+        // One at a time: a second flush (another `on_event`, or the hourly trigger) waits for the
+        // first to finish and clear its held markers, then finds only what's left (#276's review).
+        let _one = self.flushing.lock().await;
         self.flush_queued.store(false, Ordering::Release);
         self.clear_ended_pause(ctx)?;
         let (s, _) = settings(ctx)?;
@@ -529,8 +579,12 @@ fn cap_inbox(tx: &mut Tx<'_>, older: Vec<String>, new: Option<&str>, max: usize)
     }
     let mut entries = Vec::with_capacity(total);
     for id in older {
-        let read = tx_message(tx, &id)?.is_some_and(|m| m.read);
-        entries.push((id, read));
+        // A message that can't be read (a damaged file, or an I/O error reading it) is left alone
+        // and not counted, as `list` skips it: one bad file must never make every later send fail
+        // (#276's review).
+        if let Ok(m) = tx_message(tx, &id) {
+            entries.push((id, m.is_some_and(|m| m.read)));
+        }
     }
     if let Some(new) = new {
         entries.push((new.to_owned(), false));
@@ -596,8 +650,8 @@ fn count(params: &Value, ctx: &Ctx) -> Result<Value> {
     Ok(out)
 }
 
-/// `notify.get`: `{"id"}`, the whole id or a unique ending of one.
-fn get(params: &Value, ctx: &Ctx) -> Result<Value> {
+/// `notify.show`: `{"id"}`, the whole id or a unique ending of one.
+fn show(params: &Value, ctx: &Ctx) -> Result<Value> {
     let written = params
         .get("id")
         .and_then(Value::as_str)
@@ -675,11 +729,21 @@ impl Notify {
         ctx: &Ctx,
         f: impl FnOnce(&mut settings::File) -> Result<Vec<(&'static str, Value)>>,
     ) -> Result<settings::File> {
+        self.write_settings_with(ctx, |file, _| f(file))
+    }
+
+    /// [`write_settings`](Self::write_settings), where `f` can also stage other changes in the
+    /// same transaction, so a setting and what it does land together or not at all (§7.1).
+    fn write_settings_with(
+        &self,
+        ctx: &Ctx,
+        f: impl FnOnce(&mut settings::File, &mut Tx<'_>) -> Result<Vec<(&'static str, Value)>>,
+    ) -> Result<settings::File> {
         let _g = self.write.lock();
         let text = ctx.store.read_string(settings::FILE)?;
         let mut file = settings::editable(text.as_deref()).map_err(Error::invalid_params)?;
-        let events = f(&mut file)?;
         ctx.store.transaction(|tx| {
+            let events = f(&mut file, tx)?;
             tx.put(settings::FILE, settings::encode(&file))?;
             for (topic, payload) in events {
                 tx.emit(topic, payload)?;
@@ -720,9 +784,12 @@ impl Notify {
 
     /// `notify.resume`: stop holding, and send what waited (one flush).
     async fn resume(&self, ctx: &Ctx) -> Result<Value> {
-        let held = held_ids(ctx)?.len();
+        let mut held = 0;
         let mut was_paused = false;
         self.write_settings(ctx, |file| {
+            // Counted under the write lock that holds and releases messages, so the number is
+            // exact (#276's review).
+            held = held_ids(ctx)?.len();
             was_paused = file.pause.take().is_some();
             Ok(if was_paused { vec![("notify.pause.ended", json!({"held": held}))] } else { Vec::new() })
         })?;
@@ -800,15 +867,13 @@ impl Notify {
             .map(|n| n as usize)
             .filter(|n| *n >= settings::MIN_CAP)
             .ok_or_else(|| Error::invalid_params(format!("max is a number, at least {}", settings::MIN_CAP)))?;
-        self.write_settings(ctx, |file| {
+        // The new cap and the trimming it causes are one transaction (§7.1, #276's review).
+        let mut removed_unread = 0;
+        self.write_settings_with(ctx, |file, tx| {
             file.cap = Some(max);
+            removed_unread = cap_inbox(tx, inbox_ids(ctx)?, None, max)?;
             Ok(vec![("notify.settings.changed", json!({"cap": max}))])
         })?;
-        let removed_unread = {
-            let _g = self.write.lock();
-            let ids = inbox_ids(ctx)?;
-            ctx.store.transaction(|tx| cap_inbox(tx, ids, None, max))?
-        };
         Ok(json!({"max": max, "messages": inbox_ids(ctx)?.len(), "removed_unread": removed_unread}))
     }
 

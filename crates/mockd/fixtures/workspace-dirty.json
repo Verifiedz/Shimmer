@@ -24,7 +24,7 @@
       }
     },
     {
-      "op": "workspaces.status",
+      "op": "workspaces.show",
       "params": {
         "id": "deep-work"
       },

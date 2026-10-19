@@ -324,7 +324,7 @@ mod tests {
             f.rules.iter().any(|r| r.op == op && r.error.as_ref().map(|e| e.code) == code)
         };
         assert!(has("core.manifest", None));
-        assert!(has("fetchers.fetch", Some(ErrorCode::ConfirmationRequired)), "confirmation round trip");
+        assert!(has("fetchers.run", Some(ErrorCode::ConfirmationRequired)), "confirmation round trip");
         assert!(has("workspaces.activate", Some(ErrorCode::WorkspaceDirty)), "workspace_dirty");
         assert!(f.timeline().iter().any(|e| e.topic == "core.stream.lagged"), "stream lag");
         let progress = f.rules.iter().flat_map(|r| &r.emit).filter(|e| e.topic == "queue.task.progress").count();

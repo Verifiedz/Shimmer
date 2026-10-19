@@ -175,7 +175,7 @@ fn state_role(word: &str) -> Option<Role> {
 }
 
 /// `label` followed by spaces to `width`, in the hint colour: the labels down the left of a
-/// page about one thing (`records get`, `queue show`), so the values stand out.
+/// page about one thing (`records show`, `queue show`), so the values stand out.
 pub fn label(label: &str, width: usize) -> String {
     let pad = " ".repeat(width.saturating_sub(label.chars().count()));
     format!("{}{pad}", paint(Role::Hint, label))
