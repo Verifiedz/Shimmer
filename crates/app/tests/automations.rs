@@ -41,7 +41,7 @@ when = { collection = "leetcode" }
 op = "records.update"
 params = { collection = "leetcode", id = "{id}", fields = { url = "https://x.test/{id}" } }
 "#;
-    call(&home, "automations.create", json!({"id": "fill-url", "text": rule}));
+    call(&home, "automations.new", json!({"id": "fill-url", "text": rule}));
 
     call(&home, "records.update", json!({"collection": "leetcode", "id": "two-sum", "fields": {"difficulty": "easy"}}));
     let status = until(&home, "automations.status", json!({}), |s| !s["stopped"].as_array().unwrap().is_empty());
@@ -85,8 +85,8 @@ op = "records.update"
 params = {{ collection = "leetcode", id = "two-sum", fields = {{ url = "https://x.test/{{task_id}}" }} }}
 "#
     );
-    call(&home, "automations.create", json!({"id": "kick", "text": kick}));
-    call(&home, "automations.create", json!({"id": "looping", "text": looping}));
+    call(&home, "automations.new", json!({"id": "kick", "text": kick}));
+    call(&home, "automations.new", json!({"id": "looping", "text": looping}));
 
     call(&home, "records.update", json!({"collection": "leetcode", "id": "two-sum", "fields": {"difficulty": "easy"}}));
     let status = until(&home, "automations.status", json!({}), |s| {
@@ -130,7 +130,7 @@ op = "records.reopen"
 params = { collection = "{collection}", id = "{id}" }
 after = "60d"
 "#;
-    call(&home, "automations.create", json!({"id": "redo", "text": rule}));
+    call(&home, "automations.new", json!({"id": "redo", "text": rule}));
     call(&home, "records.complete", json!({"collection": "leetcode", "id": "two-sum"}));
 
     // Other schedules may be there too (notify declares its own): find the one the rule added.

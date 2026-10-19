@@ -132,7 +132,7 @@ fn the_built_in_rules_say_what_went_wrong_once() {
     // A rule that sets itself off: stopped, and loop-stopped says so.
     ok(&home, &["records", "add", "jobs", "--title", "Acme"]);
     let rule = "[rule]\non = \"records.item.updated\"\n[[do]]\nop = \"records.update\"\nparams = { collection = \"jobs\", id = \"{id}\", fields = { attempts = 1 } }\n";
-    call(&home, "automations.create", json!({"id": "again", "text": rule}));
+    call(&home, "automations.new", json!({"id": "again", "text": rule}));
     ok(&home, &["records", "update", "jobs/acme", "--stage", "applied"]);
     assert_eq!(message(&home, "Automation again was stopped")["source"], "automation:loop-stopped");
 

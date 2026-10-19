@@ -11,7 +11,8 @@
 //! What `__complete` prints: groups, each a `>TAG<tab>TITLE` line, then one `WORD<tab>DESCRIPTION`
 //! line per candidate. The tag is zsh's name for the group (`commands`, `workspaces`), which the
 //! zsh script colours by; the tag `files` says "complete file names here". A candidate ending
-//! in `/` (`lc/`, a collection before its record) takes no space after it.
+//! in `/` (`lc/`, a collection before its record) or `=` (`PROJECT_DIR=`, a template question
+//! before its answer) takes no space after it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -560,14 +561,19 @@ impl Groups {
 
         // Walk what's typed: positionals so far, and what the last option still wants.
         let mut positionals: Vec<String> = Vec::new();
+        // What the options typed so far were given (`--from web-project`), for what comes next.
+        let mut given: BTreeMap<String, String> = BTreeMap::new();
         let mut wanting: Option<(Opt, usize)> = None;
         for word in after {
             if let Some((opt, n)) = wanting.take() {
                 if n + 1 < opt.args.len() {
-                    wanting = Some((opt, n + 1));
+                    wanting = Some((opt.clone(), n + 1));
                 }
-                let _ = word;
+                given.insert(opt.name, word.clone());
                 continue;
+            }
+            if let Some((name, value)) = word.strip_prefix("--").and_then(|w| w.split_once('=')) {
+                given.insert(format!("--{name}"), value.to_owned());
             }
             if word.starts_with("--") && !word.contains('=') {
                 match options.iter().find(|o| &o.name == word) {
@@ -596,6 +602,9 @@ impl Groups {
                 return;
             }
             let placeholder = opt.args.get(n).cloned().unwrap_or_default();
+            if placeholder == "QUESTION=ANSWER" {
+                return self.questions(module, &cmd.word, &positionals, &given, source).await;
+            }
             if placeholder == "VALUE" && opt.args.len() == 1 {
                 // A field's own value: its choices, if it's an enum.
                 let field = opt.name.trim_start_matches('-').replace('-', "_");
@@ -797,6 +806,35 @@ impl Groups {
         }
     }
 
+    /// A template's questions after `--set`, as `NAME=` with what each asks: from `--from TEMPLATE`
+    /// for `new`, or from the workspace's own template for `copy` and `reconfigure` (ADR 0025 §9).
+    async fn questions(
+        &mut self,
+        module: &str,
+        command: &str,
+        positionals: &[String],
+        given: &BTreeMap<String, String>,
+        source: &mut impl Source,
+    ) {
+        let questions = match (module, command) {
+            (_, "new") => {
+                let Some(template) = given.get("--from") else { return };
+                let Some(data) = source.call(&format!("{module}.templates"), json!({"id": template})).await else {
+                    return;
+                };
+                data["templates"].as_array().and_then(|t| t.first()).map(|t| t["questions"].clone())
+            }
+            ("workspaces", "copy" | "reconfigure") => {
+                let Some(id) = positionals.first() else { return };
+                source.call("workspaces.answers", json!({"id": id})).await.map(|d| d["questions"].clone())
+            }
+            _ => None,
+        };
+        for q in questions.as_ref().and_then(Value::as_array).into_iter().flatten() {
+            self.add("questions", "questions", format!("{}=", text(&q["name"])), text(&q["prompt"]));
+        }
+    }
+
     async fn ops(&mut self, source: &mut impl Source) {
         let Some(data) = source.call("core.manifest", json!({})).await else { return };
         for m in data["modules"].as_array().into_iter().flatten() {
@@ -980,12 +1018,19 @@ mod tests {
                        "templates": [{"id": "leetcode", "description": "Problems"}]}),
             ),
             ("workspaces.list", json!({"workspaces": [{"id": "site", "label": "Site", "state": "ready"}]})),
+            (
+                "workspaces.templates",
+                json!({"templates": [{"id": "web-project", "questions": [
+                    {"name": "PROJECT_DIR", "prompt": "Project folder"}, {"name": "BROWSER", "prompt": "Browser"}]}]}),
+            ),
+            ("workspaces.answers", json!({"questions": [{"name": "PROJECT_DIR", "prompt": "Project folder"}]})),
             ("scheduler.list", json!({"triggers": [{"id": "usr-01JABCDEFGHJKMNPQRSTVWXYZ0", "op": "records.list"}]})),
             ("automations.list", json!({"rules": [{"id": "solved", "label": "Solved"}], "removed": ["old"]})),
             (
                 "automations.templates",
                 json!({"categories": [{"id": "messages", "label": "Tell me"}],
-                       "templates": [{"id": "notify-on-add", "description": "A message"}]}),
+                       "templates": [{"id": "notify-on-add", "description": "A message", "questions": [
+                           {"name": "COLLECTION", "prompt": "Which collection"}]}]}),
             ),
             (
                 "core.manifest",
@@ -1194,6 +1239,22 @@ mod tests {
         assert!(words("packs use ").await.contains(&"none".to_owned()));
         assert!(words("packs use ").await.contains(&"short".to_owned()));
         assert!(words("--pack ").await.contains(&"starship".to_owned()));
+    }
+
+    /// `--set <Tab>` offers the template's questions as `NAME=`, which take no space after them.
+    #[tokio::test]
+    async fn set_offers_the_templates_questions() {
+        let new = words("workspaces new site --from web-project --set ").await;
+        assert_eq!(new, ["PROJECT_DIR=", "BROWSER="]);
+        assert_eq!(words("workspaces new site --from=web-project --set ").await, new, "--from=VALUE too");
+        assert!(words("workspaces new site --set ").await.is_empty(), "no template yet: nothing to offer");
+        assert_eq!(words("workspaces copy site site-2 --set ").await, ["PROJECT_DIR="], "the workspace's own template");
+        assert_eq!(words("workspaces reconfigure site --set ").await, ["PROJECT_DIR="]);
+        assert_eq!(
+            words("automations new mine --from notify-on-add --set ").await,
+            ["COLLECTION="],
+            "rule templates too"
+        );
     }
 
     #[tokio::test]

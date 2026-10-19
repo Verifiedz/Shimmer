@@ -121,11 +121,14 @@ pub const TARGETS: &[Target] = &[
     Target { op: "scheduler.remove", words: &["scheduler", "remove"] },
     // ADR 0035 §8: automations.
     Target { op: "automations.list", words: &["automations", "list"] },
-    Target { op: "automations.get", words: &["automations", "show"] },
-    Target { op: "automations.create", words: &["automations", "new"] },
-    Target { op: "automations.save", words: &["automations", "edit"] },
+    Target { op: "automations.show", words: &["automations", "show"] },
+    Target { op: "automations.new", words: &["automations", "new"] },
+    Target { op: "automations.edit", words: &["automations", "edit"] },
     Target { op: "automations.remove", words: &["automations", "remove"] },
     Target { op: "automations.restore", words: &["automations", "restore"] },
+    Target { op: "automations.purge", words: &["automations", "purge"] },
+    Target { op: "automations.rename", words: &["automations", "rename"] },
+    Target { op: "automations.copy", words: &["automations", "copy"] },
     Target { op: "automations.enable", words: &["automations", "enable"] },
     Target { op: "automations.disable", words: &["automations", "disable"] },
     Target { op: "automations.test", words: &["automations", "test"] },
@@ -459,7 +462,7 @@ label = "My Pack"
 
     #[test]
     fn every_target_is_an_op_with_its_command_words() {
-        assert_eq!(TARGETS.len(), 84);
+        assert_eq!(TARGETS.len(), 87);
         // Where the CLI's word differs from the op's verb (ADR 0015 §1).
         let renamed = [
             ("queue.task", "show"),
@@ -467,9 +470,6 @@ label = "My Pack"
             ("records.create_collection", "new"),
             ("workspaces.create", "new"),
             ("scheduler.get", "show"),
-            ("automations.get", "show"),
-            ("automations.create", "new"),
-            ("automations.save", "edit"),
             ("notify.get", "show"),
         ];
         for t in TARGETS {

@@ -237,7 +237,7 @@ fn prints_data(cmd: &Command) -> bool {
             | Command::Scheduler(SchedulerCmd::List | SchedulerCmd::Show { .. })
             // Every reply that can carry a rule's label, which is the person's text (#253's review).
             | Command::Automations(
-                AutomationsCmd::List
+                AutomationsCmd::List { .. }
                     | AutomationsCmd::Show { .. }
                     | AutomationsCmd::New { .. }
                     | AutomationsCmd::Edit { .. }
