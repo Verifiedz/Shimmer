@@ -178,8 +178,10 @@ The event object is byte-identical to the one appended to
 `$SHIMMER_HOME/events/YYYY-MM-DD.jsonl`. One definition in `shimmer-core`. The one exception to
 "every streamed event is logged" is `queue.task.progress`, which is streamed only.
 
-`cause` is the id of the queued task the event was emitted from, and is absent for anything
-else: a request answered inline, or the queue's own `queue.task.*` events (ADR 0035 §5.1).
+`cause` is the id of the queued task the event was emitted from, and is absent for a request
+answered inline (ADR 0035 §5.1). The queue's own events about a task (`queue.task.*`, and
+`queue.fallback.*` about the failed task) carry that task as their `cause`, so a rule set off by
+its own action's `queue.task.finished` continues its chain (#251's review).
 Automations uses it to follow a chain of rules; a client may ignore it. Older log lines have no
 `cause` and read unchanged.
 
