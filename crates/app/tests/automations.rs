@@ -95,13 +95,15 @@ params = {{ collection = "leetcode", id = "two-sum", fields = {{ url = "https://
     let stop = status["stopped"].as_array().unwrap().iter().find(|x| x["rule"] == "looping").unwrap().clone();
     assert!(matches!(stop["reason"].as_str(), Some("cycle" | "depth")), "{stop}");
 
-    // Stopped means stopped: no more firings a while later.
-    let after_stop = fired(&home, "looping");
+    // Stopped means stopped: after a moment to settle (the built-in alert about the stop is a
+    // task too, and the rule may react to it once more), no more firings at all.
     std::thread::sleep(Duration::from_secs(2));
-    assert_eq!(fired(&home, "looping"), after_stop, "it kept firing after it was stopped");
+    let settled = fired(&home, "looping");
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(fired(&home, "looping"), settled, "it kept firing after it was stopped");
     // Bounded, not once: a rule on `*` reacts once to each of its first task's few events
     // (enqueued, started, finished, the record's update); every follow-up is then a cycle.
-    assert!(after_stop <= 8, "fired {after_stop} times before the guard stopped it");
+    assert!(settled <= 10, "fired {settled} times before the guard stopped it for good");
 }
 
 #[test]
