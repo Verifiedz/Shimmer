@@ -8,7 +8,7 @@ pub mod chain;
 pub mod rule;
 pub mod template;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -28,6 +28,8 @@ const SETTINGS: &str = "settings.toml";
 const HISTORY: &str = "history.json";
 /// Firings kept in `history.json`, oldest dropped; the event log keeps them all (§8).
 const HISTORY_KEPT: usize = 300;
+/// After the loop guard reports stopping a rule, further stops of it are quiet this long.
+const STOP_QUIET: chrono::Duration = chrono::Duration::minutes(10);
 /// The depth limit's default and range (§3).
 const DEPTH: usize = 3;
 const DEPTH_RANGE: std::ops::RangeInclusive<usize> = 1..=10;
@@ -64,6 +66,9 @@ struct State {
     problems: Vec<(String, String)>,
     chains: Chains,
     depth: usize,
+    /// When the loop guard last reported stopping each rule, to report it once in a while, not
+    /// every time it stops again (see `react`).
+    last_stopped: HashMap<String, DateTime<Utc>>,
 }
 
 impl Automations {
@@ -132,6 +137,11 @@ impl Automations {
         for rule in matched {
             let done = match chain.next(&rule.id, depth) {
                 Ok(next) => self.fire(&rule, ev, next, ctx).await,
+                // A stop is reported once per rule per STOP_QUIET. Reporting it sets off the built-in
+                // alert, whose message is a new task; a rule on `queue.task.*` or `*` reacts to that
+                // task in a fresh chain and is stopped again, and a report every time would loop
+                // forever, one alert per round (found testing #252's review). Stopped all the same.
+                Err(_) if self.recently_stopped(&rule.id, ctx) => Ok(()),
                 Err(stop) => {
                     let payload = json!({"chain": chain.id, "rules": chain.rules, "rule": rule.id,
                         "reason": stop.as_str(), "event": {"id": ev.id, "topic": ev.topic}});
@@ -145,6 +155,19 @@ impl Automations {
         match failures.is_empty() {
             true => Ok(()),
             false => Err(Error::internal(failures.join("; "))),
+        }
+    }
+
+    /// Whether `rule`'s stop was reported in the last [`STOP_QUIET`]; if not, notes it now.
+    fn recently_stopped(&self, rule: &str, ctx: &Ctx) -> bool {
+        let now = ctx.clock.now();
+        let mut st = self.state();
+        match st.last_stopped.get(rule) {
+            Some(at) if now.signed_duration_since(*at) < STOP_QUIET => true,
+            _ => {
+                st.last_stopped.insert(rule.to_owned(), now);
+                false
+            }
         }
     }
 
