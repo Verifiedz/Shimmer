@@ -4,20 +4,57 @@
 //! [`crate::source::registry`].
 
 use async_trait::async_trait;
-use serde_json::json;
+use serde_json::{json, Map, Value};
 use shimmer_core::{Ctx, Error, Result};
 
 use crate::http;
+use crate::kind::{self, Kind, KindConfig};
 use crate::source::{Method, Page, RawItem, Source};
 
 pub struct Rss {
     id: String,
     url: String,
+    credential: Option<String>,
 }
 
 impl Rss {
-    pub fn new(id: String, url: String) -> Self {
-        Self { id, url }
+    pub fn new(id: String, url: String, credential: Option<String>) -> Self {
+        Self { id, url, credential }
+    }
+}
+
+/// The `rss` kind (ADR 0028 §3): one required field, `url`; an optional `credential` (ADR
+/// 0036, ADR 0028 §4) for a feed that needs an auth header.
+pub struct RssKind;
+
+const RSS_FIELDS: &[&str] = &["url", "credential"];
+
+impl Kind for RssKind {
+    fn name(&self) -> &'static str {
+        "rss"
+    }
+
+    fn method(&self) -> Method {
+        Method::Api
+    }
+
+    fn parse(&self, params: &Map<String, Value>) -> std::result::Result<Box<dyn KindConfig>, String> {
+        kind::reject_unknown(params, RSS_FIELDS)?;
+        let url = kind::required_url(params, "url")?;
+        let credential = kind::optional_str(params, "credential")?;
+        Ok(Box::new(RssConfig { url, credential }))
+    }
+}
+
+#[derive(Debug)]
+struct RssConfig {
+    url: String,
+    credential: Option<String>,
+}
+
+impl KindConfig for RssConfig {
+    fn build(&self, id: String) -> std::sync::Arc<dyn Source> {
+        std::sync::Arc::new(Rss::new(id, self.url.clone(), self.credential.clone()))
     }
 }
 
@@ -43,7 +80,10 @@ impl Source for Rss {
             return Ok(Page::default());
         }
 
-        let resp = http::require_ok(http::get(ctx, &self.url).await?, &self.url)?;
+        let resp = match &self.credential {
+            Some(c) => http::require_ok(http::get_with_credential(ctx, &self.url, c).await?, &self.url)?,
+            None => http::require_ok(http::get(ctx, &self.url).await?, &self.url)?,
+        };
         // feed-rs fills in any entry id the feed itself left blank (`assign_missing_ids` ->
         // `generate_id`): a hash of the entry's link + title when both exist, or a random
         // UUID when it has neither. A hash keyed on title changes the dedup key the moment
@@ -197,7 +237,7 @@ mod tests {
 
     #[test]
     fn id_is_whatever_it_was_constructed_with_and_method_is_api() {
-        let rss = Rss::new("my-team-blog".into(), "https://example.test/feed.xml".into());
+        let rss = Rss::new("my-team-blog".into(), "https://example.test/feed.xml".into(), None);
         assert_eq!(rss.id(), "my-team-blog");
         assert_eq!(rss.method(), Method::Api);
     }
@@ -206,7 +246,7 @@ mod tests {
     async fn both_entries_parse_with_their_dedup_key_title_and_url() {
         let env = TestEnv::new("fetchers");
         stub(&env, "https://example.test/feed.xml", ok(ATOM_FEED));
-        let rss = Rss::new("my-team-blog".into(), "https://example.test/feed.xml".into());
+        let rss = Rss::new("my-team-blog".into(), "https://example.test/feed.xml".into(), None);
 
         let page = rss.fetch_page(&env.ctx, None).await.unwrap();
         assert_eq!(page.items.len(), 2);
@@ -222,7 +262,7 @@ mod tests {
     async fn an_entry_with_no_feed_supplied_id_gets_a_dedup_key_derived_from_its_link() {
         let env = TestEnv::new("fetchers");
         stub(&env, "https://example.test/feed.xml", ok(&no_id_feed_with_title("Original title")));
-        let rss = Rss::new("my-team-blog".into(), "https://example.test/feed.xml".into());
+        let rss = Rss::new("my-team-blog".into(), "https://example.test/feed.xml".into(), None);
 
         let page = rss.fetch_page(&env.ctx, None).await.unwrap();
         assert_eq!(page.items.len(), 1);
@@ -235,7 +275,7 @@ mod tests {
         // link + title together, so an edited title alone would otherwise mint a brand
         // new id and the item would be wrongly re-emitted as new.
         let env = TestEnv::new("fetchers");
-        let rss = Rss::new("my-team-blog".into(), "https://example.test/feed.xml".into());
+        let rss = Rss::new("my-team-blog".into(), "https://example.test/feed.xml".into(), None);
 
         stub(&env, "https://example.test/feed.xml", ok(&no_id_feed_with_title("Original title")));
         let first = rss.fetch_page(&env.ctx, None).await.unwrap();
@@ -252,7 +292,7 @@ mod tests {
         // make this item look "new" on every single parse -- the opposite of dedup.
         let env = TestEnv::new("fetchers");
         stub(&env, "https://example.test/feed.xml", ok(NO_ID_NO_LINK_FEED));
-        let rss = Rss::new("my-team-blog".into(), "https://example.test/feed.xml".into());
+        let rss = Rss::new("my-team-blog".into(), "https://example.test/feed.xml".into(), None);
 
         let page = rss.fetch_page(&env.ctx, None).await.unwrap();
         assert!(page.items.is_empty());
@@ -262,7 +302,7 @@ mod tests {
     async fn an_entry_with_an_explicit_id_but_no_link_is_skipped() {
         let env = TestEnv::new("fetchers");
         stub(&env, "https://example.test/feed.xml", ok(EXPLICIT_ID_NO_LINK_FEED));
-        let rss = Rss::new("my-team-blog".into(), "https://example.test/feed.xml".into());
+        let rss = Rss::new("my-team-blog".into(), "https://example.test/feed.xml".into(), None);
 
         let page = rss.fetch_page(&env.ctx, None).await.unwrap();
         assert!(page.items.is_empty(), "no link means no usable url, even with an explicit id");
@@ -272,7 +312,7 @@ mod tests {
     async fn zero_entries_is_an_empty_page_not_a_failure() {
         let env = TestEnv::new("fetchers");
         stub(&env, "https://example.test/feed.xml", ok(EMPTY_ATOM_FEED));
-        let rss = Rss::new("my-team-blog".into(), "https://example.test/feed.xml".into());
+        let rss = Rss::new("my-team-blog".into(), "https://example.test/feed.xml".into(), None);
 
         let page = rss.fetch_page(&env.ctx, None).await.unwrap();
         assert!(page.items.is_empty());
@@ -284,7 +324,7 @@ mod tests {
         let env = TestEnv::new("fetchers");
         // Deliberately no stub for the url -- if this impl ever tried to re-fetch for a
         // cursor it never hands out, the test would fail with "no stub for...".
-        let rss = Rss::new("my-team-blog".into(), "https://example.test/feed.xml".into());
+        let rss = Rss::new("my-team-blog".into(), "https://example.test/feed.xml".into(), None);
         let page = rss.fetch_page(&env.ctx, Some("anything")).await.unwrap();
         assert!(page.items.is_empty());
     }
@@ -293,10 +333,47 @@ mod tests {
     async fn malformed_xml_is_a_classifiable_module_error() {
         let env = TestEnv::new("fetchers");
         stub(&env, "https://example.test/feed.xml", ok("not a feed at all"));
-        let rss = Rss::new("my-team-blog".into(), "https://example.test/feed.xml".into());
+        let rss = Rss::new("my-team-blog".into(), "https://example.test/feed.xml".into(), None);
 
         let err = rss.fetch_page(&env.ctx, None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::ModuleError);
         assert!(err.message.contains("could not parse feed"), "{}", err.message);
+    }
+
+    fn params(v: Value) -> Map<String, Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn rss_kind_parses_a_url_and_an_optional_credential() {
+        let cfg = RssKind.parse(&params(json!({"url": "https://example.test/feed.xml"}))).unwrap();
+        let source = cfg.build("my-team-blog".into());
+        assert_eq!(source.id(), "my-team-blog");
+        assert_eq!(source.method(), Method::Api);
+
+        let cfg =
+            RssKind.parse(&params(json!({"url": "https://example.test/feed.xml", "credential": "my-key"}))).unwrap();
+        cfg.build("my-team-blog".into()); // doesn't panic; credential plumbing checked below
+    }
+
+    #[test]
+    fn rss_kind_rejects_a_missing_or_malformed_url_and_any_unknown_field() {
+        assert!(RssKind.parse(&params(json!({}))).unwrap_err().contains("url"));
+        assert!(RssKind.parse(&params(json!({"url": "not-a-url"}))).unwrap_err().contains("url"));
+        assert!(RssKind.parse(&params(json!({"url": "ftp://x.test/f.xml"}))).unwrap_err().contains("url"));
+        assert!(RssKind.parse(&params(json!({"url": "https://x.test/f.xml", "credential": "  "}))).is_err());
+        let err = RssKind.parse(&params(json!({"url": "https://x.test/f.xml", "items_path": "jobs"}))).unwrap_err();
+        assert!(err.contains("items_path"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_configured_credential_is_attached_to_every_request() {
+        let env = TestEnv::new("fetchers");
+        stub(&env, "https://example.test/feed.xml", ok(EMPTY_ATOM_FEED));
+        let rss = Rss::new("my-team-blog".into(), "https://example.test/feed.xml".into(), Some("my-key".into()));
+
+        rss.fetch_page(&env.ctx, None).await.unwrap();
+        let calls = env.http.calls.lock().unwrap();
+        assert_eq!(calls.last(), Some(&("https://example.test/feed.xml".to_string(), Some("my-key".to_string()))));
     }
 }

@@ -153,53 +153,15 @@ pub fn resolve(ctx: &Ctx, id: &str) -> Result<Option<std::sync::Arc<dyn Source>>
 }
 
 fn resolve_from(config: &FetchersConfig, id: &str) -> Result<Option<std::sync::Arc<dyn Source>>> {
-    match config.sources.get(id).and_then(|c| c.kind.as_deref()) {
-        Some("rss") => {
-            let url = config.sources.get(id).and_then(|c| c.url.as_deref()).ok_or_else(|| {
-                Error::internal(format!("sources.{id}: kind \"rss\" has no url despite passing load-time validation"))
-            })?;
-            Ok(Some(std::sync::Arc::new(crate::sources::rss::Rss::new(id.to_string(), url.to_string()))))
-        }
-        Some("json-api") => {
-            let cfg = config.sources.get(id).ok_or_else(|| {
-                Error::internal(format!(
-                    "sources.{id}: kind \"json-api\" has no config despite passing load-time validation"
-                ))
-            })?;
-            let missing = |field: &str| {
-                Error::internal(format!(
-                    "sources.{id}: kind \"json-api\" has no {field} despite passing load-time validation"
-                ))
-            };
-            let url = cfg.url.clone().ok_or_else(|| missing("url"))?;
-            let id_field = cfg.id_field.clone().ok_or_else(|| missing("id_field"))?;
-            let title_field = cfg.title_field.clone().ok_or_else(|| missing("title_field"))?;
-            let url_field = cfg.url_field.clone().ok_or_else(|| missing("url_field"))?;
-            let items_path = cfg.items_path.clone().unwrap_or_default();
-            let pagination = match cfg.pagination.as_deref().unwrap_or("none") {
-                "offset" => {
-                    let page_size = cfg.page_size.ok_or_else(|| missing("page_size"))?;
-                    crate::sources::json_api::Pagination::Offset { page_size }
-                }
-                _ => crate::sources::json_api::Pagination::None,
-            };
-            Ok(Some(std::sync::Arc::new(crate::sources::json_api::JsonApi::new(
-                id.to_string(),
-                url,
-                items_path,
-                id_field,
-                title_field,
-                url_field,
-                cfg.url_base.clone(),
-                pagination,
-                cfg.active_field.clone(),
-            ))))
-        }
-        Some(other) => {
-            Err(Error::internal(format!("sources.{id}: unknown kind \"{other}\" despite passing load-time validation")))
-        }
-        None => Ok(find(id)),
-    }
+    let Some(cfg) = config.sources.get(id) else { return Ok(find(id)) };
+    let Some(kind_name) = cfg.kind.as_deref() else { return Ok(find(id)) };
+    let kind = crate::kind::kind(kind_name).ok_or_else(|| {
+        Error::internal(format!("sources.{id}: unknown kind \"{kind_name}\" despite passing load-time validation"))
+    })?;
+    let parsed = kind.parse(&cfg.kind_params).map_err(|m| {
+        Error::internal(format!("sources.{id}: kind \"{kind_name}\" {m} despite passing load-time validation"))
+    })?;
+    Ok(Some(parsed.build(id.to_string())))
 }
 
 /// Every source `fetchers.list`/`fetchers.status` surface *unprompted*: a fixed [`registry`]

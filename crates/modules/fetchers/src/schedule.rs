@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use shimmer_core::{CatchUp, Ctx, Error, Result, Schedule, TriggerSpec};
 
 /// How often the heartbeat fires.
@@ -64,7 +64,6 @@ pub struct FetchersConfig {
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct SourceConfig {
     /// Every source starts disabled (ADR 0028 §5) -- the user opts in explicitly.
     #[serde(default)]
@@ -72,46 +71,9 @@ pub struct SourceConfig {
     pub interval: IntervalSpec,
     /// Absent: `id` must already be one of the fixed, compiled-in sources
     /// (`crate::source::registry`) -- today's behavior, unchanged. Present: build a new
-    /// instance of this *kind* instead (ADR 0028 §2a) -- currently only `"rss"`.
+    /// instance of this *kind* instead (ADR 0028 §2a/§3), via `crate::kind::kind`.
     #[serde(default)]
     pub kind: Option<String>,
-    /// The `rss` kind's one required setting (ADR 0028 §2a), and the `json-api` kind's own
-    /// endpoint (ADR 0028 §15, which also reuses this field rather than inventing a second
-    /// one). Meaningless, and left unvalidated, when `kind` is absent or neither of those.
-    #[serde(default)]
-    pub url: Option<String>,
-    /// `json-api` only (ADR 0028 §15): dot-separated path from the response root to the
-    /// items array. Omitted (or empty) means the response root is already that array.
-    #[serde(default)]
-    pub items_path: Option<String>,
-    /// `json-api` only: the field within each item holding its dedup key.
-    #[serde(default)]
-    pub id_field: Option<String>,
-    /// `json-api` only: the field within each item holding its title.
-    #[serde(default)]
-    pub title_field: Option<String>,
-    /// `json-api` only: the field within each item holding its url.
-    #[serde(default)]
-    pub url_field: Option<String>,
-    /// `json-api` only: prepended to `url_field`'s value when that field is a site-relative
-    /// path rather than already absolute (e.g. Amazon's own job search endpoint).
-    #[serde(default)]
-    pub url_base: Option<String>,
-    /// `json-api` only: `"none"` (default, everything in one response) or `"offset"` (`url`
-    /// must contain a literal `{offset}` placeholder, driven by `page_size`).
-    #[serde(default)]
-    pub pagination: Option<String>,
-    /// `json-api` only: required, and must be greater than 0, when `pagination = "offset"`.
-    #[serde(default)]
-    pub page_size: Option<u32>,
-    /// `json-api` only: the field within each item that marks it still open. When set, an
-    /// item whose value there is the boolean `false` is dropped before dedup ever sees it --
-    /// a feed that keeps already-closed postings around (e.g. a community-maintained
-    /// listings archive) would otherwise surface dead links as "new". Missing, non-boolean,
-    /// or `true` all pass through unfiltered; omitted entirely means no such field exists
-    /// and nothing is dropped on this basis.
-    #[serde(default)]
-    pub active_field: Option<String>,
     /// A title must contain at least one of these (case-insensitive substring, OR-matched)
     /// to be kept. Empty means no inclusion filter at all -- everything passes this stage.
     #[serde(default)]
@@ -122,6 +84,15 @@ pub struct SourceConfig {
     /// searched.
     #[serde(default)]
     pub title_excludes: Vec<String>,
+    /// Everything else in this entry -- a configured `kind`'s own fields, untouched and
+    /// opaque to this struct. Handed to `crate::kind::Kind::parse` as-is; that kind's own
+    /// code is the only thing that knows what any of these keys mean (ADR 0028 §3). No
+    /// `#[serde(deny_unknown_fields)]` on this struct any more -- flatten and
+    /// `deny_unknown_fields` don't compose in serde, so each kind's `parse` now rejects a key
+    /// it doesn't recognise itself (`crate::kind::reject_unknown`), including a kind with no
+    /// fields of its own rejecting *any* stray key.
+    #[serde(flatten)]
+    pub kind_params: Map<String, Value>,
 }
 
 impl SourceConfig {
@@ -249,12 +220,8 @@ fn validate_source(id: &str, source: &SourceConfig) -> Result<()> {
         }
     }
     // Each `Method` gets its own floor (ADR 0028 §5/§7) -- a scraped page must not be
-    // pollable at an API source's much lower cadence (PR #126 review). For a `kind`
-    // entry there is no fixed `Source` to ask yet (it is only ever built by
-    // `crate::source::resolve`, lazily, per `Ctx`) -- but `sources::rss::Rss::method`
-    // always answers `Method::Api` (a feed url is a known endpoint, not a crawled
-    // page), so the `"rss"` floor can be hardcoded here rather than instantiating one
-    // just to ask.
+    // pollable at an API source's much lower cadence (PR #126 review). `Kind::method` is
+    // static per kind, so this needs no built `Source` to ask.
     let floor = match source.kind.as_deref() {
         None => {
             let Some(found) = crate::source::find(id) else {
@@ -270,7 +237,7 @@ fn validate_source(id: &str, source: &SourceConfig) -> Result<()> {
                 crate::source::Method::Scrape => MIN_INTERVAL_SCRAPE_S,
             }
         }
-        Some(kind) => {
+        Some(kind_name) => {
             // A `kind` entry builds a brand-new instance (`crate::source::resolve`)
             // rather than adjusting a fixed, compiled-in one -- so an id that
             // already belongs to the fixed registry would either sit alongside it
@@ -281,91 +248,25 @@ fn validate_source(id: &str, source: &SourceConfig) -> Result<()> {
             // win.
             if crate::source::find(id).is_some() {
                 return Err(Error::invalid_params(format!(
-                    "sources.{id}: kind \"{kind}\" collides with a fixed, compiled-in source of the same id"
+                    "sources.{id}: kind \"{kind_name}\" collides with a fixed, compiled-in source of the same id"
                 )));
             }
-            match kind {
-                "rss" => {
-                    let url = source.url.as_deref().unwrap_or_default().trim();
-                    if url.is_empty() {
-                        return Err(Error::invalid_params(format!("sources.{id}: kind \"rss\" needs a non-empty url")));
-                    }
-                    if !is_http_url(url) {
-                        return Err(Error::invalid_params(format!(
-                            "sources.{id}: kind \"rss\" url must be a well-formed http:// or https:// url, got '{url}'"
-                        )));
-                    }
-                    MIN_INTERVAL_API_S
-                }
-                "json-api" => {
-                    let url = source.url.as_deref().unwrap_or_default().trim();
-                    if url.is_empty() {
-                        return Err(Error::invalid_params(format!(
-                            "sources.{id}: kind \"json-api\" needs a non-empty url"
-                        )));
-                    }
-                    if !is_http_url(url) {
-                        return Err(Error::invalid_params(format!(
-                                "sources.{id}: kind \"json-api\" url must be a well-formed http:// or https:// url, got '{url}'"
-                            )));
-                    }
-                    for (field_name, value) in [
-                        ("id_field", &source.id_field),
-                        ("title_field", &source.title_field),
-                        ("url_field", &source.url_field),
-                    ] {
-                        if value.as_deref().unwrap_or_default().trim().is_empty() {
-                            return Err(Error::invalid_params(format!(
-                                "sources.{id}: kind \"json-api\" needs a non-empty {field_name}"
-                            )));
-                        }
-                    }
-                    if let Some(field) = &source.active_field {
-                        if field.trim().is_empty() {
-                            return Err(Error::invalid_params(format!(
-                                "sources.{id}: kind \"json-api\" active_field must be non-empty when given"
-                            )));
-                        }
-                    }
-                    match source.pagination.as_deref().unwrap_or("none") {
-                        "none" => {}
-                        "offset" => {
-                            if source.page_size.unwrap_or(0) == 0 {
-                                return Err(Error::invalid_params(format!(
-                                    "sources.{id}: kind \"json-api\" pagination \"offset\" needs page_size > 0"
-                                )));
-                            }
-                            if !url.contains("{offset}") {
-                                return Err(Error::invalid_params(format!(
-                                        "sources.{id}: kind \"json-api\" pagination \"offset\" needs a literal '{{offset}}' placeholder in url"
-                                    )));
-                            }
-                        }
-                        other => {
-                            return Err(Error::invalid_params(format!(
-                                    "sources.{id}: kind \"json-api\" has unknown pagination \"{other}\" (known: none, offset)"
-                                )));
-                        }
-                    }
-                    MIN_INTERVAL_API_S
-                }
-                other => {
-                    return Err(Error::invalid_params(format!(
-                        "sources.{id}: unknown kind \"{other}\" (known: rss, json-api)"
-                    )));
-                }
+            let kind = crate::kind::kind(kind_name).ok_or_else(|| {
+                Error::invalid_params(format!(
+                    "sources.{id}: unknown kind \"{kind_name}\" (known: {})",
+                    crate::kind::known_names()
+                ))
+            })?;
+            kind.parse(&source.kind_params)
+                .map_err(|m| Error::invalid_params(format!("sources.{id}: kind \"{kind_name}\" {m}")))?;
+            match kind.method() {
+                crate::source::Method::Api => MIN_INTERVAL_API_S,
+                crate::source::Method::Scrape => MIN_INTERVAL_SCRAPE_S,
             }
         }
     };
     source.interval.resolve(floor).map_err(|e| Error::invalid_params(format!("sources.{id}.interval: {e}")))?;
     Ok(())
-}
-
-/// `url` is deliberately not a free-text field: an `rss` source feeds straight into
-/// `http::get` (ADR 0028 §2a), so a malformed value would otherwise surface as a cryptic
-/// connection error deep in the first tick rather than a clear one at load time.
-fn is_http_url(candidate: &str) -> bool {
-    matches!(url::Url::parse(candidate), Ok(u) if u.scheme() == "http" || u.scheme() == "https")
 }
 
 /// Every enabled, configured source whose interval has elapsed since its last run (or that
@@ -635,7 +536,10 @@ mod tests {
             "sources": {"my-team-blog": {"enabled": true, "interval": "hourly", "kind": "rss", "url": "https://example.test/feed.xml"}}
         }))
         .unwrap();
-        assert_eq!(cfg.sources["my-team-blog"].url.as_deref(), Some("https://example.test/feed.xml"));
+        assert_eq!(
+            cfg.sources["my-team-blog"].kind_params.get("url").and_then(Value::as_str),
+            Some("https://example.test/feed.xml")
+        );
     }
 
     #[test]
@@ -737,7 +641,7 @@ mod tests {
             }}
         }))
         .unwrap();
-        assert_eq!(cfg.sources["acme-jobs"].active_field.as_deref(), Some("active"));
+        assert_eq!(cfg.sources["acme-jobs"].kind_params.get("active_field").and_then(Value::as_str), Some("active"));
     }
 
     #[test]
@@ -758,17 +662,9 @@ mod tests {
             enabled,
             interval: IntervalSpec::Seconds(interval_s),
             kind: None,
-            url: None,
-            items_path: None,
-            id_field: None,
-            title_field: None,
-            url_field: None,
-            url_base: None,
-            pagination: None,
-            page_size: None,
-            active_field: None,
             title_contains: Vec::new(),
             title_excludes: Vec::new(),
+            kind_params: Map::new(),
         }
     }
 

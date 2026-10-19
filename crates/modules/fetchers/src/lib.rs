@@ -5,9 +5,11 @@
 //! [`source`] is the `Source` trait (ADR 0028 §2); [`sources`] holds one file per
 //! implementation -- `hn-whoishiring` (`Method::Api`) and `weworkremotely` (`Method::Scrape`),
 //! the fixed reference sources from ADR 0028 §10 that [`source::registry`] always compiles
-//! in, plus `rss`, a configured *kind* (ADR 0028 §2a) [`source::resolve`] builds on demand.
-//! [`source::known`] only reports a fixed source once the user has given it its own config
-//! entry (ADR 0028 §19). [`dedup`] has the
+//! in, plus `rss` and `json-api`, generic *kinds* (ADR 0028 §2a/§3/§15) [`source::resolve`]
+//! builds on demand from a config entry, by way of [`kind`]'s `Kind`/`KindConfig` traits --
+//! adding one is adding a file implementing those, never an edit to `schedule.rs`'s validator
+//! or `source.rs`'s resolver. [`source::known`] only reports a fixed source once the user has
+//! given it its own config entry (ADR 0028 §19). [`dedup`] has the
 //! per-source "seen" bookkeeping and [`RunGuard`](dedup::RunGuard), the overlap guard
 //! (ADR 0028 §4, §5). [`http`] is the retry wrapper around `ctx.http.get` (ADR 0028 §6);
 //! [`html`] and [`robots`] are the scraping and robots.txt helpers `weworkremotely` uses,
@@ -21,6 +23,7 @@
 pub mod dedup;
 pub mod html;
 pub mod http;
+pub mod kind;
 mod module;
 pub mod robots;
 mod schedule;
