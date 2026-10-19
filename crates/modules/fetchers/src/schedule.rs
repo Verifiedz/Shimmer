@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use shimmer_core::{CatchUp, Ctx, Error, Result, Schedule, TriggerSpec};
 
@@ -142,8 +142,10 @@ pub struct SourceConfig {
 }
 
 /// The file as written, `data/fetchers/sources/<id>.toml` (ADR 0028 §4): `[source]`, the
-/// envelope every kind shares, and `[kind]`, that kind's own fields.
-#[derive(Deserialize)]
+/// envelope every kind shares, and `[kind]`, that kind's own fields. Also `Serialize` --
+/// [`render`] builds this same shape from `fetchers.new`/`.edit`'s structured params, so a
+/// structured command and a hand-edited file go through the exact same [`SourceConfig::parse`].
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SourceFile {
     source: SourceMeta,
@@ -151,20 +153,54 @@ struct SourceFile {
     kind: toml::Table,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SourceMeta {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     label: Option<String>,
     #[serde(default)]
     enabled: bool,
     interval: IntervalSpec,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     kind: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     title_contains: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     title_excludes: Vec<String>,
+}
+
+/// Builds a source file's TOML text from `fetchers.new`/`.edit`'s structured params (ADR 0028
+/// §9) -- the mechanical inverse of [`SourceConfig::parse`], so a structured command, a
+/// template (later), and a hand-edited-then-`fetchers.reload`ed file all produce and accept
+/// the identical on-disk shape. Validation stays centralized in `SourceConfig::parse`, called
+/// on this function's own output by the caller -- this function only renders text, it never
+/// decides whether that text is valid.
+pub(crate) fn render(
+    label: Option<&str>,
+    kind: Option<&str>,
+    enabled: bool,
+    interval: &IntervalSpec,
+    params: &Map<String, Value>,
+    title_contains: &[String],
+    title_excludes: &[String],
+) -> std::result::Result<String, String> {
+    let kind_table = match toml::Value::try_from(params) {
+        Ok(toml::Value::Table(t)) => t,
+        Ok(_) => unreachable!("a JSON object always serializes to a toml table"),
+        Err(e) => return Err(format!("params: {e}")),
+    };
+    let file = SourceFile {
+        source: SourceMeta {
+            label: label.map(str::to_owned),
+            enabled,
+            interval: interval.clone(),
+            kind: kind.map(str::to_owned),
+            title_contains: title_contains.to_vec(),
+            title_excludes: title_excludes.to_vec(),
+        },
+        kind: kind_table,
+    };
+    toml::to_string(&file).map_err(|e| format!("internal: {e}"))
 }
 
 impl SourceConfig {
@@ -264,7 +300,7 @@ pub fn matches_title(title: &str, contains: &[String], excludes: &[String]) -> b
     included && !excluded
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum IntervalSpec {
     Preset(String),
@@ -900,5 +936,36 @@ mod tests {
     fn load_last_run_with_nothing_recorded_yet_is_empty_not_an_error() {
         let env = TestEnv::new("fetchers");
         assert!(load_last_run(&env.ctx).unwrap().is_empty());
+    }
+
+    #[test]
+    fn render_builds_a_file_that_parses_back_to_the_same_fields() {
+        let text = render(
+            Some("My Team's Blog"),
+            Some("rss"),
+            true,
+            &IntervalSpec::Preset("hourly".into()),
+            &json!({"url": "https://example.test/feed.xml"}).as_object().unwrap().clone(),
+            &["junior".to_string()],
+            &["staff".to_string()],
+        )
+        .unwrap();
+        let cfg = SourceConfig::parse("my-team-blog", &text).unwrap();
+        assert_eq!(cfg.label.as_deref(), Some("My Team's Blog"));
+        assert_eq!(cfg.kind.as_deref(), Some("rss"));
+        assert!(cfg.enabled);
+        assert_eq!(cfg.interval, IntervalSpec::Preset("hourly".into()));
+        assert_eq!(cfg.kind_params.get("url").and_then(Value::as_str), Some("https://example.test/feed.xml"));
+        assert_eq!(cfg.title_contains, vec!["junior".to_string()]);
+        assert_eq!(cfg.title_excludes, vec!["staff".to_string()]);
+    }
+
+    #[test]
+    fn render_omits_label_and_kind_entirely_when_absent_so_a_built_in_source_still_parses() {
+        let text =
+            render(None, None, false, &IntervalSpec::Seconds(MIN_INTERVAL_API_S), &Map::new(), &[], &[]).unwrap();
+        let cfg = SourceConfig::parse("hn-whoishiring", &text).unwrap();
+        assert_eq!(cfg.label, None);
+        assert_eq!(cfg.kind, None);
     }
 }

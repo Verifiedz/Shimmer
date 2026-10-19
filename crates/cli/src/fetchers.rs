@@ -1,14 +1,11 @@
 //! `shimmer fetchers …`: sources that reach outward for new items (ADR 0028). Every command is
 //! one of the `fetchers` module's own ops; nothing here decides anything (CLAUDE.md §2).
 
-use std::path::{Path, PathBuf};
-
 use chrono::{DateTime, Utc};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use shimmer_core::{Error, ErrorCode, Result};
 
 use crate::client::Client;
-use crate::editor;
 use crate::flags::Flags;
 use crate::render::{self, table};
 use crate::style::{paint, Role};
@@ -21,9 +18,11 @@ commands:
   list [--removed]      every known source and its configured state; --removed: the ones you
                         removed, to restore or purge
   show SOURCE           one source in full, with its file text
-  new SOURCE [--file FILE]    a source from FILE, or opened in your editor to write from scratch
-  edit SOURCE [--file FILE]   open its file in your editor, or replace it with FILE; a broken
-                        source is refused and the old one kept
+  new SOURCE --interval SPEC [--kind KIND] [--label TEXT] [--enabled] [--set KEY=VALUE]…
+                        [FILTER]    make a new source
+  edit SOURCE --interval SPEC [--kind KIND] [--label TEXT] [--enabled] [--set KEY=VALUE]…
+                        [FILTER]    replace a source's settings; a broken edit is refused and
+                        the old one kept
   remove SOURCE         remove a source (restore brings it back)
   restore SOURCE        bring a removed source back
   purge [SOURCE] [--yes]      delete a removed source for good, or every removed one (asks first)
@@ -32,18 +31,19 @@ commands:
   rename SOURCE NEW     give a source a new id; its dedup state and last-run time follow it
   copy SOURCE NEW [--label TEXT]
                         a new source like SOURCE, switched off until you enable it
-  status               per-source last-run time and whether it is running
+  status               the whole feature at a glance: how many sources, how many enabled, any problems
   test SOURCE [FILTER]   fetch one page and show its parsed items; never saves or marks anything seen
   run SOURCE [--wait] [FILTER]  fetch one source now
   items [SOURCE] [--contains W,W] [--excludes W,W]  items a real run has actually found and kept,
                         most recent first
 
-FILTER (test and run only):
+FILTER (new, edit, test and run):
   --contains W,W,...    keep only a title containing at least one of these (case-insensitive)
   --excludes W,W,...    drop a title containing any of these, even one --contains would keep
 
-When given to test or run, each of these replaces -- never merges with -- whatever the source's
-own file configures, for that one call only.
+On test/run, FILTER replaces -- never merges with -- whatever the source's own file
+configures, for that one call only. On new/edit, it's the source's own setting, same as
+--label/--interval/etc.
 
 items' own --contains/--excludes are a separate, client-side narrowing of what's already
 been found and saved.
@@ -57,12 +57,32 @@ A source is a file in your data folder, data/fetchers/sources/SOURCE.toml:
   [kind]
   url = \"https://example.test/feed.xml\"
 
+new/edit's --set KEY=VALUE fills in [kind]'s own fields (e.g. --set url=https://example.test/feed.xml);
+--kind omitted means SOURCE must already be one of the built-in ones. --interval takes a preset
+(hourly, daily, weekly) or a number of seconds; --set's value is read as JSON when it parses as
+a number or true/false, otherwise as plain text.
+
 Add --json to any command for raw output.";
 
 /// `core.events.list`'s own query limit for `items` -- generous enough to cover several runs
 /// across every source before filtering down to one, well under the daemon's own cap
 /// (`MAX_EVENTS_LIMIT`, `crates/daemon/src/core.rs`).
 const ITEMS_QUERY_LIMIT: usize = 200;
+
+/// `fetchers new`/`edit`'s own flags, turned into `fetchers.new`/`.edit`'s params (ADR 0028
+/// §9) by [`source_params`]. `interval` stays raw text here (not yet known to be a preset or a
+/// number of seconds) -- that's for the daemon's own `IntervalSpec` to decide.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SourceInput {
+    pub id: String,
+    pub kind: Option<String>,
+    pub label: Option<String>,
+    pub interval: String,
+    pub enabled: bool,
+    pub params: Map<String, Value>,
+    pub title_contains: Option<Vec<String>>,
+    pub title_excludes: Option<Vec<String>>,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum FetchersCmd {
@@ -74,14 +94,10 @@ pub enum FetchersCmd {
     Show {
         id: String,
     },
-    New {
-        id: String,
-        file: Option<PathBuf>,
-    },
-    Edit {
-        id: String,
-        file: Option<PathBuf>,
-    },
+    /// `fetchers.new`/`.edit`'s structured params (ADR 0028 §9), shared by both since `edit` is
+    /// a full replace, the same shape `new` creates with.
+    New(SourceInput),
+    Edit(SourceInput),
     Remove {
         id: String,
     },
@@ -158,8 +174,10 @@ pub fn parse(words: Vec<String>) -> std::result::Result<FetchersCmd, String> {
     let rest: Vec<String> = words.collect();
     match sub.as_str() {
         "help" => Ok(FetchersCmd::Help),
-        "list" | "show" | "new" | "edit" | "remove" | "restore" | "purge" | "enable" | "disable" | "rename"
-        | "copy" => parse_source_command(&sub, rest),
+        "new" | "edit" => parse_source_input(&sub, rest),
+        "list" | "show" | "remove" | "restore" | "purge" | "enable" | "disable" | "rename" | "copy" => {
+            parse_source_command(&sub, rest)
+        }
         "status" if rest.is_empty() => Ok(FetchersCmd::Status),
         "status" => Err("'fetchers status' takes no arguments".into()),
         "test" => {
@@ -207,12 +225,12 @@ pub fn parse(words: Vec<String>) -> std::result::Result<FetchersCmd, String> {
     }
 }
 
-/// `list`/`show`/`new`/`edit`/`remove`/`restore`/`purge`/`enable`/`disable`/`rename`/`copy` --
-/// the source-definition commands (ADR 0038 §3/§6), split out of [`parse`] since they share no
-/// flags with `test`/`run`/`items`'s own `--contains`/`--excludes`.
+/// `list`/`show`/`remove`/`restore`/`purge`/`enable`/`disable`/`rename`/`copy` -- the
+/// source-definition commands (ADR 0038 §3/§6) that take no more than an id, a `to`, and a
+/// couple of simple flags. `new`/`edit` are structured ([`parse_source_input`]) and parsed
+/// separately.
 fn parse_source_command(sub: &str, rest: Vec<String>) -> std::result::Result<FetchersCmd, String> {
     let options: &[&str] = match sub {
-        "new" | "edit" => &["--file"],
         "copy" => &["--label"],
         _ => &[],
     };
@@ -227,15 +245,12 @@ fn parse_source_command(sub: &str, rest: Vec<String>) -> std::result::Result<Fet
         [id] => Ok(id.clone()),
         _ => Err(usage(what)),
     };
-    let file = flags.value("--file").map(PathBuf::from);
     Ok(match sub {
         "list" => match flags.positional.as_slice() {
             [] => FetchersCmd::List { removed: flags.has("--removed") },
             _ => return Err("'fetchers list' takes no arguments".into()),
         },
         "show" => FetchersCmd::Show { id: id("SOURCE")? },
-        "new" => FetchersCmd::New { id: id("SOURCE [--file FILE]")?, file },
-        "edit" => FetchersCmd::Edit { id: id("SOURCE [--file FILE]")?, file },
         "remove" => FetchersCmd::Remove { id: id("SOURCE")? },
         "restore" => FetchersCmd::Restore { id: id("REMOVED")? },
         "purge" => match flags.positional.as_slice() {
@@ -259,13 +274,70 @@ fn parse_source_command(sub: &str, rest: Vec<String>) -> std::result::Result<Fet
     })
 }
 
+/// `--set KEY=VALUE`'s value: read as JSON when it parses as one (a number, `true`/`false`,
+/// a quoted string), otherwise kept as plain text -- the same convention `--set` flags
+/// elsewhere in the CLI avoid needing by only ever taking strings, but a kind's own fields
+/// (`page_size`, `active_field`) are a mix of numbers, bools and strings, and there is no
+/// single type to assume.
+fn set_value(raw: &str) -> Value {
+    serde_json::from_str(raw).unwrap_or_else(|_| json!(raw))
+}
+
+/// `new SOURCE --interval SPEC [--kind KIND] [--label TEXT] [--enabled] [--set KEY=VALUE]…
+/// [--contains W,W] [--excludes W,W]` -- `edit` takes the identical shape (ADR 0028 §9: `edit`
+/// is a full replace, not a patch, so there is no reason for its flags to differ from `new`'s).
+fn parse_source_input(sub: &str, words: Vec<String>) -> std::result::Result<FetchersCmd, String> {
+    let usage = format!(
+        "usage: shimmer fetchers {sub} SOURCE --interval SPEC [--kind KIND] [--label TEXT] [--enabled] \
+         [--set KEY=VALUE]… [--contains W,W] [--excludes W,W]"
+    );
+    let mut words = words.into_iter();
+    let id = words.next().ok_or_else(|| usage.clone())?;
+    if id.starts_with('-') {
+        return Err(usage);
+    }
+    let (mut kind, mut label, mut interval) = (None, None, None);
+    let (mut contains, mut excludes) = (None, None);
+    let mut enabled = false;
+    let mut params = Map::new();
+    while let Some(word) = words.next() {
+        let mut value = |flag: &str| words.next().ok_or_else(|| format!("{flag} needs a value"));
+        match word.as_str() {
+            "--kind" => kind = Some(value("--kind")?),
+            "--label" => label = Some(value("--label")?),
+            "--interval" => interval = Some(value("--interval")?),
+            "--enabled" => enabled = true,
+            "--contains" => contains = Some(value("--contains")?),
+            "--excludes" => excludes = Some(value("--excludes")?),
+            "--set" => {
+                let kv = value("--set")?;
+                let (k, v) = kv.split_once('=').ok_or_else(|| "--set needs KEY=VALUE".to_owned())?;
+                params.insert(k.to_owned(), set_value(v));
+            }
+            other => return Err(format!("unknown option '{other}' for 'fetchers {sub}'")),
+        }
+    }
+    let interval = interval.ok_or(usage)?;
+    let input = SourceInput {
+        id,
+        kind,
+        label,
+        interval,
+        enabled,
+        params,
+        title_contains: terms(contains.as_deref()),
+        title_excludes: terms(excludes.as_deref()),
+    };
+    Ok(if sub == "new" { FetchersCmd::New(input) } else { FetchersCmd::Edit(input) })
+}
+
 pub async fn run(client: &mut Client, cmd: &FetchersCmd, json_out: bool, prompt: &mut impl Prompt) -> Result<String> {
     let one = |id: &str| json!({ "id": id });
     match cmd {
         FetchersCmd::Help => Ok(USAGE.into()),
         FetchersCmd::List { removed: false } => {
             let data = client.call("fetchers.list", json!({})).await?;
-            Ok(if json_out { render::json(&data) } else { list(&data) })
+            Ok(if json_out { render::json(&data) } else { list(&data, Utc::now()) })
         }
         FetchersCmd::List { removed: true } => {
             let data = client.call("fetchers.list", json!({"removed": true})).await?;
@@ -275,37 +347,13 @@ pub async fn run(client: &mut Client, cmd: &FetchersCmd, json_out: bool, prompt:
             let data = client.call("fetchers.show", one(id)).await?;
             Ok(if json_out { render::json(&data) } else { show(&data) })
         }
-        FetchersCmd::New { id, file: Some(file) } => {
-            let data = client.call("fetchers.new", json!({"id": id, "text": read(file)?})).await?;
+        FetchersCmd::New(input) => {
+            let data = client.call("fetchers.new", source_params(input)).await?;
             Ok(if json_out { render::json(&data) } else { format!("✓ made source {}", source_summary(&data)) })
         }
-        FetchersCmd::New { id, file: None } => {
-            if json_out || !prompt.interactive() {
-                return Err(Error::invalid_params(format!(
-                    "fetchers new needs a terminal; give its file instead: shimmer fetchers new {id} --file FILE"
-                )));
-            }
-            edit_loop(client, "fetchers.new", id, STARTER.to_owned(), prompt).await.map(|saved| match saved {
-                true => format!("✓ made source {id}; it's switched off until: shimmer fetchers enable {id}"),
-                false => format!("nothing made: {id} was left unchanged from the starter"),
-            })
-        }
-        FetchersCmd::Edit { id, file: Some(file) } => {
-            let data = client.call("fetchers.edit", json!({"id": id, "text": read(file)?})).await?;
+        FetchersCmd::Edit(input) => {
+            let data = client.call("fetchers.edit", source_params(input)).await?;
             Ok(if json_out { render::json(&data) } else { format!("✓ saved source {}", source_summary(&data)) })
-        }
-        FetchersCmd::Edit { id, file: None } => {
-            let text = data_text(client, id).await?;
-            if !prompt.interactive() {
-                return Err(Error::invalid_params(format!(
-                    "fetchers edit needs a terminal; replace the source from a file instead: \
-                     shimmer fetchers edit {id} --file FILE"
-                )));
-            }
-            edit_loop(client, "fetchers.edit", id, text, prompt).await.map(|saved| match saved {
-                true => format!("✓ saved source {id}"),
-                false => format!("no changes to {id}"),
-            })
         }
         FetchersCmd::Remove { id } => {
             let data = client.call("fetchers.remove", one(id)).await?;
@@ -390,7 +438,7 @@ pub async fn run(client: &mut Client, cmd: &FetchersCmd, json_out: bool, prompt:
         }
         FetchersCmd::Status => {
             let data = client.call("fetchers.status", json!({})).await?;
-            Ok(if json_out { render::json(&data) } else { status(&data, Utc::now()) })
+            Ok(if json_out { render::json(&data) } else { status(&data) })
         }
         FetchersCmd::Test { source, title_contains, title_excludes } => {
             // Always follows: a dry run that returned immediately with just a task id would
@@ -443,82 +491,37 @@ pub async fn run(client: &mut Client, cmd: &FetchersCmd, json_out: bool, prompt:
     }
 }
 
-/// Opened in the editor for `fetchers new SOURCE` with no `--file`: a disabled source with
-/// both tables present but nothing filled in, so there's something to delete rather than
-/// something to remember the shape of.
-const STARTER: &str = "[source]
-enabled = false
-interval = \"daily\"            # a preset (hourly, daily, weekly) or a number of seconds
-# kind = \"rss\"                # omit entirely for a built-in source (hn-whoishiring, weworkremotely)
-
-[kind]
-# url = \"https://example.test/feed.xml\"
-";
-
-fn read(file: &Path) -> Result<String> {
-    std::fs::read_to_string(file).map_err(|e| Error::invalid_params(format!("can't read {}: {e}", file.display())))
-}
-
-async fn data_text(client: &mut Client, id: &str) -> Result<String> {
-    let data = client.call("fetchers.show", json!({ "id": id })).await?;
-    Ok(data["text"].as_str().unwrap_or_default().to_owned())
-}
-
-/// Edit a copy of `text` in the editor and send it with `op` (`fetchers.new` or
-/// `fetchers.edit`); a refused source can be edited again with your text kept, the same
-/// pattern `automations new`/`edit` use. `Ok(true)` when something was actually saved.
-async fn edit_loop(client: &mut Client, op: &str, id: &str, text: String, prompt: &mut impl Prompt) -> Result<bool> {
-    let path = new_private_file(id, &text)?;
-    loop {
-        editor::open(&path)?;
-        let edited = read(&path)?;
-        if edited == text {
-            let _ = std::fs::remove_file(&path);
-            return Ok(false);
-        }
-        match client.call(op, json!({"id": id, "text": edited})).await {
-            Ok(_) => {
-                let _ = std::fs::remove_file(&path);
-                return Ok(true);
-            }
-            Err(e) if e.code == ErrorCode::InvalidParams => {
-                eprintln!("{} {}", paint(Role::Error, "✗ not saved:"), e.message);
-                if !prompt.confirm("Edit it again?") {
-                    return Err(Error::invalid_params(format!(
-                        "{id} not saved (the old source is unchanged); your text is in {}",
-                        path.display()
-                    )));
-                }
-            }
-            // Whatever went wrong (the source removed meanwhile, the daemon restarted), the
-            // edit isn't lost: say where it is (same reasoning as automations' own #253 review).
-            Err(e) => {
-                return Err(Error::new(
-                    e.code,
-                    format!("{}; {id} not saved, your text is in {}", e.message, path.display()),
-                ))
-            }
-        }
+/// `fetchers.new`/`.edit`'s params from a [`SourceInput`] (ADR 0028 §9): structured, not raw
+/// file text -- the daemon validates `kind`'s own fields through `Kind::parse`, the same as a
+/// hand-edited file. `interval` is sent as a JSON number when it parses as one, otherwise as a
+/// string (a preset name) -- `IntervalSpec`'s own untagged `Preset(String) | Seconds(u64)`.
+fn source_params(input: &SourceInput) -> Value {
+    let mut p = json!({
+        "id": input.id,
+        "enabled": input.enabled,
+        "interval": interval_value(&input.interval),
+        "params": input.params,
+    });
+    if let Some(k) = &input.kind {
+        p["kind"] = json!(k);
     }
+    if let Some(l) = &input.label {
+        p["label"] = json!(l);
+    }
+    if let Some(c) = &input.title_contains {
+        p["title_contains"] = json!(c);
+    }
+    if let Some(e) = &input.title_excludes {
+        p["title_excludes"] = json!(e);
+    }
+    p
 }
 
-/// A new file in the temp folder holding `text`, readable only by you, at a name nobody else
-/// can have made first: it's created with `create_new`, so a file or link someone planted
-/// there is refused rather than written through (same reasoning as automations' own #253
-/// review).
-fn new_private_file(id: &str, text: &str) -> Result<PathBuf> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-    let path = std::env::temp_dir().join(format!("shimmer-source-{id}-{}-{stamp}.toml", std::process::id()));
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-        .map_err(|e| Error::internal(format!("can't create {}: {e}", path.display())))?;
-    f.write_all(text.as_bytes()).map_err(|e| Error::internal(format!("can't write {}: {e}", path.display())))?;
-    Ok(path)
+fn interval_value(s: &str) -> Value {
+    match s.parse::<u64>() {
+        Ok(n) => json!(n),
+        Err(_) => json!(s),
+    }
 }
 
 /// `id` (kind): enabled/disabled, for a one-line confirmation after `new`/`edit`/`restore`.
@@ -565,12 +568,12 @@ fn removed_list(data: &Value) -> String {
     out
 }
 
-/// `fetchers.run`/`fetchers.test`'s params: `source`, plus `title_contains`/
+/// `fetchers.run`/`fetchers.test`'s params: `id`, plus `title_contains`/
 /// `title_excludes` only when a `--contains`/`--excludes` flag was actually given --
 /// omitted entirely, not sent as an empty list, so the module falls back to the source's
 /// own configured filter (ADR 0028 §14) rather than overriding it with "nothing allowed."
 fn filter_params(source: &str, title_contains: &Option<Vec<String>>, title_excludes: &Option<Vec<String>>) -> Value {
-    let mut params = json!({"source": source});
+    let mut params = json!({"id": source});
     if let Some(c) = title_contains {
         params["title_contains"] = json!(c);
     }
@@ -641,31 +644,9 @@ fn task_error(payload: &Value) -> Error {
 }
 
 /// One table of every known source and its configured state, or a line saying there are none.
-fn list(data: &Value) -> String {
-    let sources = data["sources"].as_array().cloned().unwrap_or_default();
-    if sources.is_empty() {
-        return "no sources known".into();
-    }
-    let rows: Vec<Vec<String>> = sources
-        .iter()
-        .map(|s| {
-            vec![
-                render::cell(&s["id"]),
-                render::cell(&s["method"]),
-                s["kind"].as_str().unwrap_or("-").to_string(),
-                // on/off under STATE, coloured like every other feature's (ADR 0038 §6).
-                if s["enabled"].as_bool().unwrap_or(false) { "on".into() } else { "off".into() },
-                s["interval_s"].as_u64().map(when::format_duration).unwrap_or_else(|| "-".into()),
-            ]
-        })
-        .collect();
-    let header = ["ID", "METHOD", "KIND", "STATE", "INTERVAL"].map(String::from);
-    let n = sources.len();
-    format!("{}\n{n} source{}", table(&header, &rows), if n == 1 { "" } else { "s" })
-}
-
-/// One table of every known source's last-run time and whether it is currently running.
-fn status(data: &Value, now: DateTime<Utc>) -> String {
+/// One table of every known source, its configured state, and its last run (ADR 0028 §9 merges
+/// the prior design's separate per-source `list`/`status` into one).
+fn list(data: &Value, now: DateTime<Utc>) -> String {
     let sources = data["sources"].as_array().cloned().unwrap_or_default();
     if sources.is_empty() {
         return "no sources known".into();
@@ -676,12 +657,42 @@ fn status(data: &Value, now: DateTime<Utc>) -> String {
             let last_run = when::timestamp(&s["last_run_at"]);
             vec![
                 render::cell(&s["id"]),
+                render::cell(&s["method"]),
+                s["kind"].as_str().unwrap_or("-").to_string(),
+                // on/off under STATE, coloured like every other feature's (ADR 0038 §6).
+                if s["enabled"].as_bool().unwrap_or(false) { "on".into() } else { "off".into() },
+                s["interval_s"].as_u64().map(when::format_duration).unwrap_or_else(|| "-".into()),
                 last_run.map_or("never".into(), |t| when::relative(t, now)),
                 if s["running"].as_bool().unwrap_or(false) { "running".into() } else { "idle".into() },
             ]
         })
         .collect();
-    table(&["ID", "LAST RUN", "STATE"].map(String::from), &rows)
+    let header = ["ID", "METHOD", "KIND", "STATE", "INTERVAL", "LAST RUN", ""].map(String::from);
+    let n = sources.len();
+    format!("{}\n{n} source{}", table(&header, &rows), if n == 1 { "" } else { "s" })
+}
+
+/// The whole feature at a glance (ADR 0028 §9): not per-source -- that's `fetchers.list`/
+/// `fetchers.show` now -- the same "feature-wide summary" shape `automations.status` has.
+fn status(data: &Value) -> String {
+    let total = data["sources"].as_u64().unwrap_or(0);
+    let enabled = data["enabled"].as_u64().unwrap_or(0);
+    let disabled = data["disabled"].as_u64().unwrap_or(0);
+    let mut out =
+        format!("{total} source{}: {enabled} enabled, {disabled} disabled", if total == 1 { "" } else { "s" });
+    let problems: Vec<Vec<String>> = data["problems"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| vec![render::cell(&p["id"]), full(&p["problem"])])
+        .collect();
+    if !problems.is_empty() {
+        out.push_str("\n\n");
+        out.push_str(&paint(Role::Warning, "problems:"));
+        out.push('\n');
+        out.push_str(&table(&["ID".into(), "PROBLEM".into()], &problems));
+    }
+    out
 }
 
 /// Every parsed item `fetchers.test` found, title and url, or a line saying it found none.
@@ -763,12 +774,61 @@ mod tests {
         assert_eq!(p(&["list", "--removed"]), Ok(FetchersCmd::List { removed: true }));
         assert_eq!(p(&["status"]), Ok(FetchersCmd::Status));
         assert_eq!(p(&["show", "blog"]), Ok(FetchersCmd::Show { id: "blog".into() }));
-        assert_eq!(p(&["new", "blog"]), Ok(FetchersCmd::New { id: "blog".into(), file: None }));
         assert_eq!(
-            p(&["new", "blog", "--file", "s.toml"]),
-            Ok(FetchersCmd::New { id: "blog".into(), file: Some("s.toml".into()) })
+            p(&["new", "blog", "--interval", "daily"]),
+            Ok(FetchersCmd::New(SourceInput {
+                id: "blog".into(),
+                kind: None,
+                label: None,
+                interval: "daily".into(),
+                enabled: false,
+                params: Map::new(),
+                title_contains: None,
+                title_excludes: None,
+            }))
         );
-        assert_eq!(p(&["edit", "blog"]), Ok(FetchersCmd::Edit { id: "blog".into(), file: None }));
+        assert_eq!(
+            p(&[
+                "new",
+                "blog",
+                "--interval",
+                "3600",
+                "--kind",
+                "rss",
+                "--label",
+                "My Blog",
+                "--enabled",
+                "--set",
+                "url=https://example.test/f.xml",
+                "--contains",
+                "junior",
+                "--excludes",
+                "senior"
+            ]),
+            Ok(FetchersCmd::New(SourceInput {
+                id: "blog".into(),
+                kind: Some("rss".into()),
+                label: Some("My Blog".into()),
+                interval: "3600".into(),
+                enabled: true,
+                params: json!({"url": "https://example.test/f.xml"}).as_object().unwrap().clone(),
+                title_contains: Some(vec!["junior".into()]),
+                title_excludes: Some(vec!["senior".into()]),
+            }))
+        );
+        assert_eq!(
+            p(&["edit", "blog", "--interval", "daily"]),
+            Ok(FetchersCmd::Edit(SourceInput {
+                id: "blog".into(),
+                kind: None,
+                label: None,
+                interval: "daily".into(),
+                enabled: false,
+                params: Map::new(),
+                title_contains: None,
+                title_excludes: None,
+            }))
+        );
         assert_eq!(p(&["remove", "blog"]), Ok(FetchersCmd::Remove { id: "blog".into() }));
         assert_eq!(p(&["restore", "blog"]), Ok(FetchersCmd::Restore { id: "blog".into() }));
         assert_eq!(p(&["purge"]), Ok(FetchersCmd::Purge { id: None, yes: false }));
@@ -850,41 +910,64 @@ mod tests {
         assert!(p(&["run", "a", "--bogus"]).unwrap_err().contains("unknown option '--bogus'"));
         assert!(p(&["items", "a", "b"]).unwrap_err().contains("usage: shimmer fetchers items"));
         assert!(p(&["frob"]).unwrap_err().contains("unknown fetchers command 'frob'"));
+        assert!(p(&["new"]).unwrap_err().contains("usage: shimmer fetchers new SOURCE --interval SPEC"));
+        assert!(p(&["new", "blog"]).unwrap_err().contains("usage: shimmer fetchers new SOURCE --interval SPEC"));
+        assert!(p(&["new", "blog", "--interval"]).unwrap_err().contains("--interval needs a value"));
+        assert!(p(&["new", "blog", "--interval", "daily", "--set", "nope"]).unwrap_err().contains("KEY=VALUE"));
+        assert!(p(&["new", "blog", "--interval", "daily", "--bogus"])
+            .unwrap_err()
+            .contains("unknown option '--bogus' for 'fetchers new'"));
     }
 
     #[test]
     fn list_renders_a_table_with_a_count() {
+        let now = Utc::now();
         let data = json!({"sources": [
-            {"id": "hn-whoishiring", "method": "api", "kind": null, "enabled": true, "interval_s": 86_400},
-            {"id": "my-team-blog", "method": "api", "kind": "rss", "enabled": false, "interval_s": null},
+            {"id": "hn-whoishiring", "method": "api", "kind": null, "enabled": true, "interval_s": 86_400,
+             "last_run_at": (now - chrono::Duration::seconds(90)).to_rfc3339(), "running": false},
+            {"id": "my-team-blog", "method": "api", "kind": "rss", "enabled": false, "interval_s": null,
+             "last_run_at": null, "running": true},
         ]});
-        let out = list(&data);
+        let out = list(&data, now);
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines[0].split_whitespace().collect::<Vec<_>>(), ["ID", "METHOD", "KIND", "STATE", "INTERVAL"]);
-        assert!(lines[1].contains("hn-whoishiring") && lines[1].contains(" on ") && lines[1].contains("1d"), "{out}");
-        assert!(lines[2].contains("my-team-blog") && lines[2].contains("rss") && lines[2].contains(" off "), "{out}");
+        assert_eq!(
+            lines[0].split_whitespace().collect::<Vec<_>>(),
+            ["ID", "METHOD", "KIND", "STATE", "INTERVAL", "LAST", "RUN"]
+        );
+        assert!(
+            lines[1].contains("hn-whoishiring")
+                && lines[1].contains(" on ")
+                && lines[1].contains("1d")
+                && lines[1].contains("ago")
+                && lines[1].ends_with("idle"),
+            "{out}"
+        );
+        assert!(
+            lines[2].contains("my-team-blog")
+                && lines[2].contains("rss")
+                && lines[2].contains(" off ")
+                && lines[2].contains("never")
+                && lines[2].ends_with("running"),
+            "{out}"
+        );
         assert_eq!(lines[3], "2 sources");
     }
 
     #[test]
     fn list_with_nothing_known_says_so() {
-        assert_eq!(list(&json!({"sources": []})), "no sources known");
+        assert_eq!(list(&json!({"sources": []}), Utc::now()), "no sources known");
     }
 
     #[test]
-    fn status_renders_last_run_and_running() {
-        let now = Utc::now();
-        let data = json!({"sources": [
-            {"id": "hn-whoishiring", "last_run_at": (now - chrono::Duration::seconds(90)).to_rfc3339(), "running": false},
-            {"id": "weworkremotely", "last_run_at": null, "running": true},
-        ]});
-        let out = status(&data, now);
-        let lines: Vec<&str> = out.lines().collect();
-        assert!(lines[1].contains("hn-whoishiring") && lines[1].contains("ago") && lines[1].ends_with("idle"), "{out}");
-        assert!(
-            lines[2].contains("weworkremotely") && lines[2].contains("never") && lines[2].ends_with("running"),
-            "{out}"
-        );
+    fn status_renders_the_feature_wide_summary_and_any_problems() {
+        let data = json!({"sources": 5, "enabled": 2, "disabled": 3, "problems": []});
+        assert_eq!(status(&data), "5 sources: 2 enabled, 3 disabled");
+
+        let with_problems =
+            json!({"sources": 1, "enabled": 0, "disabled": 1, "problems": [{"id": "broken", "problem": "bad toml"}]});
+        let out = status(&with_problems);
+        assert!(out.contains("1 source: 0 enabled, 1 disabled"), "{out}");
+        assert!(out.contains("broken") && out.contains("bad toml"), "{out}");
     }
 
     #[test]
@@ -979,14 +1062,56 @@ mod tests {
 
     #[test]
     fn filter_params_omits_a_field_entirely_when_its_flag_was_not_given() {
-        assert_eq!(filter_params("hn-whoishiring", &None, &None), json!({"source": "hn-whoishiring"}));
+        assert_eq!(filter_params("hn-whoishiring", &None, &None), json!({"id": "hn-whoishiring"}));
         assert_eq!(
             filter_params("hn-whoishiring", &Some(vec!["junior".into()]), &None),
-            json!({"source": "hn-whoishiring", "title_contains": ["junior"]})
+            json!({"id": "hn-whoishiring", "title_contains": ["junior"]})
         );
         assert_eq!(
             filter_params("hn-whoishiring", &None, &Some(vec!["senior".into()])),
-            json!({"source": "hn-whoishiring", "title_excludes": ["senior"]})
+            json!({"id": "hn-whoishiring", "title_excludes": ["senior"]})
+        );
+    }
+
+    #[test]
+    fn set_value_reads_json_when_it_parses_and_otherwise_keeps_plain_text() {
+        assert_eq!(set_value("50"), json!(50));
+        assert_eq!(set_value("true"), json!(true));
+        assert_eq!(set_value("active"), json!("active"));
+        assert_eq!(set_value("https://example.test/f.xml"), json!("https://example.test/f.xml"));
+    }
+
+    #[test]
+    fn source_params_sends_an_interval_as_a_number_or_a_preset_and_omits_absent_fields() {
+        let minimal = SourceInput {
+            id: "blog".into(),
+            kind: None,
+            label: None,
+            interval: "daily".into(),
+            enabled: false,
+            params: Map::new(),
+            title_contains: None,
+            title_excludes: None,
+        };
+        assert_eq!(source_params(&minimal), json!({"id": "blog", "enabled": false, "interval": "daily", "params": {}}));
+
+        let full = SourceInput {
+            id: "blog".into(),
+            kind: Some("rss".into()),
+            label: Some("My Blog".into()),
+            interval: "3600".into(),
+            enabled: true,
+            params: json!({"url": "https://example.test/f.xml"}).as_object().unwrap().clone(),
+            title_contains: Some(vec!["junior".into()]),
+            title_excludes: Some(vec!["senior".into()]),
+        };
+        assert_eq!(
+            source_params(&full),
+            json!({
+                "id": "blog", "kind": "rss", "label": "My Blog", "enabled": true, "interval": 3600,
+                "params": {"url": "https://example.test/f.xml"},
+                "title_contains": ["junior"], "title_excludes": ["senior"],
+            })
         );
     }
 }

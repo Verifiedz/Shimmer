@@ -3,7 +3,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use shimmer_core::params::decode;
 use shimmer_core::{
     CommandSpec, Ctx, Error, ErrorCode, Execution, LaneConfig, Manifest, Module, Result, TriggerSpec, WriteLock,
@@ -132,9 +132,9 @@ impl Module for Fetchers {
                 op: RUN_OP.into(),
                 summary: "Fetch one source now".into(),
                 params_schema: json!({
-                    "type": "object", "required": ["source"],
+                    "type": "object", "required": ["id"],
                     "properties": {
-                        "source": {"type": "string"},
+                        "id": {"type": "string"},
                         "title_contains": {"type": "array", "items": {"type": "string"}},
                         "title_excludes": {"type": "array", "items": {"type": "string"}},
                     },
@@ -148,9 +148,9 @@ impl Module for Fetchers {
                 summary: "Internal: the real fetch (fetchers.run enqueues this after checking the source exists)"
                     .into(),
                 params_schema: json!({
-                    "type": "object", "required": ["source"],
+                    "type": "object", "required": ["id"],
                     "properties": {
-                        "source": {"type": "string"},
+                        "id": {"type": "string"},
                         "title_contains": {"type": "array", "items": {"type": "string"}},
                         "title_excludes": {"type": "array", "items": {"type": "string"}},
                     },
@@ -159,13 +159,15 @@ impl Module for Fetchers {
             },
             CommandSpec {
                 op: LIST_OP.into(),
-                summary: "List every known source and its configured state".into(),
+                summary: "Every known source, its configured state, and its last run (or, with \
+                          'removed', every removed one)"
+                    .into(),
                 params_schema: json!({"type": "object", "properties": {"removed": {"type": "boolean"}}}),
                 execution: Execution::Inline,
             },
             CommandSpec {
                 op: STATUS_OP.into(),
-                summary: "Per-source last-run time and whether it is currently running".into(),
+                summary: "The whole feature at a glance: how many sources, how many enabled, any problems".into(),
                 params_schema: json!({"type": "null"}),
                 execution: Execution::Inline,
             },
@@ -175,9 +177,9 @@ impl Module for Fetchers {
                     "Fetch one page from a source and show its parsed items, without saving or marking anything seen"
                         .into(),
                 params_schema: json!({
-                    "type": "object", "required": ["source"],
+                    "type": "object", "required": ["id"],
                     "properties": {
-                        "source": {"type": "string"},
+                        "id": {"type": "string"},
                         "title_contains": {"type": "array", "items": {"type": "string"}},
                         "title_excludes": {"type": "array", "items": {"type": "string"}},
                     },
@@ -192,20 +194,14 @@ impl Module for Fetchers {
             },
             CommandSpec {
                 op: NEW_OP.into(),
-                summary: "Make a new source from its file text".into(),
-                params_schema: json!({
-                    "type": "object", "required": ["id", "text"],
-                    "properties": {"id": {"type": "string"}, "text": {"type": "string"}},
-                }),
+                summary: "Make a new source".into(),
+                params_schema: source_input_schema(),
                 execution: Execution::Inline,
             },
             CommandSpec {
                 op: EDIT_OP.into(),
-                summary: "Replace a source's file text".into(),
-                params_schema: json!({
-                    "type": "object", "required": ["id", "text"],
-                    "properties": {"id": {"type": "string"}, "text": {"type": "string"}},
-                }),
+                summary: "Replace a source's settings".into(),
+                params_schema: source_input_schema(),
                 execution: Execution::Inline,
             },
             CommandSpec {
@@ -277,17 +273,17 @@ impl Module for Fetchers {
             RUN_TASK_OP => {
                 let p: FetchParams = decode(params)?;
                 let filter = TitleFilterOverride::from_params(p.title_contains, p.title_excludes)?;
-                self.fetch(ctx, p.source, filter).await
+                self.fetch(ctx, p.id, filter).await
             }
             LIST_OP => {
                 let p: ListParams = decode(params)?;
                 self.list(ctx, p).await
             }
-            STATUS_OP => self.status(ctx).await,
+            STATUS_OP => self.status(ctx),
             TEST_OP => {
                 let p: FetchParams = decode(params)?;
                 let filter = TitleFilterOverride::from_params(p.title_contains, p.title_excludes)?;
-                self.test(ctx, p.source, filter).await
+                self.test(ctx, p.id, filter).await
             }
             RELOAD_OP => {
                 self.load(ctx)?;
@@ -295,11 +291,11 @@ impl Module for Fetchers {
                 Ok(json!({"sources": st.sources.len(), "problems": problems_of(&st)}))
             }
             NEW_OP => {
-                let p: Create = decode(params)?;
+                let p: SourceInput = decode(params)?;
                 self.create(ctx, p)
             }
             EDIT_OP => {
-                let p: Edit = decode(params)?;
+                let p: SourceInput = decode(params)?;
                 self.edit(ctx, p)
             }
             SHOW_OP => {
@@ -341,7 +337,7 @@ impl Module for Fetchers {
 
 #[derive(Deserialize)]
 struct FetchParams {
-    source: String,
+    id: String,
     #[serde(default)]
     title_contains: Option<Vec<String>>,
     #[serde(default)]
@@ -359,16 +355,44 @@ struct ListParams {
     removed: bool,
 }
 
+/// `fetchers.new`/`.edit`'s params (ADR 0028 §9): a source's complete settings, structured
+/// rather than raw file text -- `kind`'s own fields are validated by `Kind::parse` the same
+/// way a hand-edited file's `[kind]` table is, through `schedule::render` then
+/// `SourceConfig::parse` (one validation path for both). `kind` stays optional for now: the
+/// fixed, compiled-in registry (`source::registry`) is only removed in ADR 0028 §10, a later
+/// step, and a bare entry for one of those ids must keep working until then.
 #[derive(Deserialize)]
-struct Create {
+struct SourceInput {
     id: String,
-    text: String,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    enabled: bool,
+    interval: schedule::IntervalSpec,
+    #[serde(default)]
+    params: Map<String, Value>,
+    #[serde(default)]
+    title_contains: Vec<String>,
+    #[serde(default)]
+    title_excludes: Vec<String>,
 }
 
-#[derive(Deserialize)]
-struct Edit {
-    id: String,
-    text: String,
+fn source_input_schema() -> Value {
+    json!({
+        "type": "object", "required": ["id", "interval"],
+        "properties": {
+            "id": {"type": "string"},
+            "label": {"type": "string"},
+            "kind": {"type": "string"},
+            "enabled": {"type": "boolean"},
+            "interval": {},
+            "params": {"type": "object"},
+            "title_contains": {"type": "array", "items": {"type": "string"}},
+            "title_excludes": {"type": "array", "items": {"type": "string"}},
+        },
+    })
 }
 
 #[derive(Deserialize)]
@@ -445,7 +469,7 @@ impl Fetchers {
                 already_running.push(source);
                 continue;
             }
-            ctx.queue.enqueue(RUN_TASK_OP, json!({"source": source})).await?;
+            ctx.queue.enqueue(RUN_TASK_OP, json!({"id": source})).await?;
             enqueued.push(source);
         }
         Ok(json!({"enqueued": enqueued, "already_running": already_running}))
@@ -466,12 +490,12 @@ impl Fetchers {
     /// queue (CLAUDE.md §6.2) -- this is a display-only cost, accepted for the correctness fix.
     async fn run(&self, ctx: &Ctx, params: Value) -> Result<Value> {
         let p: FetchParams = decode(params.clone())?;
-        if p.source.trim().is_empty() {
-            return Err(Error::invalid_params("source must not be empty"));
+        if p.id.trim().is_empty() {
+            return Err(Error::invalid_params("id must not be empty"));
         }
         let sources = self.state().clone();
-        if source::resolve(&sources, &p.source)?.is_none() {
-            return Err(Error::not_found(format!("no source '{}'", p.source)));
+        if source::resolve(&sources, &p.id)?.is_none() {
+            return Err(Error::not_found(format!("no source '{}'", p.id)));
         }
         let handle = ctx.queue.enqueue(RUN_TASK_OP, params).await?;
         Ok(json!({
@@ -484,7 +508,7 @@ impl Fetchers {
 
     async fn fetch(&self, ctx: &Ctx, source_id: String, filter_override: Option<TitleFilterOverride>) -> Result<Value> {
         if source_id.trim().is_empty() {
-            return Err(Error::invalid_params("source must not be empty"));
+            return Err(Error::invalid_params("id must not be empty"));
         }
         let sources = self.state().clone();
         let source = source::resolve(&sources, &source_id)?
@@ -527,13 +551,16 @@ impl Fetchers {
 
     /// Every source the user has actually opted into seeing: a fixed-registry source once it
     /// has its own file, plus every configured `kind` instance (ADR 0028 §2a/§19),
-    /// cross-referenced with that entry. `{"removed": true}` lists removed sources instead
-    /// (ADR 0038 §3), by id only -- a removed source may no longer parse, so there is nothing
-    /// else safe to show about it without reading its file.
+    /// cross-referenced with that entry, its last run and whether it's currently mid-fetch
+    /// (ADR 0028 §9 merges the prior design's separate per-source `list`/`status` into one).
+    /// `{"removed": true}` lists removed sources instead (ADR 0038 §3), by id only -- a
+    /// removed source may no longer parse, so there is nothing else safe to show about it
+    /// without reading its file.
     async fn list(&self, ctx: &Ctx, p: ListParams) -> Result<Value> {
         if p.removed {
             return Ok(json!({"removed": schedule::removed(ctx)?}));
         }
+        let last_run = schedule::load_last_run(ctx)?;
         let st = self.state();
         let sources: Vec<Value> = source::known(&st)
             .iter()
@@ -542,6 +569,7 @@ impl Fetchers {
                 let cfg = st.sources.get(id);
                 json!({
                     "id": id,
+                    "label": cfg.and_then(|c| c.label.clone()),
                     "method": match s.method() { source::Method::Api => "api", source::Method::Scrape => "scrape" },
                     "kind": cfg.and_then(|c| c.kind.clone()),
                     "enabled": cfg.is_some_and(|c| c.enabled),
@@ -550,30 +578,31 @@ impl Fetchers {
                     "interval_s": cfg.and_then(|c| c.interval.resolve(0).ok()),
                     "title_contains": cfg.map(|c| c.title_contains.clone()).unwrap_or_default(),
                     "title_excludes": cfg.map(|c| c.title_excludes.clone()).unwrap_or_default(),
+                    "last_run_at": last_run.get(id),
+                    "running": self.running.is_running(id),
                 })
             })
             .collect();
         // A source whose own file couldn't be read is reported here rather than being
         // invisible (or, as before, failing this whole op) -- #126's review, B1.
-        Ok(json!({"sources": sources, "problems": problems_of(&st)}))
-    }
-
-    /// Per-source last-run time and whether it is currently mid-fetch (ADR 0028 §5's
-    /// `RunGuard`) -- the same source universe [`Fetchers::list`] enumerates.
-    async fn status(&self, ctx: &Ctx) -> Result<Value> {
-        let last_run = schedule::load_last_run(ctx)?;
-        let st = self.state();
-        let sources: Vec<Value> = source::known(&st)
-            .iter()
-            .map(|s| {
-                let id = s.id();
-                json!({"id": id, "last_run_at": last_run.get(id), "running": self.running.is_running(id)})
-            })
-            .collect();
         let mut problems = problems_of(&st);
         drop(st);
         problems.extend(schedule::last_run_problem(ctx).map(|why| json!({"id": "last_run", "problem": why})));
         Ok(json!({"sources": sources, "problems": problems}))
+    }
+
+    /// The whole feature at a glance (ADR 0028 §9): how many sources exist, how many are
+    /// enabled, and every problem -- the same "feature-wide summary, not per-source" shape
+    /// `automations.status` already has. Per-source detail (what `fetchers.status` used to
+    /// answer) is `fetchers.list`/`fetchers.show` now.
+    fn status(&self, ctx: &Ctx) -> Result<Value> {
+        let st = self.state();
+        let enabled = st.sources.values().filter(|c| c.enabled).count();
+        let total = st.sources.len();
+        let mut problems = problems_of(&st);
+        drop(st);
+        problems.extend(schedule::last_run_problem(ctx).map(|why| json!({"id": "last_run", "problem": why})));
+        Ok(json!({"sources": total, "enabled": enabled, "disabled": total - enabled, "problems": problems}))
     }
 
     /// Fetches exactly one page from a source and returns its parsed items -- never the
@@ -583,7 +612,7 @@ impl Fetchers {
     /// alongside a real `fetch` of the same source without conflict.
     async fn test(&self, ctx: &Ctx, source_id: String, filter_override: Option<TitleFilterOverride>) -> Result<Value> {
         if source_id.trim().is_empty() {
-            return Err(Error::invalid_params("source must not be empty"));
+            return Err(Error::invalid_params("id must not be empty"));
         }
         let sources = self.state().clone();
         let source = source::resolve(&sources, &source_id)?
@@ -695,47 +724,64 @@ impl Fetchers {
 /// the two modules store one definition per named thing the same way, so the same shape of
 /// code handles it (CLAUDE.md §8).
 impl Fetchers {
-    /// A new source from `text` (ADR 0028 §9). Unlike `automations.new`, there is no
-    /// starter/template path yet (ADR 0028 §7 is a later step) -- both `id` and `text` are
-    /// required.
-    fn create(&self, ctx: &Ctx, p: Create) -> Result<Value> {
+    /// A new source (ADR 0028 §9): validated the same way a hand-edited file is, through
+    /// `schedule::render` then `SourceConfig::parse` -- one validation path for both a
+    /// structured command and `fetchers.reload`. Unlike `automations.new`, there is no
+    /// starter/template path yet (ADR 0028 §10 is a later step).
+    fn create(&self, ctx: &Ctx, p: SourceInput) -> Result<Value> {
         let _g = self.write.lock();
         if ctx.store.read(&schedule::path(&p.id))?.is_some() {
             return Err(Error::conflict(format!("source '{}' already exists", p.id)));
         }
-        self.write_source(ctx, &p.id, &p.text, "fetchers.source.created")
+        self.write_source(ctx, p, "fetchers.source.created")
     }
 
-    /// Replace a source's file with `text`, after checking it: a broken file is refused and
-    /// the old one kept (same rule `automations.edit` uses).
-    fn edit(&self, ctx: &Ctx, p: Edit) -> Result<Value> {
+    /// Replace a source's settings, after checking them: a broken edit is refused and the old
+    /// file kept (same rule `automations.edit` uses). A full replace, not a merge -- the
+    /// caller sends the complete desired state, same as `automations.edit`'s full file text.
+    fn edit(&self, ctx: &Ctx, p: SourceInput) -> Result<Value> {
         let _g = self.write.lock();
         if ctx.store.read(&schedule::path(&p.id))?.is_none() {
             return Err(Error::not_found(format!("no source '{}'", p.id)));
         }
-        self.write_source(ctx, &p.id, &p.text, "fetchers.source.edited")
+        self.write_source(ctx, p, "fetchers.source.edited")
     }
 
-    fn write_source(&self, ctx: &Ctx, id: &str, text: &str, topic: &str) -> Result<Value> {
-        let cfg = schedule::SourceConfig::parse(id, text).map_err(Error::invalid_params)?;
+    fn write_source(&self, ctx: &Ctx, p: SourceInput, topic: &str) -> Result<Value> {
+        let text = schedule::render(
+            p.label.as_deref(),
+            p.kind.as_deref(),
+            p.enabled,
+            &p.interval,
+            &p.params,
+            &p.title_contains,
+            &p.title_excludes,
+        )
+        .map_err(Error::invalid_params)?;
+        let cfg = schedule::SourceConfig::parse(&p.id, &text).map_err(Error::invalid_params)?;
         ctx.store.transaction(|tx| {
-            tx.put(&schedule::path(id), text)?;
-            tx.emit(topic, json!({"source": id}))
+            tx.put(&schedule::path(&p.id), text.as_str())?;
+            tx.emit(topic, json!({"source": p.id}))
         })?;
         let mut st = self.state();
-        st.problems.remove(id);
-        st.sources.insert(id.to_owned(), cfg.clone());
+        st.problems.remove(&p.id);
+        st.sources.insert(p.id.clone(), cfg.clone());
         drop(st);
-        Ok(view(id, &cfg))
+        Ok(view(&p.id, &cfg))
     }
 
-    /// One source in full, with its file text, read fresh rather than from the cache -- so it
-    /// is never stale and shows the same parse error `new`/`edit` would for a broken file.
+    /// One source in full: its settings, its file text, its last run and whether it's
+    /// currently mid-fetch (ADR 0028 §9) -- `fetchers.list`'s own per-source shape, plus the
+    /// raw text. Read fresh rather than from the cache for the settings/text, so a broken file
+    /// shows the same parse error `new`/`edit` would, never a stale cached copy.
     fn show(&self, ctx: &Ctx, id: &str) -> Result<Value> {
         let text =
             ctx.store.read_string(&schedule::path(id))?.ok_or_else(|| Error::not_found(format!("no source '{id}'")))?;
         let cfg = schedule::SourceConfig::parse(id, &text).map_err(Error::invalid_params)?;
+        let last_run = schedule::load_last_run(ctx)?;
         let mut v = view(id, &cfg);
+        v["last_run_at"] = json!(last_run.get(id));
+        v["running"] = json!(self.running.is_running(id));
         v["text"] = json!(text);
         Ok(v)
     }
@@ -1195,7 +1241,7 @@ mod tests {
         let submitted = env.queue.requests.lock().unwrap();
         assert_eq!(submitted.len(), 1);
         assert_eq!(submitted[0].op, RUN_TASK_OP);
-        assert_eq!(submitted[0].params, json!({"source": "hn-whoishiring"}));
+        assert_eq!(submitted[0].params, json!({"id": "hn-whoishiring"}));
     }
 
     #[tokio::test]
@@ -1540,9 +1586,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_reports_last_run_and_whether_a_source_is_mid_fetch() {
+    async fn list_reports_last_run_and_whether_a_source_is_mid_fetch() {
+        // ADR 0028 §9 merges the prior design's separate per-source `list`/`status` into one.
         let env = TestEnv::new("fetchers");
-        // Both must have their own entry to show up in status at all (ADR 0028 §19) --
+        // Both must have their own entry to show up in list at all (ADR 0028 §19) --
         // fetching hn-whoishiring works regardless (resolve() needs none), but seeing it
         // and weworkremotely listed afterward does not.
         write_source(&env, "hn-whoishiring", json!({"enabled": true, "interval": "daily"}));
@@ -1552,7 +1599,7 @@ mod tests {
         stub_one_hn_comment(&env, 10, "<p>Acme | Remote<p>Hiring.");
         fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None).await.unwrap();
 
-        let out = fetchers.status(&env.ctx).await.unwrap();
+        let out = fetchers.list(&env.ctx, ListParams::default()).await.unwrap();
         let sources = out["sources"].as_array().unwrap();
         let hn = sources.iter().find(|s| s["id"] == "hn-whoishiring").unwrap();
         assert_eq!(hn["last_run_at"], json!(env.ctx.clock.now()));
@@ -1560,6 +1607,18 @@ mod tests {
 
         let wwr = sources.iter().find(|s| s["id"] == "weworkremotely").unwrap();
         assert!(wwr["last_run_at"].is_null(), "never fetched -- no last run");
+    }
+
+    #[test]
+    fn status_is_a_feature_wide_summary_not_per_source() {
+        let env = TestEnv::new("fetchers");
+        write_source(&env, "hn-whoishiring", json!({"enabled": true, "interval": "daily"}));
+        write_source(&env, "weworkremotely", json!({"enabled": false, "interval": schedule::MIN_INTERVAL_SCRAPE_S}));
+        let fetchers = Fetchers::default();
+        fetchers.load(&env.ctx).unwrap();
+
+        let out = fetchers.status(&env.ctx).unwrap();
+        assert_eq!(out, json!({"sources": 2, "enabled": 1, "disabled": 1, "problems": []}));
     }
 
     #[tokio::test]
@@ -1622,11 +1681,11 @@ mod tests {
         let tick = fetchers.handle(TICK_OP, Value::Null, &env.ctx).await.unwrap();
         assert_eq!(tick["enqueued"], json!([]), "no source files at all by default");
 
-        let run = fetchers.handle(RUN_OP, json!({"source": "hn-whoishiring"}), &env.ctx).await.unwrap();
+        let run = fetchers.handle(RUN_OP, json!({"id": "hn-whoishiring"}), &env.ctx).await.unwrap();
         assert_eq!(run["queued"], true);
         assert!(run["task_id"].is_string(), "{run:?}");
 
-        let fetch = fetchers.handle(RUN_TASK_OP, json!({"source": "hn-whoishiring"}), &env.ctx).await.unwrap();
+        let fetch = fetchers.handle(RUN_TASK_OP, json!({"id": "hn-whoishiring"}), &env.ctx).await.unwrap();
         assert_eq!(fetch["source"], "hn-whoishiring");
         assert_eq!(fetch["new_items"], 1);
     }
@@ -1637,7 +1696,7 @@ mod tests {
         // the task failed at once with `not_found` -- never shown to whoever ran it.
         let env = TestEnv::new("fetchers");
         let fetchers = Fetchers::default();
-        let err = fetchers.handle(RUN_OP, json!({"source": "nope"}), &env.ctx).await.unwrap_err();
+        let err = fetchers.handle(RUN_OP, json!({"id": "nope"}), &env.ctx).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);
         assert!(env.queue.requests.lock().unwrap().is_empty(), "nothing should have been queued at all");
     }
@@ -1647,7 +1706,7 @@ mod tests {
         let env = TestEnv::new("fetchers");
         let fetchers = Fetchers::default();
         let out = fetchers
-            .handle(RUN_OP, json!({"source": "hn-whoishiring", "title_contains": ["junior"]}), &env.ctx)
+            .handle(RUN_OP, json!({"id": "hn-whoishiring", "title_contains": ["junior"]}), &env.ctx)
             .await
             .unwrap();
         assert_eq!(out["queued"], true);
@@ -1655,7 +1714,7 @@ mod tests {
         let submitted = env.queue.requests.lock().unwrap();
         assert_eq!(submitted.len(), 1);
         assert_eq!(submitted[0].op, RUN_TASK_OP);
-        assert_eq!(submitted[0].params, json!({"source": "hn-whoishiring", "title_contains": ["junior"]}));
+        assert_eq!(submitted[0].params, json!({"id": "hn-whoishiring", "title_contains": ["junior"]}));
     }
 
     #[tokio::test]
@@ -1745,27 +1804,44 @@ mod tests {
         source_file(&json!({"enabled": true, "interval": "hourly", "kind": "rss", "url": url}))
     }
 
+    /// `fetchers.new`/`.edit`'s structured params (ADR 0028 §9), an `rss` source enabled on an
+    /// hourly interval -- the shape every create/edit test below starts from.
+    fn rss_input(id: &str, url: &str) -> SourceInput {
+        SourceInput {
+            id: id.into(),
+            label: None,
+            kind: Some("rss".into()),
+            enabled: true,
+            interval: schedule::IntervalSpec::Preset("hourly".into()),
+            params: json!({"url": url}).as_object().unwrap().clone(),
+            title_contains: Vec::new(),
+            title_excludes: Vec::new(),
+        }
+    }
+
     #[test]
     fn create_makes_a_new_source_and_refuses_a_duplicate_id() {
         let env = TestEnv::new("fetchers");
         let fetchers = Fetchers::default();
-        let text = rss_text("https://example.test/f.xml");
-        let v = fetchers.create(&env.ctx, Create { id: "blog".into(), text: text.clone() }).unwrap();
+        let v = fetchers.create(&env.ctx, rss_input("blog", "https://example.test/f.xml")).unwrap();
         assert_eq!(v["id"], "blog");
         assert_eq!(v["kind"], "rss");
         assert!(fetchers.state().sources.contains_key("blog"));
-        assert_eq!(env.ctx.store.read_string(&schedule::path("blog")).unwrap().unwrap(), text);
+        let saved = env.ctx.store.read_string(&schedule::path("blog")).unwrap().unwrap();
+        let cfg = schedule::SourceConfig::parse("blog", &saved).unwrap();
+        assert_eq!(cfg.kind_params.get("url").and_then(Value::as_str), Some("https://example.test/f.xml"));
 
-        let err = fetchers.create(&env.ctx, Create { id: "blog".into(), text }).unwrap_err();
+        let err = fetchers.create(&env.ctx, rss_input("blog", "https://example.test/f.xml")).unwrap_err();
         assert_eq!(err.code, shimmer_core::ErrorCode::Conflict);
     }
 
     #[test]
-    fn create_rejects_text_that_does_not_parse_and_leaves_nothing_behind() {
+    fn create_rejects_invalid_params_and_leaves_nothing_behind() {
         let env = TestEnv::new("fetchers");
         let fetchers = Fetchers::default();
-        let bad = source_file(&json!({"enabled": true, "interval": "hourly", "kind": "rss"}));
-        let err = fetchers.create(&env.ctx, Create { id: "blog".into(), text: bad }).unwrap_err();
+        let mut bad = rss_input("blog", "https://example.test/f.xml");
+        bad.params = Map::new(); // rss needs a url
+        let err = fetchers.create(&env.ctx, bad).unwrap_err();
         assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams);
         assert!(env.ctx.store.read(&schedule::path("blog")).unwrap().is_none());
     }
@@ -1781,14 +1857,11 @@ mod tests {
         );
         fetchers.load(&env.ctx).unwrap();
 
-        let text = rss_text("https://b.test/f.xml");
-        let v = fetchers.edit(&env.ctx, Edit { id: "blog".into(), text: text.clone() }).unwrap();
+        let v = fetchers.edit(&env.ctx, rss_input("blog", "https://b.test/f.xml")).unwrap();
         assert_eq!(v["kind_params"]["url"], "https://b.test/f.xml");
-        assert_eq!(env.ctx.store.read_string(&schedule::path("blog")).unwrap().unwrap(), text);
         assert!(fetchers.state().sources.get("blog").unwrap().enabled);
 
-        let err =
-            fetchers.edit(&env.ctx, Edit { id: "nope".into(), text: rss_text("https://c.test/f.xml") }).unwrap_err();
+        let err = fetchers.edit(&env.ctx, rss_input("nope", "https://c.test/f.xml")).unwrap_err();
         assert_eq!(err.code, shimmer_core::ErrorCode::NotFound);
     }
 
