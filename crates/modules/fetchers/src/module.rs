@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -6,11 +5,11 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use shimmer_core::params::decode;
 use shimmer_core::{
-    CommandSpec, Ctx, Error, ErrorCode, Execution, LaneConfig, Manifest, Module, Result, TriggerSpec, WriteLock,
+    CommandSpec, Ctx, Error, ErrorCode, Execution, LaneConfig, Manifest, Module, Result, TriggerId, WriteLock,
 };
 
 use crate::dedup::{self, RunGuard};
-use crate::schedule::{self, Sources, RUN_TASK_OP, TICK_OP};
+use crate::schedule::{self, Sources, RUN_TASK_OP};
 use crate::source::{self, RawItem, Source};
 
 /// Network-bound and slow, same reasoning as every other fetch-shaped lane (CLAUDE.md §6.1).
@@ -48,8 +47,8 @@ const MIN_FIELD_CHARS: usize = 64;
 
 #[derive(Default)]
 pub struct Fetchers {
-    /// A scheduled tick and a manual `fetchers.run` for the same source must never overlap
-    /// (ADR 0028 §5).
+    /// A source's own schedule firing and a manual `fetchers.run` for the same source must
+    /// never overlap (ADR 0028 §5/§6).
     running: RunGuard,
     /// Serialises `last_run.toml`'s read-modify-write (`schedule::record_run`) against itself
     /// -- the `fetchers` lane runs up to 8 fetches at once, each ending in its own call to
@@ -114,20 +113,12 @@ impl Module for Fetchers {
         vec![LaneConfig::new(LANE, 8)]
     }
 
-    fn triggers(&self) -> Vec<TriggerSpec> {
-        vec![schedule::trigger()]
-    }
+    // No `triggers()` override: a fixed heartbeat is replaced by each source scheduling its own
+    // next run directly, via `ctx.schedules` (ADR 0028 §6) -- see `schedule_run`/
+    // `cancel_schedule`/`reconcile_schedule` below.
 
     fn commands(&self) -> Vec<CommandSpec> {
         vec![
-            CommandSpec {
-                op: TICK_OP.into(),
-                summary: "Internal: check configured sources and enqueue a fetch for each one due (the scheduler \
-                          calls this, not a person)"
-                    .into(),
-                params_schema: json!({"type": "null"}),
-                execution: Execution::Queued { lane: LANE.into() },
-            },
             CommandSpec {
                 op: RUN_OP.into(),
                 summary: "Fetch one source now".into(),
@@ -145,7 +136,8 @@ impl Module for Fetchers {
             },
             CommandSpec {
                 op: RUN_TASK_OP.into(),
-                summary: "Internal: the real fetch (fetchers.run enqueues this after checking the source exists)"
+                summary: "Internal: the real fetch -- fetchers.run enqueues this after checking the source \
+                          exists, and a source's own schedule fires it directly"
                     .into(),
                 params_schema: json!({
                     "type": "object", "required": ["id"],
@@ -271,7 +263,6 @@ impl Module for Fetchers {
 
     async fn handle(&self, op: &str, params: Value, ctx: &Ctx) -> Result<Value> {
         match op {
-            TICK_OP => self.tick(ctx).await,
             RUN_OP => self.run(ctx, params).await,
             RUN_TASK_OP => {
                 let p: FetchParams = decode(params)?;
@@ -364,7 +355,7 @@ struct ListParams {
 /// `SourceConfig::parse` (one validation path for both). `kind` stays optional for now: the
 /// fixed, compiled-in registry (`source::registry`) is only removed in ADR 0028 §10, a later
 /// step, and a bare entry for one of those ids must keep working until then.
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct SourceInput {
     id: String,
     #[serde(default)]
@@ -462,29 +453,52 @@ impl TitleFilterOverride {
 }
 
 impl Fetchers {
-    async fn tick(&self, ctx: &Ctx) -> Result<Value> {
-        let sources = self.state().sources.clone();
-        self.run_due(ctx, &sources).await
+    /// Cancels `id`'s pending schedule, if it has one (ADR 0028 §6) -- used by `disable`/
+    /// `remove`, and by `rename`'s "remove the old, add a new one under the new id."
+    fn cancel_schedule(&self, ctx: &Ctx, id: &str) -> Result<()> {
+        if let Some(state) = schedule::load_schedule_state(ctx, id)? {
+            // `false` (already gone -- it fired, or was somehow removed already) is fine; this
+            // is "make sure nothing is pending," not "assert one was."
+            ctx.schedules.remove(&TriggerId::new(state.trigger_id))?;
+            schedule::delete_schedule_state(ctx, id)?;
+        }
+        Ok(())
     }
 
-    /// Split from [`Fetchers::tick`] so the enqueue-and-skip-if-running logic is testable
-    /// against a hand-built map, without needing to write any source files at all.
-    async fn run_due(&self, ctx: &Ctx, sources: &BTreeMap<String, schedule::SourceConfig>) -> Result<Value> {
-        let last_run = schedule::load_last_run(ctx)?;
-        let due = schedule::due_sources(sources, &last_run, ctx.clock.now());
+    /// Replaces `id`'s pending schedule (if any) with one due at `at` (ADR 0028 §6). The op
+    /// fired is always [`RUN_TASK_OP`] with just `{"id"}` -- a scheduled run uses the source's
+    /// own configured filter, never an ad-hoc override.
+    fn schedule_run(&self, ctx: &Ctx, id: &str, at: chrono::DateTime<chrono::Utc>) -> Result<()> {
+        self.cancel_schedule(ctx, id)?;
+        let trigger_id = ctx.schedules.add_once(RUN_TASK_OP, json!({"id": id}), at, &format!("fetchers: {id}"))?;
+        schedule::save_schedule_state(ctx, id, trigger_id.as_str(), at)
+    }
 
-        let (mut enqueued, mut already_running) = (Vec::new(), Vec::new());
-        for source in due {
-            // A peek only -- an optimization to avoid enqueuing a source we can already see
-            // is running. `fetch`'s own `try_acquire` is the real, race-free guarantee.
-            if self.running.is_running(&source) {
-                already_running.push(source);
-                continue;
+    /// Reconciles `id`'s pending schedule after a settings change (ADR 0028 §6): cancels it if
+    /// no longer enabled, schedules it if newly enabled, and recomputes its due time if the
+    /// interval change moved it -- a no-op otherwise, so editing a source's label doesn't
+    /// needlessly reschedule it. `was_enabled` is the state *before* this change; `cfg` is the
+    /// state *after* it, already written to disk by the caller.
+    fn reconcile_schedule(&self, ctx: &Ctx, id: &str, was_enabled: bool, cfg: &schedule::SourceConfig) -> Result<()> {
+        if !cfg.enabled {
+            if was_enabled {
+                self.cancel_schedule(ctx, id)?;
             }
-            ctx.queue.enqueue(RUN_TASK_OP, json!({"id": source})).await?;
-            enqueued.push(source);
+            return Ok(());
         }
-        Ok(json!({"enqueued": enqueued, "already_running": already_running}))
+        // 0: already validated at parse time against the right per-`Method` floor.
+        let interval_s = cfg.interval.resolve(0).unwrap_or(0);
+        let last_run = schedule::load_last_run(ctx)?;
+        let basis = last_run.get(id).copied().unwrap_or_else(|| ctx.clock.now());
+        let due_at = basis + chrono::Duration::seconds(interval_s as i64);
+        if was_enabled {
+            if let Some(state) = schedule::load_schedule_state(ctx, id)? {
+                if state.due_at == due_at {
+                    return Ok(()); // nothing that affects timing changed
+                }
+            }
+        }
+        self.schedule_run(ctx, id, due_at)
     }
 
     /// `fetchers.run` (inline): refuses an unknown source with `not_found` before acking
@@ -496,10 +510,12 @@ impl Fetchers {
     /// The one cost: a task this enqueues has `Origin::Module`, not `Origin::User` --
     /// `Ctx`/`QueueHandle` has no way for a module to submit as the user, by design (CLAUDE.md
     /// §5: "adding a field is a security decision"). So `shimmer queue list` shows "module:
-    /// fetchers" for a person's own `fetchers run`, same as a heartbeat-triggered one, rather
-    /// than attributing it to them directly. Priority and lane ordering are unaffected --
-    /// `Origin::User` and `Origin::Module` both get `Priority::Normal`, the same arrival-order
-    /// queue (CLAUDE.md §6.2) -- this is a display-only cost, accepted for the correctness fix.
+    /// fetchers" for a person's own `fetchers run`, rather than attributing it to them
+    /// directly -- distinct from a source's own schedule firing, which shows as
+    /// `Origin::Scheduler` (the trigger that fired it), since that one really does come from
+    /// `ctx.schedules`. Priority and lane ordering are unaffected -- every origin shares the
+    /// same arrival-order queue except `Overridden` (CLAUDE.md §6.2) -- this is a display-only
+    /// cost, accepted for the correctness fix.
     async fn run(&self, ctx: &Ctx, params: Value) -> Result<Value> {
         let p: FetchParams = decode(params.clone())?;
         if p.id.trim().is_empty() {
@@ -533,8 +549,8 @@ impl Fetchers {
         let configured = sources.sources.get(&source_id);
         let outcome = self.run_source(ctx, source.as_ref(), filter_override.as_ref(), configured).await;
         // Recorded regardless of outcome -- including failure -- so a broken source is
-        // retried at most once per interval (ADR 0028 §5, §6: "after that, wait for the
-        // next trigger"), not hammered every tick. Held only across this call -- up to 8
+        // retried at most once per interval (ADR 0028 §6: its next scheduled run), not
+        // retried immediately. Held only across this call -- up to 8
         // fetches finish around the same time on this lane, and this file's own
         // read-modify-write must not interleave with another source's (PR #126 review).
         //
@@ -544,6 +560,13 @@ impl Fetchers {
         if !ctx.cancel.is_cancelled() {
             let _g = self.write.lock();
             schedule::record_run(ctx, &source_id, ctx.clock.now())?;
+            // Next run scheduled from here, success or failure (ADR 0028 §6) -- whether this
+            // run was the source's own schedule firing or a person's manual `fetchers.run`,
+            // there is always exactly one pending schedule per source, pointing at its last
+            // actual run plus its interval.
+            if let Some(cfg) = configured {
+                self.reconcile_schedule(ctx, &source_id, cfg.enabled, cfg)?;
+            }
         }
 
         match outcome {
@@ -745,7 +768,7 @@ impl Fetchers {
         if ctx.store.read(&schedule::path(&p.id))?.is_some() {
             return Err(Error::conflict(format!("source '{}' already exists", p.id)));
         }
-        self.write_source(ctx, p, "fetchers.source.created")
+        self.write_source(ctx, p, false, "fetchers.source.created")
     }
 
     /// Replace a source's file text wholesale, after checking it (same rule `automations.edit`
@@ -760,6 +783,9 @@ impl Fetchers {
         if ctx.store.read(&schedule::path(id))?.is_none() {
             return Err(Error::not_found(format!("no source '{id}'")));
         }
+        // `false` for a source whose old file was broken (in `problems`, not `sources`): a
+        // file that never successfully parsed never had a schedule to reconcile against.
+        let was_enabled = self.state().sources.get(id).map(|c| c.enabled).unwrap_or(false);
         let cfg = schedule::SourceConfig::parse(id, text).map_err(Error::invalid_params)?;
         ctx.store.transaction(|tx| {
             tx.put(&schedule::path(id), text)?;
@@ -769,10 +795,11 @@ impl Fetchers {
         st.problems.remove(id);
         st.sources.insert(id.to_owned(), cfg.clone());
         drop(st);
+        self.reconcile_schedule(ctx, id, was_enabled, &cfg)?;
         Ok(view(id, &cfg))
     }
 
-    fn write_source(&self, ctx: &Ctx, p: SourceInput, topic: &str) -> Result<Value> {
+    fn write_source(&self, ctx: &Ctx, p: SourceInput, was_enabled: bool, topic: &str) -> Result<Value> {
         let text = schedule::render(
             p.label.as_deref(),
             p.kind.as_deref(),
@@ -792,6 +819,7 @@ impl Fetchers {
         st.problems.remove(&p.id);
         st.sources.insert(p.id.clone(), cfg.clone());
         drop(st);
+        self.reconcile_schedule(ctx, &p.id, was_enabled, &cfg)?;
         Ok(view(&p.id, &cfg))
     }
 
@@ -829,6 +857,9 @@ impl Fetchers {
         let mut st = self.state();
         st.sources.remove(id);
         st.problems.remove(id);
+        drop(st);
+        // Nothing should fire for a removed source (ADR 0028 §6).
+        self.cancel_schedule(ctx, id)?;
         Ok(json!({"removed": true, "source": id}))
     }
 
@@ -902,6 +933,9 @@ impl Fetchers {
             Ok(cfg) => {
                 st.sources.insert(id.to_owned(), cfg.clone());
                 drop(st);
+                // Re-adds a schedule the same way enabling does (ADR 0028 §6) -- `remove`
+                // already cancelled whatever it had before, so this starts fresh.
+                self.reconcile_schedule(ctx, id, false, &cfg)?;
                 Ok(json!({"restored": true, "source": view(id, &cfg), "problem": null}))
             }
             Err(e) => {
@@ -933,6 +967,7 @@ impl Fetchers {
             tx.emit(topic, json!({"source": id}))
         })?;
         self.state().sources.insert(id.to_owned(), cfg.clone());
+        self.reconcile_schedule(ctx, id, !on, &cfg)?;
         Ok(view(id, &cfg))
     }
 
@@ -961,6 +996,7 @@ impl Fetchers {
         let renamed = schedule::SourceConfig::parse(&p.to, &text).map_err(Error::invalid_params)?;
         let seen = ctx.store.read(&dedup::path(&p.id))?;
         let last_run = schedule::rename_last_run(ctx, &p.id, &p.to)?;
+        let old_schedule = schedule::load_schedule_state(ctx, &p.id)?;
         ctx.store.transaction(|tx| {
             tx.put(&schedule::path(&p.to), text.as_str())?;
             tx.delete(&schedule::path(&p.id))?;
@@ -978,6 +1014,19 @@ impl Fetchers {
         st.problems.remove(&p.id);
         st.sources.insert(p.to.clone(), renamed.clone());
         drop(st);
+        // The pending schedule follows the rename at its same due time (ADR 0028 §6) -- simpler
+        // than reconciling, which would recompute a (possibly different) due time from scratch.
+        if let Some(state) = old_schedule {
+            ctx.schedules.remove(&TriggerId::new(state.trigger_id))?;
+            schedule::delete_schedule_state(ctx, &p.id)?;
+            let trigger_id = ctx.schedules.add_once(
+                RUN_TASK_OP,
+                json!({"id": p.to}),
+                state.due_at,
+                &format!("fetchers: {}", p.to),
+            )?;
+            schedule::save_schedule_state(ctx, &p.to, trigger_id.as_str(), state.due_at)?;
+        }
         Ok(view(&p.to, &renamed))
     }
 
@@ -1133,7 +1182,6 @@ mod tests {
 
     use super::*;
     use crate::schedule::test_support::{source_file, write_source};
-    use crate::schedule::IntervalSpec;
 
     #[test]
     fn manifest_declares_its_topics_and_the_network_capability() {
@@ -1167,9 +1215,10 @@ mod tests {
     }
 
     #[test]
-    fn declares_exactly_the_heartbeat_trigger() {
-        let triggers = Fetchers::default().triggers();
-        assert_eq!(triggers, vec![schedule::trigger()]);
+    fn declares_no_fixed_triggers() {
+        // Each source schedules its own next run directly, via `ctx.schedules` (ADR 0028 §6) --
+        // no heartbeat.
+        assert_eq!(Fetchers::default().triggers(), Vec::new());
     }
 
     #[tokio::test]
@@ -1269,51 +1318,6 @@ mod tests {
             Ok(_) => panic!("a whitespace-only title_contains term must be rejected"),
             Err(e) => assert!(e.message.contains("title_contains"), "{}", e.message),
         }
-    }
-
-    fn source_config(enabled: bool, interval_s: u64) -> schedule::SourceConfig {
-        schedule::SourceConfig {
-            label: None,
-            enabled,
-            interval: IntervalSpec::Seconds(interval_s),
-            kind: None,
-            title_contains: Vec::new(),
-            title_excludes: Vec::new(),
-            kind_params: serde_json::Map::new(),
-        }
-    }
-
-    #[tokio::test]
-    async fn tick_enqueues_every_due_source_and_only_those() {
-        let env = TestEnv::new("fetchers");
-        let mut sources = BTreeMap::new();
-        sources.insert("hn-whoishiring".into(), source_config(true, schedule::MIN_INTERVAL_API_S));
-        sources.insert("weworkremotely".into(), source_config(false, schedule::MIN_INTERVAL_API_S));
-
-        let fetchers = Fetchers::default();
-        let result = fetchers.run_due(&env.ctx, &sources).await.unwrap();
-        assert_eq!(result["enqueued"], json!(["hn-whoishiring"]));
-        assert_eq!(result["already_running"], json!([]));
-
-        let submitted = env.queue.requests.lock().unwrap();
-        assert_eq!(submitted.len(), 1);
-        assert_eq!(submitted[0].op, RUN_TASK_OP);
-        assert_eq!(submitted[0].params, json!({"id": "hn-whoishiring"}));
-    }
-
-    #[tokio::test]
-    async fn tick_skips_a_source_it_already_sees_running() {
-        let env = TestEnv::new("fetchers");
-        let mut sources = BTreeMap::new();
-        sources.insert("hn-whoishiring".into(), source_config(true, schedule::MIN_INTERVAL_API_S));
-
-        let fetchers = Fetchers::default();
-        let _permit = fetchers.running.try_acquire("hn-whoishiring").unwrap();
-        let result = fetchers.run_due(&env.ctx, &sources).await.unwrap();
-
-        assert_eq!(result["enqueued"], json!([]));
-        assert_eq!(result["already_running"], json!(["hn-whoishiring"]));
-        assert!(env.queue.requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1734,9 +1738,6 @@ mod tests {
         let env = TestEnv::new("fetchers");
         stub_one_hn_comment(&env, 20, "<p>Widgets Inc<p>Hiring.");
         let fetchers = Fetchers::default();
-
-        let tick = fetchers.handle(TICK_OP, Value::Null, &env.ctx).await.unwrap();
-        assert_eq!(tick["enqueued"], json!([]), "no source files at all by default");
 
         let run = fetchers.handle(RUN_OP, json!({"id": "hn-whoishiring"}), &env.ctx).await.unwrap();
         assert_eq!(run["queued"], true);
@@ -2197,5 +2198,145 @@ mod tests {
 
         let out = fetchers.list(&env.ctx, ListParams { removed: true }).await.unwrap();
         assert_eq!(out, json!({"removed": ["blog"]}));
+    }
+
+    /// The one `OneTime` currently pending for `id`, by inspecting the test harness's own
+    /// record of everything `ctx.schedules.add_once` was ever called with -- not
+    /// `schedule::load_schedule_state`, so these tests also prove the sidecar file and the
+    /// scheduler's own idea of what's pending agree.
+    fn pending_schedule(env: &TestEnv, id: &str) -> Option<schedule::ScheduleState> {
+        let state = schedule::load_schedule_state(&env.ctx, id).unwrap()?;
+        let added = env.schedules.added.lock().unwrap();
+        let (_, trigger_id, once) =
+            added.iter().find(|(_, t, _)| t.as_str() == state.trigger_id).expect("state.toml names a real trigger");
+        assert_eq!(once.op, RUN_TASK_OP);
+        assert_eq!(once.params, json!({"id": id}));
+        assert_eq!(trigger_id.as_str(), state.trigger_id);
+        Some(state)
+    }
+
+    #[test]
+    fn create_enabled_schedules_a_run_at_now_plus_interval_create_disabled_schedules_nothing() {
+        let env = TestEnv::new("fetchers");
+        let fetchers = Fetchers::default();
+        let mut enabled = rss_input("blog", "https://example.test/f.xml");
+        enabled.interval = schedule::IntervalSpec::Seconds(3600);
+        fetchers.create(&env.ctx, enabled).unwrap();
+        let state = pending_schedule(&env, "blog").expect("an enabled source schedules its first run");
+        assert_eq!(state.due_at, env.ctx.clock.now() + chrono::Duration::seconds(3600));
+
+        let mut disabled = rss_input("quiet-blog", "https://example.test/g.xml");
+        disabled.enabled = false;
+        fetchers.create(&env.ctx, disabled).unwrap();
+        assert!(pending_schedule(&env, "quiet-blog").is_none());
+    }
+
+    #[test]
+    fn enable_schedules_and_disable_cancels() {
+        let env = TestEnv::new("fetchers");
+        let fetchers = Fetchers::default();
+        write_source(
+            &env,
+            "blog",
+            json!({"enabled": false, "interval": 3600, "kind": "rss", "url": "https://e.test/f"}),
+        );
+        fetchers.load(&env.ctx).unwrap();
+        assert!(pending_schedule(&env, "blog").is_none());
+
+        fetchers.set_enabled(&env.ctx, "blog", true).unwrap();
+        assert!(pending_schedule(&env, "blog").is_some());
+
+        fetchers.set_enabled(&env.ctx, "blog", false).unwrap();
+        assert!(pending_schedule(&env, "blog").is_none(), "disabling must cancel the pending schedule");
+    }
+
+    #[test]
+    fn editing_the_interval_reschedules_but_an_unrelated_edit_does_not() {
+        let env = TestEnv::new("fetchers");
+        let fetchers = Fetchers::default();
+        let mut input = rss_input("blog", "https://example.test/f.xml");
+        input.interval = schedule::IntervalSpec::Seconds(3600);
+        fetchers.create(&env.ctx, input).unwrap();
+        let first = pending_schedule(&env, "blog").unwrap();
+        let first_trigger_count = env.schedules.added.lock().unwrap().len();
+
+        // Same interval, only the label changes: must not touch the schedule at all.
+        let relabeled = source_file(&json!({
+            "enabled": true, "interval": 3600, "kind": "rss", "url": "https://example.test/f.xml",
+            "label": "My Blog",
+        }));
+        fetchers.edit(&env.ctx, "blog", &relabeled).unwrap();
+        assert_eq!(pending_schedule(&env, "blog"), Some(first.clone()), "an unrelated field must not reschedule");
+        assert_eq!(env.schedules.added.lock().unwrap().len(), first_trigger_count, "no new schedule was added");
+
+        // A longer interval must move the due time.
+        let longer = source_file(&json!({
+            "enabled": true, "interval": 7200, "kind": "rss", "url": "https://example.test/f.xml",
+            "label": "My Blog",
+        }));
+        fetchers.edit(&env.ctx, "blog", &longer).unwrap();
+        let second = pending_schedule(&env, "blog").unwrap();
+        assert_ne!(second.due_at, first.due_at);
+        assert_eq!(second.due_at, env.ctx.clock.now() + chrono::Duration::seconds(7200));
+    }
+
+    #[test]
+    fn remove_cancels_the_pending_schedule_and_restore_schedules_a_fresh_one() {
+        let env = TestEnv::new("fetchers");
+        let fetchers = Fetchers::default();
+        let mut input = rss_input("blog", "https://example.test/f.xml");
+        input.interval = schedule::IntervalSpec::Seconds(3600);
+        fetchers.create(&env.ctx, input).unwrap();
+        assert!(pending_schedule(&env, "blog").is_some());
+
+        fetchers.remove(&env.ctx, "blog").unwrap();
+        assert!(pending_schedule(&env, "blog").is_none());
+
+        fetchers.restore(&env.ctx, "blog").unwrap();
+        assert!(pending_schedule(&env, "blog").is_some(), "restoring an enabled source re-schedules it");
+    }
+
+    #[test]
+    fn rename_moves_the_pending_schedule_to_the_new_id_at_the_same_due_time() {
+        let env = TestEnv::new("fetchers");
+        let fetchers = Fetchers::default();
+        let mut input = rss_input("blog", "https://example.test/f.xml");
+        input.interval = schedule::IntervalSpec::Seconds(3600);
+        fetchers.create(&env.ctx, input).unwrap();
+        let before = pending_schedule(&env, "blog").unwrap();
+
+        fetchers.rename(&env.ctx, MoveParams { id: "blog".into(), to: "team-blog".into() }).unwrap();
+        assert!(pending_schedule(&env, "blog").is_none());
+        let after = pending_schedule(&env, "team-blog").expect("the schedule follows the rename");
+        assert_eq!(after.due_at, before.due_at, "rename keeps the same due time, unlike an interval edit");
+    }
+
+    #[test]
+    fn copy_never_schedules_since_it_always_starts_disabled() {
+        let env = TestEnv::new("fetchers");
+        let fetchers = Fetchers::default();
+        write_source(
+            &env,
+            "blog",
+            json!({"enabled": true, "interval": 3600, "kind": "rss", "url": "https://e.test/f"}),
+        );
+        fetchers.load(&env.ctx).unwrap();
+
+        fetchers.copy(&env.ctx, CopyParams { id: "blog".into(), to: "blog-2".into(), label: None }).unwrap();
+        assert!(pending_schedule(&env, "blog-2").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_finished_run_schedules_the_next_one_from_its_own_last_run_time() {
+        let env = TestEnv::new("fetchers");
+        write_source(&env, "hn-whoishiring", json!({"enabled": true, "interval": schedule::MIN_INTERVAL_API_S}));
+        let fetchers = Fetchers::default();
+        fetchers.load(&env.ctx).unwrap();
+        stub_one_hn_comment(&env, 10, "<p>Acme | Remote<p>Hiring.");
+
+        fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None).await.unwrap();
+
+        let state = pending_schedule(&env, "hn-whoishiring").expect("a finished run reschedules the source");
+        assert_eq!(state.due_at, env.ctx.clock.now() + chrono::Duration::seconds(schedule::MIN_INTERVAL_API_S as i64));
     }
 }

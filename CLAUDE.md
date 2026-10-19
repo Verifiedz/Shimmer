@@ -472,6 +472,7 @@ $SHIMMER_HOME/
   data/automations/rules/<id>.toml  One per rule; settings.toml, history.json, removed/ (ADR 0035).
   data/fetchers/sources/<id>.toml  One per source: [source] (enabled, interval, kind, title
                            filters) + [kind] (that kind's own fields) (ADR 0028 §4). Also
+                           <id>.state.toml (its one pending ctx.schedules entry, ADR 0028 §6),
                            <id>/seen.toml (dedup) and last_run.toml, per source.
   data/notify/             Notify's inbox (inbox/<id>.toml, one file per message), settings.toml,
                            and held/ markers (ADR 0032). A message no sink could deliver stays in
