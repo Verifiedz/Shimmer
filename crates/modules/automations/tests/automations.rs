@@ -280,7 +280,7 @@ async fn a_rules_stop_is_reported_once_in_a_while_not_every_time() {
     let m = started(&env).await;
     let ctx = &env.ctx;
     let rule = "[rule]\non = \"records.item.updated\"\n[[do]]\nop = \"records.update\"\n";
-    call(&m, ctx, "automations.create", json!({"id": "again", "text": rule})).await.unwrap();
+    call(&m, ctx, "automations.new", json!({"id": "again", "text": rule})).await.unwrap();
     let stops = |env: &TestEnv| topics(env).iter().filter(|t| *t == "automations.chain.stopped").count();
 
     // Fresh chain, fire, then its own update comes back: stopped. Twice, from two fresh chains.
