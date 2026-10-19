@@ -412,6 +412,15 @@ mod tests {
         }
     }
 
+    /// Polls until `path` exists (empty is fine), up to 5s.
+    async fn wait_for_file_to_exist(path: &Path) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !path.exists() {
+            assert!(tokio::time::Instant::now() < deadline, "{} never appeared", path.display());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// A script line that starts a grandchild in the script's process group and writes its pid
     /// to `pid_file` (atomically, so a reader never sees half of it). The grandchild sleeps
     /// far longer than any test waits, so it's only gone if something killed it.
@@ -437,7 +446,19 @@ mod tests {
     async fn detached_script_outlives_the_backend_that_spawned_it() {
         let home = TempDir::new().unwrap();
         let marker = home.path().join("marker");
-        write_step_script(home.path(), "deep-work", "setup", &format!("sleep 0.3 && touch {}\n", marker.display()));
+        let release = home.path().join("release");
+        // The script waits for the test to say go, rather than a guessed 0.3 s that a slow
+        // runner could spend just spawning it; it gives up after 10 s so it never lingers.
+        write_step_script(
+            home.path(),
+            "deep-work",
+            "setup",
+            &format!(
+                "i=0; while [ ! -e {r} ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done; touch {m}\n",
+                r = release.display(),
+                m = marker.display()
+            ),
+        );
 
         {
             let backend = backend(&home);
@@ -449,8 +470,8 @@ mod tests {
         }
 
         assert!(!marker.exists(), "script should not have finished yet");
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        assert!(marker.exists(), "detached process did not outlive the backend that spawned it");
+        std::fs::write(&release, "").unwrap();
+        wait_for_file_to_exist(&marker).await;
     }
 
     const ECHO_ALL_INJECTED: &str = "echo \"$SHIMMER_WORKSPACE_ID|$SHIMMER_WORKSPACE_DIR|$SHIMMER_HOME|$SHIMMER_SOCKET|$SHIMMER_SESSION_ID|$SHIMMER_PLATFORM\"";
