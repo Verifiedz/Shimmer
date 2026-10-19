@@ -25,6 +25,9 @@ pub enum Op {
     Set(bool),
     /// Text containing this, ignoring case; kept lowercase.
     Contains(String),
+    /// Text not containing this, ignoring case; kept lowercase. Unset or non-text passes, the
+    /// same "the negative condition isn't violated" reasoning as `Ne` (ADR 0028 §8, fetchers).
+    NotContains(String),
     /// A list holding this item (text ignoring case).
     Has(Value),
 }
@@ -51,6 +54,10 @@ impl Op {
                 Some(s) if !s.is_empty() => Op::Contains(s.to_lowercase()),
                 _ => return Err("'contains' takes some text".into()),
             },
+            "not_contains" => match arg.as_str() {
+                Some(s) if !s.is_empty() => Op::NotContains(s.to_lowercase()),
+                _ => return Err("'not_contains' takes some text".into()),
+            },
             other => return Err(format!("unknown operator '{other}'")),
         })
     }
@@ -67,7 +74,7 @@ impl Op {
             Op::Gte(v) => Op::Gte(f(&v)?),
             Op::Has(v) => Op::Has(f(&v)?),
             Op::In(list) => Op::In(list.iter().map(f).collect::<Result<_, _>>()?),
-            other @ (Op::Set(_) | Op::Contains(_)) => other,
+            other @ (Op::Set(_) | Op::Contains(_) | Op::NotContains(_)) => other,
         })
     }
 
@@ -85,6 +92,7 @@ impl Op {
             Op::In(list) => is_set(got) && list.contains(got),
             Op::Set(want) => is_set(got) == *want,
             Op::Contains(needle) => got.as_str().is_some_and(|s| s.to_lowercase().contains(needle)),
+            Op::NotContains(needle) => !got.as_str().is_some_and(|s| s.to_lowercase().contains(needle)),
             Op::Has(want) => got.as_array().is_some_and(|items| items.iter().any(|i| same(i, want))),
         }
     }
@@ -295,6 +303,8 @@ mod tests {
         assert!(passes(json!({"pay": {"gte": 90, "lt": 100.5}}), ev.clone()), "numbers as numbers");
         assert!(passes(json!({"stage": {"in": ["Applied", "offer"]}}), ev.clone()));
         assert!(passes(json!({"stage": {"contains": "PPL"}}), ev.clone()));
+        assert!(passes(json!({"stage": {"not_contains": "rejected"}}), ev.clone()));
+        assert!(!passes(json!({"stage": {"not_contains": "ppl"}}), ev.clone()), "not_contains is case-insensitive too");
         assert!(passes(json!({"tags": {"has": "A"}, "nope": {"set": false}}), ev.clone()));
         assert!(passes(json!({"stage": {"ne": "rejected"}}), ev.clone()));
         assert!(passes(json!({"due": {"lte": "today+3", "gt": "today"}}), ev.clone()), "relative dates");
@@ -324,6 +334,24 @@ mod tests {
         assert!(!passes(f, json!({"collection": "docs", "stage": "offer"})));
     }
 
+    /// Unset or non-text passes `not_contains`, the same "negative condition isn't violated"
+    /// reasoning `ne` already has — so an exclude term can't accidentally reject a record that
+    /// never had the field at all.
+    #[test]
+    fn not_contains_passes_when_unset_and_combines_with_or() {
+        assert!(passes(json!({"title": {"not_contains": "intern"}}), json!({})), "no title at all");
+        assert!(passes(json!({"title": {"not_contains": "intern"}}), json!({"title": 5})), "not text at all");
+
+        // A source's filter (ADR 0028 §8): an "or" of include terms, anded with an exclude term.
+        let f = json!({
+            "or": [{"title": {"contains": "senior"}}, {"title": {"contains": "staff"}}],
+            "title": {"not_contains": "intern"},
+        });
+        assert!(passes(f.clone(), json!({"title": "Senior Engineer"})));
+        assert!(!passes(f.clone(), json!({"title": "Senior Engineer Intern"})), "excluded, even though included");
+        assert!(!passes(f, json!({"title": "Backend Engineer"})), "matches neither include term");
+    }
+
     #[test]
     fn mistakes_name_the_key() {
         for (f, want) in [
@@ -332,6 +360,7 @@ mod tests {
             (json!({"stage": {"in": []}}), "'in' takes a non-empty list"),
             (json!({"x": {"set": "yes"}}), "'set' takes true or false"),
             (json!({"x": {"contains": ""}}), "'contains' takes some text"),
+            (json!({"x": {"not_contains": ""}}), "'not_contains' takes some text"),
             (json!({"due": {"lt": "today+x"}}), "write today, today+N or today-N"),
             (json!({"or": [{"or": [{"a": 1}]}]}), "can't be nested"),
             (json!({"or": []}), "non-empty list of filters"),
