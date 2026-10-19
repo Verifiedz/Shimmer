@@ -60,6 +60,12 @@ impl Store {
         &self.home
     }
 
+    /// The events logged at or after `since`, oldest first, reading only the day files from
+    /// then on (#261 finding 1).
+    pub fn read_events_since(&self, since: chrono::DateTime<chrono::Utc>) -> Result<EventScan> {
+        log::read_since(&self.home, since)
+    }
+
     pub fn index_path(&self) -> PathBuf {
         self.home.join("index.sqlite")
     }
