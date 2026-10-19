@@ -37,8 +37,9 @@ daemon.sock
 
 pub struct Store {
     home: PathBuf,
-    /// Serialises commits and log appends. Cheap: one writer process anyway.
-    write_lock: Mutex<()>,
+    /// Serialises commits and log appends. Cheap: one writer process anyway. Holds the
+    /// committed transactions whose last step failed, retried before the next commit (#260).
+    write_lock: Mutex<Vec<PathBuf>>,
 }
 
 impl Store {
@@ -53,7 +54,7 @@ impl Store {
         if !ignore.exists() {
             atomic::write_atomic(&ignore, GITIGNORE.as_bytes())?;
         }
-        Ok(Self { home, write_lock: Mutex::new(()) })
+        Ok(Self { home, write_lock: Mutex::new(Vec::new()) })
     }
 
     pub fn home(&self) -> &Path {
@@ -81,7 +82,7 @@ impl Store {
         log::read_all(&self.home)
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<PathBuf>> {
         // A panic mid-commit leaves staging state that recovery handles; the lock itself
         // guards no data, so poisoning carries no information.
         self.write_lock.lock().unwrap_or_else(|e| e.into_inner())
@@ -125,7 +126,7 @@ impl StoreBackend for Store {
             let (shimmer_core::Write::Put { path, .. } | shimmer_core::Write::Delete { path }) = w;
             validate_path(path)?;
         }
-        let _g = self.lock();
-        tx::commit(&self.home, &dir, namespace, plan)
+        let mut pending = self.lock();
+        tx::commit(&self.home, &dir, namespace, plan, &mut pending)
     }
 }

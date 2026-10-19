@@ -4,6 +4,10 @@
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Makes each in-flight temp file's name its own (#260 finding 3).
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub fn fsync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
@@ -13,7 +17,11 @@ pub fn write_atomic(dest: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = dest.parent().ok_or_else(|| io::Error::other("path has no parent"))?;
     fs::create_dir_all(parent)?;
     let name = dest.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-    let tmp = parent.join(format!(".{name}.tmp-{}", std::process::id()));
+    // Unique per call, not just per process: two writers of one file at once (the HTTP cache's
+    // two requests for one url) each rename their own temp file, and the last rename wins
+    // cleanly, where one shared name let one writer's rename take the other's file (#260).
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".{name}.tmp-{}-{seq}", std::process::id()));
     let result = (|| {
         let mut f = File::create(&tmp)?;
         f.write_all(bytes)?;
