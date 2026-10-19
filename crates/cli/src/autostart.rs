@@ -17,11 +17,17 @@ const POLL: Duration = Duration::from_millis(50);
 
 /// Launch `<exe> daemon` detached, bound to `socket`, and wait until it completes a handshake.
 pub async fn start_and_connect(exe: &Path, socket: &Path) -> Result<Client> {
+    // The daemon runs in `/`, never in the folder this command happens to be in (a USB drive's
+    // folder couldn't be unmounted while it runs, #266 finding 3). So the folder and socket it's
+    // given are made absolute first: a relative `SHIMMER_HOME=play` means this command's `play`.
+    let absolute = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
     let mut child = Command::new(exe)
         .arg("daemon")
         // `socket` may itself have come from $SHIMMER_SOCKET or $XDG_RUNTIME_DIR; pinning it makes
         // the daemon bind exactly where this client is about to look.
-        .env("SHIMMER_SOCKET", socket)
+        .env("SHIMMER_SOCKET", absolute(socket))
+        .env("SHIMMER_HOME", absolute(&shimmer_proto::paths::shimmer_home()))
+        .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
