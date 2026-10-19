@@ -15,6 +15,7 @@ mod editor;
 mod first;
 mod flags;
 mod follow;
+mod notify;
 pub mod packs;
 mod queue;
 mod records;
@@ -207,6 +208,7 @@ fn usage_for(args: &[String]) -> &'static str {
             "automations" => return automations::USAGE,
             "schedule" => return schedule::USAGE,
             "packs" => return packs::cmd::USAGE,
+            "notify" => return notify::USAGE,
             "doctor" => return doctor::USAGE,
             _ => return USAGE,
         }
@@ -235,7 +237,7 @@ fn prints_data(cmd: &Command) -> bool {
             | Command::Scheduler(SchedulerCmd::List | SchedulerCmd::Show { .. })
             // Every reply that can carry a rule's label, which is the person's text (#253's review).
             | Command::Automations(
-                AutomationsCmd::List
+                AutomationsCmd::List { .. }
                     | AutomationsCmd::Show { .. }
                     | AutomationsCmd::New { .. }
                     | AutomationsCmd::Edit { .. }
@@ -249,6 +251,9 @@ fn prints_data(cmd: &Command) -> bool {
                     | AutomationsCmd::Reload
             )
             | Command::Schedule(_)
+            | Command::Notify(
+                notify::NotifyCmd::List { .. } | notify::NotifyCmd::Show { .. } | notify::NotifyCmd::Send { .. }
+            )
     )
 }
 
@@ -271,6 +276,9 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
 
     if let Command::Records(cmd) = &args.command {
         return records::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
+    }
+    if let Command::Notify(cmd) = &args.command {
+        return notify::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
     }
     if let Command::Queue(cmd) = &args.command {
         return queue::run(&mut client, cmd, args.json).await.map(Some);
@@ -304,7 +312,8 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
         | Command::Scheduler(_)
         | Command::Automations(_)
         | Command::Schedule(_)
-        | Command::Packs(_) => {
+        | Command::Packs(_)
+        | Command::Notify(_) => {
             unreachable!("handled above")
         }
     };
@@ -374,7 +383,8 @@ fn output(args: &Args, data: &Value) -> String {
         | Command::Scheduler(_)
         | Command::Automations(_)
         | Command::Schedule(_)
-        | Command::Packs(_) => render::json(data),
+        | Command::Packs(_)
+        | Command::Notify(_) => render::json(data),
     }
 }
 

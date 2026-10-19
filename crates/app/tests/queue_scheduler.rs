@@ -145,7 +145,9 @@ fn a_trigger_fires_and_can_be_paused_resumed_and_removed() {
     assert!(ok(&home, &["scheduler", "resume", &id]).starts_with(&format!("✓ resumed {what}")));
     assert!(ok(&home, &["scheduler", "show", &id]).starts_with(&format!("{id}  (active)")));
     assert_eq!(ok(&home, &["scheduler", "remove", &id]).trim(), format!("✓ removed {what}"));
-    assert!(ok(&home, &["scheduler", "list"]).starts_with("no triggers yet"));
+    // Gone; only modules' own remain (notify's hourly `notify.flush`).
+    let left = ok(&home, &["scheduler", "list"]);
+    assert!(!left.contains(shown(&id)) && !left.contains("records.list"), "{left}");
 }
 
 #[test]

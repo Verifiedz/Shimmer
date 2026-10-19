@@ -64,7 +64,7 @@ async fn every_template_makes_rules_that_check_with_and_without_optional_answers
         for all in [false, true] {
             let rule = format!("{id}-{all}");
             let params = json!({"id": rule, "template": id, "values": answers(t, all)});
-            let made = m.handle("automations.create", params, &env.ctx).await;
+            let made = m.handle("automations.new", params, &env.ctx).await;
             let made = made.unwrap_or_else(|e| panic!("{id} (all answers: {all}): {}", e.message));
             let rules = made["rules"].as_array().unwrap();
             assert_eq!(rules.len(), t["rules"].as_array().unwrap().len(), "{id}");
@@ -73,7 +73,8 @@ async fn every_template_makes_rules_that_check_with_and_without_optional_answers
     }
     let status = m.handle("automations.status", json!({}), &env.ctx).await.unwrap();
     assert_eq!(status["problems"], json!([]));
-    assert_eq!(status["rules"], 2 * (9 + 2), "stage-creates-workspace makes three rules");
+    // stage-creates-workspace makes three rules; the two built-ins on queue.task.failed are there too.
+    assert_eq!(status["rules"], 2 * (9 + 2) + 2);
 }
 
 #[tokio::test]
@@ -84,7 +85,7 @@ async fn preview_shows_the_rules_and_makes_nothing() {
     let values = json!({"COLLECTION": "jobs", "FIELD": "stage", "VALUE": "interviewing", "TEMPLATE": "interview-prep",
                         "CLOSED": "offer, rejected", "ANSWERS": "COMPANY=title"});
     let params = json!({"id": "prep", "template": "stage-creates-workspace", "values": values, "preview": true});
-    let shown = m.handle("automations.create", params.clone(), &env.ctx).await.unwrap();
+    let shown = m.handle("automations.new", params.clone(), &env.ctx).await.unwrap();
     let ids: Vec<&str> = shown["rules"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
     assert_eq!(ids, ["prep-make", "prep-open", "prep-stop"]);
     let make = shown["rules"][0]["text"].as_str().unwrap();
@@ -101,9 +102,9 @@ async fn preview_shows_the_rules_and_makes_nothing() {
     // Made for real, then the same ids clash.
     let mut real = params.clone();
     real["preview"] = json!(false);
-    m.handle("automations.create", real.clone(), &env.ctx).await.unwrap();
+    m.handle("automations.new", real.clone(), &env.ctx).await.unwrap();
     assert_eq!(env.backend.events().len(), 3);
-    let again = m.handle("automations.create", real, &env.ctx).await.unwrap_err();
+    let again = m.handle("automations.new", real, &env.ctx).await.unwrap_err();
     assert_eq!(again.code, ErrorCode::Conflict);
     assert!(again.message.contains("prep-make, prep-open, prep-stop"), "{}", again.message);
 }
@@ -113,7 +114,7 @@ async fn mistakes_and_missing_modules_are_explained() {
     let env = env(&["workspaces.activate"]);
     let m = Automations::default();
     m.init(&env.ctx).await.unwrap();
-    let call = |p: Value| m.handle("automations.create", p, &env.ctx);
+    let call = |p: Value| m.handle("automations.new", p, &env.ctx);
 
     let e = call(json!({"id": "x", "template": "notify-on-add", "values": {"COLLECTION": "jobs"}})).await.unwrap_err();
     assert_eq!(e.code, ErrorCode::Unavailable);
@@ -124,11 +125,7 @@ async fn mistakes_and_missing_modules_are_explained() {
     let m2 = Automations::default();
     m2.init(&env2.ctx).await.unwrap();
     let e = m2
-        .handle(
-            "automations.create",
-            json!({"id": "x", "template": "stage-creates-workspace", "values": {}}),
-            &env2.ctx,
-        )
+        .handle("automations.new", json!({"id": "x", "template": "stage-creates-workspace", "values": {}}), &env2.ctx)
         .await
         .unwrap_err();
     assert!(e.message.contains("from the workspaces module, which isn't"), "{}", e.message);

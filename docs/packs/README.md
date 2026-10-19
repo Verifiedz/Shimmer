@@ -97,16 +97,33 @@ belongs to this machine, so copying your Shimmer folder elsewhere doesn't bring 
 | automations edit | `naoshite` | `edit-hook` | `revise-orders` | `aedit` |
 | automations remove | `bye-bye` | `unhook` | `belay-that` | `arm` |
 | automations restore | `modotte` | `rehook` | `reinstate` | `aundo` |
+| automations purge | `zetsumetsu` | `gc-hooks` | `incinerate` | `apurge` |
+| automations rename | `namae-kae` | `relabel` | `rechristen` | `amv` |
+| automations copy | `fukusei` | `spin-off` | `clone-ship` | `acp` |
 | automations enable | `tsukete` | `flag-on` | `arm-systems` | `aon` |
-| automations disable | `keshite` | `flag-off` | `disarm` | `aoff` |
+| automations disable | `tomete` | `flag-off` | `disarm` | `aoff` |
 | automations test | `tameshi` | `dry-run` | `simulation` | `atest` |
 | automations events | `dekigoto` | `triggers` | `sensor-log` | `aevents` |
 | automations history | `kioku` | `audit-log` | `captains-log` | `alog` |
-| automations status | `genki` | `status-page` | `status-report` | `ast` |
+| automations status | `choushi` | `status-page` | `status-report` | `ast` |
 | automations depth | `fukasa` | `blast-radius` | `chain-of-command` | `adepth` |
 | automations reload | `saikidou` | `hot-reload` | `power-cycle` | `areload` |
 | automations templates | `jutsu` | `playbooks` | `battle-plans` | `atpl` |
 | automations peek | `chira` | `read-playbook` | `review-plan` | `apeek` |
+| notify list | `tegami` | `inbox` | `message-log` | `nlist` |
+| notify show | `kore` | `deep-dive` | `decode` | `nshow` |
+| notify count | `ikutsu` | `badge` | `signal-count` | `ncount` |
+| notify mark-read | `wakatta` | `ack` | `acknowledged` | `nread` |
+| notify mark-unread | `ato-de` | `unack` | `flag-it` | `nunread` |
+| notify remove | `keshite` | `dismiss` | `jettison` | `nrm` |
+| notify send | `oshirase` | `page-me` | `broadcast` | `nsend` |
+| notify test | `kikoeru` | `health-check` | `signal-check` | `ntest` |
+| notify resend | `mou-ichido` | `retry` | `rebroadcast` | `nresend` |
+| notify pause | `yasumi` | `snooze` | `radio-silence` | `npause` |
+| notify resume | `okite` | `unsnooze` | `open-channel` | `nresume` |
+| notify quiet | `shizuka-ni` | `focus-time` | `night-watch` | `nquiet` |
+| notify status | `genki` | `dashboard` | `bridge-report` | `nst` |
+| notify cap | `genkai` | `retention` | `memory-banks` | `ncap` |
 
 ## Writing your own
 
@@ -142,6 +159,9 @@ On the right of each alias goes the command it runs, by its op name:
 | `workspaces.force_relaunch`, `workspaces.create` | `shimmer workspaces force-relaunch`, `new` |
 | `queue.list`, `.task`, `.cancel`, `.reorder` | `shimmer queue list`, `show`, `cancel`, `move` |
 | `scheduler.list`, `.get`, `.add`, `.pause`, `.resume`, `.remove` | `shimmer scheduler list`, `show`, `add`, `pause`, `resume`, `remove` |
+| `notify.list`, `.count`, `.remove`, `.send`, `.test`, `.resend`, `.pause`, `.resume`, `.quiet`, `.status`, `.cap` | `shimmer notify <verb>` |
+| `notify.get`, `.mark_read`, `.mark_unread` | `shimmer notify show`, `mark-read`, `mark-unread` |
+| `automations.list`, `.show`, `.new`, `.edit`, `.remove`, `.restore`, `.purge`, `.rename`, `.copy`, `.enable`, `.disable`, `.test`, `.events`, `.history`, `.status`, `.depth`, `.reload`, `.templates`, `.peek` | `shimmer automations <verb>` |
 
 `shimmer packs --help` prints the same list. Your own pack names as many or as few as you like;
 the built-in packs name every one.
@@ -160,7 +180,7 @@ $ shimmer packs use my-first-pack
   `a-z`, `0-9`, `-` and `_`, and are at most 32 characters. `label` is one line, at most 40.
 - An alias can't be one of Shimmer's own command words (`ping`, `records`, `workspaces`, `packs`,
   `help`, …, plus `queue`, `scheduler`, `calendar` and a few others kept for commands to come).
-- A pack has 1 to 64 aliases. Several aliases may run the same command.
+- A pack has 1 to 256 aliases. Several aliases may run the same command.
 - Unknown keys are errors, so a typo is caught rather than ignored.
 - Packs are data only: no scripts, ever.
 

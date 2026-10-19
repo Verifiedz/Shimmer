@@ -32,7 +32,8 @@ run-once (once on waking) or backfill (once for each missed time). Leave it out 
 to be asked.
 
 What can be scheduled: a records or workspaces command that makes one change, e.g.
-records add/update/complete/reopen/remove/restore, workspaces activate/stop/cleanup. An alias
+records add/update/complete/reopen/remove/restore, workspaces activate/stop/cleanup, and
+notify send (a reminder: shimmer schedule weekdays 08:45 --catch-up skip notify send \"Standup in 15\"). An alias
 from your command pack works too. See schedules with 'shimmer scheduler list'.";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -78,9 +79,10 @@ fn is_command_word(word: &str) -> bool {
 
 /// What can be scheduled: the commands that make exactly one change (ADR 0031 §1). Running one
 /// checks it in [`request`]; completion offers only these after `shimmer schedule WHEN`.
-pub const SCHEDULABLE: [(&str, &[&str]); 2] = [
+pub const SCHEDULABLE: [(&str, &[&str]); 3] = [
     ("records", &["add", "update", "complete", "reopen", "remove", "restore"]),
     ("workspaces", &["activate", "stop", "cleanup"]),
+    ("notify", &["send"]),
 ];
 
 /// `shimmer`'s own options that go before the command (`--pack`, `--canonical`, `--no-color`):
@@ -349,8 +351,13 @@ async fn request(client: &mut Client, command: &[String]) -> Result<(&'static st
                 None => Err(not("only workspaces activate, stop and cleanup can")),
             },
         },
+        "notify" => crate::notify::parse(rest.to_vec())
+            .ok()
+            .as_ref()
+            .and_then(crate::notify::scheduled_send)
+            .ok_or_else(|| not("only notify send can (one message each time)")),
         other => Err(Error::invalid_params(format!(
-            "'{other}' can't be scheduled: only records and workspaces commands that make one change can"
+            "'{other}' can't be scheduled: only records and workspaces commands that make one change, and notify send, can"
         ))),
     }
 }

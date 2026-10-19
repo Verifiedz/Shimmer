@@ -18,7 +18,8 @@ use crate::workspaces::Prompt;
 pub const USAGE: &str = "usage: shimmer automations <command>
 
 commands:
-  list                       your rules: on or off, what they react to, what they do
+  list [--removed]           your rules: on or off, what they react to, what they do;
+                             --removed: the ones you removed, to restore or purge
   show RULE                  one rule and its file
   new RULE [--file FILE]     a starter rule (switched off) opened in your editor, or one from FILE
   new RULE --from TEMPLATE [--set QUESTION=ANSWER]… [--yes]
@@ -28,6 +29,10 @@ commands:
                              rule is refused and the old one kept
   remove RULE                remove a rule (restore brings it back)
   restore REMOVED            bring a removed rule back
+  rename RULE NEW            give a rule a new id; its waiting delayed actions follow it
+  copy RULE NEW [--label TEXT]
+                             a new rule like RULE, switched off until you enable it
+  purge [REMOVED] [--yes]    delete a removed rule for good, or every removed one (asks first)
   enable RULE                switch a rule on
   disable RULE               switch a rule off
   test RULE --event FILE     what it would do for a sample event, without doing it; FILE is
@@ -56,7 +61,20 @@ Rules only run while the daemon runs. Add --json to any command for raw output."
 #[derive(Clone, Debug, PartialEq)]
 pub enum AutomationsCmd {
     Help,
-    List,
+    /// `removed`: the removed rules instead (ADR 0038 §6).
+    List {
+        removed: bool,
+    },
+    Rename {
+        id: String,
+        to: String,
+    },
+    /// A new rule from another, switched off; `label` its own.
+    Copy {
+        id: String,
+        to: String,
+        label: Option<String>,
+    },
     Show {
         id: String,
     },
@@ -87,6 +105,11 @@ pub enum AutomationsCmd {
     Restore {
         id: String,
     },
+    /// `id`: one removed rule; `None` is every one (ADR 0038).
+    Purge {
+        id: Option<String>,
+        yes: bool,
+    },
     Enable {
         id: String,
     },
@@ -116,14 +139,20 @@ pub fn parse(words: Vec<String>) -> std::result::Result<AutomationsCmd, String> 
         return from_template(words.into_iter().skip(1));
     }
     let mut words = words.into_iter();
-    let Some(sub) = words.next() else { return Ok(AutomationsCmd::List) };
+    let Some(sub) = words.next() else { return Ok(AutomationsCmd::List { removed: false }) };
     let options: &[&str] = match sub.as_str() {
         "new" | "edit" => &["--file"],
+        "copy" => &["--label"],
         "test" => &["--event"],
         "history" => &["--since", "--limit"],
         _ => &[],
     };
-    let flags = Flags::split(words.collect(), options, &[]).map_err(|e| format!("automations {sub}: {e}"))?;
+    let switches: &[&str] = match sub.as_str() {
+        "purge" => &["--yes"],
+        "list" => &["--removed"],
+        _ => &[],
+    };
+    let flags = Flags::split(words.collect(), options, switches).map_err(|e| format!("automations {sub}: {e}"))?;
     let usage = |what: &str| format!("usage: shimmer automations {sub} {what}");
     let id = |what: &str| match flags.positional.as_slice() {
         [id] => Ok(id.clone()),
@@ -136,12 +165,27 @@ pub fn parse(words: Vec<String>) -> std::result::Result<AutomationsCmd, String> 
     let file = flags.value("--file").map(PathBuf::from);
     Ok(match sub.as_str() {
         "help" => AutomationsCmd::Help,
-        "list" => none().map(|()| AutomationsCmd::List)?,
+        "list" => none().map(|()| AutomationsCmd::List { removed: flags.has("--removed") })?,
+        "rename" | "copy" => {
+            let [id, to]: [String; 2] = flags.positional.clone().try_into().map_err(|_| match sub.as_str() {
+                "rename" => usage("RULE NEW"),
+                _ => usage("RULE NEW [--label TEXT]"),
+            })?;
+            match sub.as_str() {
+                "rename" => AutomationsCmd::Rename { id, to },
+                _ => AutomationsCmd::Copy { id, to, label: flags.value("--label").map(str::to_owned) },
+            }
+        }
         "show" => AutomationsCmd::Show { id: id("RULE")? },
         "new" => AutomationsCmd::New { id: id("RULE [--file FILE]")?, file },
         "edit" => AutomationsCmd::Edit { id: id("RULE [--file FILE]")?, file },
         "remove" => AutomationsCmd::Remove { id: id("RULE")? },
         "restore" => AutomationsCmd::Restore { id: id("REMOVED")? },
+        "purge" => match flags.positional.as_slice() {
+            [] => AutomationsCmd::Purge { id: None, yes: flags.has("--yes") },
+            [id] => AutomationsCmd::Purge { id: Some(id.clone()), yes: flags.has("--yes") },
+            _ => return Err(usage("[REMOVED] [--yes]")),
+        },
         "enable" => AutomationsCmd::Enable { id: id("RULE")? },
         "disable" => AutomationsCmd::Disable { id: id("RULE")? },
         "test" => {
@@ -221,29 +265,54 @@ pub async fn run(client: &mut Client, cmd: &AutomationsCmd, json: bool, prompt: 
     let raw = |data: Value| Ok(render::json(&data));
     match cmd {
         AutomationsCmd::Help => Ok(USAGE.into()),
-        AutomationsCmd::List => {
+        AutomationsCmd::List { removed: false } => {
             let data = client.call("automations.list", json!({})).await?;
             if json {
                 return raw(data);
             }
             Ok(list(&data, Utc::now()))
         }
+        AutomationsCmd::List { removed: true } => {
+            let data = client.call("automations.list", json!({"removed": true})).await?;
+            if json {
+                return raw(data);
+            }
+            Ok(removed_list(&data))
+        }
+        AutomationsCmd::Rename { id, to } => {
+            let data = client.call("automations.rename", json!({"id": id, "to": to})).await?;
+            if json {
+                return raw(data);
+            }
+            Ok(format!("✓ {id} is now {to}"))
+        }
+        AutomationsCmd::Copy { id, to, label } => {
+            let mut params = json!({"id": id, "to": to});
+            if let Some(label) = label {
+                params["label"] = json!(label);
+            }
+            let data = client.call("automations.copy", params).await?;
+            if json {
+                return raw(data);
+            }
+            Ok(format!("✓ made {to} from {id}, switched off so the same event doesn't fire both\n  turn it on when it's ready: shimmer automations enable {to}"))
+        }
         AutomationsCmd::Show { id } => {
-            let data = client.call("automations.get", one(id)).await?;
+            let data = client.call("automations.show", one(id)).await?;
             if json {
                 return raw(data);
             }
             Ok(show(&data, Utc::now()))
         }
         AutomationsCmd::New { id, file: Some(file) } => {
-            let data = client.call("automations.create", json!({"id": id, "text": read(file)?})).await?;
+            let data = client.call("automations.new", json!({"id": id, "text": read(file)?})).await?;
             if json {
                 return raw(data);
             }
             Ok(format!("✓ made rule {}", summary(&data)))
         }
         AutomationsCmd::New { id, file: None } => {
-            let data = client.call("automations.create", one(id)).await?;
+            let data = client.call("automations.new", one(id)).await?;
             if json || !prompt.interactive() {
                 return if json {
                     raw(data)
@@ -260,7 +329,7 @@ pub async fn run(client: &mut Client, cmd: &AutomationsCmd, json: bool, prompt: 
             })
         }
         AutomationsCmd::Edit { id, file: Some(file) } => {
-            let data = client.call("automations.save", json!({"id": id, "text": read(file)?})).await?;
+            let data = client.call("automations.edit", json!({"id": id, "text": read(file)?})).await?;
             if json {
                 return raw(data);
             }
@@ -296,6 +365,35 @@ pub async fn run(client: &mut Client, cmd: &AutomationsCmd, json: bool, prompt: 
                 Some(problem) => format!(
                     "✓ restored {id}, but it can't run: {problem}\n  fix it with: shimmer automations edit {id}"
                 ),
+            })
+        }
+        AutomationsCmd::Purge { id, yes } => {
+            // ADR 0038: the daemon says how many go; ask, then send that count back.
+            let mut params = json!({});
+            if let Some(id) = id {
+                params["id"] = json!(id);
+            }
+            let data = match client.call("automations.purge", params.clone()).await {
+                Err(e) if e.code == shimmer_core::ErrorCode::ConfirmationRequired => {
+                    let what = match id {
+                        Some(id) => format!("the removed rule '{id}'"),
+                        None => "every removed rule".to_owned(),
+                    };
+                    if !crate::records::confirm_purge(prompt, *yes, &what, &e.message)? {
+                        return Ok("nothing purged".into());
+                    }
+                    params["confirm"] = e.detail.unwrap_or_default();
+                    client.call("automations.purge", params).await?
+                }
+                other => other?,
+            };
+            if json {
+                return raw(data);
+            }
+            Ok(match (data["purged"].as_u64().unwrap_or(0), id) {
+                (0, _) => "no removed rules to purge".to_owned(),
+                (_, Some(id)) => format!("✓ {id} is deleted for good"),
+                (n, None) => format!("✓ {n} removed rule(s) deleted for good"),
             })
         }
         AutomationsCmd::Enable { id } | AutomationsCmd::Disable { id } => {
@@ -411,7 +509,7 @@ async fn from_template_run(
     let values = crate::workspaces::answers(&t["questions"], set, prompt, &crate::workspaces::Paths::from_env())?;
     let mut params = json!({"id": id, "template": template, "values": values, "preview": true});
     let shown = client
-        .call("automations.create", params.clone())
+        .call("automations.new", params.clone())
         .await
         .map_err(|e| crate::workspaces::how_to_answer(e, prompt))?;
     let rules = shown["rules"].as_array().cloned().unwrap_or_default();
@@ -448,7 +546,7 @@ Make these {n} rules? They're on as soon as they're made."
         }
     }
     params["preview"] = json!(false);
-    let made = client.call("automations.create", params).await?;
+    let made = client.call("automations.new", params).await?;
     if json {
         return Ok(render::json(&made));
     }
@@ -565,11 +663,11 @@ fn read(file: &Path) -> Result<String> {
 }
 
 async fn data_text(client: &mut Client, id: &str) -> Result<String> {
-    let data = client.call("automations.get", json!({ "id": id })).await?;
+    let data = client.call("automations.show", json!({ "id": id })).await?;
     Ok(data["text"].as_str().unwrap_or_default().to_owned())
 }
 
-/// Edit a copy of the rule in the editor and send it with `automations.save`; a refused rule can
+/// Edit a copy of the rule in the editor and send it with `automations.edit`; a refused rule can
 /// be edited again with your text kept (ADR 0035 §8). True when something was saved.
 async fn edit_loop(client: &mut Client, id: &str, text: String, prompt: &mut impl Prompt) -> Result<bool> {
     let path = new_private_file(id, &text)?;
@@ -580,7 +678,7 @@ async fn edit_loop(client: &mut Client, id: &str, text: String, prompt: &mut imp
             let _ = std::fs::remove_file(&path);
             return Ok(false);
         }
-        match client.call("automations.save", json!({"id": id, "text": edited})).await {
+        match client.call("automations.edit", json!({"id": id, "text": edited})).await {
             Ok(_) => {
                 let _ = std::fs::remove_file(&path);
                 return Ok(true);
@@ -677,17 +775,25 @@ fn list(data: &Value, now: DateTime<Utc>) -> String {
                 ]
             })
             .collect();
-        let header = ["RULE", "ON", "REACTS TO", "DOES", "LAST FIRED", ""].map(String::from);
+        // on/off under STATE, coloured like every other feature's states (ADR 0038 §6).
+        let header = ["RULE", "STATE", "REACTS TO", "DOES", "LAST FIRED", ""].map(String::from);
         table(&header, &rows)
     };
     out.push_str(&problems(&data["problems"]));
-    let removed: Vec<String> = data["removed"].as_array().into_iter().flatten().map(render::cell).collect();
-    if !removed.is_empty() {
-        out.push_str(&format!(
-            "\n\nremoved: {} (bring one back: shimmer automations restore RULE)",
-            removed.join(", ")
-        ));
+    out
+}
+
+/// `list --removed`: each removed rule, and how to bring it back or delete it for good.
+fn removed_list(data: &Value) -> String {
+    let all = data["rules"].as_array().cloned().unwrap_or_default();
+    if all.is_empty() {
+        return "no removed rules".into();
     }
+    let rows: Vec<Vec<String>> = all.iter().map(|r| vec![render::cell(&r["id"]), render::cell(&r["label"])]).collect();
+    let mut out = table(&["RULE".into(), "LABEL".into()], &rows);
+    out.push_str(
+        "\nbring one back: shimmer automations restore RULE; delete for good: shimmer automations purge [RULE]",
+    );
     out
 }
 
@@ -820,11 +926,19 @@ mod tests {
 
     #[test]
     fn commands_parse() {
-        assert_eq!(p(""), Ok(AutomationsCmd::List));
+        assert_eq!(p(""), Ok(AutomationsCmd::List { removed: false }));
+        assert_eq!(p("list --removed"), Ok(AutomationsCmd::List { removed: true }));
+        assert_eq!(p("rename a b"), Ok(AutomationsCmd::Rename { id: "a".into(), to: "b".into() }));
+        let copy = AutomationsCmd::Copy { id: "a".into(), to: "b".into(), label: Some("B".into()) };
+        assert_eq!(p("copy a b --label B"), Ok(copy));
+        assert!(p("rename a").unwrap_err().contains("usage: shimmer automations rename RULE NEW"));
         assert_eq!(p("show solved"), Ok(AutomationsCmd::Show { id: "solved".into() }));
         assert_eq!(p("new x --file r.toml"), Ok(AutomationsCmd::New { id: "x".into(), file: Some("r.toml".into()) }));
         assert_eq!(p("edit x"), Ok(AutomationsCmd::Edit { id: "x".into(), file: None }));
         assert_eq!(p("test x --event e.json"), Ok(AutomationsCmd::Test { id: "x".into(), event: "e.json".into() }));
+        assert_eq!(p("purge"), Ok(AutomationsCmd::Purge { id: None, yes: false }));
+        assert_eq!(p("purge x --yes"), Ok(AutomationsCmd::Purge { id: Some("x".into()), yes: true }));
+        assert!(p("remove x --yes").is_err(), "--yes is purge's only");
         assert_eq!(p("depth"), Ok(AutomationsCmd::Depth { depth: None }));
         assert_eq!(p("depth 5"), Ok(AutomationsCmd::Depth { depth: Some(5) }));
         assert_eq!(
@@ -838,6 +952,7 @@ mod tests {
             ("depth zero", "from 1 up"),
             ("history --since soon", "isn't a date"),
             ("list x", "takes no arguments"),
+            ("purge a b", "usage: shimmer automations purge [REMOVED] [--yes]"),
             ("frob", "unknown automations command"),
         ] {
             assert!(p(bad).unwrap_err().contains(want), "{bad}: {:?}", p(bad));
@@ -851,8 +966,7 @@ mod tests {
             "rules": [{"id": "solved", "label": "Solved", "enabled": true, "builtin": false, "on": "records.item.completed",
                        "actions": [{"op": "notify.send", "after_s": null}, {"op": "notify.send", "after_s": 5_184_000}],
                        "last_fired": null, "loop_stopped_at": (now - chrono::Duration::minutes(5)).to_rfc3339()}],
-            "problems": [{"file": "rules/bad.toml", "error": "on: no event 'x'"}],
-            "removed": ["old"]});
+            "problems": [{"file": "rules/bad.toml", "error": "on: no event 'x'"}]});
         let out = list(&data, now);
         let row = out.lines().nth(1).unwrap();
         for want in [
@@ -866,7 +980,12 @@ mod tests {
             assert!(row.contains(want), "{want} in {row}");
         }
         assert!(out.contains("✗ rules/bad.toml: on: no event 'x'"), "{out}");
-        assert!(out.contains("removed: old"), "{out}");
+        let removed = removed_list(&json!({"rules": [{"id": "old", "label": "Old one"}]}));
+        assert!(
+            removed.contains("old") && removed.contains("Old one") && removed.contains("automations restore"),
+            "{removed}"
+        );
+        assert_eq!(removed_list(&json!({"rules": []})), "no removed rules");
         assert!(list(&json!({"rules": []}), now).starts_with("no rules yet"));
     }
 
