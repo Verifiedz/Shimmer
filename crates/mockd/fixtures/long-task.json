@@ -1,7 +1,7 @@
 {
   "responses": [
     {
-      "op": "fetchers.fetch",
+      "op": "fetchers.run",
       "params": {
         "source": "hn-whoishiring"
       },
@@ -18,7 +18,7 @@
           "payload": {
             "task_id": "01JD2N00000000000000000001",
             "lane": "fetchers",
-            "op": "fetchers.fetch"
+            "op": "fetchers.run"
           }
         },
         {
@@ -93,7 +93,7 @@
           "payload": {
             "task_id": "01JD2N00000000000000000001",
             "lane": "fetchers",
-            "op": "fetchers.fetch",
+            "op": "fetchers.run",
             "result": {
               "new_items": 12
             }

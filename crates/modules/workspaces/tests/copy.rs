@@ -17,9 +17,7 @@ fn file(env: &TestEnv, path: &str) -> String {
 
 async fn site(w: &Workspaces, env: &TestEnv) {
     let values = json!({"PROJECT_DIR": "/home/me/code/site", "LOCAL_URL": "http://localhost:3000"});
-    call(w, env, "workspaces.create", json!({"id": "site", "template": "web-project", "values": values}))
-        .await
-        .unwrap();
+    call(w, env, "workspaces.new", json!({"id": "site", "template": "web-project", "values": values})).await.unwrap();
 }
 
 #[tokio::test]
@@ -60,7 +58,7 @@ async fn copy_makes_a_fresh_workspace_with_the_same_files_and_new_answers() {
     assert!(toml.contains("label = \"My blog\"") && toml.contains("PROJECT_DIR = \"/home/me/code/blog\""), "{toml}");
     assert_eq!(file(&env, "site/workspace.toml"), original, "the original is untouched");
 
-    let status = call(&w, &env, "workspaces.status", json!({"id": "blog"})).await.unwrap();
+    let status = call(&w, &env, "workspaces.show", json!({"id": "blog"})).await.unwrap();
     assert_eq!((status["state"].as_str(), status["last_session"].is_null()), (Some("ready"), true));
     let ev = env.backend.events().pop().unwrap();
     assert_eq!(ev.topic, "workspaces.workspace.copied");
@@ -71,7 +69,7 @@ async fn copy_makes_a_fresh_workspace_with_the_same_files_and_new_answers() {
 async fn copy_refuses_what_create_and_reconfigure_refuse_and_writes_nothing() {
     let (env, w) = (TestEnv::new("workspaces"), Workspaces::default());
     site(&w, &env).await;
-    call(&w, &env, "workspaces.create", json!({"id": "taken", "template": "smoke-test"})).await.unwrap();
+    call(&w, &env, "workspaces.new", json!({"id": "taken", "template": "smoke-test"})).await.unwrap();
     for (params, code, says) in [
         (json!({"id": "site", "to": "Bad Name"}), ErrorCode::InvalidParams, "not a valid workspace id"),
         (json!({"id": "site", "to": "taken"}), ErrorCode::Conflict, "already a workspace 'taken'"),

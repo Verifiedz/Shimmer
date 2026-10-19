@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use shimmer_core::{Error, Result};
 
 use crate::packs::settings::{self, Settings, Startup};
+use crate::style::{paint, state, Role};
 
 pub const USAGE: &str = "usage: shimmer startup <command>
 
@@ -248,10 +249,10 @@ fn on(env: &Env, services: &mut impl Services) -> Result<String> {
             out.push(
                 match target {
                     When::AnyLogin => {
-                        "on: Shimmer's daemon starts every time you log in (no desktop here, so at any login)"
+                        "✓ on: Shimmer's daemon starts every time you log in (no desktop here, so at any login)"
                     }
-                    When::WithDesktop => "on: Shimmer's daemon starts with your desktop every time you log in",
-                    When::DesktopWithoutTarget => "on: Shimmer's daemon starts every time you log in",
+                    When::WithDesktop => "✓ on: Shimmer's daemon starts with your desktop every time you log in",
+                    When::DesktopWithoutTarget => "✓ on: Shimmer's daemon starts every time you log in",
                 }
                 .to_owned(),
             );
@@ -269,7 +270,7 @@ fn on(env: &Env, services: &mut impl Services) -> Result<String> {
             if !env.daemon_up && !loaded {
                 ok(services, "launchctl", &["bootstrap", &domain, &file.display().to_string()])?;
             }
-            out.push("on: Shimmer's daemon starts every time you log in".to_owned());
+            out.push("✓ on: Shimmer's daemon starts every time you log in".to_owned());
         }
         Os::Other => {}
     }
@@ -281,7 +282,7 @@ fn on(env: &Env, services: &mut impl Services) -> Result<String> {
         );
     }
     if let Some(warning) = build_folder(exe) {
-        out.push(format!("warning: {warning}"));
+        out.push(warning_line(&warning));
     }
     Ok(out.join("\n"))
 }
@@ -409,7 +410,7 @@ fn off(env: &Env, services: &mut impl Services) -> Result<String> {
     settings::save(&cli_toml, &saved)
         .map_err(|e| Error::internal(format!("can't update {}: {e}", cli_toml.display())))?;
     let mut out = format!(
-        "off: Shimmer's daemon won't start at login any more (removed {}).\nThe daemon running now keeps running; 'shimmer shutdown' stops it.",
+        "✓ off: Shimmer's daemon won't start at login any more (removed {}).\nThe daemon running now keeps running; 'shimmer shutdown' stops it.",
         file.display()
     );
     if lingers {
@@ -420,6 +421,11 @@ fn off(env: &Env, services: &mut impl Services) -> Result<String> {
 
 // ---------------------------------------------------------------- status
 
+/// A warning line, `warning:` in the warning colour (shared styling doesn't mark it by itself).
+fn warning_line(warning: &str) -> String {
+    format!("{} {warning}", paint(Role::Warning, "warning:"))
+}
+
 fn status(env: &Env, services: &mut impl Services) -> Result<String> {
     env.service_file()?;
     let saved = env.settings().map(|(_, s)| s).unwrap_or_default();
@@ -428,24 +434,21 @@ fn status(env: &Env, services: &mut impl Services) -> Result<String> {
         None => unit_file(env, services)?,
     };
     let Some(text) = std::fs::read_to_string(&file).ok() else {
-        return Ok("off: Shimmer's daemon starts when a command needs it.\n'shimmer startup on' starts it every time you log in, so schedules run after a restart.".into());
+        return Ok(format!("{}: Shimmer's daemon starts when a command needs it.\n'shimmer startup on' starts it every time you log in, so schedules run after a restart.", state("off")));
     };
     if !is_ours(&text) {
-        return Ok(format!("off. {} exists, but Shimmer didn't write it.", file.display()));
+        return Ok(format!("{}. {} exists, but Shimmer didn't write it.", state("off"), file.display()));
     }
     let mut out = Vec::new();
     let mut warnings = Vec::new();
     match env.os {
         Os::Linux => {
             let desktop = text.contains("WantedBy=graphical-session.target");
-            out.push(
-                if desktop {
-                    "on: starts with your desktop every time you log in"
-                } else {
-                    "on: starts every time you log in"
-                }
-                .to_owned(),
-            );
+            out.push(if desktop {
+                format!("{}: starts with your desktop every time you log in", state("on"))
+            } else {
+                format!("{}: starts every time you log in", state("on"))
+            });
             out.push(format!("  {}", file.display()));
             let enabled = services.run("systemctl", &["--user", "is-enabled", UNIT]);
             if !enabled.as_ref().is_ok_and(|(ok, _)| *ok) {
@@ -464,7 +467,7 @@ fn status(env: &Env, services: &mut impl Services) -> Result<String> {
             }
         }
         Os::Mac => {
-            out.push("on: starts every time you log in".to_owned());
+            out.push(format!("{}: starts every time you log in", state("on")));
             out.push(format!("  {}", file.display()));
             // launchd says `state = running` for a job whose process it started and still has.
             let by_launchd = ok(services, "id", &["-u"])
@@ -486,7 +489,7 @@ fn status(env: &Env, services: &mut impl Services) -> Result<String> {
         Some(_) => {}
         None => warnings.push("can't tell which shimmer it runs: run 'shimmer startup on' again".to_owned()),
     }
-    out.extend(warnings.into_iter().map(|w| format!("warning: {w}")));
+    out.extend(warnings.iter().map(|w| warning_line(w)));
     Ok(out.join("\n"))
 }
 
@@ -749,7 +752,7 @@ mod tests {
         let t = env(Os::Linux);
         let mut fake = Fake::default();
         let out = on(&t.env, &mut fake).unwrap();
-        assert!(out.starts_with("on: Shimmer's daemon starts every time you log in (no desktop here"), "{out}");
+        assert!(out.starts_with("✓ on: Shimmer's daemon starts every time you log in (no desktop here"), "{out}");
         let unit = std::fs::read_to_string(unit_file(&t)).unwrap();
         assert!(unit.contains("WantedBy=default.target"));
         assert_eq!(
@@ -768,7 +771,7 @@ mod tests {
         let mut t = env(Os::Linux);
         t.env.display = true;
         let out = on(&t.env, &mut Fake::default()).unwrap();
-        assert!(out.starts_with("on: Shimmer's daemon starts with your desktop"), "{out}");
+        assert!(out.starts_with("✓ on: Shimmer's daemon starts with your desktop"), "{out}");
         assert!(std::fs::read_to_string(unit_file(&t)).unwrap().contains("WantedBy=graphical-session.target"));
 
         // Hyprland started directly: the target never comes, so any login, plus its config line.
@@ -835,7 +838,7 @@ mod tests {
         on(&t.env, &mut Fake::default()).unwrap();
         let mut fake = Fake::default();
         let out = off(&t.env, &mut fake).unwrap();
-        assert!(out.starts_with("off: Shimmer's daemon won't start at login"), "{out}");
+        assert!(out.starts_with("✓ off: Shimmer's daemon won't start at login"), "{out}");
         assert_eq!(fake.calls, ["systemctl --user disable shimmer.service", "systemctl --user daemon-reload"]);
         assert!(!unit_file(&t).exists());
         assert_eq!(saved(&t).startup, None);
@@ -879,7 +882,7 @@ mod tests {
             failure_says: "Failed to disable unit: Unit file shimmer.service does not exist.",
             ..Fake::default()
         };
-        assert!(off(&t.env, &mut fake).unwrap().starts_with("off:"));
+        assert!(off(&t.env, &mut fake).unwrap().starts_with("✓ off:"));
         assert!(!unit_file(&t).exists());
         assert_eq!(saved(&t).startup, None);
         // Any other failure still stops it, with systemd's words.
@@ -931,7 +934,7 @@ mod tests {
         let t = env(Os::Mac);
         let mut fake = Fake { failing: vec!["launchctl print gui/501/io.github.verifiedz.shimmer"], ..Fake::default() };
         let out = on(&t.env, &mut fake).unwrap();
-        assert!(out.starts_with("on: Shimmer's daemon starts every time you log in"), "{out}");
+        assert!(out.starts_with("✓ on: Shimmer's daemon starts every time you log in"), "{out}");
         let plist = t.env.home_dir.clone().unwrap().join("Library/LaunchAgents/io.github.verifiedz.shimmer.plist");
         assert!(fake.calls.contains(&format!("launchctl bootstrap gui/501 {}", plist.display())), "{:?}", fake.calls);
         assert_eq!(saved(&t).startup.unwrap().target, "login");

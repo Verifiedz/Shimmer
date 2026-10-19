@@ -48,11 +48,11 @@ pub fn line(t: &Value) -> String {
     } else {
         s.to_string()
     };
-    let paused = if t["paused"] == true { " (paused)" } else { "" };
-    format!("{} {}, {when}{paused}", cell(&t["id"]), cell(&t["op"]))
+    let off = if t["enabled"] == false { " (off)" } else { "" };
+    format!("{} {}, {when}{off}", cell(&t["id"]), cell(&t["op"]))
 }
 
-/// Move one schedule: the same trigger added again with `changes` merged into its params (paused
+/// Move one schedule: the same trigger added again with `changes` merged into its params (off
 /// if it was), then the old one removed. Its new id. Never leaves two copies silently (#179): if
 /// adding fails the old one stays; if pausing the copy fails the copy is removed again; and an
 /// error says plainly when both are left. #166 would make this one atomic daemon op.
@@ -70,15 +70,15 @@ pub async fn move_one(client: &mut Client, t: &Value, changes: &Map<String, Valu
     let new = client.call("scheduler.add", add).await?;
     let new_id = new["trigger_id"].as_str().unwrap_or_default().to_owned();
     let old_id = cell(&t["id"]);
-    if t["paused"] == true {
-        if let Err(e) = client.call("scheduler.pause", json!({"trigger_id": new_id})).await {
-            // An active copy of a paused schedule would fire: take the copy back out.
+    if t["enabled"] == false {
+        if let Err(e) = client.call("scheduler.disable", json!({"trigger_id": new_id})).await {
+            // An enabled copy of a switched-off schedule would fire: take the copy back out.
             return Err(match client.call("scheduler.remove", json!({"trigger_id": new_id})).await {
                 Ok(_) => e,
                 Err(_) => Error::new(
                     e.code,
                     format!(
-                        "{}; the new copy {new_id} is active while {old_id} is paused: remove it with \
+                        "{}; the new copy {new_id} is on while {old_id} is off: remove it with \
                          'shimmer scheduler remove {new_id}'",
                         e.message
                     ),
@@ -192,9 +192,9 @@ mod tests {
     fn all() -> Value {
         json!({"triggers": [
             {"id": "usr-1", "source": {"type": "user"}, "op": "workspaces.activate", "params": {"id": "site"},
-             "schedule": {"cron": "0 9 * * 1-5"}, "paused": false, "done": false},
+             "schedule": {"cron": "0 9 * * 1-5"}, "enabled": true, "done": false},
             {"id": "usr-2", "source": {"type": "user"}, "op": "workspaces.stop", "params": {"id": "site"},
-             "schedule": {"every": 3600}, "paused": true, "done": false},
+             "schedule": {"every": 3600}, "enabled": false, "done": false},
             {"id": "usr-3", "source": {"type": "user"}, "op": "workspaces.activate", "params": {"id": "other"},
              "schedule": {"every": 60}, "done": false},
             {"id": "usr-4", "source": {"type": "user"}, "op": "workspaces.activate", "params": {"id": "site"},
@@ -221,7 +221,7 @@ mod tests {
         assert_eq!(ids(&site), ["usr-1", "usr-2"], "yours, unfinished, a workspaces op, this workspace");
         assert_eq!(
             site.iter().map(line).collect::<Vec<_>>(),
-            ["usr-1 workspaces.activate, cron 0 9 * * 1-5", "usr-2 workspaces.stop, every 3600s (paused)"]
+            ["usr-1 workspaces.activate, cron 0 9 * * 1-5", "usr-2 workspaces.stop, every 3600s (off)"]
         );
         // A collection: every records op that names it; a record: its collection and id both.
         assert_eq!(ids(&naming(&all(), "records.", &names(&[("collection", "jobs")]))), ["usr-6", "usr-7"]);
@@ -283,7 +283,7 @@ mod tests {
 
     fn paused() -> Value {
         json!({"id": "usr-old", "op": "records.list", "params": {"collection": "jobs"},
-               "schedule": {"every": 86400}, "catch_up": "skip", "paused": true})
+               "schedule": {"every": 86400}, "catch_up": "skip", "enabled": false})
     }
 
     #[tokio::test]
@@ -291,13 +291,13 @@ mod tests {
         // #179: the copy of a paused schedule would fire while unpaused, so it's removed again.
         let dir = tempfile::TempDir::new().unwrap();
         let sock = dir.path().join("s.sock");
-        let log = scheduler_daemon(&sock, "scheduler.pause", false).await;
+        let log = scheduler_daemon(&sock, "scheduler.disable", false).await;
         let mut client = Client::connect(&sock).await.unwrap();
         let e = move_one(&mut client, &paused(), &names(&[("collection", "applications")])).await.unwrap_err();
-        assert_eq!(e.message, "scheduler.pause broke");
+        assert_eq!(e.message, "scheduler.disable broke");
         assert_eq!(
             *log.lock().unwrap(),
-            ["scheduler.add", "scheduler.pause usr-new", "scheduler.remove usr-new"],
+            ["scheduler.add", "scheduler.disable usr-new", "scheduler.remove usr-new"],
             "the old one is never touched"
         );
     }
@@ -307,11 +307,11 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         // Pausing the copy fails, and so does taking it back out.
         let sock = dir.path().join("a.sock");
-        scheduler_daemon(&sock, "scheduler.pause", true).await;
+        scheduler_daemon(&sock, "scheduler.disable", true).await;
         let mut client = Client::connect(&sock).await.unwrap();
         let e = move_one(&mut client, &paused(), &names(&[("collection", "x")])).await.unwrap_err();
         assert!(
-            e.message.contains("the new copy usr-new is active while usr-old is paused")
+            e.message.contains("the new copy usr-new is on while usr-old is off")
                 && e.message.contains("shimmer scheduler remove usr-new"),
             "{}",
             e.message

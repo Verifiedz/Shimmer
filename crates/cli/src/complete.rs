@@ -11,7 +11,8 @@
 //! What `__complete` prints: groups, each a `>TAG<tab>TITLE` line, then one `WORD<tab>DESCRIPTION`
 //! line per candidate. The tag is zsh's name for the group (`commands`, `workspaces`), which the
 //! zsh script colours by; the tag `files` says "complete file names here". A candidate ending
-//! in `/` (`lc/`, a collection before its record) takes no space after it.
+//! in `/` (`lc/`, a collection before its record) or `=` (`PROJECT_DIR=`, a template question
+//! before its answer) takes no space after it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -27,13 +28,15 @@ use crate::style::{Palette, Role};
 const DAEMON_WAIT: Duration = Duration::from_millis(500);
 
 /// The modules with their own help page, by the command word that opens it.
-fn modules() -> [(&'static str, &'static str); 6] {
+fn modules() -> [(&'static str, &'static str); 8] {
     [
         ("records", crate::records::USAGE),
         ("workspaces", crate::workspaces::USAGE),
         ("queue", crate::queue::USAGE),
         ("scheduler", crate::scheduler::USAGE),
         ("packs", crate::packs::cmd::USAGE),
+        ("fetchers", crate::fetchers::USAGE),
+        ("notify", crate::notify::USAGE),
         ("startup", crate::startup::USAGE),
     ]
 }
@@ -429,6 +432,13 @@ impl Groups {
         if first == "scheduler" && rest.get(1).map(String::as_str) == Some("add") {
             return self.schedule(&rest[2..], current, cx, source).await;
         }
+        // `scheduler edit TRIGGER` then the same words as `add` (ADR 0038 §6).
+        if first == "scheduler" && rest.get(1).map(String::as_str) == Some("edit") {
+            return match rest.get(2) {
+                None => self.triggers("edit", source).await,
+                Some(_) => self.schedule(&rest[3..], current, cx, source).await,
+            };
+        }
         let (cmd, usage, after) = match modules().into_iter().find(|(m, _)| *m == first) {
             Some((module, usage)) => {
                 let subs = commands(usage);
@@ -440,7 +450,10 @@ impl Groups {
                 };
                 let Some(cmd) = subs.iter().find(|c| &c.word == sub).cloned() else { return };
                 let cmd = if cmd.list_options {
-                    let list = subs.iter().find(|c| c.word == "list").cloned().unwrap_or_default();
+                    let mut list = subs.iter().find(|c| c.word == "list").cloned().unwrap_or_default();
+                    // Paging is list's own: the commands that take its filters (records export,
+                    // notify count, mark-read, mark-unread, remove) refuse --limit and --offset.
+                    list.options.retain(|o| o.name != "--limit" && o.name != "--offset");
                     Cmd { field_flags: true, ..merged(cmd, list) }
                 } else {
                     cmd
@@ -550,14 +563,19 @@ impl Groups {
 
         // Walk what's typed: positionals so far, and what the last option still wants.
         let mut positionals: Vec<String> = Vec::new();
+        // What the options typed so far were given (`--from web-project`), for what comes next.
+        let mut given: BTreeMap<String, String> = BTreeMap::new();
         let mut wanting: Option<(Opt, usize)> = None;
         for word in after {
             if let Some((opt, n)) = wanting.take() {
                 if n + 1 < opt.args.len() {
-                    wanting = Some((opt, n + 1));
+                    wanting = Some((opt.clone(), n + 1));
                 }
-                let _ = word;
+                given.insert(opt.name, word.clone());
                 continue;
+            }
+            if let Some((name, value)) = word.strip_prefix("--").and_then(|w| w.split_once('=')) {
+                given.insert(format!("--{name}"), value.to_owned());
             }
             if word.starts_with("--") && !word.contains('=') {
                 match options.iter().find(|o| &o.name == word) {
@@ -586,6 +604,9 @@ impl Groups {
                 return;
             }
             let placeholder = opt.args.get(n).cloned().unwrap_or_default();
+            if placeholder == "QUESTION=ANSWER" {
+                return self.questions(module, &cmd.word, &positionals, &given, source).await;
+            }
             if placeholder == "VALUE" && opt.args.len() == 1 {
                 // A field's own value: its choices, if it's an enum.
                 let field = opt.name.trim_start_matches('-').replace('-', "_");
@@ -638,13 +659,17 @@ impl Groups {
             return self.add("values", "values", placeholder, "");
         }
         match (module, placeholder.trim_start_matches('-')) {
-            ("records", "COLLECTION") => self.collections(false, source).await,
+            ("records", "COLLECTION") => self.collections(false, false, source).await,
+            // `restore` and `purge` act on a collection's removed records (ADR 0038 §6).
             ("records", "COLLECTION/ID" | "COLLECTION[/ID]") => match current.split_once('/') {
-                Some((c, _)) => self.records(c, source).await,
-                None => self.collections(true, source).await,
+                Some((c, _)) => self.records(c, matches!(command, "restore" | "purge"), source).await,
+                None => self.collections(true, false, source).await,
             },
-            // A collection by its id, except a new one's.
-            ("records", "ID") if command != "new" && command != "add" => self.collections(false, source).await,
+            // A collection by its id, except a new one's; a removed one's to restore or purge it.
+            ("records", "ID") if matches!(command, "restore-collection" | "purge-collection") => {
+                self.collections(false, true, source).await
+            }
+            ("records", "ID") if command != "new" && command != "add" => self.collections(false, false, source).await,
             ("records", "FIELD" | "FROM") => {
                 for f in self.fields(collection, source).await.unwrap_or_default() {
                     self.add("fields", "fields", f["name"].as_str().unwrap_or_default(), field_type(&f));
@@ -662,6 +687,10 @@ impl Groups {
             ("queue", "TASK" | "OTHER") => self.tasks(source).await,
             ("queue" | "scheduler", "LANE") => self.lanes(source).await,
             ("scheduler", "TRIGGER") => self.triggers(command, source).await,
+            ("scheduler", "REMOVED") => self.removed_triggers(source).await,
+            ("workspaces", "REMOVED") => self.removed_workspaces(source).await,
+            ("fetchers", "SOURCE") => self.sources(source).await,
+            ("notify", "ID") => self.messages(source).await,
             ("scheduler" | "", "OP") => self.ops(source).await,
             ("scheduler", "WHAT") => {
                 for v in crate::scheduler::CATCH_UP {
@@ -683,8 +712,9 @@ impl Groups {
         }
     }
 
-    async fn collections(&mut self, with_slash: bool, source: &mut impl Source) {
-        let Some(data) = source.call("records.collections", json!({})).await else { return };
+    async fn collections(&mut self, with_slash: bool, removed: bool, source: &mut impl Source) {
+        let params = if removed { json!({"removed": true}) } else { json!({}) };
+        let Some(data) = source.call("records.collections", params).await else { return };
         for c in data["collections"].as_array().into_iter().flatten() {
             let id = c["id"].as_str().unwrap_or_default();
             let word = if with_slash { format!("{id}/") } else { id.to_owned() };
@@ -692,8 +722,12 @@ impl Groups {
         }
     }
 
-    async fn records(&mut self, collection: &str, source: &mut impl Source) {
-        let params = json!({"collection": collection, "limit": 500});
+    /// A collection's records, or with `removed` its removed ones (the whole trash: no paging).
+    async fn records(&mut self, collection: &str, removed: bool, source: &mut impl Source) {
+        let params = match removed {
+            true => json!({"collection": collection, "removed": true}),
+            false => json!({"collection": collection, "limit": 500}),
+        };
         let Some(data) = source.call("records.list", params).await else { return };
         for r in data["items"].as_array().into_iter().flatten() {
             let id = r["id"].as_str().unwrap_or_default();
@@ -752,6 +786,16 @@ impl Groups {
         }
     }
 
+    /// Inbox messages by the short ending `notify list` shows, newest first.
+    async fn messages(&mut self, source: &mut impl Source) {
+        let Some(data) = source.call("notify.list", json!({"limit": 200})).await else { return };
+        let all = data["items"].as_array().cloned().unwrap_or_default();
+        let ids: Vec<String> = all.iter().map(|m| text(&m["id"])).collect();
+        for (m, short) in all.iter().zip(crate::render::short_ids(&ids)) {
+            self.add("messages", "messages", short, text(&m["title"]));
+        }
+    }
+
     async fn triggers(&mut self, command: &str, source: &mut impl Source) {
         let Some(data) = source.call("scheduler.list", json!({})).await else { return };
         let all: Vec<Value> = data["triggers"]
@@ -762,10 +806,73 @@ impl Groups {
             // The ones you added, as `scheduler list` shows (#244), for anything you can only do to
             // your own. Pausing is the one thing you can do to a module's schedule, so pause and
             // resume offer every one (#249's review).
-            .filter(|t| matches!(command, "pause" | "resume") || t["source"]["type"] == "user")
+            .filter(|t| matches!(command, "disable" | "enable") || t["source"]["type"] == "user")
             .cloned()
             .collect();
         // The same short endings `scheduler list` shows, which every scheduler command accepts.
+        let ids: Vec<String> = all.iter().map(|t| text(&t["id"])).collect();
+        for (t, short) in all.iter().zip(crate::render::short_ids(&ids)) {
+            self.add("triggers", "triggers", short, text(&t["op"]));
+        }
+    }
+
+    /// Removed workspaces, for `workspaces restore` and `purge` (ADR 0038).
+    async fn removed_workspaces(&mut self, source: &mut impl Source) {
+        let Some(data) = source.call("workspaces.list", json!({"removed": true})).await else { return };
+        for w in data["workspaces"].as_array().into_iter().flatten() {
+            self.add("workspaces", "removed workspaces", text(&w["id"]), text(&w["label"]));
+        }
+    }
+
+    /// Fetchers' sources, for `fetchers test` and `run`.
+    async fn sources(&mut self, source: &mut impl Source) {
+        let Some(data) = source.call("fetchers.list", json!({})).await else { return };
+        for s in data["sources"].as_array().into_iter().flatten() {
+            let what = [text(&s["kind"]), text(&s["method"])].into_iter().find(|t| !t.is_empty()).unwrap_or_default();
+            self.add("sources", "sources", text(&s["id"]), what);
+        }
+    }
+
+    /// A template's questions after `--set`, as `NAME=` with what each asks: from `--from TEMPLATE`
+    /// for `new`, or from the workspace's own template for `copy` and `reconfigure` (ADR 0025 §9).
+    async fn questions(
+        &mut self,
+        module: &str,
+        command: &str,
+        positionals: &[String],
+        given: &BTreeMap<String, String>,
+        source: &mut impl Source,
+    ) {
+        let questions = match (module, command) {
+            (_, "new") => {
+                let Some(template) = given.get("--from") else { return };
+                let Some(data) = source.call(&format!("{module}.templates"), json!({"id": template})).await else {
+                    return;
+                };
+                data["templates"].as_array().and_then(|t| t.first()).map(|t| t["questions"].clone())
+            }
+            ("workspaces", "copy" | "reconfigure") => {
+                let Some(id) = positionals.first() else { return };
+                source.call("workspaces.answers", json!({"id": id})).await.map(|d| d["questions"].clone())
+            }
+            _ => None,
+        };
+        for q in questions.as_ref().and_then(Value::as_array).into_iter().flatten() {
+            self.add("questions", "questions", format!("{}=", text(&q["name"])), text(&q["prompt"]));
+        }
+    }
+
+    /// Removed schedules, for `scheduler restore` and `purge` (ADR 0038).
+    async fn removed_triggers(&mut self, source: &mut impl Source) {
+        let Some(data) = source.call("scheduler.list", json!({"removed": true})).await else { return };
+        // Only a person's own schedule is ever removed (a module's can only be disabled).
+        let all: Vec<Value> = data["triggers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|t| t["source"]["type"] == "user")
+            .cloned()
+            .collect();
         let ids: Vec<String> = all.iter().map(|t| text(&t["id"])).collect();
         for (t, short) in all.iter().zip(crate::render::short_ids(&ids)) {
             self.add("triggers", "triggers", short, text(&t["op"]));
@@ -934,7 +1041,11 @@ mod tests {
     struct Canned(BTreeMap<&'static str, Value>);
 
     impl Source for Canned {
-        async fn call(&mut self, op: &str, _params: Value) -> Option<Value> {
+        async fn call(&mut self, op: &str, params: Value) -> Option<Value> {
+            // `{"removed": true}` has its own answer, under `"<op> removed"`.
+            if params["removed"] == true {
+                return self.0.get(format!("{op} removed").as_str()).cloned();
+            }
             self.0.get(op).cloned()
         }
     }
@@ -950,11 +1061,28 @@ mod tests {
             ),
             ("records.list", json!({"items": [{"id": "two-sum", "status": "done", "title": "Two Sum"}], "titles": {}})),
             (
+                "records.list removed",
+                json!({"items": [{"id": "gone", "status": "todo", "title": "Gone"}], "titles": {}}),
+            ),
+            ("records.collections removed", json!({"collections": [{"id": "old-jobs", "label": "Old jobs"}]})),
+            (
                 "records.templates",
                 json!({"categories": [{"id": "practice", "label": "Practice"}],
                        "templates": [{"id": "leetcode", "description": "Problems"}]}),
             ),
             ("workspaces.list", json!({"workspaces": [{"id": "site", "label": "Site", "state": "ready"}]})),
+            ("workspaces.list removed", json!({"workspaces": [{"id": "old-site", "label": "Old site"}]})),
+            (
+                "workspaces.templates",
+                json!({"templates": [{"id": "web-project", "questions": [
+                    {"name": "PROJECT_DIR", "prompt": "Project folder"}, {"name": "BROWSER", "prompt": "Browser"}]}]}),
+            ),
+            ("workspaces.answers", json!({"questions": [{"name": "PROJECT_DIR", "prompt": "Project folder"}]})),
+            ("fetchers.list", json!({"sources": [{"id": "hn-whoishiring", "method": "api", "kind": null}]})),
+            (
+                "scheduler.list removed",
+                json!({"triggers": [{"id": "usr-01JZZZZZZZZZZZZZZZZZZZZZR9", "op": "records.list", "source": {"type": "user"}}]}),
+            ),
             (
                 "scheduler.list",
                 json!({"triggers": [
@@ -1102,7 +1230,11 @@ mod tests {
         assert_eq!(words("scheduler add w").await, ["weekdays", "weekends"]);
         assert!(words("scheduler add daily ").await.is_empty(), "a time is typed, not picked");
         assert!(words("scheduler add once 2026-10-20 ").await.is_empty(), "the time still to come");
-        assert_eq!(words("scheduler add daily 09:00 ").await, ["records", "workspaces"], "only what can be scheduled");
+        assert_eq!(
+            words("scheduler add daily 09:00 ").await,
+            ["records", "workspaces", "notify"],
+            "only what can be scheduled"
+        );
         assert_eq!(words("scheduler add daily 09:00 --").await, ["--catch-up", "--lane"]);
         assert_eq!(words("scheduler add every 1d --catch-up ").await, ["skip", "run-once", "backfill"]);
         assert_eq!(words("scheduler add every 1d --lane ").await, ["default"]);
@@ -1132,8 +1264,22 @@ mod tests {
         };
         let offered = got(complete(&at("scheduler add daily 09:00 "), &cx, &mut daemon()).await);
         assert!(offered.contains(&"wgo".to_owned()), "workspaces activate's alias: {offered:?}");
-        assert!(!offered.contains(&"wst".to_owned()), "workspaces status can't be scheduled");
+        assert!(!offered.contains(&"wshow".to_owned()), "workspaces show can't be scheduled");
         assert_eq!(got(complete(&at("scheduler add daily 09:00 wgo "), &cx, &mut daemon()).await), ["site"]);
+    }
+
+    #[tokio::test]
+    async fn commands_that_take_lists_filters_dont_offer_its_paging() {
+        for line in ["records export lc --", "notify count --", "notify mark-read --", "notify remove --"] {
+            let offered = words(line).await;
+            assert!(
+                !offered.contains(&"--limit".to_owned()) && !offered.contains(&"--offset".to_owned()),
+                "{line}: {offered:?}"
+            );
+        }
+        assert!(words("notify count --").await.contains(&"--unread".to_owned()), "the filters still come");
+        assert!(words("records export lc --").await.contains(&"--status".to_owned()));
+        assert!(words("notify list --").await.contains(&"--limit".to_owned()), "list keeps its own");
     }
 
     #[tokio::test]
@@ -1145,12 +1291,37 @@ mod tests {
         assert_eq!(words("records new jobs --from ").await, ["leetcode"]);
         assert_eq!(words("records templates ").await, ["practice"]);
         assert_eq!(words("scheduler remove ").await, ["VWXYZ0"], "the short ending lists show, not the whole id");
-        let pause = words("scheduler pause ").await;
+        assert_eq!(words("scheduler restore ").await, ["ZZZZR9"], "from scheduler list --removed");
+        // ADR 0038 §6: removed workspaces, fetchers' sources, and scheduler edit's trigger then add's words.
+        assert_eq!(words("workspaces purge ").await, ["old-site"], "from workspaces list --removed");
+        assert_eq!(words("workspaces restore ").await, ["old-site"]);
+        assert_eq!(words("records restore lc/").await, ["lc/gone"], "a collection's removed records");
+        assert_eq!(words("records purge lc/").await, ["lc/gone"]);
+        assert_eq!(words("records restore-collection ").await, ["old-jobs"], "removed collections");
+        assert_eq!(words("records purge-collection ").await, ["old-jobs"]);
+        assert_eq!(words("records remove lc/").await, ["lc/two-sum"], "remove still offers what's there");
+        assert_eq!(words("fetchers run ").await, ["hn-whoishiring"]);
+        assert_eq!(words("fetchers test ").await, ["hn-whoishiring"]);
+        assert_eq!(words("scheduler edit ").await, ["VWXYZ0"], "a schedule you added, by the ending list shows");
+        assert_eq!(words("scheduler edit VWXYZ0 w").await, ["weekdays", "weekends"], "then add's WHEN words");
+        assert_eq!(words("scheduler edit VWXYZ0 daily 09:00 workspaces activate ").await, ["site"]);
+        let pause = words("scheduler disable ").await;
         assert!(pause.contains(&"VWXYZ0".to_owned()) && pause.contains(&"notify.flush".to_owned()), "{pause:?}");
         assert_eq!(words("call ").await, ["core.ping"]);
         assert!(words("packs use ").await.contains(&"none".to_owned()));
         assert!(words("packs use ").await.contains(&"short".to_owned()));
         assert!(words("--pack ").await.contains(&"starship".to_owned()));
+    }
+
+    /// `--set <Tab>` offers the template's questions as `NAME=`, which take no space after them.
+    #[tokio::test]
+    async fn set_offers_the_templates_questions() {
+        let new = words("workspaces new site --from web-project --set ").await;
+        assert_eq!(new, ["PROJECT_DIR=", "BROWSER="]);
+        assert_eq!(words("workspaces new site --from=web-project --set ").await, new, "--from=VALUE too");
+        assert!(words("workspaces new site --set ").await.is_empty(), "no template yet: nothing to offer");
+        assert_eq!(words("workspaces copy site site-2 --set ").await, ["PROJECT_DIR="], "the workspace's own template");
+        assert_eq!(words("workspaces reconfigure site --set ").await, ["PROJECT_DIR="]);
     }
 
     #[tokio::test]

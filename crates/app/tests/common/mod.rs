@@ -16,7 +16,12 @@ pub struct Home {
 
 impl Home {
     pub fn new() -> Self {
-        Self { dir: TempDir::new().unwrap() }
+        let dir = TempDir::new().unwrap();
+        // Notify's popups are logged, never shown: no test may pop anything up on a developer's
+        // screen (ADR 0032 §2).
+        std::fs::create_dir_all(dir.path().join("home")).unwrap();
+        std::fs::write(dir.path().join("home/config.toml"), "[desktop]\nshow = false\n").unwrap();
+        Self { dir }
     }
 
     /// A home with a LeetCode-style collection already in it. A fresh install has no
@@ -40,9 +45,19 @@ impl Home {
             .env("SHIMMER_SOCKET", self.socket())
             // The CLI's own settings (the active command pack, ADR 0013): never the developer's.
             .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
+            // A workspace step calling `shimmer` runs this build, never one installed on the
+            // developer's machine (an older one speaks an older protocol and is refused).
+            .env("PATH", path_with_this_build())
             .output()
             .unwrap()
     }
+}
+
+/// `PATH` with the folder of the `shimmer` under test first.
+fn path_with_this_build() -> std::ffi::OsString {
+    let bin = Path::new(env!("CARGO_BIN_EXE_shimmer")).parent().unwrap().to_owned();
+    let rest = std::env::var_os("PATH").unwrap_or_default();
+    std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&rest))).unwrap()
 }
 
 /// Never leave a daemon running behind a failed assertion.

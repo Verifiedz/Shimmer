@@ -92,7 +92,7 @@ fn use_links_aliases_that_run_shimmer_and_the_whole_command() {
     );
     assert!(ok(bare(&home, "rdone", &["leetcode/two-sum"])).starts_with("✓ leetcode/two-sum done"));
     // After shimmer too, and the real names still work alongside.
-    let rec = ok(shimmer(&home, &["rget", "leetcode/two-sum", "--json"]));
+    let rec = ok(shimmer(&home, &["rshow", "leetcode/two-sum", "--json"]));
     assert!(rec.contains("\"status\": \"done\""), "{rec}");
     assert!(ok(shimmer(&home, &["records", "list", "leetcode"])).contains("two-sum"));
 

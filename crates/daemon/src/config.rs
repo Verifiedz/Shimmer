@@ -6,9 +6,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use serde_json::Value;
-use shimmer_core::{Error, LocalTimezone, Result};
+use shimmer_core::{Error, LocalTimezone, ModuleId, Result};
 
-use crate::http_backend::{HostLimits, HttpConfig};
+use crate::http_backend::{CredentialBinding, HostLimits, HttpConfig};
 
 #[derive(Debug, Default)]
 pub struct Config {
@@ -20,6 +20,13 @@ pub struct Config {
     pub local_timezone: LocalTimezone,
     /// `[http]` (ADR 0027): the real gateway's rate limits, cache and timeout.
     pub http: HttpConfig,
+    /// `[credentials.<name>]` (ADR 0036 §2): which module and host a named credential is
+    /// bound to. The secret value itself never lives here -- resolved separately, by name,
+    /// through a `SecretStore` (`crates/daemon/src/secrets.rs`).
+    pub credentials: HashMap<String, CredentialBinding>,
+    /// `[desktop] show = false` (ADR 0032 §2): log desktop notes instead of showing them, for
+    /// machines with no screen and for tests.
+    pub hide_desktop: bool,
 }
 
 impl Config {
@@ -90,8 +97,87 @@ impl Config {
         if let Some(http) = root.get("http") {
             cfg.http = parse_http(http)?;
         }
+        if let Some(credentials) = root.get("credentials").and_then(|c| c.as_table()) {
+            for (name, entry) in credentials {
+                cfg.credentials.insert(name.clone(), parse_credential(name, entry)?);
+            }
+        }
+        if let Some(desktop) = root.get("desktop") {
+            let table =
+                desktop.as_table().ok_or_else(|| Error::invalid_params("config.toml: [desktop] must be a table"))?;
+            for (key, v) in table {
+                match (key.as_str(), v.as_bool()) {
+                    ("show", Some(show)) => cfg.hide_desktop = !show,
+                    ("show", None) => {
+                        return Err(Error::invalid_params("config.toml: desktop.show must be true or false"))
+                    }
+                    (other, _) => {
+                        return Err(Error::invalid_params(format!(
+                            "config.toml: desktop.{other} isn't a setting (only show)"
+                        )))
+                    }
+                }
+            }
+        }
         Ok(cfg)
     }
+}
+
+/// `[credentials.<name>]` (ADR 0036 §2): `module`, `host` and `header` are all required --
+/// a credential with no module to restrict it to, or no host to restrict it to, would be
+/// usable anywhere by anything, which defeats the entire point of binding it.
+fn parse_credential(name: &str, entry: &toml::Value) -> Result<CredentialBinding> {
+    let table = entry
+        .as_table()
+        .ok_or_else(|| Error::invalid_params(format!("config.toml: credentials.{name} must be a table")))?;
+    let field =
+        |key: &str| {
+            table.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).ok_or_else(|| {
+                Error::invalid_params(format!("config.toml: credentials.{name} needs a non-empty {key}"))
+            })
+        };
+    let header = field("header")?;
+    if !is_header_name(header) {
+        return Err(Error::invalid_params(format!(
+            "config.toml: credentials.{name}: header '{header}' is not a valid header name"
+        )));
+    }
+    Ok(CredentialBinding {
+        module: ModuleId::new(field("module")?),
+        host: normalized_host(name, field("host")?)?,
+        header: header.to_owned(),
+    })
+}
+
+/// A binding's `host` is matched against `RealHttpBackend`'s own `host:port` bucketing, so a
+/// bare `api.example.com` would never match anything and the credential would silently never
+/// attach (#257's review). Normalise it here instead: a missing port becomes `:443`, since a
+/// credentialed API over plain `http` is not a thing we want to make convenient by default.
+/// An explicit port is kept as written, so `:80` or `:8443` still work when spelled out.
+fn normalized_host(name: &str, host: &str) -> Result<String> {
+    let bad = |why: &str| Error::invalid_params(format!("config.toml: credentials.{name}: host '{host}' {why}"));
+    if host.contains('/') {
+        return Err(bad("must be a host, optionally with a port -- not a url"));
+    }
+    if host.contains('[') || host.contains(']') {
+        return Err(bad("looks like an IPv6 literal, which isn't supported here"));
+    }
+    match host.rsplit_once(':') {
+        Some((h, port)) => {
+            if h.is_empty() {
+                return Err(bad("has no host before its port"));
+            }
+            port.parse::<u16>().map(|_| host.to_owned()).map_err(|_| bad("has a port that is not a number"))
+        }
+        None => Ok(format!("{host}:443")),
+    }
+}
+
+/// RFC 7230's `token` charset, which is what `reqwest` will accept as a header name anyway --
+/// checked here so a typo is a clear config error at startup rather than a request that fails
+/// deep inside a fetch.
+fn is_header_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c))
 }
 
 fn number(v: &toml::Value) -> Option<f64> {
@@ -241,6 +327,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn desktop_notes_can_be_logged_instead_of_shown() {
+        assert!(!Config::parse("").unwrap().hide_desktop, "shown by default");
+        assert!(Config::parse("[desktop]\nshow = false\n").unwrap().hide_desktop);
+        assert!(Config::parse("[desktop]\nshow = \"no\"\n").unwrap_err().message.contains("true or false"));
+        assert!(Config::parse("[desktop]\nsound = true\n").unwrap_err().message.contains("only show"));
+    }
+
+    #[test]
     fn parses_lanes_and_module_sections() {
         let cfg = Config::parse("[lanes]\nfetchers = 2\n[modules.records]\npage_size = 50\n").unwrap();
         assert_eq!(cfg.lanes["fetchers"], 2);
@@ -299,6 +393,75 @@ mod tests {
     #[test]
     fn rejects_a_non_positive_rate() {
         assert!(Config::parse("[http]\ndefault_requests_per_sec = 0\n").is_err());
+    }
+
+    #[test]
+    fn parses_a_credentials_section() {
+        let text = "[credentials.my-api-key]\nmodule = \"fetchers\"\nhost = \"api.example.com:443\"\nheader = \"Authorization\"\n";
+        let cfg = Config::parse(text).unwrap();
+        let cred = &cfg.credentials["my-api-key"];
+        assert_eq!(cred.module, ModuleId::new("fetchers"));
+        assert_eq!(cred.host, "api.example.com:443");
+        assert_eq!(cred.header, "Authorization");
+    }
+
+    #[test]
+    fn a_credential_host_without_a_port_is_normalised_rather_than_silently_never_matching() {
+        // `host` is matched against RealHttpBackend's own `host:port` bucketing, so a bare host
+        // used to match nothing at all and the credential silently never attached (#257 review).
+        let text = "[credentials.k]\nmodule = \"fetchers\"\nhost = \"api.example.com\"\nheader = \"Authorization\"\n";
+        assert_eq!(Config::parse(text).unwrap().credentials["k"].host, "api.example.com:443");
+    }
+
+    #[test]
+    fn an_explicit_credential_port_is_kept_as_written() {
+        for (written, expected) in
+            [("api.example.com:80", "api.example.com:80"), ("api.example.com:8443", "api.example.com:8443")]
+        {
+            let text = format!("[credentials.k]\nmodule = \"f\"\nhost = \"{written}\"\nheader = \"Authorization\"\n");
+            assert_eq!(Config::parse(&text).unwrap().credentials["k"].host, expected);
+        }
+    }
+
+    #[test]
+    fn a_credential_host_that_is_a_url_or_has_a_bad_port_is_rejected() {
+        for host in [
+            "https://api.example.com",
+            "api.example.com/v1",
+            "api.example.com:https",
+            "api.example.com:",
+            "[::1]",
+            "[::1]:8443",
+        ] {
+            let text = format!("[credentials.k]\nmodule = \"f\"\nhost = \"{host}\"\nheader = \"Authorization\"\n");
+            let e = Config::parse(&text).unwrap_err();
+            assert_eq!(e.code, shimmer_core::ErrorCode::InvalidParams, "host: {host}");
+            assert!(e.message.contains("host"), "host {host}: {}", e.message);
+        }
+    }
+
+    #[test]
+    fn a_credential_header_that_is_not_a_header_name_is_rejected_at_load() {
+        for header in ["Authorization: Bearer", "X Api Key", "has\nnewline"] {
+            let text = format!(
+                "[credentials.k]\nmodule = \"f\"\nhost = \"a.test:443\"\nheader = \"{}\"\n",
+                header.escape_default()
+            );
+            let e = Config::parse(&text).unwrap_err();
+            assert_eq!(e.code, shimmer_core::ErrorCode::InvalidParams, "header: {header}");
+        }
+        // The shapes a real API actually uses all pass.
+        for header in ["Authorization", "X-Api-Key", "x-goog-api-key"] {
+            let text = format!("[credentials.k]\nmodule = \"f\"\nhost = \"a.test:443\"\nheader = \"{header}\"\n");
+            Config::parse(&text).unwrap_or_else(|e| panic!("header {header} should be valid: {}", e.message));
+        }
+    }
+
+    #[test]
+    fn a_credential_missing_a_required_field_is_rejected() {
+        let e =
+            Config::parse("[credentials.my-api-key]\nmodule = \"fetchers\"\nheader = \"Authorization\"\n").unwrap_err();
+        assert!(e.message.contains("host"), "{}", e.message);
     }
 
     #[test]

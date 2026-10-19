@@ -3,7 +3,7 @@
     {
       "op": "core.manifest",
       "data": {
-        "protocol": 1,
+        "protocol": 2,
         "lanes": [
           {
             "id": "workspaces",
@@ -45,7 +45,7 @@
                 "execution": "inline"
               },
               {
-                "op": "records.get",
+                "op": "records.show",
                 "summary": "Get one record",
                 "params_schema": {},
                 "execution": "inline"
@@ -87,19 +87,13 @@
                 "execution": "inline"
               },
               {
-                "op": "records.trash",
-                "summary": "List a collection's removed records",
-                "params_schema": {},
-                "execution": "inline"
-              },
-              {
                 "op": "records.templates",
                 "summary": "List the built-in collection templates",
                 "params_schema": {},
                 "execution": "inline"
               },
               {
-                "op": "records.create_collection",
+                "op": "records.new",
                 "summary": "Create a collection from a template",
                 "params_schema": {},
                 "execution": "inline"
@@ -166,7 +160,7 @@
               "records.collection.restored",
               "records.item.removed",
               "records.collection.created",
-              "records.trash.purged"
+              "records.item.purged"
             ]
           },
           {
@@ -175,7 +169,17 @@
             "namespace": "fetchers",
             "commands": [
               {
-                "op": "fetchers.fetch",
+                "op": "fetchers.tick",
+                "summary": "Internal: check configured sources and enqueue a fetch for each one due (the scheduler calls this, not a person)",
+                "params_schema": {},
+                "execution": {
+                  "queued": {
+                    "lane": "fetchers"
+                  }
+                }
+              },
+              {
+                "op": "fetchers.run",
                 "summary": "Fetch a source now",
                 "params_schema": {},
                 "execution": {
@@ -203,7 +207,7 @@
                 "execution": "inline"
               },
               {
-                "op": "workspaces.status",
+                "op": "workspaces.show",
                 "summary": "Full state of one workspace",
                 "params_schema": {},
                 "execution": "inline"
@@ -285,7 +289,7 @@
                 "execution": "inline"
               },
               {
-                "op": "workspaces.create",
+                "op": "workspaces.new",
                 "summary": "Create a workspace from a template and your answers",
                 "params_schema": {},
                 "execution": "inline"
@@ -316,6 +320,143 @@
               "workspaces.workspace.renamed",
               "workspaces.workspace.copied"
             ]
+          },
+          {
+            "id": "notify",
+            "version": "0.1.0",
+            "namespace": "notify",
+            "commands": [
+              {
+                "op": "notify.send",
+                "summary": "Send a message: to the inbox, then every way Shimmer can reach you",
+                "params_schema": {},
+                "execution": {
+                  "queued": {
+                    "lane": "notify"
+                  }
+                }
+              },
+              {
+                "op": "notify.test",
+                "summary": "Send a test message to every way Shimmer can reach you",
+                "params_schema": {},
+                "execution": {
+                  "queued": {
+                    "lane": "notify"
+                  }
+                }
+              },
+              {
+                "op": "notify.resend",
+                "summary": "Try messages again (e.g. the failed ones)",
+                "params_schema": {},
+                "execution": {
+                  "queued": {
+                    "lane": "notify"
+                  }
+                }
+              },
+              {
+                "op": "notify.flush",
+                "summary": "Send what quiet hours or a pause held back, as one summary",
+                "params_schema": {},
+                "execution": {
+                  "queued": {
+                    "lane": "notify"
+                  }
+                }
+              },
+              {
+                "op": "notify.list",
+                "summary": "The inbox, newest first",
+                "params_schema": {},
+                "execution": "inline"
+              },
+              {
+                "op": "notify.count",
+                "summary": "How many messages match",
+                "params_schema": {},
+                "execution": "inline"
+              },
+              {
+                "op": "notify.show",
+                "summary": "One message in full",
+                "params_schema": {},
+                "execution": "inline"
+              },
+              {
+                "op": "notify.mark_read",
+                "summary": "Mark messages read",
+                "params_schema": {},
+                "execution": "inline"
+              },
+              {
+                "op": "notify.mark_unread",
+                "summary": "Mark messages unread",
+                "params_schema": {},
+                "execution": "inline"
+              },
+              {
+                "op": "notify.remove",
+                "summary": "Delete messages",
+                "params_schema": {},
+                "execution": "inline"
+              },
+              {
+                "op": "notify.pause",
+                "summary": "Hold messages until resume (high priority still comes through unless all)",
+                "params_schema": {},
+                "execution": "inline"
+              },
+              {
+                "op": "notify.resume",
+                "summary": "Stop holding messages and send what waited",
+                "params_schema": {},
+                "execution": "inline"
+              },
+              {
+                "op": "notify.quiet",
+                "summary": "Show or set quiet hours",
+                "params_schema": {},
+                "execution": "inline"
+              },
+              {
+                "op": "notify.builtin_alerts",
+                "summary": "Show or switch the built-in alerts",
+                "params_schema": {},
+                "execution": "inline"
+              },
+              {
+                "op": "notify.cap",
+                "summary": "Show or set how many messages the inbox keeps",
+                "params_schema": {},
+                "execution": "inline"
+              },
+              {
+                "op": "notify.status",
+                "summary": "Notify at a glance: settings, pause, counts",
+                "params_schema": {},
+                "execution": "inline"
+              },
+              {
+                "op": "notify.health",
+                "summary": "Check notify for problems; changes nothing (ADR 0033)",
+                "params_schema": {},
+                "execution": "inline"
+              }
+            ],
+            "topics": [
+              "notify.message.received",
+              "notify.message.held",
+              "notify.message.sent",
+              "notify.message.exhausted",
+              "notify.message.read",
+              "notify.message.unread",
+              "notify.message.removed",
+              "notify.pause.started",
+              "notify.pause.ended",
+              "notify.settings.changed"
+            ]
           }
         ]
       }
@@ -339,7 +480,7 @@
               {
                 "task_id": "01JD2P00000000000000000001",
                 "lane": "fetchers",
-                "op": "fetchers.fetch",
+                "op": "fetchers.run",
                 "status": "running",
                 "priority": "normal",
                 "origin": {
@@ -360,7 +501,7 @@
               {
                 "task_id": "01JD2P00000000000000000002",
                 "lane": "fetchers",
-                "op": "fetchers.fetch",
+                "op": "fetchers.run",
                 "status": "queued",
                 "priority": "scheduled",
                 "origin": {
@@ -380,7 +521,7 @@
               {
                 "task_id": "01JD2P00000000000000000003",
                 "lane": "fetchers",
-                "op": "fetchers.fetch",
+                "op": "fetchers.run",
                 "status": "queued",
                 "priority": "scheduled",
                 "origin": {
@@ -400,7 +541,7 @@
               {
                 "task_id": "01JD2P00000000000000000004",
                 "lane": "fetchers",
-                "op": "fetchers.fetch",
+                "op": "fetchers.run",
                 "status": "queued",
                 "priority": "scheduled",
                 "origin": {
@@ -533,7 +674,7 @@
       }
     },
     {
-      "op": "records.get",
+      "op": "records.show",
       "params": {
         "collection": "leetcode",
         "id": "two-sum"

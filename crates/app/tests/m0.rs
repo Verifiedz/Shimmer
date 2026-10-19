@@ -20,7 +20,7 @@ fn a_command_reaches_the_daemon_and_back() {
     let o = home.shimmer(&["manifest", "--json"]);
     assert!(o.status.success(), "stderr: {}", stderr(&o));
     let m: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
-    assert_eq!(m["protocol"], 1);
+    assert_eq!(m["protocol"], shimmer_proto::PROTOCOL_VERSION);
     assert!(m["lanes"].as_array().unwrap().iter().any(|l| l["id"] == "default"));
 
     // Daemon errors come back with their stable code and exit 1.

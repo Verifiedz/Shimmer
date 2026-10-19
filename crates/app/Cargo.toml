@@ -22,6 +22,8 @@ shimmer-mockd = { path = "../mockd" }
 shimmer-cli = { path = "../cli" }
 shimmer-records = { path = "../modules/records" }
 shimmer-workspaces = { path = "../modules/workspaces" }
+shimmer-fetchers = { path = "../modules/fetchers" }
+shimmer-notify = { path = "../modules/notify" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 tracing = "0.1"
 tracing-appender = "0.2"

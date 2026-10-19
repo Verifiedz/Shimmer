@@ -123,7 +123,7 @@ shimmer records collections                  # list collections and their fields
 shimmer records add leetcode two-sum --title "Two Sum" --difficulty easy
 shimmer records list leetcode --status todo  # --FIELD VALUE filters on an exact value
 shimmer records complete leetcode/two-sum    # mark done; stamps last_solved with today's date
-shimmer records get leetcode/two-sum
+shimmer records show leetcode/two-sum
 shimmer records update leetcode/two-sum --url https://leetcode.com/problems/two-sum/
 shimmer records remove leetcode/two-sum
 ```
@@ -133,7 +133,7 @@ You can write a record as `leetcode/two-sum` or `leetcode two-sum`. There is mor
 - **Finding records:** `list` filters (`--filter "difficulty=hard"`, `--or`, `--has`,
   `--missing`, dates like `today+7`), searches (`--search`), sorts (`--sort -last_solved`) and
   pages (`--limit`, `--offset`).
-- **Undo:** `remove` moves a record to the trash; `restore` brings it back, `trash` lists it, and
+- **Undo:** `remove` moves a record to the trash; `restore` brings it back, `list --removed` lists it, and
   `purge` deletes it for good (it asks first). `reopen` makes a done record todo again.
 - **Moving data:** `import` from CSV or JSON, `export` to either.
 - **Changing a collection:** `edit` opens its file; `check`, `rename-field`, `rename-collection`,
@@ -186,7 +186,7 @@ shimmer workspaces peek web-project        # what one does before you use it
 shimmer workspaces new site --from web-project
 shimmer workspaces list                    # every workspace and its state (ready, active, dirty)
 shimmer workspaces activate site           # run its steps in order; add --wait to follow along
-shimmer workspaces status site             # steps, last session, and why it's dirty if it is
+shimmer workspaces show site               # steps, last session, and why it's dirty if it is
 shimmer workspaces stop site               # stop what it started
 shimmer queue list                     # what is running and waiting, per lane
 shimmer scheduler list                 # your schedules, when each next fires and its state (--all: modules' too)
@@ -198,6 +198,27 @@ A workspace is a folder in `$SHIMMER_HOME/data/workspaces/<name>/` holding a `wo
 and a `steps/` folder of scripts. [`CLAUDE.md`](CLAUDE.md) §10 shows an example and ADR 0012
 has every rule. `shimmer workspaces --help`, `shimmer queue --help` and
 `shimmer scheduler --help` cover the rest.
+
+### Notifications
+
+```sh
+shimmer notify test                        # check that messages reach you (a desktop notification)
+shimmer notify send "Build finished" --body "v1.4 is live" --priority high
+shimmer notify list                        # your messages, newest first; --unread, --from alerts, --text …
+shimmer notify show 0A3F6K                 # one in full (the ending list shows is enough)
+shimmer notify quiet 22:00-08:00           # quiet hours: low and normal messages wait, then one summary
+shimmer notify pause 2h                    # do not disturb for a while; shimmer notify resume to stop
+shimmer notify remove --read               # clean up (asks first)
+shimmer scheduler add weekdays 08:45 --catch-up skip notify send "Standup in 15"
+```
+
+Every message lands in an inbox first (`$SHIMMER_HOME/data/notify/inbox/`), then appears as a
+desktop notification: `notify-send` on Linux (the `libnotify-bin` package), `osascript` on macOS.
+Nothing is lost if it can't be shown. Normal and high priority pop up; on GNOME, low priority goes
+straight to the notification list without popping up (on macOS every priority pops up the same). Shimmer also tells you by itself when a workspace couldn't
+launch or a scheduled task failed (`shimmer notify builtin-alerts`). On a machine with no screen,
+`[desktop] show = false` in `config.toml` logs notifications instead. ADR 0032 has the details;
+`shimmer notify --help` lists every command.
 
 ### Command packs
 

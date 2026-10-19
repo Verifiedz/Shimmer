@@ -1,6 +1,6 @@
 //! Waiting for a queued task to end, for `--wait`: one copy for every command that queues work
 //! (#142). Follows the task's events on the subscription stream; when the stream lags and events
-//! were dropped, asks `queue.task` instead.
+//! were dropped, asks `queue.show` instead.
 
 use serde_json::{json, Value};
 use shimmer_core::{Error, ErrorCode, Result};
@@ -12,8 +12,8 @@ use crate::client::Client;
 pub enum Followed {
     /// Its `queue.task.finished` event arrived: the op's result.
     Finished(Value),
-    /// It succeeded, but its result went with events the stream dropped: `queue.task` has no
-    /// `result`. Carries what `queue.task` did say. Still a success: the caller says the output
+    /// It succeeded, but its result went with events the stream dropped: `queue.show` has no
+    /// `result`. Carries what `queue.show` did say. Still a success: the caller says the output
     /// was missed, never that the work failed.
     ResultMissed(Value),
 }
@@ -27,7 +27,7 @@ pub async fn follow(client: &mut Client, task: &str, notes: bool, look: &str) ->
         let ev = client.next_event().await?;
         if ev.topic == "core.stream.lagged" {
             // Events were dropped, maybe the one we wait for: ask directly instead.
-            let t = match client.call("queue.task", json!({"task_id": task})).await {
+            let t = match client.call("queue.show", json!({"task_id": task})).await {
                 Ok(t) => t,
                 // The daemon keeps only its most recent finished tasks: this one is gone too.
                 Err(e) if e.code == ErrorCode::NotFound => return Err(forgotten(task, look)),
@@ -57,8 +57,8 @@ pub async fn follow(client: &mut Client, task: &str, notes: bool, look: &str) ->
     }
 }
 
-/// From `queue.task`'s reply `t` after a lag: how the task ended, or `None` while it is still
-/// queued or running. `queue.task` carries neither the result nor the error's detail, so a
+/// From `queue.show`'s reply `t` after a lag: how the task ended, or `None` while it is still
+/// queued or running. `queue.show` carries neither the result nor the error's detail, so a
 /// failure keeps its code but names `look` for the rest.
 fn ended(t: &Value, look: &str) -> Option<Result<Followed>> {
     match t["status"].as_str() {
@@ -85,7 +85,7 @@ pub(crate) fn task_error(payload: &Value) -> Error {
     e
 }
 
-/// `queue.task`'s `error` is the error as the daemon prints it, `"<code>: <message>"`; the
+/// `queue.show`'s `error` is the error as the daemon prints it, `"<code>: <message>"`; the
 /// `queue.task.failed` event carries the two apart. Split them, so a failure has the same code
 /// and reads the same whether or not the stream lagged (clients branch on the code).
 fn split_code(error: &str) -> (Option<ErrorCode>, &str) {
@@ -117,7 +117,7 @@ fn cancelled() -> Error {
 mod tests {
     use super::*;
 
-    const LOOK: &str = "shimmer workspaces status site";
+    const LOOK: &str = "shimmer workspaces show site";
 
     #[test]
     fn after_a_lag_a_success_is_still_a_success_with_its_result_missed() {
@@ -132,7 +132,7 @@ mod tests {
         assert_eq!(
             e.message,
             "workspace 'site' is dirty (some events were dropped, so details may be missing: \
-             see 'shimmer workspaces status site')"
+             see 'shimmer workspaces show site')"
         );
         let cancelled = ended(&json!({"status": "cancelled"}), LOOK).unwrap().unwrap_err();
         assert_eq!(cancelled.message, "the task was cancelled");
@@ -140,7 +140,7 @@ mod tests {
 
     #[test]
     fn after_a_lag_a_failure_reads_as_it_would_without_one() {
-        // queue.task prints the error with its code in front; the event has the message alone.
+        // queue.show prints the error with its code in front; the event has the message alone.
         let t = json!({"status": "failed", "error": "workspace_dirty: workspace 'site' failed at step 1/3 setup"});
         let e = ended(&t, LOOK).unwrap().unwrap_err();
         assert_eq!(e.code, ErrorCode::WorkspaceDirty, "the code survives the lag");
@@ -173,7 +173,7 @@ mod tests {
         assert_eq!(task_error(&json!({"task_id": "01"})).code, ErrorCode::ModuleError, "unknown code still fails");
     }
 
-    /// A daemon that, once connected, sends `events`, then answers `queue.task` with `task`, as
+    /// A daemon that, once connected, sends `events`, then answers `queue.show` with `task`, as
     /// a lagging stream does: the events that mattered are gone. `after` are sent right after
     /// that answer, as events of a task that was still running.
     async fn lagging_daemon(
@@ -194,7 +194,7 @@ mod tests {
                     ClientFrame::Hello { .. } => std::iter::once(ServerFrame::welcome("test", "s1"))
                         .chain(events.iter().cloned().map(ServerFrame::event))
                         .collect(),
-                    ClientFrame::Request { id, op, .. } if op == "queue.task" => {
+                    ClientFrame::Request { id, op, .. } if op == "queue.show" => {
                         let reply = match &task {
                             Ok(v) => ServerFrame::ok(id, v.clone()),
                             Err(e) => ServerFrame::err(id, e.clone()),
@@ -218,7 +218,7 @@ mod tests {
     async fn a_success_lost_to_a_lag_is_reported_as_a_success_through_a_real_client() {
         let dir = tempfile::TempDir::new().unwrap();
         let sock = dir.path().join("s.sock");
-        // Another task's event, then the lag that swallowed ours; queue.task says it succeeded,
+        // Another task's event, then the lag that swallowed ours; queue.show says it succeeded,
         // with no result (the daemon's `view` has none).
         let events = vec![
             event("queue.task.progress", json!({"task_id": "other", "note": "x"})),
@@ -264,7 +264,7 @@ mod tests {
 
     #[tokio::test]
     async fn after_a_lag_a_task_still_running_is_followed_to_its_end() {
-        // The path most likely to break: queue.task says running, so follow keeps reading the
+        // The path most likely to break: queue.show says running, so follow keeps reading the
         // stream, and the task's own finished event arrives after that answer.
         let dir = tempfile::TempDir::new().unwrap();
         let sock = dir.path().join("s.sock");
