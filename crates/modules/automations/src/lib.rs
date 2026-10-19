@@ -13,7 +13,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use shimmer_core::params::decode;
 use shimmer_core::{local_date, CommandSpec, Ctx, Error, Event, Execution, Manifest, Module, Result, WriteLock};
@@ -26,6 +26,8 @@ const RULES: &str = "rules";
 const REMOVED: &str = "removed";
 const SETTINGS: &str = "settings.toml";
 const HISTORY: &str = "history.json";
+/// Renamed rules, so a delayed action set before a rename still finds its rule (#287's review).
+const RENAMED: &str = "renamed.toml";
 /// Firings kept in `history.json`, oldest dropped; the event log keeps them all (§8).
 const HISTORY_KEPT: usize = 300;
 /// After the loop guard reports stopping a rule, further stops of it are quiet this long.
@@ -185,7 +187,7 @@ impl Automations {
                     // delay never starts a fresh chain the loop guard can't see, even across a
                     // restart (ADR 0035 §3, #238's review).
                     let at = ctx.clock.now() + wait;
-                    let deferred = json!({"rule": rule.id, "op": action.op, "params": params, "chain": chain});
+                    let deferred = json!({"rule": rule.id, "op": action.op, "params": params, "chain": chain, "made_at": ctx.clock.now()});
                     match ctx.schedules.add_once(DEFERRED, deferred, at, &label(rule)) {
                         Ok(id) => scheduled.push(json!({"op": action.op, "trigger_id": id, "at": at})),
                         Err(e) => failed.push(json!({"op": action.op, "error": e.message})),
@@ -207,7 +209,15 @@ impl Automations {
 
     /// A delayed action's time has come: queue its op, continuing the chain that scheduled it. A
     /// rule removed or switched off meanwhile has nothing left to do.
-    async fn deferred(&self, ctx: &Ctx, d: Deferred) -> Result<Value> {
+    async fn deferred(&self, ctx: &Ctx, mut d: Deferred) -> Result<Value> {
+        // Renamed since it was set: it belongs to the rule under its new id. A rule given the old
+        // id later is a different rule, and keeps only its own delayed actions.
+        for r in renames(ctx).unwrap_or_default() {
+            if r.from == d.rule && d.made_at.is_none_or(|made| made < r.at) {
+                d.chain.rules.iter_mut().filter(|id| **id == r.from).for_each(|id| id.clone_from(&r.to));
+                d.rule = r.to;
+            }
+        }
         let on = self.state().rules.get(&d.rule).is_some_and(|r| r.enabled);
         if !on {
             return Ok(json!({"skipped": format!("rule '{}' was removed or switched off", d.rule)}));
@@ -257,38 +267,36 @@ impl Automations {
         json!({"rules": rules, "problems": self.problems()})
     }
 
-    /// Give a rule a new id (ADR 0038 §6). Refused while a delayed action from it is still waiting:
-    /// it runs under the rule's id, and would find no rule and be skipped. Only the delayed actions
-    /// in history (the last [`HISTORY_KEPT`] firings) can be seen.
+    /// Give a rule a new id (ADR 0038 §6). Its history moves with it, and a delayed action it set
+    /// that is still waiting follows it: `renamed.toml` records the rename, and `deferred` reads it
+    /// (#287's review). Entries older than the longest `after` can't matter and are dropped.
     fn rename(&self, ctx: &Ctx, p: MoveParams) -> Result<Value> {
         let _g = self.write.lock();
         let rule = self.rule(&p.id)?;
         let text = self.free_copy_target(ctx, &rule, &p.to)?;
-        let now = ctx.clock.now();
-        let waiting = history(ctx)
-            .iter()
-            .filter(|e| e["rule"] == p.id.as_str())
-            .flat_map(|e| e["scheduled"].as_array().cloned().unwrap_or_default())
-            .filter(|s| s["at"].as_str().and_then(|a| a.parse::<DateTime<Utc>>().ok()).is_some_and(|at| at > now))
-            .count();
-        if waiting > 0 {
-            return Err(Error::conflict(format!(
-                "{waiting} delayed action(s) from '{}' are still waiting and would be skipped under a new id; \
-                 rename it after they run, or remove them first (shimmer scheduler list --all)",
-                p.id
-            )));
-        }
         let renamed = Rule::parse(&p.to, &text, &ctx.catalog, false).map_err(Error::invalid_params)?;
+        let now = ctx.clock.now();
+        let oldest = now - chrono::Duration::days(rule::MAX_AFTER_DAYS);
+        let mut renames: Vec<Renamed> = renames(ctx)?.into_iter().filter(|r| r.at >= oldest).collect();
+        renames.push(Renamed { from: p.id.clone(), to: p.to.clone(), at: now });
+        let renames = toml::to_string(&RenamedFile { renamed: renames }).map_err(|e| Error::internal(e.to_string()))?;
+        let mut entries = history(ctx);
+        for e in entries.iter_mut().filter(|e| e["rule"] == p.id.as_str()) {
+            e["rule"] = json!(p.to);
+        }
+        let moved = serde_json::to_vec_pretty(&entries).map_err(|e| Error::internal(e.to_string()))?;
         ctx.store.transaction(|tx| {
             tx.put(&path(&p.to), text.as_str())?;
             tx.delete(&path(&p.id))?;
+            tx.put(RENAMED, renames)?;
+            tx.put(HISTORY, moved)?;
             tx.emit("automations.rule.renamed", json!({"from": p.id, "to": p.to}))
         })?;
         let mut st = self.state();
         st.rules.remove(&p.id);
         st.rules.insert(p.to.clone(), renamed.clone());
         drop(st);
-        Ok(view(&renamed, &history(ctx)))
+        Ok(view(&renamed, &entries))
     }
 
     /// A new rule from another's text, switched off so the same event doesn't fire both before
@@ -743,7 +751,7 @@ impl Module for Automations {
             ("automations.restore", "Bring a removed rule back", id()),
             (
                 "automations.rename",
-                "Give a rule a new id (refused while a delayed action from it is still waiting)",
+                "Give a rule a new id; its history and waiting delayed actions follow it",
                 json!({"type": "object", "required": ["id", "to"], "properties": {
                     "id": {"type": "string"}, "to": {"type": "string"}}}),
             ),
@@ -851,6 +859,24 @@ struct Deferred {
     #[serde(default)]
     params: Value,
     chain: Chain,
+    /// When the rule set it, to tell it from one set by a later rule of the same id. Missing on
+    /// one set before renames were followed: it follows them all.
+    #[serde(default)]
+    made_at: Option<DateTime<Utc>>,
+}
+
+/// `renamed.toml`: one `[[renamed]]` per rename, oldest first.
+#[derive(Default, Deserialize, Serialize)]
+struct RenamedFile {
+    #[serde(default)]
+    renamed: Vec<Renamed>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct Renamed {
+    from: String,
+    to: String,
+    at: DateTime<Utc>,
 }
 
 #[derive(Deserialize)]
@@ -1011,6 +1037,15 @@ fn editable_settings(ctx: &Ctx) -> Result<toml_edit::DocumentMut> {
 
 /// The history, oldest first. A broken file reads as empty: it's a convenience, the event log
 /// has everything.
+/// The renames, oldest first. One that doesn't parse is refused rather than replaced, as
+/// settings.toml is: it's the only record of where a waiting delayed action's rule went.
+fn renames(ctx: &Ctx) -> Result<Vec<Renamed>> {
+    let Some(text) = ctx.store.read_string(RENAMED)? else { return Ok(Vec::new()) };
+    let file: RenamedFile = toml::from_str(&text)
+        .map_err(|e| Error::conflict(format!("{RENAMED} doesn't parse: {}; fix it first", e.message())))?;
+    Ok(file.renamed)
+}
+
 fn history(ctx: &Ctx) -> Vec<Value> {
     ctx.store
         .read_string(HISTORY)

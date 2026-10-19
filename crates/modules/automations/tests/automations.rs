@@ -178,19 +178,58 @@ async fn rename_and_copy_like_workspaces_and_a_copy_starts_off() {
     assert_eq!(refused.code, ErrorCode::Conflict, "a built-in rule has no file to rename");
 }
 
-/// ADR 0038 §6: a rule with a delayed action still waiting isn't renamed: under a new id that
-/// action would find no rule and be skipped.
+/// ADR 0038 §6, #287's review: a delayed action still waiting follows its rule to the new id, and
+/// the history moves with it. A new rule given the old id keeps only its own delayed actions.
 #[tokio::test]
-async fn a_rule_with_a_delayed_action_waiting_is_not_renamed() {
+async fn a_delayed_action_follows_its_rule_through_a_rename() {
+    let env = env();
+    let m = started(&env).await;
+    let ctx = &env.ctx;
+    let solved =
+        || event("records.item.completed", json!({"collection": "leetcode", "title": "Two Sum", "item": {}}), None);
+    call(&m, ctx, "automations.new", json!({"id": "solved", "text": DONE})).await.unwrap();
+    m.on_event(&solved(), ctx).await.unwrap();
+    let (_, _, before) = env.schedules.added.lock().unwrap()[0].clone();
+
+    env.clock.advance(std::time::Duration::from_secs(60));
+    call(&m, ctx, "automations.rename", json!({"id": "solved", "to": "done"})).await.unwrap();
+    let history = call(&m, ctx, "automations.history", json!({"id": "done"})).await.unwrap();
+    assert_eq!(history["history"].as_array().unwrap().len(), 1, "the history moved: {history}");
+    let listed = call(&m, ctx, "automations.list", json!({})).await.unwrap();
+    assert!(rule(&listed, "done")["last_fired"].is_string(), "{listed}");
+    let renames = String::from_utf8(env.backend.read("automations", "renamed.toml").unwrap().unwrap()).unwrap();
+    assert!(renames.contains("from = \"solved\"") && renames.contains("to = \"done\""), "{renames}");
+
+    // A new `solved`, set off after the rename.
+    env.clock.advance(std::time::Duration::from_secs(60));
+    call(&m, ctx, "automations.new", json!({"id": "solved", "text": DONE})).await.unwrap();
+    m.on_event(&solved(), ctx).await.unwrap();
+    let (_, _, after) = env.schedules.added.lock().unwrap().last().unwrap().clone();
+
+    // `done` switched off: the action set before the rename is its, and is skipped; the new
+    // `solved`'s runs.
+    call(&m, ctx, "automations.disable", json!({"id": "done"})).await.unwrap();
+    let skipped = m.handle(&before.op, before.params.clone(), ctx).await.unwrap();
+    assert!(skipped["skipped"].as_str().unwrap().contains("'done'"), "{skipped}");
+    let ran = m.handle(&after.op, after.params.clone(), ctx).await.unwrap();
+    assert!(ran["task_id"].is_string(), "{ran}");
+
+    // `done` back on: the one set before the rename runs under it.
+    call(&m, ctx, "automations.enable", json!({"id": "done"})).await.unwrap();
+    let ran = m.handle(&before.op, before.params, ctx).await.unwrap();
+    assert!(ran["task_id"].is_string(), "{ran}");
+}
+
+/// A renamed.toml broken by hand is refused, never replaced: it's where a waiting action's rule went.
+#[tokio::test]
+async fn a_broken_renamed_file_is_refused_not_replaced() {
     let env = env();
     let m = started(&env).await;
     let ctx = &env.ctx;
     call(&m, ctx, "automations.new", json!({"id": "solved", "text": DONE})).await.unwrap();
-    let ev = event("records.item.completed", json!({"collection": "leetcode", "title": "Two Sum", "item": {}}), None);
-    m.on_event(&ev, ctx).await.unwrap();
+    env.ctx.store.write("renamed.toml", "[[renamed]\n").unwrap();
     let e = call(&m, ctx, "automations.rename", json!({"id": "solved", "to": "done"})).await.unwrap_err();
-    assert_eq!(e.code, ErrorCode::Conflict);
-    assert!(e.message.contains("1 delayed action(s)"), "{}", e.message);
+    assert!(e.message.contains("renamed.toml doesn't parse"), "{}", e.message);
     assert!(env.backend.read("automations", "rules/solved.toml").unwrap().is_some(), "nothing moved");
 }
 
