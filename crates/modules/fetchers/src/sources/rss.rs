@@ -1,5 +1,5 @@
 //! The `rss` kind (ADR 0028 §2a): any RSS 0.x/1.0/2.0 or Atom feed, configured by url rather
-//! than compiled in. One instance per `[modules.fetchers.sources.<id>]` entry with
+//! than compiled in. One instance per source file with its own
 //! `kind = "rss"`, built by [`crate::source::resolve`] -- never part of the fixed
 //! [`crate::source::registry`].
 

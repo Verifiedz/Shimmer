@@ -27,7 +27,7 @@ pub enum Pagination {
     Offset { page_size: u32 },
 }
 
-/// One `[modules.fetchers.sources.<id>]` entry's field-path mapping (ADR 0028 §15), built once
+/// One source file's `[kind]` table (its field-path mapping) (ADR 0028 §15), built once
 /// by `crate::source::resolve` from validated config -- never constructed directly from raw,
 /// unvalidated input.
 pub struct JsonApi {

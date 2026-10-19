@@ -3,9 +3,9 @@
 //!
 //! `Module::triggers()` has no `Ctx`/config access (`crates/core/src/module.rs:25-27`, called
 //! before `Config::load` and before `Module::init`, `crates/daemon/src/lib.rs:95-96,98-102,120`)
-//! -- so the trigger's own firing period is a fixed constant here, not a `config.toml` key.
-//! Only which *sources* are due, and how often each one runs, is read from
-//! `[modules.fetchers]` when the trigger actually fires and the handler gets a real `Ctx`.
+//! -- so the trigger's own firing period is a fixed constant here, not a config key.
+//! Only which *sources* are due, and how often each one runs, is read from the loaded
+//! [`Sources`] when the trigger actually fires and the handler gets a real `Ctx`.
 //!
 //! (Amends ADR 0028 §5's own example config, which still showed a `tick_interval_s` key --
 //! that was never actually readable by `triggers()`, so it is dropped here rather than built.)
@@ -26,11 +26,7 @@ pub const FETCH_OP: &str = "fetchers.run";
 /// Floors below which a source's own cadence may not be set, per `Method` (ADR 0028 §5/§7).
 /// An API source hits a known, source-maintained endpoint built for this kind of polling; a
 /// scraped page is a much heavier, more easily-noticed load on a host that never agreed to
-/// be polled, so it gets a much higher floor. `crate::source::find`'s registry (which exists
-/// now, unlike when a single uniform floor was first written here) is what lets
-/// `FetchersConfig::from_value` look a source's `Method` up and apply the right one
-/// (PR #126 review -- a single `MIN_INTERVAL_S` let `weworkremotely`, a `Method::Scrape`
-/// source, be polled as often as every 15 minutes).
+/// be polled, so it gets a much higher floor.
 pub const MIN_INTERVAL_API_S: u64 = 1800;
 pub const MIN_INTERVAL_SCRAPE_S: u64 = 21_600;
 
@@ -49,53 +45,176 @@ pub fn trigger() -> TriggerSpec {
     }
 }
 
-#[derive(Debug, Default, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
-pub struct FetchersConfig {
+/// Where a source's own file lives (ADR 0028 §4): `data/fetchers/sources/<id>.toml`. The
+/// write side (`fetchers.new`/`.edit`/`.remove`, which construct this path too) lands with
+/// the rest of the command set.
+pub const SOURCES_DIR: &str = "sources";
+
+/// Every source whose file loaded, plus every one that didn't (ADR 0028 §5). Loaded once at
+/// `Module::init`, re-read on `fetchers.reload` and after any write -- never re-scanned on
+/// every op call, the same shape `automations::State` already uses for its rule files.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Sources {
     pub sources: BTreeMap<String, SourceConfig>,
-    /// Sources whose own entry could not be read, by id, with why. They are kept out of
-    /// [`FetchersConfig::sources`] entirely -- never fetched, never scheduled -- but they are
-    /// *not* an error for everything else (#126's review, B1): one typo in one source used to
-    /// fail every `fetchers.tick`, `fetchers.list` and `fetchers.status`, which with the
-    /// built-in `scheduled-task-failed` alert meant a high-priority popup every five minutes.
-    /// `fetchers.list`/`status` report these so a broken source is visible rather than silent.
-    #[serde(skip)]
+    /// A source file that couldn't be used, by id, with why. Kept out of [`Sources::sources`]
+    /// entirely -- never fetched, never scheduled -- but not an error for everything else
+    /// (#126's review, B1): one broken file must not take every other source down with it.
     pub problems: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+impl Sources {
+    /// Reads and parses every `data/fetchers/sources/*.toml`. One bad file is recorded in
+    /// `problems` and left out of `sources`; every other file still loads. A missing
+    /// `sources/` folder at all (a fresh install) is empty, not an error.
+    pub fn load(ctx: &Ctx) -> Result<Self> {
+        let mut sources = BTreeMap::new();
+        let mut problems = BTreeMap::new();
+        let prefix = format!("{SOURCES_DIR}/");
+        for file in ctx.store.list(SOURCES_DIR)? {
+            let Some(id) = file.strip_prefix(&prefix).and_then(|f| f.strip_suffix(".toml")) else { continue };
+            let text = ctx.store.read_string(&file)?.unwrap_or_default();
+            match SourceConfig::parse(id, &text) {
+                Ok(config) => {
+                    sources.insert(id.to_owned(), config);
+                }
+                Err(e) => {
+                    problems.insert(id.to_owned(), e);
+                }
+            }
+        }
+        Ok(Self { sources, problems })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct SourceConfig {
+    /// Optional, free text, like a workspace's or automation's label.
+    pub label: Option<String>,
     /// Every source starts disabled (ADR 0028 §5) -- the user opts in explicitly.
-    #[serde(default)]
     pub enabled: bool,
     pub interval: IntervalSpec,
     /// Absent: `id` must already be one of the fixed, compiled-in sources
-    /// (`crate::source::registry`) -- today's behavior, unchanged. Present: build a new
-    /// instance of this *kind* instead (ADR 0028 §2a/§3), via `crate::kind::kind`.
-    #[serde(default)]
+    /// (`crate::source::registry`). Present: built from this source's own `[kind]` table
+    /// instead (ADR 0028 §2a/§3), via `crate::kind::kind`.
     pub kind: Option<String>,
     /// A title must contain at least one of these (case-insensitive substring, OR-matched)
     /// to be kept. Empty means no inclusion filter at all -- everything passes this stage.
-    #[serde(default)]
     pub title_contains: Vec<String>,
     /// A title containing any of these (same matching as `title_contains`) is dropped, even
     /// if `title_contains` would have kept it. Checked against every source's own title
     /// only (ADR 0028 §13) -- a source whose `raw_data` carries a longer description is not
     /// searched.
-    #[serde(default)]
     pub title_excludes: Vec<String>,
-    /// Everything else in this entry -- a configured `kind`'s own fields, untouched and
-    /// opaque to this struct. Handed to `crate::kind::Kind::parse` as-is; that kind's own
-    /// code is the only thing that knows what any of these keys mean (ADR 0028 §3). No
-    /// `#[serde(deny_unknown_fields)]` on this struct any more -- flatten and
-    /// `deny_unknown_fields` don't compose in serde, so each kind's `parse` now rejects a key
-    /// it doesn't recognise itself (`crate::kind::reject_unknown`), including a kind with no
-    /// fields of its own rejecting *any* stray key.
-    #[serde(flatten)]
+    /// This source's `kind`'s own fields, from the file's `[kind]` table, untouched and
+    /// opaque to this struct -- `crate::kind::Kind::parse` is the only thing that knows what
+    /// any of these keys mean (ADR 0028 §3).
     pub kind_params: Map<String, Value>,
 }
 
+/// The file as written, `data/fetchers/sources/<id>.toml` (ADR 0028 §4): `[source]`, the
+/// envelope every kind shares, and `[kind]`, that kind's own fields.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceFile {
+    source: SourceMeta,
+    #[serde(default)]
+    kind: toml::Table,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceMeta {
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    enabled: bool,
+    interval: IntervalSpec,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    title_contains: Vec<String>,
+    #[serde(default)]
+    title_excludes: Vec<String>,
+}
+
 impl SourceConfig {
+    /// `id`'s file text, checked: its id's own charset, every `title_contains`/
+    /// `title_excludes` term, and -- the bulk of it -- its `kind`'s own fields, dispatched
+    /// through `crate::kind::kind` (ADR 0028 §3). One sentence naming what's wrong, the same
+    /// convention `Rule::parse` already uses in `automations`, so a broken file looks the
+    /// same regardless of which module it's from.
+    pub fn parse(id: &str, text: &str) -> std::result::Result<Self, String> {
+        // An id becomes a folder name under the module's own store namespace
+        // (`dedup::path`), so it is checked here with the same charset rule every other
+        // user-named thing uses, rather than only failing at the first fetch when the store
+        // rejects the path (#126's review, B14).
+        if !shimmer_core::ids::is_valid_id(id) {
+            return Err("not a usable source id -- lowercase letters, digits, '-' and '_' only".into());
+        }
+        let file: SourceFile = toml::from_str(text).map_err(|e| format!("not a source file: {}", e.message()))?;
+        for (what, terms) in
+            [("title_contains", &file.source.title_contains), ("title_excludes", &file.source.title_excludes)]
+        {
+            // An empty or whitespace term is a substring of every title, so one stray comma
+            // in `title_excludes = ["senior", ""]` excludes everything, and in
+            // `title_contains` matches everything (#126's review, B3).
+            if terms.iter().any(|t| t.trim().is_empty()) {
+                return Err(format!("{what}: an empty term matches every title -- remove it (a trailing comma?)"));
+            }
+        }
+        let kind_params =
+            serde_json::to_value(&file.kind).ok().and_then(|v| v.as_object().cloned()).unwrap_or_default();
+        // Each `Method` gets its own floor (ADR 0028 §5/§7) -- a scraped page must not be
+        // pollable at an API source's much lower cadence (PR #126 review). `Kind::method` is
+        // static per kind, so this needs no built `Source` to ask.
+        let floor = match file.source.kind.as_deref() {
+            None => {
+                let Some(found) = crate::source::find(id) else {
+                    let registry = crate::source::registry();
+                    let known: Vec<&str> = registry.iter().map(|s| s.id()).collect();
+                    return Err(format!("unknown source id (known: {})", known.join(", ")));
+                };
+                // A fixed, compiled-in source has no `kind` and so no `Kind::parse` of its
+                // own to reject a stray key -- without this, a `[kind]` table on
+                // hn-whoishiring/weworkremotely loaded silently with every key ignored.
+                crate::kind::reject_unknown(&kind_params, &[])?;
+                match found.method() {
+                    crate::source::Method::Api => MIN_INTERVAL_API_S,
+                    crate::source::Method::Scrape => MIN_INTERVAL_SCRAPE_S,
+                }
+            }
+            Some(kind_name) => {
+                // A `kind` entry builds a brand-new instance rather than adjusting a fixed,
+                // compiled-in one -- so an id that already belongs to the fixed registry
+                // would either sit alongside it as a silent duplicate (`crate::source::known`)
+                // or shadow it outright (`crate::source::resolve` always prefers the `kind`
+                // branch). Neither is a real "configured and reconfigured" case to allow.
+                if crate::source::find(id).is_some() {
+                    return Err(format!(
+                        "kind \"{kind_name}\" collides with a fixed, compiled-in source of the same id"
+                    ));
+                }
+                let kind = crate::kind::kind(kind_name)
+                    .ok_or_else(|| format!("unknown kind \"{kind_name}\" (known: {})", crate::kind::known_names()))?;
+                kind.parse(&kind_params).map_err(|m| format!("kind \"{kind_name}\" {m}"))?;
+                match kind.method() {
+                    crate::source::Method::Api => MIN_INTERVAL_API_S,
+                    crate::source::Method::Scrape => MIN_INTERVAL_SCRAPE_S,
+                }
+            }
+        };
+        file.source.interval.resolve(floor).map_err(|e| format!("interval: {e}"))?;
+        Ok(Self {
+            label: file.source.label,
+            enabled: file.source.enabled,
+            interval: file.source.interval,
+            kind: file.source.kind,
+            title_contains: file.source.title_contains,
+            title_excludes: file.source.title_excludes,
+            kind_params,
+        })
+    }
+
     /// Whether an item's title should be kept, given this source's own filter lists. See
     /// [`matches_title`] for the matching rule itself.
     pub fn matches_title(&self, title: &str) -> bool {
@@ -107,7 +226,7 @@ impl SourceConfig {
 /// title matching anything in `excludes` is always dropped, regardless of `contains`. Both
 /// are case-insensitive substrings, OR'd within each list. A free function, not only
 /// [`SourceConfig::matches_title`], so an ad-hoc CLI override (ADR 0028 §14) can run the
-/// identical rule against lists that never came from `config.toml` at all.
+/// identical rule against lists that never came from a source's own file at all.
 pub fn matches_title(title: &str, contains: &[String], excludes: &[String]) -> bool {
     let lower = title.to_lowercase();
     let included = contains.is_empty() || contains.iter().any(|w| lower.contains(&w.to_lowercase()));
@@ -115,7 +234,7 @@ pub fn matches_title(title: &str, contains: &[String], excludes: &[String]) -> b
     included && !excluded
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum IntervalSpec {
     Preset(String),
@@ -125,8 +244,8 @@ pub enum IntervalSpec {
 impl IntervalSpec {
     /// A named preset, or a raw seconds count, checked against `floor_s`. The right floor
     /// depends on the source's `Method` (`MIN_INTERVAL_API_S` / `MIN_INTERVAL_SCRAPE_S`), so
-    /// the caller supplies it -- only `FetchersConfig::from_value` can look a source's
-    /// `Method` up (via `crate::source::find`) to know which one applies.
+    /// the caller supplies it -- only [`SourceConfig::parse`] can look a source's `Method` up
+    /// (via `crate::source::find`/`crate::kind::kind`) to know which one applies.
     pub fn resolve(&self, floor_s: u64) -> Result<u64> {
         let secs = match self {
             Self::Seconds(n) => *n,
@@ -148,147 +267,19 @@ impl IntervalSpec {
     }
 }
 
-impl FetchersConfig {
-    /// Pure parse, no `Ctx` -- [`load`] is the thin wrapper that supplies `ctx.config.raw()`.
-    ///
-    /// Each source is read and validated **on its own** (#126's review, B1). One entry with a
-    /// bad `url`, an unknown `kind`, a misspelled id or the wrong type for a field is recorded
-    /// in `problems` and left out of `sources`; every other source still loads and still runs.
-    /// Only a `[modules.fetchers]` section that isn't a table at all, or an unknown key at the
-    /// top level, is fatal -- at that point there is no per-source structure to salvage.
-    pub fn from_value(raw: &Value) -> Result<Self> {
-        // `ModuleConfig::default()` (no `[modules.fetchers]` section attached at all, e.g.
-        // `shimmer_core::testing::TestEnv`) wraps `Value::Null`, not `{}` -- both mean "no
-        // config given", so both resolve to every default.
-        if raw.is_null() {
-            return Ok(Self::default());
-        }
-        // Deserialized in two steps on purpose: `sources` as raw JSON first, so one entry whose
-        // *type* is wrong (`interval = {}`) fails only itself, where deserializing the whole
-        // `FetchersConfig` in one go would fail the lot.
-        #[derive(Default, Deserialize)]
-        #[serde(default, deny_unknown_fields)]
-        struct Outer {
-            sources: BTreeMap<String, Value>,
-        }
-        let outer: Outer = serde_json::from_value(raw.clone())
-            .map_err(|e| Error::invalid_params(format!("[modules.fetchers]: {e}")))?;
-
-        let mut cfg = Self::default();
-        for (id, entry) in outer.sources {
-            match serde_json::from_value::<SourceConfig>(entry)
-                .map_err(|e| Error::invalid_params(format!("sources.{id}: {e}")))
-                .and_then(|source| validate_source(&id, &source).map(|()| source))
-            {
-                Ok(source) => {
-                    cfg.sources.insert(id, source);
-                }
-                Err(e) => {
-                    cfg.problems.insert(id, e.message);
-                }
-            }
-        }
-        Ok(cfg)
-    }
-    pub fn load(ctx: &Ctx) -> Result<Self> {
-        Self::from_value(ctx.config.raw())
-    }
-}
-
-/// Everything that must be true of one source's own entry, checked at load rather than on the
-/// first tick that happens to look at it. Returns the reason as an error for the caller to
-/// record against that one source (#126's review, B1) -- it never decides the fate of any
-/// other source.
-fn validate_source(id: &str, source: &SourceConfig) -> Result<()> {
-    // An id becomes a folder name under the module's own store namespace
-    // (`dedup::path`), so it is checked here with the same charset rule every other
-    // user-named thing uses, rather than only failing at the first fetch when the store
-    // rejects the path (#126's review, B14).
-    if !shimmer_core::ids::is_valid_id(id) {
-        return Err(Error::invalid_params(format!(
-            "sources.{id}: not a usable source id -- lowercase letters, digits, '-' and '_' only"
-        )));
-    }
-    for (what, terms) in [("title_contains", &source.title_contains), ("title_excludes", &source.title_excludes)] {
-        // An empty or whitespace term is a substring of every title, so one stray comma in
-        // `title_excludes = ["senior", ""]` excludes everything, and in `title_contains`
-        // matches everything (#126's review, B3). Neither can be what anyone meant.
-        if terms.iter().any(|t| t.trim().is_empty()) {
-            return Err(Error::invalid_params(format!(
-                "sources.{id}.{what}: an empty term matches every title -- remove it (a trailing comma?)"
-            )));
-        }
-    }
-    // Each `Method` gets its own floor (ADR 0028 §5/§7) -- a scraped page must not be
-    // pollable at an API source's much lower cadence (PR #126 review). `Kind::method` is
-    // static per kind, so this needs no built `Source` to ask.
-    let floor = match source.kind.as_deref() {
-        None => {
-            let Some(found) = crate::source::find(id) else {
-                let known_sources = crate::source::registry();
-                let known: Vec<&str> = known_sources.iter().map(|s| s.id()).collect();
-                return Err(Error::invalid_params(format!(
-                    "sources.{id}: unknown source id (known: {})",
-                    known.join(", ")
-                )));
-            };
-            // A fixed, compiled-in source has no `kind` and so no `Kind::parse` of its own to
-            // reject a stray key -- without this, dropping the old struct-level
-            // `deny_unknown_fields` (see `kind_params`'s doc comment) silently accepted typos
-            // like `title_exclude` (missing the `s`) that master used to refuse outright.
-            crate::kind::reject_unknown(&source.kind_params, &[])
-                .map_err(|m| Error::invalid_params(format!("sources.{id}: {m}")))?;
-            match found.method() {
-                crate::source::Method::Api => MIN_INTERVAL_API_S,
-                crate::source::Method::Scrape => MIN_INTERVAL_SCRAPE_S,
-            }
-        }
-        Some(kind_name) => {
-            // A `kind` entry builds a brand-new instance (`crate::source::resolve`)
-            // rather than adjusting a fixed, compiled-in one -- so an id that
-            // already belongs to the fixed registry would either sit alongside it
-            // as a silent duplicate (`crate::source::known`) or shadow it outright
-            // (`crate::source::resolve` always prefers the `kind` branch). Neither
-            // is a real "this source is both configured and reconfigured" case we
-            // want to allow; reject it at load time rather than let one silently
-            // win.
-            if crate::source::find(id).is_some() {
-                return Err(Error::invalid_params(format!(
-                    "sources.{id}: kind \"{kind_name}\" collides with a fixed, compiled-in source of the same id"
-                )));
-            }
-            let kind = crate::kind::kind(kind_name).ok_or_else(|| {
-                Error::invalid_params(format!(
-                    "sources.{id}: unknown kind \"{kind_name}\" (known: {})",
-                    crate::kind::known_names()
-                ))
-            })?;
-            kind.parse(&source.kind_params)
-                .map_err(|m| Error::invalid_params(format!("sources.{id}: kind \"{kind_name}\" {m}")))?;
-            match kind.method() {
-                crate::source::Method::Api => MIN_INTERVAL_API_S,
-                crate::source::Method::Scrape => MIN_INTERVAL_SCRAPE_S,
-            }
-        }
-    };
-    source.interval.resolve(floor).map_err(|e| Error::invalid_params(format!("sources.{id}.interval: {e}")))?;
-    Ok(())
-}
-
 /// Every enabled, configured source whose interval has elapsed since its last run (or that
 /// has never run at all). Deterministic order (`BTreeMap`'s own id order).
 pub fn due_sources(
-    config: &FetchersConfig,
+    sources: &BTreeMap<String, SourceConfig>,
     last_run: &BTreeMap<String, DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> Vec<String> {
-    config
-        .sources
+    sources
         .iter()
         .filter(|(_, c)| c.enabled)
         .filter_map(|(id, c)| {
             // Already validated (against the right per-`Method` floor) by
-            // `FetchersConfig::load` -- a floor of 0 here only converts units, it never
+            // `SourceConfig::parse` -- a floor of 0 here only converts units, it never
             // re-checks anything.
             let interval = c.interval.resolve(0).ok()?;
             let due = match last_run.get(id) {
@@ -350,24 +341,52 @@ pub fn record_run(ctx: &Ctx, source: &str, now: DateTime<Utc>) -> Result<()> {
     ctx.store.write(LAST_RUN_PATH, toml::to_string(&raw).unwrap_or_default())
 }
 
+/// Shared across this crate's own tests (`schedule`, `source`, `module`): a source file's text
+/// from one flat JSON fixture, the same shape tests wrote before sources moved to files, split
+/// into `[source]`/`[kind]` by whether a key is part of the shared envelope.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use shimmer_core::testing::TestEnv;
+
+    use super::*;
+
+    const ENVELOPE_KEYS: &[&str] = &["label", "enabled", "interval", "kind", "title_contains", "title_excludes"];
+
+    pub(crate) fn source_file(fields: &Value) -> String {
+        let mut source = toml::Table::new();
+        let mut kind = toml::Table::new();
+        for (k, v) in fields.as_object().expect("test fixture must be an object") {
+            let tv: toml::Value = serde_json::from_value(v.clone()).expect("test fixture value must convert to toml");
+            if ENVELOPE_KEYS.contains(&k.as_str()) { &mut source } else { &mut kind }.insert(k.clone(), tv);
+        }
+        let mut file = toml::Table::new();
+        file.insert("source".into(), toml::Value::Table(source));
+        file.insert("kind".into(), toml::Value::Table(kind));
+        toml::to_string(&file).unwrap()
+    }
+
+    pub(crate) fn write_source(env: &TestEnv, id: &str, fields: Value) {
+        env.ctx.store.write(&format!("{SOURCES_DIR}/{id}.toml"), source_file(&fields)).unwrap();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
     use shimmer_core::testing::TestEnv;
 
+    use super::test_support::{source_file, write_source};
     use super::*;
 
     fn at(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
     }
 
-    /// A bad source entry no longer fails the whole load (#126's review, B1): it is dropped
-    /// from `sources` and its reason recorded in `problems`. Returns that reason, asserting
-    /// the source really was kept out of the live set.
-    fn problem_for(raw: Value, id: &str) -> String {
-        let cfg = FetchersConfig::from_value(&raw).expect("one bad source must not fail the load");
-        assert!(!cfg.sources.contains_key(id), "a source that failed validation must not be live");
-        cfg.problems.get(id).cloned().unwrap_or_else(|| panic!("no problem recorded for {id}: {:?}", cfg.problems))
+    /// A bad source file doesn't fail the whole load (#126's review, B1): it is dropped from
+    /// `sources` and its reason recorded in `problems`. Returns that reason, asserting the
+    /// source really was kept out of the live set.
+    fn problem_for(fields: Value, id: &str) -> String {
+        SourceConfig::parse(id, &source_file(&fields)).expect_err("this source must fail to parse")
     }
 
     #[test]
@@ -392,16 +411,58 @@ mod tests {
 
     #[test]
     fn a_scrape_source_below_its_own_higher_floor_is_rejected_even_at_an_interval_an_api_source_would_accept() {
-        let why =
-            problem_for(json!({"sources": {"weworkremotely": {"enabled": true, "interval": 3600}}}), "weworkremotely");
+        let why = problem_for(json!({"enabled": true, "interval": 3600}), "weworkremotely");
         assert!(why.contains(&MIN_INTERVAL_SCRAPE_S.to_string()), "{why}");
 
         // The identical interval is fine for an API source -- the floor is per-`Method`, not
         // one uniform number.
-        FetchersConfig::from_value(&json!({
-            "sources": {"hn-whoishiring": {"enabled": true, "interval": 3600}}
-        }))
+        SourceConfig::parse("hn-whoishiring", &source_file(&json!({"enabled": true, "interval": 3600}))).unwrap();
+    }
+
+    #[test]
+    fn a_folder_with_no_source_files_at_all_is_empty_not_an_error() {
+        let env = TestEnv::new("fetchers");
+        let loaded = Sources::load(&env.ctx).unwrap();
+        assert!(loaded.sources.is_empty() && loaded.problems.is_empty());
+    }
+
+    #[test]
+    fn load_reads_every_source_file_and_reports_one_broken_one_without_losing_the_rest() {
+        let env = TestEnv::new("fetchers");
+        write_source(
+            &env,
+            "good",
+            json!({"enabled": true, "interval": "daily", "kind": "rss", "url": "https://example.test/f.xml"}),
+        );
+        write_source(&env, "bad", json!({"enabled": true, "interval": "daily", "kind": "rss", "url": "not-a-url"}));
+        let loaded = Sources::load(&env.ctx).unwrap();
+        assert_eq!(loaded.sources.keys().collect::<Vec<_>>(), vec!["good"]);
+        assert_eq!(loaded.problems.len(), 1);
+        assert!(loaded.problems.get("bad").is_some_and(|p| p.contains("url")));
+    }
+
+    #[test]
+    fn an_unreadable_source_file_is_reported_without_a_toml_parser_panic() {
+        let env = TestEnv::new("fetchers");
+        env.ctx.store.write(&format!("{SOURCES_DIR}/broken.toml"), "this is not [[[ valid toml").unwrap();
+        let loaded = Sources::load(&env.ctx).unwrap();
+        assert!(loaded.sources.is_empty());
+        assert!(loaded.problems.get("broken").is_some_and(|p| p.contains("not a source file")));
+    }
+
+    #[test]
+    fn a_title_filter_round_trips_through_a_file() {
+        let cfg = SourceConfig::parse(
+            "hn-whoishiring",
+            &source_file(&json!({
+                "enabled": true, "interval": "daily",
+                "title_contains": ["junior", "entry level"],
+                "title_excludes": ["senior", "staff"],
+            })),
+        )
         .unwrap();
+        assert_eq!(cfg.title_contains, vec!["junior".to_string(), "entry level".to_string()]);
+        assert_eq!(cfg.title_excludes, vec!["senior".to_string(), "staff".to_string()]);
     }
 
     #[test]
@@ -410,59 +471,9 @@ mod tests {
         // `kind_params`'s `#[serde(flatten)]`) stopped catching a typo on a *fixed*,
         // kind-less source -- `title_exclude` (missing the `s`) used to be refused by
         // master and loaded silently here, with the filter just never applied.
-        let why = problem_for(
-            json!({
-                "sources": {
-                    "hn-whoishiring": {"enabled": true, "interval": "daily", "title_exclude": ["intern"]},
-                },
-            }),
-            "hn-whoishiring",
-        );
+        let why =
+            problem_for(json!({"enabled": true, "interval": "daily", "title_exclude": ["intern"]}), "hn-whoishiring");
         assert!(why.contains("title_exclude"), "{why}");
-    }
-
-    #[test]
-    fn an_absent_modules_section_is_no_sources_not_an_error() {
-        let cfg = FetchersConfig::from_value(&json!({})).unwrap();
-        assert!(cfg.sources.is_empty());
-    }
-
-    #[test]
-    fn a_null_config_is_also_no_sources_not_an_error() {
-        // `ModuleConfig::default()` wraps `Value::Null`, not `{}` -- both must mean the same
-        // thing, not a type error.
-        let cfg = FetchersConfig::from_value(&Value::Null).unwrap();
-        assert!(cfg.sources.is_empty());
-    }
-
-    #[test]
-    fn a_configured_source_parses_with_its_interval_validated_up_front() {
-        let cfg = FetchersConfig::from_value(&json!({
-            "sources": {
-                "hn-whoishiring": {"enabled": true, "interval": "daily"},
-                "weworkremotely": {"enabled": false, "interval": MIN_INTERVAL_SCRAPE_S},
-            }
-        }))
-        .unwrap();
-        assert!(cfg.sources["hn-whoishiring"].enabled);
-        assert!(!cfg.sources["weworkremotely"].enabled);
-    }
-
-    #[test]
-    fn a_title_filter_round_trips_through_config() {
-        let cfg = FetchersConfig::from_value(&json!({
-            "sources": {
-                "hn-whoishiring": {
-                    "enabled": true, "interval": "daily",
-                    "title_contains": ["junior", "entry level"],
-                    "title_excludes": ["senior", "staff"],
-                },
-            }
-        }))
-        .unwrap();
-        let hn = &cfg.sources["hn-whoishiring"];
-        assert_eq!(hn.title_contains, vec!["junior".to_string(), "entry level".to_string()]);
-        assert_eq!(hn.title_excludes, vec!["senior".to_string(), "staff".to_string()]);
     }
 
     #[test]
@@ -493,52 +504,48 @@ mod tests {
 
     #[test]
     fn a_bad_interval_fails_at_load_time_not_on_the_first_tick() {
-        let why = problem_for(
-            json!({"sources": {"hn-whoishiring": {"enabled": true, "interval": "fortnightly"}}}),
-            "hn-whoishiring",
-        );
+        let why = problem_for(json!({"enabled": true, "interval": "fortnightly"}), "hn-whoishiring");
         assert!(why.contains("interval"), "{why}");
     }
 
     #[test]
-    fn an_unknown_top_level_key_is_rejected() {
-        let err = FetchersConfig::from_value(&json!({"tick_interval_s": 60})).unwrap_err();
-        assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams);
+    fn an_unknown_field_in_the_source_table_is_rejected() {
+        let err = SourceConfig::parse(
+            "hn-whoishiring",
+            "[source]\nenabled = true\ninterval = \"daily\"\ntick_interval_s = 60\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("tick_interval_s") || err.contains("unknown field"), "{err}");
     }
 
     #[test]
     fn a_misspelled_source_id_fails_at_load_time_not_on_the_first_tick() {
-        let why = problem_for(
-            json!({"sources": {"hn-whoishirign": {"enabled": true, "interval": "daily"}}}),
-            "hn-whoishirign",
-        );
+        let why = problem_for(json!({"enabled": true, "interval": "daily"}), "hn-whoishirign");
         assert!(why.contains("hn-whoishiring"), "the reason should name the real ids: {why}");
     }
 
     #[test]
     fn a_configured_rss_kind_with_a_url_parses() {
-        let cfg = FetchersConfig::from_value(&json!({
-            "sources": {
-                "my-team-blog": {"enabled": true, "interval": "hourly", "kind": "rss", "url": "https://example.test/feed.xml"},
-            }
-        }))
+        let cfg = SourceConfig::parse(
+            "my-team-blog",
+            &source_file(
+                &json!({"enabled": true, "interval": "hourly", "kind": "rss", "url": "https://example.test/feed.xml"}),
+            ),
+        )
         .unwrap();
-        assert_eq!(cfg.sources["my-team-blog"].kind.as_deref(), Some("rss"));
+        assert_eq!(cfg.kind.as_deref(), Some("rss"));
     }
 
     #[test]
     fn an_rss_kind_with_no_url_fails_at_load_time() {
-        let why = problem_for(
-            json!({"sources": {"my-team-blog": {"enabled": true, "interval": "hourly", "kind": "rss"}}}),
-            "my-team-blog",
-        );
+        let why = problem_for(json!({"enabled": true, "interval": "hourly", "kind": "rss"}), "my-team-blog");
         assert!(why.contains("url"), "{why}");
     }
 
     #[test]
     fn an_rss_kind_with_a_non_http_url_fails_at_load_time() {
         let why = problem_for(
-            json!({"sources": {"my-team-blog": {"enabled": true, "interval": "hourly", "kind": "rss", "url": "not-a-url"}}}),
+            json!({"enabled": true, "interval": "hourly", "kind": "rss", "url": "not-a-url"}),
             "my-team-blog",
         );
         assert!(why.contains("url"), "{why}");
@@ -547,7 +554,7 @@ mod tests {
     #[test]
     fn an_rss_kind_with_a_non_http_scheme_url_fails_at_load_time() {
         let why = problem_for(
-            json!({"sources": {"my-team-blog": {"enabled": true, "interval": "hourly", "kind": "rss", "url": "ftp://example.test/feed.xml"}}}),
+            json!({"enabled": true, "interval": "hourly", "kind": "rss", "url": "ftp://example.test/feed.xml"}),
             "my-team-blog",
         );
         assert!(why.contains("url"), "{why}");
@@ -555,21 +562,21 @@ mod tests {
 
     #[test]
     fn an_rss_kind_with_an_https_url_parses() {
-        let cfg = FetchersConfig::from_value(&json!({
-            "sources": {"my-team-blog": {"enabled": true, "interval": "hourly", "kind": "rss", "url": "https://example.test/feed.xml"}}
-        }))
+        let cfg = SourceConfig::parse(
+            "my-team-blog",
+            &source_file(
+                &json!({"enabled": true, "interval": "hourly", "kind": "rss", "url": "https://example.test/feed.xml"}),
+            ),
+        )
         .unwrap();
-        assert_eq!(
-            cfg.sources["my-team-blog"].kind_params.get("url").and_then(Value::as_str),
-            Some("https://example.test/feed.xml")
-        );
+        assert_eq!(cfg.kind_params.get("url").and_then(Value::as_str), Some("https://example.test/feed.xml"));
     }
 
     #[test]
     fn a_kind_entry_whose_id_collides_with_a_fixed_source_fails_at_load_time() {
         for id in ["hn-whoishiring", "weworkremotely"] {
             let why = problem_for(
-                json!({"sources": {id: {"enabled": true, "interval": "hourly", "kind": "rss", "url": "https://example.test/feed.xml"}}}),
+                json!({"enabled": true, "interval": "hourly", "kind": "rss", "url": "https://example.test/feed.xml"}),
                 id,
             );
             assert!(why.contains("collides"), "id {id}: {why}");
@@ -578,26 +585,22 @@ mod tests {
 
     #[test]
     fn an_unknown_kind_is_rejected() {
-        let why = problem_for(
-            json!({"sources": {"my-team-blog": {"enabled": true, "interval": "hourly", "kind": "carrier-pigeon"}}}),
-            "my-team-blog",
-        );
+        let why = problem_for(json!({"enabled": true, "interval": "hourly", "kind": "carrier-pigeon"}), "my-team-blog");
         assert!(why.contains("carrier-pigeon"), "{why}");
     }
 
     #[test]
     fn a_json_api_kind_with_every_required_field_parses() {
-        let cfg = FetchersConfig::from_value(&json!({
-            "sources": {
-                "figma-jobs": {
-                    "enabled": true, "interval": "daily", "kind": "json-api",
-                    "url": "https://boards-api.greenhouse.io/v1/boards/figma/jobs",
-                    "items_path": "jobs", "id_field": "id", "title_field": "title", "url_field": "absolute_url",
-                },
-            }
-        }))
+        let cfg = SourceConfig::parse(
+            "figma-jobs",
+            &source_file(&json!({
+                "enabled": true, "interval": "daily", "kind": "json-api",
+                "url": "https://boards-api.greenhouse.io/v1/boards/figma/jobs",
+                "items_path": "jobs", "id_field": "id", "title_field": "title", "url_field": "absolute_url",
+            })),
+        )
         .unwrap();
-        assert_eq!(cfg.sources["figma-jobs"].kind.as_deref(), Some("json-api"));
+        assert_eq!(cfg.kind.as_deref(), Some("json-api"));
     }
 
     #[test]
@@ -609,7 +612,7 @@ mod tests {
                 "items_path": "jobs", "id_field": "id", "title_field": "title", "url_field": "url",
             });
             fields.as_object_mut().unwrap().remove(missing);
-            let why = problem_for(json!({"sources": {"acme-jobs": fields}}), "acme-jobs");
+            let why = problem_for(fields, "acme-jobs");
             assert!(why.contains(missing), "missing {missing}: {why}");
         }
     }
@@ -625,7 +628,7 @@ mod tests {
             for (k, v) in extra.as_object().unwrap() {
                 fields.as_object_mut().unwrap().insert(k.clone(), v.clone());
             }
-            json!({"sources": {"acme-jobs": fields}})
+            fields
         };
 
         let why = problem_for(raw(json!({"page_size": 0})), "acme-jobs");
@@ -634,21 +637,22 @@ mod tests {
         let why = problem_for(raw(json!({"page_size": 50, "url": "https://example.test/jobs"})), "acme-jobs");
         assert!(why.contains("{offset}"), "{why}");
 
-        let good = FetchersConfig::from_value(&raw(
-            json!({"page_size": 50, "url": "https://example.test/jobs?offset={offset}"}),
-        ))
+        let good = SourceConfig::parse(
+            "acme-jobs",
+            &source_file(&raw(json!({"page_size": 50, "url": "https://example.test/jobs?offset={offset}"}))),
+        )
         .unwrap();
-        assert!(good.sources.contains_key("acme-jobs") && good.problems.is_empty());
+        assert_eq!(good.kind.as_deref(), Some("json-api"));
     }
 
     #[test]
     fn a_json_api_kind_with_an_unknown_pagination_is_rejected() {
         let why = problem_for(
-            json!({"sources": {"acme-jobs": {
+            json!({
                 "enabled": true, "interval": "daily", "kind": "json-api",
                 "url": "https://example.test/jobs", "id_field": "id", "title_field": "title", "url_field": "url",
                 "pagination": "cursor",
-            }}}),
+            }),
             "acme-jobs",
         );
         assert!(why.contains("cursor"), "{why}");
@@ -656,25 +660,26 @@ mod tests {
 
     #[test]
     fn a_json_api_kind_takes_an_optional_active_field() {
-        let cfg = FetchersConfig::from_value(&json!({
-            "sources": {"acme-jobs": {
+        let cfg = SourceConfig::parse(
+            "acme-jobs",
+            &source_file(&json!({
                 "enabled": true, "interval": "daily", "kind": "json-api",
                 "url": "https://example.test/jobs", "id_field": "id", "title_field": "title", "url_field": "url",
                 "active_field": "active",
-            }}
-        }))
+            })),
+        )
         .unwrap();
-        assert_eq!(cfg.sources["acme-jobs"].kind_params.get("active_field").and_then(Value::as_str), Some("active"));
+        assert_eq!(cfg.kind_params.get("active_field").and_then(Value::as_str), Some("active"));
     }
 
     #[test]
     fn a_json_api_kind_rejects_a_blank_active_field() {
         let why = problem_for(
-            json!({"sources": {"acme-jobs": {
+            json!({
                 "enabled": true, "interval": "daily", "kind": "json-api",
                 "url": "https://example.test/jobs", "id_field": "id", "title_field": "title", "url_field": "url",
                 "active_field": "  ",
-            }}}),
+            }),
             "acme-jobs",
         );
         assert!(why.contains("active_field"), "{why}");
@@ -682,6 +687,7 @@ mod tests {
 
     fn source(enabled: bool, interval_s: u64) -> SourceConfig {
         SourceConfig {
+            label: None,
             enabled,
             interval: IntervalSpec::Seconds(interval_s),
             kind: None,
@@ -693,63 +699,67 @@ mod tests {
 
     #[test]
     fn a_never_run_enabled_source_is_due() {
-        let mut cfg = FetchersConfig::default();
-        cfg.sources.insert("hn-whoishiring".into(), source(true, MIN_INTERVAL_API_S));
-        let due = due_sources(&cfg, &BTreeMap::new(), at("2026-01-01T00:00:00Z"));
+        let mut sources = BTreeMap::new();
+        sources.insert("hn-whoishiring".into(), source(true, MIN_INTERVAL_API_S));
+        let due = due_sources(&sources, &BTreeMap::new(), at("2026-01-01T00:00:00Z"));
         assert_eq!(due, vec!["hn-whoishiring".to_string()]);
     }
 
     #[test]
     fn a_disabled_source_is_never_due() {
-        let mut cfg = FetchersConfig::default();
-        cfg.sources.insert("hn-whoishiring".into(), source(false, MIN_INTERVAL_API_S));
-        let due = due_sources(&cfg, &BTreeMap::new(), at("2026-01-01T00:00:00Z"));
+        let mut sources = BTreeMap::new();
+        sources.insert("hn-whoishiring".into(), source(false, MIN_INTERVAL_API_S));
+        let due = due_sources(&sources, &BTreeMap::new(), at("2026-01-01T00:00:00Z"));
         assert!(due.is_empty());
     }
 
     #[test]
     fn a_source_run_within_its_interval_is_not_due_yet() {
-        let mut cfg = FetchersConfig::default();
-        cfg.sources.insert("hn-whoishiring".into(), source(true, 3600));
+        let mut sources = BTreeMap::new();
+        sources.insert("hn-whoishiring".into(), source(true, 3600));
         let mut last = BTreeMap::new();
         last.insert("hn-whoishiring".to_string(), at("2026-01-01T00:00:00Z"));
-        let due = due_sources(&cfg, &last, at("2026-01-01T00:30:00Z"));
+        let due = due_sources(&sources, &last, at("2026-01-01T00:30:00Z"));
         assert!(due.is_empty(), "only 30 minutes have passed of a 1-hour interval");
     }
 
     #[test]
     fn a_source_run_past_its_interval_is_due_again() {
-        let mut cfg = FetchersConfig::default();
-        cfg.sources.insert("hn-whoishiring".into(), source(true, 3600));
+        let mut sources = BTreeMap::new();
+        sources.insert("hn-whoishiring".into(), source(true, 3600));
         let mut last = BTreeMap::new();
         last.insert("hn-whoishiring".to_string(), at("2026-01-01T00:00:00Z"));
-        let due = due_sources(&cfg, &last, at("2026-01-01T01:00:01Z"));
+        let due = due_sources(&sources, &last, at("2026-01-01T01:00:01Z"));
         assert_eq!(due, vec!["hn-whoishiring".to_string()]);
     }
 
     #[test]
     fn one_bad_source_does_not_stop_the_good_ones() {
-        // #126's review, B1: this used to make `from_value` -- and so every `fetchers.tick`,
-        // `list` and `status` -- fail outright, so one typo stopped all fetching and (with the
-        // built-in scheduled-task-failed alert) popped a high-priority notification every five
-        // minutes.
-        let cfg = FetchersConfig::from_value(&json!({
-            "sources": {
-                "good": {"enabled": true, "interval": "daily", "kind": "rss", "url": "https://example.test/f.xml"},
-                "bad": {"enabled": true, "interval": "daily", "kind": "rss", "url": "not-a-url"},
-                "also-bad": {"enabled": true, "interval": "daily", "kind": "carrier-pigeon"},
-                "wrong-type": {"enabled": true, "interval": {}},
-            }
-        }))
-        .unwrap();
-        assert_eq!(cfg.sources.keys().collect::<Vec<_>>(), vec!["good"], "the good source still loads");
-        assert_eq!(cfg.problems.len(), 3, "each bad source is reported on its own: {:?}", cfg.problems);
+        // #126's review, B1: this used to make loading -- and so every `fetchers.tick`,
+        // `list` and `status` -- fail outright, so one typo stopped all fetching and (with
+        // the built-in scheduled-task-failed alert) popped a high-priority notification every
+        // five minutes.
+        let env = TestEnv::new("fetchers");
+        write_source(
+            &env,
+            "good",
+            json!({"enabled": true, "interval": "daily", "kind": "rss", "url": "https://example.test/f.xml"}),
+        );
+        write_source(&env, "bad", json!({"enabled": true, "interval": "daily", "kind": "rss", "url": "not-a-url"}));
+        write_source(&env, "also-bad", json!({"enabled": true, "interval": "daily", "kind": "carrier-pigeon"}));
+        env.ctx
+            .store
+            .write(&format!("{SOURCES_DIR}/wrong-type.toml"), "[source]\nenabled = true\ninterval = {}\n")
+            .unwrap();
+        let loaded = Sources::load(&env.ctx).unwrap();
+        assert_eq!(loaded.sources.keys().collect::<Vec<_>>(), vec!["good"], "the good source still loads");
+        assert_eq!(loaded.problems.len(), 3, "each bad source is reported on its own: {:?}", loaded.problems);
         for id in ["bad", "also-bad", "wrong-type"] {
-            assert!(cfg.problems.contains_key(id), "{id} should be reported: {:?}", cfg.problems);
+            assert!(loaded.problems.contains_key(id), "{id} should be reported: {:?}", loaded.problems);
         }
 
         // And the good one is still schedulable.
-        let due = due_sources(&cfg, &BTreeMap::new(), at("2026-01-01T00:00:00Z"));
+        let due = due_sources(&loaded.sources, &BTreeMap::new(), at("2026-01-01T00:00:00Z"));
         assert_eq!(due, vec!["good".to_string()]);
     }
 
@@ -758,17 +768,12 @@ mod tests {
         // #126's review, B3: `--excludes senior,` becomes ["senior", ""], and "" is a substring
         // of every title, so everything got excluded. Same the other way for `title_contains`.
         for field in ["title_excludes", "title_contains"] {
-            let why = problem_for(
-                json!({"sources": {"hn-whoishiring": {"enabled": true, "interval": "daily", field: ["senior", ""]}}}),
-                "hn-whoishiring",
-            );
+            let why =
+                problem_for(json!({"enabled": true, "interval": "daily", field: ["senior", ""]}), "hn-whoishiring");
             assert!(why.contains(field), "{field}: {why}");
         }
         // Whitespace-only counts as empty.
-        problem_for(
-            json!({"sources": {"hn-whoishiring": {"enabled": true, "interval": "daily", "title_contains": ["  "]}}}),
-            "hn-whoishiring",
-        );
+        problem_for(json!({"enabled": true, "interval": "daily", "title_contains": ["  "]}), "hn-whoishiring");
     }
 
     #[test]
@@ -777,7 +782,7 @@ mod tests {
         // id should be checked where every other user-named thing is -- at load.
         for id in ["../records", "has space", "UPPER", "has/slash"] {
             let why = problem_for(
-                json!({"sources": {id: {"enabled": true, "interval": "daily", "kind": "rss", "url": "https://e.test/f"}}}),
+                json!({"enabled": true, "interval": "daily", "kind": "rss", "url": "https://e.test/f"}),
                 id,
             );
             assert!(why.contains("source id"), "id {id}: {why}");
@@ -788,11 +793,11 @@ mod tests {
     fn a_last_run_in_the_future_reads_as_due_rather_than_stalling_the_source() {
         // #126's review, B10: a clock correction, or a $SHIMMER_HOME copied from a machine
         // running ahead, parked a source until that future time actually arrived.
-        let mut cfg = FetchersConfig::default();
-        cfg.sources.insert("hn-whoishiring".into(), source(true, 3600));
+        let mut sources = BTreeMap::new();
+        sources.insert("hn-whoishiring".into(), source(true, 3600));
         let mut last = BTreeMap::new();
         last.insert("hn-whoishiring".to_string(), at("2026-02-01T00:00:00Z"));
-        let due = due_sources(&cfg, &last, at("2026-01-01T00:00:00Z"));
+        let due = due_sources(&sources, &last, at("2026-01-01T00:00:00Z"));
         assert_eq!(due, vec!["hn-whoishiring".to_string()], "a future last_run must not stall the source");
     }
 
