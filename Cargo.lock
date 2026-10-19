@@ -1244,10 +1244,12 @@ name = "shimmer"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "shimmer-automations",
  "shimmer-cli",
  "shimmer-core",
  "shimmer-daemon",
  "shimmer-mockd",
+ "shimmer-notify",
  "shimmer-proto",
  "shimmer-records",
  "shimmer-store",
@@ -1257,6 +1259,21 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "shimmer-automations"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "chrono-tz",
+ "serde",
+ "serde_json",
+ "shimmer-core",
+ "tokio",
+ "toml",
+ "toml_edit",
 ]
 
 [[package]]
@@ -1323,6 +1340,21 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "ulid",
+]
+
+[[package]]
+name = "shimmer-notify"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "chrono-tz",
+ "serde",
+ "serde_json",
+ "shimmer-core",
+ "tokio",
+ "toml",
  "ulid",
 ]
 

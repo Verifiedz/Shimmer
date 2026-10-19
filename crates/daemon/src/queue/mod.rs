@@ -35,7 +35,14 @@ const SOURCE: &str = "queue";
 /// Executes one op. Implemented by the daemon core; the queue just calls it.
 #[async_trait]
 pub trait OpRunner: Send + Sync {
-    async fn run_op(&self, op: &str, params: Value, cancel: CancellationToken, progress: ProgressFn) -> Result<Value>;
+    async fn run_op(
+        &self,
+        task: TaskId,
+        op: &str,
+        params: Value,
+        cancel: CancellationToken,
+        progress: ProgressFn,
+    ) -> Result<Value>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,13 +138,16 @@ impl QueueInner {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn event(&self, topic: &str, payload: Value) -> Event {
-        Event::new(ModuleId::new(SOURCE), topic, payload, self.clock.now())
+    /// An event about task `about`, which is also its cause (ADR 0035 §3): a rule reacting to
+    /// `queue.task.finished` for a task automations queued continues that task's chain, so the
+    /// loop guard sees a rule set off by its own action (#251's review).
+    fn event(&self, about: TaskId, topic: &str, payload: Value) -> Event {
+        Event::new(ModuleId::new(SOURCE), topic, payload, self.clock.now()).caused_by(Some(about))
     }
 
     /// Durable + published. A failure to log is reported, never allowed to wedge a lane.
-    fn emit(&self, topic: &str, payload: Value) {
-        if let Err(e) = shimmer_core::EventSink::emit(&*self.backend, self.event(topic, payload)) {
+    fn emit(&self, about: TaskId, topic: &str, payload: Value) {
+        if let Err(e) = shimmer_core::EventSink::emit(&*self.backend, self.event(about, topic, payload)) {
             tracing::error!(topic, error = %e, "could not log queue event");
         }
     }
@@ -206,12 +216,14 @@ impl QueueInner {
             (id, position)
         };
         self.emit(
+            id,
             "queue.task.enqueued",
             json!({"task_id": id, "lane": lane, "op": task.op, "origin": task.origin, "position": position}),
         );
         if promotion.is_some() {
             // The audit trail for "why did my scheduled fetch run late" (protocol.md).
             self.emit(
+                id,
                 "queue.task.promoted",
                 json!({"task_id": id, "lane": lane, "op": task.op, "displaced": displaced}),
             );
@@ -244,7 +256,7 @@ impl QueueInner {
                 .collect()
         };
         for (task, token) in started {
-            self.emit("queue.task.started", json!({"task_id": task.id, "lane": task.lane, "op": task.op}));
+            self.emit(task.id, "queue.task.started", json!({"task_id": task.id, "lane": task.lane, "op": task.op}));
             let this = Arc::clone(self);
             self.tracker.spawn(async move { this.execute(task, token).await });
         }
@@ -255,9 +267,9 @@ impl QueueInner {
             None => Err(Error::unavailable("daemon is shutting down")),
             Some(runner) => {
                 let progress = self.progress_fn(task.id, task.lane.clone());
-                let (op, params, cancel) = (task.op.clone(), task.params.clone(), token.clone());
+                let (id, op, params, cancel) = (task.id, task.op.clone(), task.params.clone(), token.clone());
                 // Own task, so a panicking module fails this task instead of the queue.
-                let joined = tokio::spawn(async move { runner.run_op(&op, params, cancel, progress).await }).await;
+                let joined = tokio::spawn(async move { runner.run_op(id, &op, params, cancel, progress).await }).await;
                 joined.unwrap_or_else(|e| Err(Error::internal(format!("task panicked: {e}"))))
             }
         };
@@ -273,6 +285,7 @@ impl QueueInner {
                 r.note = note.to_owned();
             }
             q.backend.publish_ephemeral(q.event(
+                id,
                 "queue.task.progress",
                 json!({"task_id": id, "lane": lane, "fraction": fraction, "note": note}),
             ));
@@ -296,9 +309,11 @@ impl QueueInner {
                     (
                         Status::Failed(e.to_string()),
                         "queue.task.failed",
+                        // `fallback`: whether a fallback is being sent for this failure (ADR
+                        // 0032 §4), so notify's alerts never repeat its message.
                         json!({"task_id": task.id, "lane": task.lane, "op": task.op, "origin": task.origin,
                                "error": e.message, "code": e.code, "detail": e.detail,
-                               "retryable": e.is_retryable(), "attempts": 1}),
+                               "retryable": e.is_retryable(), "attempts": 1, "fallback": fallback.is_some()}),
                     )
                 }
             }
@@ -310,7 +325,7 @@ impl QueueInner {
             }
             record_finished(&mut st, task.id, status, self.clock.now());
         }
-        self.emit(topic, payload);
+        self.emit(task.id, topic, payload);
         if let Some(request) = fallback {
             self.enqueue_fallback(&task, request);
         }
@@ -328,10 +343,12 @@ impl QueueInner {
         let op = request.op.clone();
         match self.submit(request, None) {
             Ok(h) => self.emit(
+                failed.id,
                 "queue.fallback.enqueued",
                 json!({"task_id": failed.id, "fallback_task_id": h.task_id, "op": op, "lane": h.lane}),
             ),
             Err(e) => self.emit(
+                failed.id,
                 "queue.fallback.failed",
                 json!({"task_id": failed.id, "op": op, "error": e.message, "code": e.code}),
             ),
@@ -352,6 +369,7 @@ impl QueueInner {
                 record_finished(&mut st, id, Status::Cancelled, self.clock.now());
                 drop(st);
                 self.emit(
+                    id,
                     "queue.task.cancelled",
                     json!({"task_id": id, "lane": task.lane, "op": task.op, "was": "queued"}),
                 );
@@ -397,6 +415,7 @@ impl QueueInner {
         // task before the task already directly after it).
         if new_version != queue_version {
             self.emit(
+                id,
                 "queue.task.reordered",
                 json!({"task_id": id, "lane": lane, "before": before, "queue_version": new_version}),
             );
@@ -414,7 +433,7 @@ impl QueueInner {
         let st = self.lock();
         let ids: Vec<String> = st.records.keys().map(ToString::to_string).collect();
         drop(st);
-        crate::short_id::resolve(written, &ids, "task")?.parse()
+        shimmer_core::short_id::resolve(written, &ids, "task")?.parse()
     }
 
     pub fn task_view(&self, id: TaskId) -> Result<Value> {

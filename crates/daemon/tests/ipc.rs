@@ -319,7 +319,14 @@ impl Module for Rogue {
 
 fn rogue(id: &str, ns: &str, ops: &[&str]) -> Arc<dyn Module> {
     Arc::new(Rogue(
-        Manifest { id: id.into(), version: "0".into(), namespace: ns.into(), topics: vec![], capabilities: vec![] },
+        Manifest {
+            id: id.into(),
+            version: "0".into(),
+            namespace: ns.into(),
+            topics: vec![],
+            topic_descriptions: Default::default(),
+            capabilities: vec![],
+        },
         ops.iter().map(|o| spec(o, Execution::Inline)).collect(),
     ))
 }

@@ -12,8 +12,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use shimmer_core::params::decode;
 use shimmer_core::{
-    Clock, Ctx, Emitter, Error, Execution, HttpBackend, HttpGateway, LaneConfig, LaneId, ModuleConfig, ModuleId,
-    NamespacedStore, Origin, Priority, ProgressFn, QueueHandle, Result,
+    Catalog, Clock, Ctx, Desktop, DesktopBackend, Emitter, Error, Execution, HttpBackend, HttpGateway, LaneConfig,
+    LaneId, ModuleConfig, ModuleId, NamespacedStore, OneTime, Origin, Priority, ProgressFn, QueueHandle, Result,
+    ScheduleBackend, Schedules, TaskId, TriggerId,
 };
 use shimmer_core::{EnqueueRequest, TaskSubmitter};
 #[cfg(unix)]
@@ -80,6 +81,12 @@ impl Core {
             .expect("building the http client"),
         );
 
+        // The same shape again for `ctx.desktop` (ADR 0032 §1–§2): one real backend, given only
+        // to a module whose manifest declares `"desktop"`; every other keeps
+        // `Desktop::unavailable`.
+        let real_desktop: Arc<dyn DesktopBackend> =
+            Arc::new(crate::desktop::RealDesktopBackend::new(!config.hide_desktop));
+
         Arc::new_cyclic(|weak: &Weak<Core>| {
             let ops = registry
                 .entries
@@ -96,6 +103,9 @@ impl Core {
             let runner: Weak<dyn OpRunner> = weak.clone();
             let queue = QueueInner::new(&lanes, ops, backend.clone(), clock.clone(), runner, shutdown.clone());
             let submitter: Arc<dyn TaskSubmitter> = Arc::new(QueueFront::new(&queue));
+            // Every module gets it (ADR 0035 §5.6): the same power as `ctx.queue`, later.
+            let schedules: Arc<dyn ScheduleBackend> = Arc::new(SchedulerFront(weak.clone()));
+            let catalog = Arc::new(catalog(&registry));
 
             let ctxs = registry
                 .entries
@@ -117,8 +127,13 @@ impl Core {
                     if e.manifest.capabilities.iter().any(|c| c == "process") {
                         ctx.launcher = Launcher::new(real_launcher.clone());
                     }
+                    ctx.schedules = Schedules::new(id.clone(), schedules.clone());
+                    ctx.catalog = catalog.clone();
                     if e.manifest.capabilities.iter().any(|c| c == "network") {
                         ctx.http = HttpGateway::new(id.clone(), real_http.clone());
+                    }
+                    if e.manifest.capabilities.iter().any(|c| c == "desktop") {
+                        ctx.desktop = Desktop::new(real_desktop.clone());
                     }
                     (id, ctx)
                 })
@@ -239,6 +254,7 @@ impl Core {
                     namespace: e.manifest.namespace.clone(),
                     commands: e.commands.clone(),
                     topics: e.manifest.topics.clone(),
+                    topic_descriptions: e.manifest.topic_descriptions.clone(),
                 })
                 .collect(),
         }
@@ -247,7 +263,14 @@ impl Core {
 
 #[async_trait]
 impl OpRunner for Core {
-    async fn run_op(&self, op: &str, params: Value, cancel: CancellationToken, progress: ProgressFn) -> Result<Value> {
+    async fn run_op(
+        &self,
+        task: TaskId,
+        op: &str,
+        params: Value,
+        cancel: CancellationToken,
+        progress: ProgressFn,
+    ) -> Result<Value> {
         let (entry, _) =
             self.registry.command(op).ok_or_else(|| Error::unknown_op(format!("no module registered op '{op}'")))?;
         if !entry.ready.load(Ordering::Acquire) {
@@ -257,8 +280,61 @@ impl OpRunner for Core {
             .ctxs
             .get(&entry.manifest.id)
             .ok_or_else(|| Error::internal("module has no ctx"))?
-            .for_task(cancel, progress);
+            .for_task(task, cancel, progress);
         entry.module.handle(op, params, &ctx).await
+    }
+}
+
+/// The daemon's own topics, which no module declares, with what they mean (`docs/protocol.md`).
+/// `queue.task.progress` is left out: it's streamed only, never logged or seen by modules.
+const SERVICE_TOPICS: [(&str, &str); 16] = [
+    ("queue.task.enqueued", "a task joined the queue"),
+    ("queue.task.started", "a task started running"),
+    ("queue.task.finished", "a task finished"),
+    ("queue.task.failed", "a task failed"),
+    ("queue.task.cancelled", "a task was cancelled"),
+    ("queue.task.promoted", "a task was moved to the front of its lane"),
+    ("queue.task.reordered", "a waiting task was moved within its lane"),
+    ("queue.fallback.enqueued", "a failed scheduled task's fallback message was queued"),
+    ("queue.fallback.failed", "a fallback message couldn't be queued"),
+    ("scheduler.trigger.added", "a schedule was added"),
+    ("scheduler.trigger.fired", "a schedule came due and queued its task"),
+    ("scheduler.trigger.missed", "a schedule came due while the computer was off"),
+    ("scheduler.trigger.skipped", "a schedule came due but didn't run"),
+    ("scheduler.trigger.paused", "a schedule was paused"),
+    ("scheduler.trigger.resumed", "a schedule was resumed"),
+    ("scheduler.trigger.removed", "a schedule was removed"),
+];
+
+/// `ctx.catalog` (ADR 0035 §5.7): every module op, and every topic with its description.
+fn catalog(registry: &Registry) -> Catalog {
+    let ops = registry.entries.iter().flat_map(|e| e.commands.iter().cloned());
+    let modules = registry
+        .entries
+        .iter()
+        .flat_map(|e| e.manifest.topics.iter().map(|t| (t.clone(), e.manifest.topic_descriptions.get(t).cloned())));
+    let services = SERVICE_TOPICS.iter().map(|(t, d)| (t.to_string(), Some(d.to_string())));
+    Catalog::new(ops, modules.chain(services))
+}
+
+/// `ctx.schedules`' way to the scheduler, which starts after the modules are initialised: until
+/// then (in `Module::init`) it answers `unavailable`.
+struct SchedulerFront(Weak<Core>);
+
+impl SchedulerFront {
+    fn scheduler(&self) -> Result<Arc<Scheduler>> {
+        let core = self.0.upgrade().ok_or_else(|| Error::unavailable("daemon is shutting down"))?;
+        core.scheduler.get().cloned().ok_or_else(|| Error::unavailable("the scheduler isn't running yet"))
+    }
+}
+
+impl ScheduleBackend for SchedulerFront {
+    fn add_once(&self, module: &ModuleId, once: OneTime) -> Result<TriggerId> {
+        self.scheduler()?.add_once(module, once)
+    }
+
+    fn remove(&self, module: &ModuleId, id: &TriggerId) -> Result<bool> {
+        ScheduleBackend::remove(&*self.scheduler()?, module, id)
     }
 }
 

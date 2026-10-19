@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -13,6 +15,11 @@ pub struct Manifest {
     /// Topics this module emits. Each must start with `<id>.`.
     #[serde(default)]
     pub topics: Vec<String>,
+    /// One line on each topic, for people choosing what a rule reacts to (`shimmer automations
+    /// events`, ADR 0035 §5.5): "a record was marked done". Every key is one of `topics`; a topic
+    /// left out has no description.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub topic_descriptions: BTreeMap<String, String>,
     /// Declared, not yet enforced. Free-form until an ADR fixes the vocabulary.
     #[serde(default)]
     pub capabilities: Vec<String>,

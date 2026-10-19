@@ -91,6 +91,7 @@ async fn a_failed_tasks_slot_frees_before_the_next_task_starts() {
     let finished_next = index_of(&seen, "queue.task.finished", &next);
 
     assert!(started_failing < failed, "it ran, then failed");
+    assert_eq!(seen[failed].payload["fallback"], false, "no fallback was sent for it (ADR 0032 §4)");
     assert!(failed < started_next, "the failure is reported before the next task takes the slot");
     assert!(started_next < finished_next);
     assert_eq!(seen[failed].payload["lane"], "slow");
@@ -452,6 +453,7 @@ async fn a_structural_failure_enqueues_the_fallback_in_the_notify_lane() {
     let failed = &seen[index_of(&seen, "queue.task.failed", &primary)];
     assert_eq!(failed.payload["code"], "unavailable");
     assert_eq!(failed.payload["lane"], "slow", "the primary ran in its own lane");
+    assert_eq!(failed.payload["fallback"], true, "a fallback is being sent for this failure (ADR 0032 §4)");
 
     // The fallback is an ordinary task, configured exactly as the trigger declared it.
     let done = until(&mut c, "queue.task.finished", &fallback).await;
@@ -574,5 +576,39 @@ async fn a_fallback_that_cannot_be_enqueued_is_reported_and_never_stalls_the_lan
 
     let next = quick(&mut c).await;
     assert_eq!(until(&mut c, "queue.task.finished", &next).await.last().unwrap().payload["task_id"], next.as_str());
+    stop(d).await;
+}
+
+/// ADR 0035 §5.1: what automations follows a chain of rules by.
+#[tokio::test]
+async fn events_a_queued_task_emits_carry_it_as_their_cause() {
+    let env = Env::new();
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    c.subscribe(&["demo.item.saved"]).await;
+    let task = task_id(&c.call("demo.put_queued", json!({})).await.unwrap());
+    for _ in 0..2 {
+        let ev = c.event("demo.item.saved").await;
+        assert_eq!(ev.cause.map(|t| t.to_string()), Some(task.clone()), "{:?}", ev.payload);
+    }
+    c.call("demo.put", json!({"key": "k", "val": "v"})).await.unwrap();
+    assert_eq!(c.event("demo.item.saved").await.cause, None, "answered inline: no task");
+    stop(d).await;
+}
+
+/// #251's review: the queue's own events about a task carry that task as their cause, so a rule
+/// on `queue.task.*` set off by its own action continues the chain and the loop guard stops it.
+#[tokio::test]
+async fn the_queues_events_about_a_task_carry_it_as_their_cause() {
+    let env = Env::new();
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    c.subscribe(&["queue.task.*"]).await;
+    let task = task_id(&c.call("demo.put_queued", json!({})).await.unwrap());
+    for topic in ["queue.task.enqueued", "queue.task.started", "queue.task.finished"] {
+        let ev = c.event(topic).await;
+        assert_eq!(ev.payload["task_id"], task.as_str(), "{topic}");
+        assert_eq!(ev.cause.map(|t| t.to_string()), Some(task.clone()), "{topic}: {:?}", ev.payload);
+    }
     stop(d).await;
 }

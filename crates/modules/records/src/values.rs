@@ -120,12 +120,7 @@ pub fn tidy(items: Vec<Value>) -> Value {
 }
 
 /// List items are the same if equal, strings ignoring case.
-pub fn same(a: &Value, b: &Value) -> bool {
-    match (a.as_str(), b.as_str()) {
-        (Some(a), Some(b)) => a.to_lowercase() == b.to_lowercase(),
-        _ => a == b,
-    }
-}
+pub use shimmer_core::filter::same;
 
 /// Resolve `{"add": [...], "remove": [...]}` on list fields against the record's current values
 /// (ADR 0024 §2), so the changes hold whole lists. Removing an item that isn't there is fine;

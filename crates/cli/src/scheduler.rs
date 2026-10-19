@@ -288,6 +288,17 @@ fn candidates(op: &str, params: &Value) -> Vec<Vec<String>> {
     let Some(target) = crate::packs::pack::TARGETS.iter().find(|t| t.op == op) else { return Vec::new() };
     let Some(p) = params.as_object() else { return Vec::new() };
     let base: Vec<String> = target.words.iter().map(|w| w.to_string()).collect();
+    if op == "notify.send" {
+        let mut words = base;
+        let Some(title) = p.get("title").and_then(Value::as_str) else { return Vec::new() };
+        words.push(title.to_owned());
+        for key in ["body", "priority"] {
+            if let Some(v) = p.get(key).and_then(Value::as_str) {
+                words.extend([format!("--{key}"), v.to_owned()]);
+            }
+        }
+        return vec![words];
+    }
     if op.starts_with("workspaces.") {
         let mut words = base;
         words.extend(p.get("id").and_then(Value::as_str).map(String::from));
@@ -426,6 +437,7 @@ fn parses_back_to(words: &[String], op: &str, params: &Value, schemas: &Schemas)
         "workspaces" => {
             crate::workspaces::parse(rest.to_vec()).ok().and_then(|cmd| crate::schedule::workspaces_op(&cmd))
         }
+        "notify" => crate::notify::parse(rest.to_vec()).ok().as_ref().and_then(crate::notify::scheduled_send),
         _ => None,
     };
     got.is_some_and(|(got_op, got_params)| got_op == op && &got_params == params)
@@ -505,11 +517,13 @@ fn state(t: &Value) -> String {
     }
 }
 
-/// `you`, or `module <id>` for one a module declared (it can be paused, not removed).
+/// `you`, `module <id>` for one a module declared, or `<id>: <label>` for a one-time schedule a
+/// module added (ADR 0035 §5.6). Module ones can be paused, not removed.
 fn source(v: &Value) -> String {
     match v["type"].as_str() {
         Some("user") => "you".into(),
         Some("module") => format!("module {}", v["id"].as_str().unwrap_or("?")),
+        Some("added") => format!("{}: {}", v["id"].as_str().unwrap_or("?"), v["label"].as_str().unwrap_or("")),
         _ => render::cell(v),
     }
 }
@@ -637,6 +651,12 @@ mod tests {
         assert!(list(&json!({"triggers": []}), now, &Schemas::new()).starts_with("no triggers yet"));
     }
 
+    #[test]
+    fn a_modules_one_time_schedule_shows_who_added_it_and_why() {
+        let added = json!({"type": "added", "id": "automations", "label": "follow up on acme (rule nudge)"});
+        assert_eq!(source(&added), "automations: follow up on acme (rule nudge)");
+    }
+
     fn schemas() -> Schemas {
         let field = |name: &str, kind: &str| json!({"name": name, "type": kind});
         let lc = json!({"id": "lc", "fields": [
@@ -685,6 +705,7 @@ mod tests {
                 let schema = cmd.collection().and_then(|c| schemas().get(c).cloned()).unwrap_or(Value::Null);
                 crate::records::request(&cmd, &schema).unwrap()
             }
+            "notify" => crate::notify::scheduled_send(&crate::notify::parse(words[1..].to_vec()).unwrap()).unwrap(),
             _ => crate::schedule::workspaces_op(&crate::workspaces::parse(words[1..].to_vec()).unwrap()).unwrap(),
         };
         (op, params)
@@ -710,6 +731,8 @@ mod tests {
             "workspaces activate site",
             "workspaces stop site",
             "workspaces cleanup site",
+            "notify send 'Standup in 15'",
+            "notify send Stretch --body 'stand up, walk' --priority low",
             // Through `scheduler add`: list filters, options, and a field named like an option.
             "records list jobs --stage offer",
             "records list jobs --filter limit=5",

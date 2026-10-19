@@ -80,6 +80,8 @@ pub fn dirty_error(state: &WorkspaceState, workspace: &str, has_cleanup_script: 
         "failed_at": failed_at.to_rfc3339_opts(SecondsFormat::Secs, true),
         "log": log,
         "has_cleanup_script": has_cleanup_script,
+        // The command that clears it (ADR 0035 §10): what a message or the CLI tells you to run.
+        "fix": format!("shimmer workspaces {} {workspace}", if has_cleanup_script { "cleanup" } else { "reset" }),
     }))
 }
 
@@ -280,8 +282,11 @@ mod tests {
         assert_eq!(
             e.detail.unwrap(),
             json!({"workspace": "deep-work", "failed_step": "1/3 setup", "failed_at": "2026-09-16T09:12:44Z",
-                   "log": "logs/deep-work-01JD2T.log", "has_cleanup_script": true})
+                   "log": "logs/deep-work-01JD2T.log", "has_cleanup_script": true,
+                   "fix": "shimmer workspaces cleanup deep-work"})
         );
+        let without = activate(&dirty(), "deep-work", false).unwrap_err();
+        assert_eq!(without.detail.unwrap()["fix"], "shimmer workspaces reset deep-work", "no cleanup script");
     }
 
     #[test]

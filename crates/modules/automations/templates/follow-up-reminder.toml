@@ -1,0 +1,34 @@
+[template]
+label = "Remind me to follow up"
+description = "Some days after a record is done (you applied, you sent it), a reminder to follow up"
+category = "reminders"
+good_to_know = [
+    "It only sends a message: nothing else changes",
+    "The reminder waits as a schedule ('shimmer scheduler list' shows it, 'scheduler remove' cancels it)",
+    "It comes even if you've followed up already: it doesn't check",
+]
+
+[[question]]
+name = "COLLECTION"
+prompt = "Which collection (its id)"
+kind = "name"
+required = true
+
+[[question]]
+name = "DAYS"
+prompt = "How many days later"
+kind = "number"
+default = "3"
+
+[[rule]]
+text = '''
+[rule]
+label = "Remind me to follow up on ${COLLECTION}, ${DAYS} days after"
+on = "records.item.completed"
+when = { collection = "${COLLECTION}" }
+
+[[do]]
+op = "notify.send"
+params = { title = "Follow up: {title}", body = "It's been ${DAYS} days.", from = "automation:${RULE}" }
+after = "${DAYS}d"
+'''

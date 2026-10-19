@@ -1,8 +1,9 @@
 //! Short ids (ADR 0031 §4): a client may write a unique ending of a task or trigger id instead
 //! of the whole thing. Ids are ULIDs (or `usr-` plus one), whose first ten characters are the
 //! creation time and whose rest is random, so the end tells them apart and the start doesn't.
+//! The daemon's task and trigger ids and notify's message ids follow it (ADR 0032).
 
-use shimmer_core::{Error, Result};
+use crate::{Error, Result};
 
 /// The shortest ending accepted, as for git's abbreviated hashes: a stray keystroke or half a
 /// paste must never remove or cancel something (#183's review). The lists show 6 or more.
@@ -42,10 +43,27 @@ pub fn resolve(written: &str, ids: &[String], kind: &str) -> Result<String> {
     }
 }
 
+/// How many characters of its end a list shows for an id, at the least.
+pub const SHOWN: usize = 6;
+
+/// The ending of `id` a list shows: its last [`SHOWN`] characters, or more where another id in
+/// `ids` ends the same way (ignoring case), so [`resolve`] given it back finds `id`. `ids` should
+/// be every id `resolve` will look through, not only the ones on screen.
+pub fn ending(id: &str, ids: &[String]) -> String {
+    let me = id.to_lowercase();
+    let mut n = SHOWN.min(me.len());
+    while n < me.len()
+        && ids.iter().any(|other| other.to_lowercase() != me && other.to_lowercase().ends_with(&me[me.len() - n..]))
+    {
+        n += 1;
+    }
+    id[id.len() - n..].to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shimmer_core::ErrorCode;
+    use crate::ErrorCode;
 
     fn ids() -> Vec<String> {
         // Made a minute apart: the same start; the random ends differ but share "k7p2x".
@@ -78,5 +96,20 @@ mod tests {
         // A module's own trigger may have a short id: written whole, it's found.
         let short = vec!["ab".to_owned()];
         assert_eq!(resolve("AB", &short, "trigger").unwrap(), "ab");
+    }
+
+    #[test]
+    fn the_ending_shown_grows_until_resolve_finds_only_that_id() {
+        let ids = ids();
+        // The two ULIDs share "k7p2x", so six characters tell them apart; the third shows six.
+        assert_eq!(ending(&ids[0], &ids), "XK7P2X");
+        assert_eq!(ending(&ids[2], &ids), "3fq9tm");
+        let close = vec!["01M4PPHE00ABCDEF0123AK7P2X".to_owned(), "01M4PPK8K0QRSTUV4567AK7P2X".to_owned()];
+        assert_eq!(ending(&close[0], &close), "3AK7P2X");
+        for id in ids.iter().chain(&close) {
+            let all: Vec<String> = ids.iter().chain(&close).cloned().collect();
+            assert_eq!(&resolve(&ending(id, &all), &all, "message").unwrap(), id);
+        }
+        assert_eq!(ending("ab", &[]), "ab");
     }
 }

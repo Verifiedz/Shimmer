@@ -10,6 +10,8 @@ members = [
     "crates/cli",
     "crates/modules/records",
     "crates/modules/workspaces",
+    "crates/modules/automations",
+    "crates/modules/notify",
     "crates/app",
 ]
 

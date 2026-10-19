@@ -5,6 +5,7 @@
 //! [`packs`]: aliases are rewritten to canonical command words here and never reach the wire.
 
 mod args;
+mod automations;
 mod autostart;
 mod client;
 mod complete;
@@ -14,6 +15,7 @@ mod editor;
 mod first;
 mod flags;
 mod follow;
+mod notify;
 pub mod packs;
 mod queue;
 mod records;
@@ -33,6 +35,7 @@ use shimmer_core::{Error, Result};
 use shimmer_proto::ops;
 
 pub use args::{Args, Command, USAGE};
+pub use automations::AutomationsCmd;
 pub use client::{Client, ConnectError};
 pub use queue::QueueCmd;
 pub use records::RecordsCmd;
@@ -202,8 +205,10 @@ fn usage_for(args: &[String]) -> &'static str {
             "workspaces" => return workspaces::USAGE,
             "queue" => return queue::USAGE,
             "scheduler" => return scheduler::USAGE,
+            "automations" => return automations::USAGE,
             "schedule" => return schedule::USAGE,
             "packs" => return packs::cmd::USAGE,
+            "notify" => return notify::USAGE,
             "doctor" => return doctor::USAGE,
             _ => return USAGE,
         }
@@ -230,7 +235,25 @@ fn prints_data(cmd: &Command) -> bool {
             | Command::Workspaces(WorkspacesCmd::List | WorkspacesCmd::Status { .. })
             | Command::Queue(QueueCmd::List { .. } | QueueCmd::Show { .. })
             | Command::Scheduler(SchedulerCmd::List | SchedulerCmd::Show { .. })
+            // Every reply that can carry a rule's label, which is the person's text (#253's review).
+            | Command::Automations(
+                AutomationsCmd::List { .. }
+                    | AutomationsCmd::Show { .. }
+                    | AutomationsCmd::New { .. }
+                    | AutomationsCmd::Edit { .. }
+                    | AutomationsCmd::Remove { .. }
+                    | AutomationsCmd::Restore { .. }
+                    | AutomationsCmd::Enable { .. }
+                    | AutomationsCmd::Disable { .. }
+                    | AutomationsCmd::Test { .. }
+                    | AutomationsCmd::History { .. }
+                    | AutomationsCmd::Status
+                    | AutomationsCmd::Reload
+            )
             | Command::Schedule(_)
+            | Command::Notify(
+                notify::NotifyCmd::List { .. } | notify::NotifyCmd::Show { .. } | notify::NotifyCmd::Send { .. }
+            )
     )
 }
 
@@ -242,6 +265,7 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
         Command::Workspaces(WorkspacesCmd::Help) => return Ok(Some(workspaces::USAGE.into())),
         Command::Queue(QueueCmd::Help) => return Ok(Some(queue::USAGE.into())),
         Command::Scheduler(SchedulerCmd::Help) => return Ok(Some(scheduler::USAGE.into())),
+        Command::Automations(AutomationsCmd::Help) => return Ok(Some(automations::USAGE.into())),
         Command::Schedule(schedule::ScheduleCmd::Help) => return Ok(Some(schedule::USAGE.into())),
         Command::DoctorHelp => return Ok(Some(doctor::USAGE.into())),
         // Packs live entirely in the client: no daemon needed.
@@ -253,11 +277,17 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
     if let Command::Records(cmd) = &args.command {
         return records::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
     }
+    if let Command::Notify(cmd) = &args.command {
+        return notify::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
+    }
     if let Command::Queue(cmd) = &args.command {
         return queue::run(&mut client, cmd, args.json).await.map(Some);
     }
     if let Command::Scheduler(cmd) = &args.command {
         return scheduler::run(&mut client, cmd, args.json).await.map(Some);
+    }
+    if let Command::Automations(cmd) = &args.command {
+        return automations::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
     }
     if let Command::Workspaces(cmd) = &args.command {
         return workspaces::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
@@ -280,8 +310,10 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
         | Command::Workspaces(_)
         | Command::Queue(_)
         | Command::Scheduler(_)
+        | Command::Automations(_)
         | Command::Schedule(_)
-        | Command::Packs(_) => {
+        | Command::Packs(_)
+        | Command::Notify(_) => {
             unreachable!("handled above")
         }
     };
@@ -349,8 +381,10 @@ fn output(args: &Args, data: &Value) -> String {
         | Command::Workspaces(_)
         | Command::Queue(_)
         | Command::Scheduler(_)
+        | Command::Automations(_)
         | Command::Schedule(_)
-        | Command::Packs(_) => render::json(data),
+        | Command::Packs(_)
+        | Command::Notify(_) => render::json(data),
     }
 }
 
@@ -391,6 +425,9 @@ mod tests {
             &["workspaces", "status", "site"],
             &["scheduler", "list"],
             &["call", "core.ping"],
+            &["automations", "new", "x", "--file", "rule.toml"],
+            &["automations", "edit", "x"],
+            &["automations", "restore", "x"],
         ] {
             assert!(prints_data(&cmd(words)), "{words:?}");
         }

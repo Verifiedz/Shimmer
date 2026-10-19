@@ -33,6 +33,23 @@ pub struct Workspaces {
     pub(crate) write: WriteLock,
 }
 
+/// Every topic workspaces emits, with a line on it for `automations events` (ADR 0035 §5.5).
+const TOPICS: [(&str, &str); 13] = [
+    ("workspaces.session.launched", "a workspace launched: every step succeeded"),
+    ("workspaces.session.dirty", "a workspace launch failed part-way and needs cleaning up"),
+    ("workspaces.session.forced", "a dirty workspace was force-relaunched"),
+    ("workspaces.session.cleaned", "a dirty workspace's cleanup succeeded: it's ready again"),
+    ("workspaces.session.abandoned", "a launch stopped before any step ran: the workspace is as it was"),
+    ("workspaces.workspace.reset", "a dirty workspace was reset without cleanup"),
+    ("workspaces.workspace.created", "a workspace was made from a template"),
+    ("workspaces.session.stopped", "a running workspace was stopped"),
+    ("workspaces.workspace.removed", "a workspace was removed (it can be restored)"),
+    ("workspaces.workspace.restored", "a removed workspace came back"),
+    ("workspaces.workspace.copied", "a workspace was made from another"),
+    ("workspaces.workspace.renamed", "a workspace was given a new id"),
+    ("workspaces.workspace.reconfigured", "a workspace's answers were changed"),
+];
+
 #[async_trait]
 impl Module for Workspaces {
     fn manifest(&self) -> Manifest {
@@ -40,23 +57,8 @@ impl Module for Workspaces {
             id: "workspaces".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             namespace: "workspaces".into(),
-            topics: [
-                "workspaces.session.launched",
-                "workspaces.session.dirty",
-                "workspaces.session.forced",
-                "workspaces.session.cleaned",
-                "workspaces.session.abandoned",
-                "workspaces.workspace.reset",
-                "workspaces.workspace.created",
-                "workspaces.session.stopped",
-                "workspaces.workspace.removed",
-                "workspaces.workspace.restored",
-                "workspaces.workspace.copied",
-                "workspaces.workspace.renamed",
-                "workspaces.workspace.reconfigured",
-            ]
-            .map(String::from)
-            .to_vec(),
+            topics: TOPICS.iter().map(|(t, _)| t.to_string()).collect(),
+            topic_descriptions: TOPICS.iter().map(|(t, d)| (t.to_string(), d.to_string())).collect(),
             // Gets the real `ctx.launcher` (ADR 0010 §4).
             capabilities: vec!["process".into()],
         }
@@ -72,7 +74,11 @@ impl Module for Workspaces {
             ctx.store.transaction(|tx| {
                 let next = Saved::new(dirty.clone()).with_last_session(saved.last_session.clone());
                 tx.put(&state_path(&id), persist::encode(&next))?;
-                tx.emit("workspaces.session.dirty", dirty_payload(&id, &dirty))
+                // `recovered`: no task failed to report this one, so notify alerts on it
+                // (ADR 0032 §4); a launch that fails as it runs is reported by its task.
+                let mut payload = dirty_payload(&id, &dirty);
+                payload["recovered"] = json!(true);
+                tx.emit("workspaces.session.dirty", payload)
             })?;
         }
         Ok(())
