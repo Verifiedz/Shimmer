@@ -259,10 +259,12 @@ Stable strings. Clients may branch on `code`, never on `message`.
  "message":"workspace 'deep-work' failed setup and was not cleaned up",
  "detail":{"workspace":"deep-work","failed_step":"3/7 tmux-session",
    "failed_at":"2026-09-16T09:12:44Z","log":"logs/deep-work-01JD2T.log",
-   "has_cleanup_script":true}}
+   "has_cleanup_script":true,"fix":"shimmer workspaces cleanup deep-work"}}
 ```
 
-Clients should offer: run cleanup, force relaunch, or open the log. Never auto-force.
+Clients should offer: run cleanup, force relaunch, or open the log. Never auto-force. `fix` is the
+command that clears it: `cleanup` when there's a cleanup script, `reset` when there isn't (ADR 0035
+§10).
 
 ---
 
@@ -506,12 +508,16 @@ saved and loaded: its `on` pattern, its `when` filter, every op exists and none 
 
 | Op | Execution | Params | Returns |
 |---|---|---|---|
-| `automations.list` | inline | `{}` | `{"rules":[…],"problems":[{"file","error"}],"removed":[id…]}`: problems are rule files that couldn't be used; removed rules can be restored. |
-| `automations.get` | inline | `{"id"}` | One rule, plus `"text"`: its file. |
-| `automations.create` | inline | `{"id","text"?,"label"?}` | The rule. Without `text`, a commented starter rule, switched off. `conflict` if it exists. |
-| `automations.save` | inline | `{"id","text"}` | The rule. A broken rule is refused and the old one kept. |
+| `automations.list` | inline | `{"removed"?}` | `{"rules":[…],"problems":[{"file","error"}]}`: problems are rule files that couldn't be used. With `"removed": true`, the removed rules instead, `{"rules":[{"id","label"}]}`, to restore or purge (ADR 0038 §6). |
+| `automations.show` | inline | `{"id"}` | One rule, plus `"text"`: its file. |
+| `automations.new` | inline | `{"id","text"?,"label"?}` or `{"id","template","values"?,"preview"?}` | The rule. Without `text`, a commented starter rule, switched off. `conflict` if it exists. With `template`: `values` maps its questions to text; the rules it makes (`<id>`, or `<id>-<suffix>` for each when it makes several) are checked and made together, on, as `{"template","rules":[…]}`; with `preview: true`, `{"preview":true,"template","rules":[{"id","text"}]}` and nothing is made. `unavailable` naming the module when the template runs an op no installed module has; `conflict` naming every id already taken. |
+| `automations.templates` | inline | `{"id"?}` | `{"categories":[{"id","label"}],"templates":[{"id","label","description","category","good_to_know","questions","rules":[{"suffix","text"}],"ops"}]}`. A rule's text takes answers as `${NAME}`; a question's `kind` is `text`, `name`, `number`, `choice`, `list` or `pairs`. ADR 0035 §9. |
+| `automations.edit` | inline | `{"id","text"}` | The rule. A broken rule is refused and the old one kept. |
 | `automations.remove` | inline | `{"id"}` | `{"removed":true,"rule"}`. Moves the file to `data/automations/removed/` (replacing an older removed rule of the same id); also removes a rule file that couldn't be used. |
 | `automations.restore` | inline | `{"id"}` | `{"restored":true,"rule","problem"}`: the rule back as it was. One that no longer checks is still restored, with `rule: null` and the `problem` (also in `list`). `conflict` if a rule has that id, `not_found` if none was removed. |
+| `automations.purge` | inline | `{"id"?,"confirm"?}` | `{"purged":N}`. Permanently deletes one removed rule, or every one. Without a matching `confirm`, `confirmation_required` with `detail: {"rules":N}`; re-send with `"confirm": {"rules":N}`. `{"purged":0}` without asking when nothing is removed; `not_found` for an `id` that isn't removed. Emits `automations.rule.purged`. ADR 0038. |
+| `automations.rename` | inline | `{"id","to"}` | The rule under its new id (as `automations.show` without `text`); emits `automations.rule.renamed {from, to}`. A built-in rule is `conflict` (it has no file); so is a `to` that's taken. Its history moves to the new id, and a delayed action it set that is still waiting follows it (recorded in `renamed.toml`); a rule given the old id later keeps only its own. A `renamed.toml` that doesn't parse is `conflict`, never replaced. ADR 0038 §6. |
+| `automations.copy` | inline | `{"id","to","label"?}` | The new rule, **switched off** so the same event doesn't fire both, with `label` if given; emits `automations.rule.copied {from, to}`. ADR 0038 §6. |
 | `automations.enable` / `.disable` | inline | `{"id"}` | The rule; only `enabled` in its file changes. |
 | `automations.reload` | inline | `{}` | `{"rules":N,"problems":[…]}`, after re-reading files edited by hand. |
 | `automations.test` | inline | `{"id","event":{"topic","payload"}}` | `{"rule","enabled","matches","actions":[{"op","params","after_s"}]}`: what it would do, as if on. Runs nothing. |
@@ -521,11 +527,51 @@ saved and loaded: its `on` pattern, its `when` filter, every op exists and none 
 | `automations.depth` | inline | `{}` or `{"depth":N}` (1–10) | `{"depth"}`: how many rules may follow each other in a chain (default 3). |
 | `automations.health` | inline | `{}` | `{"checks":[…]}` in ADR 0033's shape: a `fail` per unusable file, a `warn` for a recently stopped loop, or one `ok` line. |
 
+**Built-in rules** (ADR 0035 §10): `workspace-dirty`, `workspace-half-launched`,
+`scheduled-task-failed` and `loop-stopped` are always listed (`"builtin": true`) once the ops they run
+are installed (they send with `notify.send`). `get` shows their text; `enable`/`disable` switch them
+in `settings.toml`'s `[builtin]` (and their event carries `"builtin": true`); `remove`, `save`, and
+`create` or `restore` with their ids are `conflict`. A rule file of yours with a built-in's id is
+reported in `problems`, not run.
+
 **The loop guard:** an event whose `cause` is a task automations queued continues that task's
 chain of rules. A rule already in the chain doesn't fire again, and a chain stops at the depth
 limit; either way `automations.chain.stopped` is emitted. Everything else starts a new chain.
 
 ---
+## Notify ops
+
+ADR 0032. Every op that picks messages takes the same filters, all optional and combined:
+`{"unread"?, "read"?, "state"?: "pending"|"held"|"delivered"|"failed",
+"from"?: "send"|"schedules"|"fallbacks"|"automations", "priority"?: "low"|"normal"|"high",
+"since"?, "before"?, "text"?}`. `since`/`before` are a date (`2026-10-01`, the start of that local
+day), a local `2026-10-01 14:00`, or RFC 3339; `text` matches the title or body, ignoring case.
+
+| Op | Execution | Params | Returns |
+|---|---|---|---|
+| `notify.send` | queued (`notify`) | `{"title","body"?,"priority"?,"from"?}`; a fallback's params (`failure_code`, `failure_reason`, `failure_detail`, `message`) are read too, unknown keys ignored | The task ends with the message (below). Never fails because delivery did: the message is kept as `failed`. |
+| `notify.test` | queued (`notify`) | `{}` | `{"deliveries":[{"medium","at","ok","error"?}],"sinks":[…]}`: a test to every sink, past quiet hours and pause; not kept |
+| `notify.resend` | queued (`notify`) | `{"ids":[…]}` or filters | `{"items":[…]}`: each tried again, the new deliveries added to it |
+| `notify.flush` | queued (`notify`) | `{}` | `{"delivered":N}`: what quiet hours or a pause held, as one summary. Run hourly by notify's own trigger `notify.flush`. |
+| `notify.list` | inline | filters, `"limit"`? (default 50) | `{"items":[…],"counts":{"total","unread","high","held","failed"},"removed_unread"?}`, newest first; each item also has `short`, the ending to show for it |
+| `notify.count` | inline | filters | `{"count", "total","unread","high","held","failed"}` |
+| `notify.get` | inline | `{"id"}` | the message |
+| `notify.mark_read` / `notify.mark_unread` | inline | `{"ids":[…]}`, `{"all":true}` or filters | `{"marked":N}` |
+| `notify.remove` | inline | `{"ids":[…]}`; or filters / `{"all":true}` with `"confirm":true` | `{"removed":N}`. A bulk remove without `confirm` answers `confirmation_required` with `detail: {"count","unread"}`. |
+| `notify.pause` | inline | `{"until"?: RFC 3339 after now, "all"?}` | `{"paused":{"since","until"?,"all"}}`; holds low and normal (and high with `all`) until `resume` or `until` |
+| `notify.resume` | inline | `{}` | `{"was_paused","held"}`; enqueues `notify.flush` when something waited |
+| `notify.quiet` | inline | `{}` shows; `{"every_day"|"weekdays"|"weekends"|"mon"…"sun": "22:00-08:00" or null}` sets or clears; `{"off":true}` clears all | `{"quiet":{…},"quiet_now"}` |
+| `notify.cap` | inline | `{}` shows; `{"max":N}` (at least 100) sets and applies it | `{"max","messages","removed_unread"?}` |
+| `notify.status` | inline | `{}` | `{"paused","quiet","quiet_now","cap","counts","removed_unread","sinks","settings_problem"}` |
+
+A message: `{"id","at","priority","title","body"?,"source","state","read","delivery":[{"medium","at","ok","error"?}]}`.
+`source` is `send`, `schedule`, `fallback` or `automation:<rule>` (a rule's message, built-in ones too: ADR 0035 §10). Messages are files
+in `data/notify/inbox/`; settings are `data/notify/settings.toml`.
+
+Every `id` and `ids` entry may be a unique ending of a message id, as for tasks (see "Short ids"
+above): at least 4 characters, `conflict` when several match, `not_found` when none does. A list
+item's `short` is its last 6 characters, or more where another message in the inbox ends the same
+way: unique across the whole inbox, not only the page returned, so it always works given back.
 
 ## Topic catalogue
 
@@ -539,7 +585,7 @@ tolerate unknown topics.
 | `queue.task.started` | Task began executing. |
 | `queue.task.progress` | Module called `ctx.progress`. Payload `{fraction, note}`. |
 | `queue.task.finished` | Task succeeded. |
-| `queue.task.failed` | Task failed. Payload includes `error`, `attempts`, `lane`, `origin`. |
+| `queue.task.failed` | Task failed. Payload includes `error`, `attempts`, `lane`, `origin`, and `fallback`: `true` only when a fallback is being sent for this failure (ADR 0005, 0032 §4). |
 | `queue.task.cancelled` | Task cancelled before or during execution. |
 | `queue.task.promoted` | A task jumped the lane. Payload lists displaced task ids. |
 | `queue.task.reordered` | A waiting task moved within its lane. Payload `{task_id, lane, before, queue_version}`. |
@@ -550,7 +596,7 @@ tolerate unknown topics.
 | `scheduler.trigger.missed` | A `catch_up` policy dropped due occurrences. Payload `{trigger_id, count, catch_up}`. |
 | `scheduler.trigger.added` / `.removed` / `.paused` / `.resumed` | Trigger lifecycle. |
 | `workspaces.session.launched` | All launch steps succeeded. Payload `{workspace, session_id, forced, steps}`. |
-| `workspaces.session.dirty` | A launch step failed, a launch was cancelled part-way, or the daemon restarted mid-launch. Payload `{workspace, reason, failed_step, failed_at, log}` (+ `session_id`, `forced`, `has_cleanup_script` when a launch was running). |
+| `workspaces.session.dirty` | A launch step failed, a launch was cancelled part-way, or the daemon restarted mid-launch. Payload `{workspace, reason, failed_step, failed_at, log}` (+ `session_id`, `forced`, `has_cleanup_script` when a launch was running; `recovered: true` when the daemon restarted mid-launch, the one case no failed task reports, ADR 0032 §4). |
 | `workspaces.session.forced` | Force relaunch of a dirty workspace, before any step runs. Payload `{workspace, prior}`, `prior` being the dirty state it overrides. |
 | `workspaces.session.cleaned` | Cleanup script succeeded; state back to `ready`. Payload `{workspace, log}`. |
 | `workspaces.session.abandoned` | A launch (forced or not) was claimed but no step ran: cancelled first, or step 1 couldn't start. The workspace is back to the state it had. Payload `{workspace, reason, forced, back_to}`. |
@@ -568,15 +614,21 @@ tolerate unknown topics.
 | `records.collection.renamed` / `.removed` / `.restored` / `.purged` | `{collection, new_id}` / `{collection, records}` / `{collection}` / `{collection, records}`. `.purged`: a removed collection was deleted for good (ADR 0021 §5a). |
 | `records.trash.purged` | `records.purge` deleted trashed records for good. `{collection, records}`, plus `id` when one record was purged. ADR 0024 §5. |
 | `automations.rule.created` / `.edited` / `.removed` / `.restored` / `.enabled` / `.disabled` | `{rule}`. ADR 0035. |
+| `automations.rule.renamed` / `.copied` | `{from, to}`. ADR 0038 §6. |
+| `automations.rule.purged` | `automations.purge` deleted removed rules for good. `{rules}`, plus `rule` when one was purged. ADR 0038. |
 | `automations.rule.fired` | A rule reacted to an event. `{rule, event: {id, topic}, chain, depth, queued: [{op, task_id, lane}], scheduled: [{op, trigger_id, at}], failed: [{op, error}]}`. |
 | `automations.chain.stopped` | The loop guard stopped a rule. `{chain, rules, rule, reason: "cycle" \| "depth", event: {id, topic}}`. |
 | `automations.settings.changed` | `{depth}`. |
 | `fetchers.item.found` | A source returned a new, deduplicated item. Planned (M6): not emitted by any module yet. |
 | `fetchers.fetch.finished` / `.failed` | A fetch run ended. Planned (M6): not emitted by any module yet. |
 | `calendar.date.registered` | A dated entry was stored. Planned (M6): not emitted by any module yet. |
-| `notify.sent` | Delivery succeeded, naming the sink used. Planned (M6): not emitted by any module yet. |
-| `notify.fallback_used` | Primary sink failed; the fallback delivered. Planned (M6): not emitted by any module yet. |
-| `notify.exhausted` | Every sink failed. Written to `notifications/failed.jsonl`. Planned (M6): not emitted by any module yet. |
+| `notify.message.received` | A message landed in the inbox. `{id, title, body, priority, source}`, plus `removed_unread` when the cap removed unread ones to fit. ADR 0032. |
+| `notify.message.held` | Quiet hours or a pause held it. `{id}`. |
+| `notify.message.sent` | At least one sink took it. `{id, mediums}`. |
+| `notify.message.exhausted` | Every sink failed; it stays in the inbox as `failed`. `{id, errors:[{medium, error}]}`. |
+| `notify.message.read` / `.unread` / `.removed` | `{ids}`; `.removed` also `reason`: `removed` or `cap`. |
+| `notify.pause.started` / `.ended` | `{until, all}` / `{held}`. |
+| `notify.settings.changed` | A setting changed: one of `{quiet}`, `{cap}`. |
 
 `queue.task.failed` is the topic a dashboard most needs: it is how failures become visible
 without polling, and it is how the elevated-priority dirty-workspace warning reaches the
@@ -640,9 +692,9 @@ Connect, discover, subscribe, enqueue, watch it run.
 // meanwhile, a scheduled workspace launch fails in another lane
 ← {"v":1,"kind":"event","event":{"topic":"queue.task.failed",
    "payload":{"task_id":"01JD2M…","lane":"workspaces","origin":"scheduler",
-     "error":"step 3/7 exited 1","workspace_dirty":true}, …}}
-← {"v":1,"kind":"event","event":{"topic":"notify.sent",
-   "payload":{"sink":"desktop","reason":"fallback","priority":"high"}, …}}
+     "error":"step 3/7 exited 1","workspace_dirty":true,"fallback":true}, …}}
+← {"v":1,"kind":"event","event":{"topic":"notify.message.sent",
+   "payload":{"id":"01JD2P…","mediums":["desktop"]}, …}}
 ```
 
 Two things to read out of the last four frames. The failing workspace task did not stall

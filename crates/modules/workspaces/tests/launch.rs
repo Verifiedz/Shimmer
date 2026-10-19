@@ -204,12 +204,14 @@ async fn a_failed_step_stops_the_launch_and_leaves_it_dirty() {
     assert_eq!(detail["failed_step"], "1/3 setup");
     assert_eq!(detail["log"], "logs/deep-work-01SESSION-setup.log");
     assert_eq!(detail["has_cleanup_script"], true);
+    assert_eq!(detail["fix"], format!("shimmer workspaces cleanup {}", detail["workspace"].as_str().unwrap()));
 
     assert_eq!(state_line(&env), "state = \"dirty\"");
     let ev = env.backend.events().pop().unwrap();
     assert_eq!(ev.topic, "workspaces.session.dirty");
     assert_eq!(ev.payload["reason"], "exit code 1");
     assert_eq!(ev.payload["session_id"], "01SESSION");
+    assert!(ev.payload.get("recovered").is_none(), "its failed task reports it, not this event");
 
     // Dirty blocks activation outright (§10.3): nothing runs.
     let e = call(&w, &env, "workspaces.activate").await.unwrap_err();

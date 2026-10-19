@@ -1,0 +1,27 @@
+[template]
+label = "Tell me when a task fails"
+description = "A message whenever a queued task fails, in every lane or one"
+category = "messages"
+good_to_know = [
+    "It only sends a message: nothing else changes",
+    "A failed message (notify.send) never sets it off, so it can't loop",
+]
+
+[[question]]
+name = "LANE"
+prompt = "Only this lane (e.g. workspaces)"
+kind = "name"
+help = "Leave empty for every lane. 'shimmer queue list' shows the lanes."
+
+[[rule]]
+text = '''
+[rule]
+label = "Tell me when a task fails"
+on = "queue.task.failed"
+when = { op = { ne = "notify.send" } } # unless LANE
+when = { op = { ne = "notify.send" }, lane = "${LANE}" } # if LANE
+
+[[do]]
+op = "notify.send"
+params = { title = "Failed: {op}", body = "{error}", priority = "high", from = "automation:${RULE}" }
+'''

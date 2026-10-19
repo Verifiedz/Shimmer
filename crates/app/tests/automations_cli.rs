@@ -50,13 +50,27 @@ fn rules_are_made_shown_tested_switched_and_brought_back() {
     ok(&home, &["automations", "enable", "solved"]);
 
     assert!(ok(&home, &["automations", "remove", "solved"]).contains("shimmer automations restore solved"));
-    assert!(ok(&home, &["automations"]).contains("removed: solved"));
+    assert!(ok(&home, &["automations", "list", "--removed"]).contains("solved"), "list --removed (ADR 0038 §6)");
     assert!(ok(&home, &["automations", "restore", "solved"]).contains("✓ restored rule solved"));
+    // Purge deletes a removed rule for good, and asks first (ADR 0038).
+    ok(&home, &["automations", "remove", "solved"]);
+    fails(&home, &["automations", "purge", "solved"]);
+    assert_eq!(ok(&home, &["automations", "purge", "--yes"]).trim(), "✓ 1 removed rule(s) deleted for good");
+    fails(&home, &["automations", "restore", "solved"]);
+    std::fs::write(&rule, RULE).unwrap();
+    ok(&home, &["automations", "new", "solved", "--file", file]);
+    // Rename and copy, like workspaces (ADR 0038 §6); a copy starts off.
+    assert!(ok(&home, &["automations", "copy", "solved", "solved-2"]).contains("switched off"));
+    assert!(ok(&home, &["automations", "rename", "solved-2", "second"]).contains("✓ solved-2 is now second"));
+    assert!(ok(&home, &["automations", "show", "second"]).contains("enabled = false"));
 
     assert!(ok(&home, &["automations", "events"]).contains("records.item.completed"));
     assert!(ok(&home, &["automations", "depth", "4"]).contains("✓ depth is 4"));
     assert!(ok(&home, &["automations", "status"]).contains("depth: 4"));
-    assert!(ok(&home, &["automations", "reload"]).contains("✓ read 1 rules"));
+    assert!(
+        ok(&home, &["automations", "reload"]).contains("✓ read 6 rules"),
+        "yours (solved and its copy) and the four built in"
+    );
     assert!(ok(&home, &["automations", "history"]).contains("nothing yet"));
 
     // Without a terminal, edit says how to do it instead of waiting on an editor.
