@@ -24,8 +24,23 @@ injected clock). These are the points it left open.
   become an object holding it) so a backfilled run knows which period it is for. Other param
   types are passed unchanged.
 * **At-most-once.** State (`last_run`, `next_due`) is persisted *before* the task is
-  enqueued. A crash in between loses one firing instead of repeating it. Duplicate emails
-  are the worse failure.
+  enqueued, so a firing is never repeated. Duplicate emails are the worse failure.
+  *Amended (#263 finding 1):* a firing is also never **lost** to a stop. The queue lives in
+  memory, so a task still waiting in its lane when the daemon stopped used to vanish (and a
+  finished `once` with it). Each firing is now kept on the trigger (`unfinished`, by the time
+  it was for) until its task ends, and settled on the next start from the event log, which
+  logs `queue.task.started` before a task's code runs:
+  - never handed to the queue, or handed and never **started** → queued again
+    (`scheduler.trigger.fired` with `after_restart: true`). It never ran, so this can't
+    repeat anything;
+  - **started** and never ended (the daemon died mid-run) → **not** run again: it may have
+    half sent something. It's recorded on the trigger (`interrupted`) and reported
+    (`scheduler.trigger.interrupted`, which the built-in `scheduled-task-interrupted` rule
+    turns into a message, ADR 0035 §10);
+  - ended (finished, failed or cancelled) → forgotten.
+  A module's finished one-time schedule is deleted once its task has ended, not when it
+  fires. A paused trigger's waiting firing is still run: it fired before the pause. This is
+  scheduled work only; whether *every* queued task should survive a restart is #236.
 * **Overlap.** If any task from an earlier firing is still queued or running, every firing
   due this tick is dropped (`scheduler.trigger.skipped`, `reason: "overlap"`), including a
   whole backfill batch. Tasks from the same batch do not count against each other. Pending
@@ -38,7 +53,11 @@ injected clock). These are the points it left open.
   skipped with a warning, so removing a module degrades instead of failing startup.
 * **Storage.** `data/scheduler/triggers/<id>.json`, pretty-printed and hand-editable. JSON
   rather than TOML because params are arbitrary JSON, which TOML cannot represent (no null).
-  An unreadable file is logged and skipped.
+  An unreadable file is skipped, never overwritten, and listed (`scheduler.list`'s `broken`,
+  `shimmer scheduler list`, `shimmer doctor`) until fixed or `scheduler.remove`d, which deletes
+  it (#263 finding 5). A module's own trigger is written again from its declaration.
+* **A `once` already past with `skip`** is refused at `scheduler.add`/`edit` (`invalid_params`):
+  it could never run (#263 finding 3). `run_once`/`backfill` run it now.
 * **Finished `once`.** Kept with `done: true` so a module re-declaring it does not fire it again.
 * `scheduler` is a reserved module id *and* namespace.
 * **Fallback.** The scheduler validates it (a `notify.*` op, never on a `notify.*` trigger) and

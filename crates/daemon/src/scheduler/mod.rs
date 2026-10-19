@@ -4,8 +4,14 @@
 //!
 //! * Time comes from the injected `Clock`, never `Utc::now()`, so tests advance a fake clock.
 //! * Last-run and next-due are persisted (`data/scheduler/triggers/<id>.json`), not memory.
-//! * State is written *before* the task is enqueued: a crash in between loses one firing
-//!   rather than repeating it. Duplicate emails are the worse failure (§6.3).
+//! * State is written *before* the task is enqueued: a crash in between never repeats a
+//!   firing. Duplicate emails are the worse failure (§6.3).
+//! * A firing is remembered on disk (`unfinished`) until its task ends, so a stop while the task
+//!   still waits in its lane doesn't lose it: on the next start, a task the event log says never
+//!   started is queued again, and one that started but never ended is reported as interrupted,
+//!   never run twice (#263 finding 1, ADR 0004 amendment).
+//! * A schedule file that can't be read is skipped but listed as broken, never overwritten
+//!   (#263 finding 5).
 //! * A trigger never overlaps itself: if a task from an earlier firing is still queued or
 //!   running, the new firing is dropped and reported as `scheduler.trigger.skipped`.
 //! * `tick` is a plain synchronous function; the async loop only sleeps between calls.
@@ -14,7 +20,7 @@
 
 mod plan;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -22,7 +28,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use shimmer_core::{
-    CatchUp, Clock, Emitter, EnqueueRequest, Error, Fallback, LaneId, LocalTimezone, ModuleId, NamespacedStore,
+    CatchUp, Clock, Emitter, EnqueueRequest, Error, Event, Fallback, LaneId, LocalTimezone, ModuleId, NamespacedStore,
     OneTime, Origin, Priority, Result, Schedule, ScheduleBackend, TaskId, TriggerId, TriggerSpec,
 };
 use tokio_util::sync::CancellationToken;
@@ -65,13 +71,29 @@ struct Stored {
     /// in another zone can move it. Absent for every other schedule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     zone: Option<String>,
+    /// Firings handed to the queue whose task hasn't ended, by the time each was for. On disk so
+    /// a restart can tell a task that never started from one that did (#263 finding 1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    unfinished: Vec<DateTime<Utc>>,
+    /// The latest firing a stop cut off while its task ran: never run again, shown instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    interrupted: Option<Interrupted>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct Interrupted {
+    task_id: TaskId,
+    scheduled_for: DateTime<Utc>,
+    /// When the restart noticed it.
+    noticed: DateTime<Utc>,
 }
 
 struct Entry {
     stored: Stored,
     parsed: Parsed,
-    /// Tasks from earlier firings. In memory on purpose: the queue's own state is too.
-    pending: Vec<TaskId>,
+    /// Tasks from earlier firings, with the time each was for. In memory, like the queue's own
+    /// state; `Stored::unfinished` is what survives a restart.
+    pending: Vec<(TaskId, DateTime<Utc>)>,
 }
 
 pub struct Scheduler {
@@ -84,6 +106,9 @@ pub struct Scheduler {
     lanes: HashSet<LaneId>,
     /// `[general] local_timezone`, for `CronLocal` schedules (ADR 0031 §2).
     local_tz: LocalTimezone,
+    /// Schedule files that couldn't be read, by id: listed, never overwritten, removable
+    /// (#263 finding 5). The file and why.
+    broken: Mutex<BTreeMap<String, (String, String)>>,
 }
 
 fn valid_trigger_id(id: &str) -> bool {
@@ -111,7 +136,17 @@ impl Scheduler {
         lanes: HashSet<LaneId>,
         local_tz: LocalTimezone,
     ) -> Self {
-        Self { state: Mutex::default(), store, emitter, clock, queue, known_ops, lanes, local_tz }
+        Self {
+            state: Mutex::default(),
+            store,
+            emitter,
+            clock,
+            queue,
+            known_ops,
+            lanes,
+            local_tz,
+            broken: Mutex::default(),
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, BTreeMap<String, Entry>> {
@@ -176,10 +211,18 @@ impl Scheduler {
                     }
                     st.insert(stored.spec.id.to_string(), Entry { stored, parsed, pending: Vec::new() });
                 }
-                Err(e) => tracing::error!(file, error = %e, "ignoring unreadable trigger file"),
+                Err(e) => {
+                    tracing::error!(file, error = %e, "skipping unreadable trigger file");
+                    let id = file.trim_start_matches(&format!("{DIR}/")).trim_end_matches(".json").to_owned();
+                    self.broken().insert(id, (format!("data/scheduler/{file}"), e.message));
+                }
             }
         }
         Ok(())
+    }
+
+    fn broken(&self) -> MutexGuard<'_, BTreeMap<String, (String, String)>> {
+        self.broken.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Reconcile persisted state with what modules declare now. Keeps last-run and paused for
@@ -237,8 +280,12 @@ impl Scheduler {
                         last_run: None,
                         done: false,
                         zone: parsed.is_local().then(|| self.local_tz.name().to_owned()),
+                        unfinished: Vec::new(),
+                        interrupted: None,
                     };
+                    // Declared again, so a broken file of it is replaced by the declaration.
                     self.write(&stored, Some(("scheduler.trigger.added", added_payload(&stored))))?;
+                    self.broken().remove(&id);
                     st.insert(id, Entry { stored, parsed, pending: Vec::new() });
                 }
             }
@@ -253,6 +300,20 @@ impl Scheduler {
             st.remove(&id);
         }
         Ok(())
+    }
+
+    /// A `once` already past with `skip` could never run (#263 finding 3): refused, rather than
+    /// made and left waiting forever. `run_once`/`backfill` run it now, as asked.
+    fn refuse_past_skip(&self, spec: &TriggerSpec) -> Result<()> {
+        match spec.schedule {
+            Schedule::Once(at) if spec.catch_up == CatchUp::Skip && at <= self.clock.now() => {
+                Err(Error::invalid_params(format!(
+                    "that time ({at}) has passed, and catch-up skip would never run it; \
+                     use catch-up run_once to run it now"
+                )))
+            }
+            _ => Ok(()),
+        }
     }
 
     fn check_target(&self, spec: &TriggerSpec) -> Result<()> {
@@ -273,53 +334,88 @@ impl Scheduler {
     pub fn tick(&self) {
         let now = self.clock.now();
         let mut st = self.lock();
-        for entry in st.values_mut() {
+        let mut gone = Vec::new();
+        for (id, entry) in st.iter_mut() {
+            let ended: Vec<DateTime<Utc>> =
+                entry.pending.iter().filter(|(task, _)| !self.task_pending(*task)).map(|(_, at)| *at).collect();
+            if !ended.is_empty() && !self.forget(entry, &ended) {
+                gone.push(id.clone());
+                continue;
+            }
             if entry.stored.paused || entry.stored.done {
                 continue;
             }
-            if entry.stored.next_due.is_some_and(|due| due <= now) {
-                self.fire_due(entry, now);
+            if entry.stored.next_due.is_some_and(|due| due <= now) && !self.fire_due(entry, now) {
+                gone.push(id.clone());
             }
         }
-        // A module's one-time schedule is gone once it has run: its file was deleted in `fire_due`.
-        st.retain(|_, e| !(e.stored.done && matches!(e.stored.source, Source::Added { .. })));
+        // A module's one-time schedule is gone once its task has ended: its file was deleted.
+        for id in gone {
+            st.remove(&id);
+        }
     }
 
     fn task_pending(&self, id: TaskId) -> bool {
         self.queue.task_view(id).map(|v| matches!(v["status"].as_str(), Some("queued" | "running"))).unwrap_or(false)
     }
 
-    fn fire_due(&self, e: &mut Entry, now: DateTime<Utc>) {
-        let Some(due) = e.stored.next_due else { return };
+    /// Forget these firings: their task ended, or never got into the queue. On disk first; a
+    /// failed write keeps them and the next tick tries again. A module's finished one-time
+    /// schedule is deleted once nothing of it is left. False when it was deleted.
+    fn forget(&self, e: &mut Entry, ats: &[DateTime<Utc>]) -> bool {
+        let mut next = e.stored.clone();
+        next.unfinished.retain(|at| !ats.contains(at));
+        let finished = matches!(next.source, Source::Added { .. }) && next.done && next.unfinished.is_empty();
+        let saved = if finished {
+            self.delete(
+                next.spec.id.as_str(),
+                ("scheduler.trigger.removed", json!({"trigger_id": next.spec.id, "reason": "ran"})),
+            )
+        } else {
+            self.write(&next, None)
+        };
+        if let Err(err) = saved {
+            tracing::error!(trigger = %e.stored.spec.id, error = %err, "could not persist trigger state; will retry");
+            return true;
+        }
+        e.pending.retain(|(_, at)| !ats.contains(at));
+        e.stored = next;
+        !finished
+    }
+
+    /// False when the entry is gone (a module's one-time schedule that fired nothing).
+    fn fire_due(&self, e: &mut Entry, now: DateTime<Utc>) -> bool {
+        let Some(due) = e.stored.next_due else { return true };
         let decision = plan::decide(&e.parsed, e.stored.spec.catch_up, due, now);
-        e.pending.retain(|id| self.task_pending(*id));
-        let overlap = !decision.fire.is_empty() && !e.pending.is_empty();
+        let overlap = !decision.fire.is_empty() && e.pending.iter().any(|(task, _)| self.task_pending(*task));
 
         let mut next = e.stored.clone();
         next.next_due = decision.next_due;
         next.done = decision.next_due.is_none();
         if !decision.fire.is_empty() && !overlap {
             next.last_run = Some(now);
+            next.unfinished.extend(decision.fire.iter().copied());
         }
         // Persist first (at-most-once). If that fails nothing has happened and the next tick retries.
-        // A module's finished one-time schedule is deleted instead of kept as `done`: nothing
-        // re-declares it, so there's nothing to remember (ADR 0035 §5.6).
-        // "ran" only when a task was enqueued this tick; an overlap drops the firing (#251's review).
-        let reason = if overlap || decision.fire.is_empty() { "skipped" } else { "ran" };
-        let persisted = match &next.source {
-            Source::Added { .. } if next.done => self.delete(
+        // A module's finished one-time schedule is deleted instead of kept as `done` once its task
+        // has ended (`forget`): nothing re-declares it, so there's nothing to remember (ADR 0035 §5.6).
+        // "skipped" when nothing was enqueued this tick; an overlap drops the firing (#251's review).
+        let gone = matches!(next.source, Source::Added { .. }) && next.done && next.unfinished.is_empty();
+        let persisted = if gone {
+            self.delete(
                 next.spec.id.as_str(),
-                ("scheduler.trigger.removed", json!({"trigger_id": next.spec.id, "reason": reason})),
-            ),
-            _ => self.write(&next, None),
+                ("scheduler.trigger.removed", json!({"trigger_id": next.spec.id, "reason": "skipped"})),
+            )
+        } else {
+            self.write(&next, None)
         };
         if let Err(err) = persisted {
             tracing::error!(trigger = %e.stored.spec.id, error = %err, "could not persist trigger state; will retry");
-            return;
+            return true;
         }
         e.stored = next;
 
-        let spec = &e.stored.spec;
+        let spec = e.stored.spec.clone();
         let id = spec.id.to_string();
         if decision.missed > 0 {
             self.emit(
@@ -328,36 +424,150 @@ impl Scheduler {
             );
         }
         if overlap {
+            let pending: Vec<TaskId> = e.pending.iter().map(|(task, _)| *task).collect();
             self.emit(
                 "scheduler.trigger.skipped",
-                json!({"trigger_id": id, "reason": "overlap", "dropped": decision.fire.len(), "pending": e.pending}),
+                json!({"trigger_id": id, "reason": "overlap", "dropped": decision.fire.len(), "pending": pending}),
             );
-            return;
+            return !gone;
         }
+        let mut failed = Vec::new();
         for scheduled_for in decision.fire {
-            let request = EnqueueRequest {
-                op: spec.op.clone(),
-                params: with_scheduled_for(&spec.params, scheduled_for),
-                lane: spec.lane.clone(),
-                priority: Priority::Scheduled,
-                origin: Origin::Scheduler { trigger_id: TriggerId::new(id.as_str()) },
-                fallback: spec.fallback.clone(),
-            };
-            match self.queue.submit_request(request) {
-                Ok(h) => {
-                    e.pending.push(h.task_id);
-                    self.emit(
-                        "scheduler.trigger.fired",
-                        json!({"trigger_id": id, "op": spec.op, "task_id": h.task_id, "lane": h.lane,
-                               "scheduled_for": scheduled_for, "late_by_s": (now - scheduled_for).num_seconds()}),
-                    );
-                }
-                Err(err) => self.emit(
-                    "scheduler.trigger.skipped",
-                    json!({"trigger_id": id, "reason": "enqueue_failed", "error": err.message, "code": err.code}),
-                ),
+            if !self.enqueue(e, &spec, scheduled_for, now, false) {
+                failed.push(scheduled_for);
             }
         }
+        if !failed.is_empty() {
+            return self.forget(e, &failed);
+        }
+        !gone
+    }
+
+    /// Hand one firing to the queue. `after_restart`: queued again on start, never having run.
+    /// False when the queue refused it (reported as skipped).
+    fn enqueue(
+        &self,
+        e: &mut Entry,
+        spec: &TriggerSpec,
+        scheduled_for: DateTime<Utc>,
+        now: DateTime<Utc>,
+        after_restart: bool,
+    ) -> bool {
+        let id = spec.id.to_string();
+        let request = EnqueueRequest {
+            op: spec.op.clone(),
+            params: with_scheduled_for(&spec.params, scheduled_for),
+            lane: spec.lane.clone(),
+            priority: Priority::Scheduled,
+            origin: Origin::Scheduler { trigger_id: TriggerId::new(id.as_str()) },
+            fallback: spec.fallback.clone(),
+        };
+        match self.queue.submit_request(request) {
+            Ok(h) => {
+                e.pending.push((h.task_id, scheduled_for));
+                let mut payload = json!({"trigger_id": id, "op": spec.op, "task_id": h.task_id, "lane": h.lane,
+                       "scheduled_for": scheduled_for, "late_by_s": (now - scheduled_for).num_seconds()});
+                if after_restart {
+                    payload["after_restart"] = json!(true);
+                }
+                self.emit("scheduler.trigger.fired", payload);
+                true
+            }
+            Err(err) => {
+                self.emit(
+                    "scheduler.trigger.skipped",
+                    json!({"trigger_id": id, "reason": "enqueue_failed", "error": err.message, "code": err.code}),
+                );
+                false
+            }
+        }
+    }
+
+    /// On start, after `load`: settle every firing a stop left unfinished, from the event log
+    /// (`events_since(topic pattern, since)`, oldest first). A task that never started is queued
+    /// again; one that started and never ended is not run twice but reported
+    /// (`scheduler.trigger.interrupted`) and shown on the trigger; an ended one is forgotten
+    /// (#263 finding 1, ADR 0004 amendment).
+    pub fn recover(&self, events_since: impl Fn(&str, DateTime<Utc>) -> Result<Vec<Event>>) -> Result<()> {
+        let now = self.clock.now();
+        let mut st = self.lock();
+        let Some(oldest) = st.values().flat_map(|e| e.stored.unfinished.iter()).min().copied() else { return Ok(()) };
+        // A firing is logged after the time it was for; a minute's margin for a clock that moved.
+        let since = oldest - chrono::Duration::minutes(1);
+        // The task each firing was handed to: the latest, if an earlier restart queued it again.
+        let mut task_for: HashMap<(String, DateTime<Utc>), TaskId> = HashMap::new();
+        for ev in events_since("scheduler.trigger.fired", since)? {
+            let p = &ev.payload;
+            let trigger = p["trigger_id"].as_str().map(str::to_owned);
+            let at = serde_json::from_value::<DateTime<Utc>>(p["scheduled_for"].clone()).ok();
+            let task = serde_json::from_value::<TaskId>(p["task_id"].clone()).ok();
+            if let (Some(trigger), Some(at), Some(task)) = (trigger, at, task) {
+                task_for.insert((trigger, at), task);
+            }
+        }
+        let (mut started, mut ended) = (HashSet::new(), HashSet::new());
+        for ev in events_since("queue.task.*", since)? {
+            let Ok(task) = serde_json::from_value::<TaskId>(ev.payload["task_id"].clone()) else { continue };
+            match ev.topic.as_str() {
+                "queue.task.started" => {
+                    started.insert(task);
+                }
+                "queue.task.finished" | "queue.task.failed" | "queue.task.cancelled" => {
+                    ended.insert(task);
+                }
+                _ => {}
+            }
+        }
+        let mut gone = Vec::new();
+        for (id, e) in st.iter_mut() {
+            if e.stored.unfinished.is_empty() {
+                continue;
+            }
+            let (mut settled, mut rerun, mut cut) = (Vec::new(), Vec::new(), None);
+            for at in e.stored.unfinished.clone() {
+                match task_for.get(&(id.clone(), at)) {
+                    Some(task) if ended.contains(task) => settled.push(at),
+                    Some(task) if started.contains(task) => {
+                        settled.push(at);
+                        cut = Some(Interrupted { task_id: *task, scheduled_for: at, noticed: now });
+                    }
+                    // Never queued, or queued and never started: it never ran.
+                    _ => rerun.push(at),
+                }
+            }
+            if let Some(cut) = &cut {
+                let mut next = e.stored.clone();
+                next.interrupted = Some(cut.clone());
+                if let Err(err) = self.write(&next, None) {
+                    tracing::error!(trigger = %id, error = %err, "could not record an interrupted firing");
+                } else {
+                    e.stored = next;
+                }
+                self.emit(
+                    "scheduler.trigger.interrupted",
+                    json!({"trigger_id": id, "op": e.stored.spec.op, "task_id": cut.task_id,
+                           "scheduled_for": cut.scheduled_for}),
+                );
+            }
+            if !settled.is_empty() && !self.forget(e, &settled) {
+                gone.push(id.clone());
+                continue;
+            }
+            let spec = e.stored.spec.clone();
+            let mut failed = Vec::new();
+            for at in rerun {
+                if !self.enqueue(e, &spec, at, now, true) {
+                    failed.push(at);
+                }
+            }
+            if !failed.is_empty() && !self.forget(e, &failed) {
+                gone.push(id.clone());
+            }
+        }
+        for id in gone {
+            st.remove(&id);
+        }
+        Ok(())
     }
 
     fn emit(&self, topic: &str, payload: Value) {
@@ -385,7 +595,13 @@ impl Scheduler {
             "scheduler.show" => self.get(&self.resolve(&trigger_id(params)?)?),
             "scheduler.add" => self.add(params),
             "scheduler.edit" => self.edit(params),
-            "scheduler.remove" => self.remove(&self.resolve(&trigger_id(params)?)?),
+            "scheduler.remove" => {
+                let written = trigger_id(params)?;
+                if self.broken().contains_key(&written) {
+                    return self.remove_broken(&written);
+                }
+                self.remove(&self.resolve(&written)?)
+            }
             "scheduler.disable" => self.set_enabled(&self.resolve(&trigger_id(params)?)?, false),
             "scheduler.enable" => self.set_enabled(&self.resolve(&trigger_id(params)?)?, true),
             "scheduler.restore" => self.restore(&trigger_id(params)?),
@@ -406,12 +622,15 @@ impl Scheduler {
         } else {
             serde_json::from_value(params).map_err(|e| Error::invalid_params(e.to_string()))?
         };
-        let triggers: Vec<Value> = if p.removed {
-            self.removed()?.iter().map(trigger_view).collect()
-        } else {
-            self.lock().values().map(|e| trigger_view(&e.stored)).collect()
-        };
-        Ok(json!({ "triggers": triggers }))
+        if p.removed {
+            let triggers: Vec<Value> = self.removed()?.iter().map(trigger_view).collect();
+            return Ok(json!({ "triggers": triggers }));
+        }
+        let triggers: Vec<Value> = self.lock().values().map(|e| trigger_view(&e.stored)).collect();
+        // Files that couldn't be read: here so a schedule never silently stops existing.
+        let broken: Vec<Value> =
+            self.broken().iter().map(|(id, (file, why))| json!({"id": id, "file": file, "problem": why})).collect();
+        Ok(json!({ "triggers": triggers, "broken": broken }))
     }
 
     /// Every removed trigger, by id. One that can't be read is skipped and logged, as `load` does.
@@ -459,6 +678,7 @@ impl Scheduler {
         let id = TriggerId::new(format!("usr-{}", ulid::Ulid::new().to_string().to_lowercase()));
         let spec = spec_from(params, id)?;
         self.check_target(&spec)?;
+        self.refuse_past_skip(&spec)?;
         let parsed = Parsed::parse(&spec.schedule, self.local_tz)?;
         let stored = Stored {
             next_due: parsed.first_due(self.clock.now()),
@@ -468,6 +688,8 @@ impl Scheduler {
             last_run: None,
             done: false,
             zone: parsed.is_local().then(|| self.local_tz.name().to_owned()),
+            unfinished: Vec::new(),
+            interrupted: None,
         };
         self.write(&stored, Some(("scheduler.trigger.added", added_payload(&stored))))?;
         let id = stored.spec.id.clone();
@@ -486,6 +708,7 @@ impl Scheduler {
         let id = self.resolve(&written)?;
         let spec = spec_from(params, TriggerId::new(id.as_str()))?;
         self.check_target(&spec)?;
+        self.refuse_past_skip(&spec)?;
         let parsed = Parsed::parse(&spec.schedule, self.local_tz)?;
         let mut st = self.lock();
         let e = st.get_mut(&id).ok_or_else(|| Error::not_found(format!("no trigger '{id}'")))?;
@@ -530,6 +753,18 @@ impl Scheduler {
         Ok(json!({"removed": true, "trigger_id": id}))
     }
 
+    /// A schedule file that can't be read is deleted, not moved aside: there's no schedule in it
+    /// to restore (#263 finding 5). Only by its full id, as `scheduler list` shows it.
+    fn remove_broken(&self, id: &str) -> Result<Value> {
+        let _st = self.lock();
+        self.store.transaction(|tx| {
+            tx.delete(&path(id))?;
+            tx.emit("scheduler.trigger.removed", json!({"trigger_id": id, "reason": "unreadable file removed"}))
+        })?;
+        self.broken().remove(id);
+        Ok(json!({"removed": true, "trigger_id": id}))
+    }
+
     /// Bring a removed trigger back as it was, paused or not (ADR 0038 §3). Like `resume`, it
     /// counts from now: a recurring trigger's next run is its next time after now, and time spent
     /// removed is never caught up. A `once` keeps its time; if that has passed, its own `catch_up`
@@ -549,6 +784,8 @@ impl Scheduler {
             stored.next_due = parsed.next_after(self.clock.now());
         }
         stored.zone = parsed.is_local().then(|| self.local_tz.name().to_owned());
+        // Firings from before it was removed aren't this schedule's any more: it counts from now.
+        stored.unfinished.clear();
         let json = serde_json::to_vec_pretty(&stored).map_err(|e| Error::internal(format!("encode trigger: {e}")))?;
         self.store.transaction(|tx| {
             tx.put(&path(&id), json)?;
@@ -660,6 +897,8 @@ impl ScheduleBackend for Scheduler {
             last_run: None,
             done: false,
             zone: None,
+            unfinished: Vec::new(),
+            interrupted: None,
         };
         // The cap is checked and the schedule added under one lock, so two calls at once can't
         // both pass it (#251's review).
@@ -696,7 +935,7 @@ fn trigger_view(s: &Stored) -> Value {
     json!({"id": s.spec.id, "source": s.source, "schedule": s.spec.schedule, "op": s.spec.op,
            "params": s.spec.params, "catch_up": s.spec.catch_up, "lane": s.spec.lane,
            "fallback": s.spec.fallback, "next_due": s.next_due, "last_run": s.last_run,
-           "enabled": !s.paused, "done": s.done})
+           "enabled": !s.paused, "done": s.done, "waiting": s.unfinished.len(), "interrupted": s.interrupted})
 }
 
 /// `scheduler.add`'s and `scheduler.edit`'s schedule, read the same way. `catch_up` has no

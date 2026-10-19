@@ -132,6 +132,7 @@ impl Daemon {
 
         // Subscribe before init so events a module emits while initialising are not missed.
         let receivers: Vec<_> = core.registry.entries.iter().map(|_| bus.subscribe()).collect();
+        let recovery_index = index.clone();
         tracker.spawn(indexer::run(index, store.clone(), bus.subscribe(), shutdown.clone()));
 
         for (entry, mut rx) in core.registry.entries.iter().zip(receivers) {
@@ -180,6 +181,14 @@ impl Daemon {
         ));
         scheduler.load()?;
         scheduler.register_module_triggers(declared)?;
+        // Firings a stop left unfinished: queued again if they never started (#263 finding 1).
+        // A failure here is logged, not fatal: the firings stay on disk for the next start.
+        let events = recovery_index.clone();
+        if let Err(e) = scheduler.recover(|pattern, since| {
+            events.lock().unwrap_or_else(|e| e.into_inner()).events_matching_since(pattern, since)
+        }) {
+            tracing::error!(error = %e, "couldn't check unfinished scheduled tasks; checked again next start");
+        }
         let _ = core.scheduler.set(scheduler.clone());
         tracker.spawn(scheduler.run(config.scheduler_tick, shutdown.clone()));
 
