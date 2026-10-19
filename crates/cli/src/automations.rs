@@ -29,7 +29,7 @@ commands:
                              rule is refused and the old one kept
   remove RULE                remove a rule (restore brings it back)
   restore REMOVED            bring a removed rule back
-  rename RULE NEW            give a rule a new id (not while a delayed action from it waits)
+  rename RULE NEW            give a rule a new id; its waiting delayed actions follow it
   copy RULE NEW [--label TEXT]
                              a new rule like RULE, switched off until you enable it
   purge [REMOVED] [--yes]    delete a removed rule for good, or every removed one (asks first)

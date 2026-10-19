@@ -221,16 +221,34 @@ async fn a_delayed_action_follows_its_rule_through_a_rename() {
 }
 
 /// A renamed.toml broken by hand is refused, never replaced: it's where a waiting action's rule went.
+/// A waiting action fails on it rather than being skipped (#287's review).
 #[tokio::test]
 async fn a_broken_renamed_file_is_refused_not_replaced() {
     let env = env();
     let m = started(&env).await;
     let ctx = &env.ctx;
     call(&m, ctx, "automations.new", json!({"id": "solved", "text": DONE})).await.unwrap();
+    m.on_event(
+        &event("records.item.completed", json!({"collection": "leetcode", "title": "Two Sum", "item": {}}), None),
+        ctx,
+    )
+    .await
+    .unwrap();
+    let (_, _, waiting) = env.schedules.added.lock().unwrap()[0].clone();
+    call(&m, ctx, "automations.rename", json!({"id": "solved", "to": "done"})).await.unwrap();
+
     env.ctx.store.write("renamed.toml", "[[renamed]\n").unwrap();
-    let e = call(&m, ctx, "automations.rename", json!({"id": "solved", "to": "done"})).await.unwrap_err();
+    call(&m, ctx, "automations.new", json!({"id": "other", "text": DONE})).await.unwrap();
+    let e = call(&m, ctx, "automations.rename", json!({"id": "other", "to": "again"})).await.unwrap_err();
     assert!(e.message.contains("renamed.toml doesn't parse"), "{}", e.message);
-    assert!(env.backend.read("automations", "rules/solved.toml").unwrap().is_some(), "nothing moved");
+    assert!(env.backend.read("automations", "rules/other.toml").unwrap().is_some(), "nothing moved");
+
+    // The waiting action fails, seen, rather than being skipped under its old id.
+    let before = env.queue.requests.lock().unwrap().len();
+    let e = m.handle(&waiting.op, waiting.params, ctx).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::Conflict);
+    assert!(e.message.contains("renamed.toml doesn't parse"), "{}", e.message);
+    assert_eq!(env.queue.requests.lock().unwrap().len(), before, "nothing queued");
 }
 
 /// ADR 0038: purge deletes removed rules for good, one or all, and always asks first.
