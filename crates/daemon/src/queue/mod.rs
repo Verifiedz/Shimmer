@@ -138,13 +138,16 @@ impl QueueInner {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn event(&self, topic: &str, payload: Value) -> Event {
-        Event::new(ModuleId::new(SOURCE), topic, payload, self.clock.now())
+    /// An event about task `about`, which is also its cause (ADR 0035 §3): a rule reacting to
+    /// `queue.task.finished` for a task automations queued continues that task's chain, so the
+    /// loop guard sees a rule set off by its own action (#251's review).
+    fn event(&self, about: TaskId, topic: &str, payload: Value) -> Event {
+        Event::new(ModuleId::new(SOURCE), topic, payload, self.clock.now()).caused_by(Some(about))
     }
 
     /// Durable + published. A failure to log is reported, never allowed to wedge a lane.
-    fn emit(&self, topic: &str, payload: Value) {
-        if let Err(e) = shimmer_core::EventSink::emit(&*self.backend, self.event(topic, payload)) {
+    fn emit(&self, about: TaskId, topic: &str, payload: Value) {
+        if let Err(e) = shimmer_core::EventSink::emit(&*self.backend, self.event(about, topic, payload)) {
             tracing::error!(topic, error = %e, "could not log queue event");
         }
     }
@@ -213,12 +216,14 @@ impl QueueInner {
             (id, position)
         };
         self.emit(
+            id,
             "queue.task.enqueued",
             json!({"task_id": id, "lane": lane, "op": task.op, "origin": task.origin, "position": position}),
         );
         if promotion.is_some() {
             // The audit trail for "why did my scheduled fetch run late" (protocol.md).
             self.emit(
+                id,
                 "queue.task.promoted",
                 json!({"task_id": id, "lane": lane, "op": task.op, "displaced": displaced}),
             );
@@ -251,7 +256,7 @@ impl QueueInner {
                 .collect()
         };
         for (task, token) in started {
-            self.emit("queue.task.started", json!({"task_id": task.id, "lane": task.lane, "op": task.op}));
+            self.emit(task.id, "queue.task.started", json!({"task_id": task.id, "lane": task.lane, "op": task.op}));
             let this = Arc::clone(self);
             self.tracker.spawn(async move { this.execute(task, token).await });
         }
@@ -280,6 +285,7 @@ impl QueueInner {
                 r.note = note.to_owned();
             }
             q.backend.publish_ephemeral(q.event(
+                id,
                 "queue.task.progress",
                 json!({"task_id": id, "lane": lane, "fraction": fraction, "note": note}),
             ));
@@ -319,7 +325,7 @@ impl QueueInner {
             }
             record_finished(&mut st, task.id, status, self.clock.now());
         }
-        self.emit(topic, payload);
+        self.emit(task.id, topic, payload);
         if let Some(request) = fallback {
             self.enqueue_fallback(&task, request);
         }
@@ -337,10 +343,12 @@ impl QueueInner {
         let op = request.op.clone();
         match self.submit(request, None) {
             Ok(h) => self.emit(
+                failed.id,
                 "queue.fallback.enqueued",
                 json!({"task_id": failed.id, "fallback_task_id": h.task_id, "op": op, "lane": h.lane}),
             ),
             Err(e) => self.emit(
+                failed.id,
                 "queue.fallback.failed",
                 json!({"task_id": failed.id, "op": op, "error": e.message, "code": e.code}),
             ),
@@ -361,6 +369,7 @@ impl QueueInner {
                 record_finished(&mut st, id, Status::Cancelled, self.clock.now());
                 drop(st);
                 self.emit(
+                    id,
                     "queue.task.cancelled",
                     json!({"task_id": id, "lane": task.lane, "op": task.op, "was": "queued"}),
                 );
@@ -406,6 +415,7 @@ impl QueueInner {
         // task before the task already directly after it).
         if new_version != queue_version {
             self.emit(
+                id,
                 "queue.task.reordered",
                 json!({"task_id": id, "lane": lane, "before": before, "queue_version": new_version}),
             );

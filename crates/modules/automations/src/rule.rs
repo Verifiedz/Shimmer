@@ -156,17 +156,18 @@ pub fn wait(s: &str) -> Result<Duration, String> {
     let bad = || format!("after: '{s}' isn't a wait: write a number and m, h, d or w (30m, 2h, 3d, 1w)");
     let unit = s.chars().last().ok_or_else(bad)?;
     let n: i64 = s[..s.len() - unit.len_utf8()].parse().map_err(|_| bad())?;
+    // `try_*`: a huge number is refused like any too-long wait, never a panic (#252's review).
     let d = match unit {
-        'm' => Duration::minutes(n),
-        'h' => Duration::hours(n),
-        'd' => Duration::days(n),
-        'w' => Duration::weeks(n),
+        'm' => Duration::try_minutes(n),
+        'h' => Duration::try_hours(n),
+        'd' => Duration::try_days(n),
+        'w' => Duration::try_weeks(n),
         _ => return Err(bad()),
     };
-    if n < 1 || d > Duration::days(MAX_AFTER_DAYS) {
-        return Err(format!("after: '{s}' must be between 1m and {MAX_AFTER_DAYS}d"));
+    match d {
+        Some(d) if n >= 1 && d <= Duration::days(MAX_AFTER_DAYS) => Ok(d),
+        _ => Err(format!("after: '{s}' must be between 1m and {MAX_AFTER_DAYS}d")),
     }
-    Ok(d)
 }
 
 /// `params` with `{field}`s filled from the event's `payload` (§1): a text that is exactly one
@@ -298,9 +299,10 @@ after = "3d"
         assert_eq!(wait("30m"), Ok(Duration::minutes(30)));
         assert_eq!(wait(" 2h "), Ok(Duration::hours(2)));
         assert_eq!(wait("1w"), Ok(Duration::weeks(1)));
-        for bad in ["", "d", "3", "0d", "-1d", "3 days", "3D"] {
+        for bad in ["", "d", "3", "0d", "-1d", "3 days", "3D", "367d", "99999999999999w", "9999999999999999m"] {
             assert!(wait(bad).is_err(), "{bad}");
         }
+        assert!(wait("99999999999999w").unwrap_err().contains("between 1m and"), "refused, not a panic");
     }
 
     #[test]
