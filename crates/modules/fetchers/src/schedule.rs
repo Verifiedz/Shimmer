@@ -147,10 +147,9 @@ pub struct SourceConfig {
     /// Every source starts disabled (ADR 0028 §5) -- the user opts in explicitly.
     pub enabled: bool,
     pub interval: IntervalSpec,
-    /// Absent: `id` must already be one of the fixed, compiled-in sources
-    /// (`crate::source::registry`). Present: built from this source's own `[kind]` table
-    /// instead (ADR 0028 §2a/§3), via `crate::kind::kind`.
-    pub kind: Option<String>,
+    /// Every source names a kind (ADR 0028 §10 -- no fixed, compiled-in registry): built from
+    /// this source's own `[kind]` table via `crate::kind::kind` (ADR 0028 §2a/§3).
+    pub kind: String,
     /// A `core::filter::Filter` (ADR 0028 §8), checked against `{"title": …}` only -- a source
     /// whose `raw_data` carries a longer description is not searched. `None` keeps everything.
     /// Kept as raw JSON, not a parsed `Filter` (which has no way back to JSON), so
@@ -183,8 +182,7 @@ struct SourceMeta {
     #[serde(default)]
     enabled: bool,
     interval: IntervalSpec,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    kind: Option<String>,
+    kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     filter: Option<toml::Table>,
 }
@@ -197,7 +195,7 @@ struct SourceMeta {
 /// decides whether that text is valid.
 pub(crate) fn render(
     label: Option<&str>,
-    kind: Option<&str>,
+    kind: &str,
     enabled: bool,
     interval: &IntervalSpec,
     params: &Map<String, Value>,
@@ -215,7 +213,7 @@ pub(crate) fn render(
             label: label.map(str::to_owned),
             enabled,
             interval: interval.clone(),
-            kind: kind.map(str::to_owned),
+            kind: kind.to_owned(),
             filter: filter_table,
         },
         kind: kind_table,
@@ -250,44 +248,18 @@ impl SourceConfig {
         }
         let kind_params =
             serde_json::to_value(&file.kind).ok().and_then(|v| v.as_object().cloned()).unwrap_or_default();
-        // Each `Method` gets its own floor (ADR 0028 §5/§7) -- a scraped page must not be
-        // pollable at an API source's much lower cadence (PR #126 review). `Kind::method` is
-        // static per kind, so this needs no built `Source` to ask.
-        let floor = match file.source.kind.as_deref() {
-            None => {
-                let Some(found) = crate::source::find(id) else {
-                    let registry = crate::source::registry();
-                    let known: Vec<&str> = registry.iter().map(|s| s.id()).collect();
-                    return Err(format!("unknown source id (known: {})", known.join(", ")));
-                };
-                // A fixed, compiled-in source has no `kind` and so no `Kind::parse` of its
-                // own to reject a stray key -- without this, a `[kind]` table on
-                // hn-whoishiring/weworkremotely loaded silently with every key ignored.
-                crate::kind::reject_unknown(&kind_params, &[])?;
-                match found.method() {
-                    crate::source::Method::Api => MIN_INTERVAL_API_S,
-                    crate::source::Method::Scrape => MIN_INTERVAL_SCRAPE_S,
-                }
-            }
-            Some(kind_name) => {
-                // A `kind` entry builds a brand-new instance rather than adjusting a fixed,
-                // compiled-in one -- so an id that already belongs to the fixed registry
-                // would either sit alongside it as a silent duplicate (`crate::source::known`)
-                // or shadow it outright (`crate::source::resolve` always prefers the `kind`
-                // branch). Neither is a real "configured and reconfigured" case to allow.
-                if crate::source::find(id).is_some() {
-                    return Err(format!(
-                        "kind \"{kind_name}\" collides with a fixed, compiled-in source of the same id"
-                    ));
-                }
-                let kind = crate::kind::kind(kind_name)
-                    .ok_or_else(|| format!("unknown kind \"{kind_name}\" (known: {})", crate::kind::known_names()))?;
-                kind.parse(&kind_params).map_err(|m| format!("kind \"{kind_name}\" {m}"))?;
-                match kind.method() {
-                    crate::source::Method::Api => MIN_INTERVAL_API_S,
-                    crate::source::Method::Scrape => MIN_INTERVAL_SCRAPE_S,
-                }
-            }
+        // Every source names a `kind` (ADR 0028 §10: no fixed, compiled-in registry any
+        // more -- `hn-whoishiring`/`wwr` are ordinary kinds too). Each `Method` gets its own
+        // floor (ADR 0028 §5/§7) -- a scraped page must not be pollable at an API source's
+        // much lower cadence (PR #126 review). `Kind::method` is static per kind, so this
+        // needs no built `Source` to ask.
+        let kind_name = &file.source.kind;
+        let kind = crate::kind::kind(kind_name)
+            .ok_or_else(|| format!("unknown kind \"{kind_name}\" (known: {})", crate::kind::known_names()))?;
+        kind.parse(&kind_params).map_err(|m| format!("kind \"{kind_name}\" {m}"))?;
+        let floor = match kind.method() {
+            crate::source::Method::Api => MIN_INTERVAL_API_S,
+            crate::source::Method::Scrape => MIN_INTERVAL_SCRAPE_S,
         };
         file.source.interval.resolve(floor).map_err(|e| format!("interval: {e}"))?;
         Ok(Self {
@@ -526,12 +498,19 @@ mod tests {
 
     #[test]
     fn a_scrape_source_below_its_own_higher_floor_is_rejected_even_at_an_interval_an_api_source_would_accept() {
-        let why = problem_for(json!({"enabled": true, "interval": 3600}), "weworkremotely");
+        let why = problem_for(
+            json!({"enabled": true, "interval": 3600, "kind": "wwr", "category": "remote-full-stack-programming-jobs"}),
+            "my-wwr",
+        );
         assert!(why.contains(&MIN_INTERVAL_SCRAPE_S.to_string()), "{why}");
 
         // The identical interval is fine for an API source -- the floor is per-`Method`, not
         // one uniform number.
-        SourceConfig::parse("hn-whoishiring", &source_file(&json!({"enabled": true, "interval": 3600}))).unwrap();
+        SourceConfig::parse(
+            "my-hn",
+            &source_file(&json!({"enabled": true, "interval": 3600, "kind": "hn-whoishiring"})),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -584,9 +563,9 @@ mod tests {
     #[test]
     fn a_filter_round_trips_through_a_file() {
         let cfg = SourceConfig::parse(
-            "hn-whoishiring",
+            "my-hn",
             &source_file(&json!({
-                "enabled": true, "interval": "daily",
+                "enabled": true, "interval": "daily", "kind": "hn-whoishiring",
                 "filter": {"or": [{"title": {"contains": "junior"}}, {"title": {"contains": "entry level"}}],
                            "title": {"not_contains": "senior"}},
             })),
@@ -602,27 +581,16 @@ mod tests {
         // used to load fine and then match nothing, forever -- the filter is checked against
         // `{"title": …}` only. Same for a key inside an "or" alternative.
         let why = problem_for(
-            json!({"enabled": true, "interval": "daily", "filter": {"company": {"contains": "Acme"}}}),
+            json!({"enabled": true, "interval": "daily", "kind": "hn-whoishiring", "filter": {"company": {"contains": "Acme"}}}),
             "hn-whoishiring",
         );
         assert!(why.contains("company"), "{why}");
 
         let why = problem_for(
-            json!({"enabled": true, "interval": "daily", "filter": {"or": [{"company": {"contains": "Acme"}}]}}),
+            json!({"enabled": true, "interval": "daily", "kind": "hn-whoishiring", "filter": {"or": [{"company": {"contains": "Acme"}}]}}),
             "hn-whoishiring",
         );
         assert!(why.contains("company"), "{why}");
-    }
-
-    #[test]
-    fn a_typo_d_field_on_a_fixed_source_is_rejected_not_silently_ignored() {
-        // #302's review: dropping the struct-level `deny_unknown_fields` (needed for
-        // `kind_params`'s `#[serde(flatten)]`) stopped catching a typo on a *fixed*,
-        // kind-less source -- `title_exclude` (missing the `s`) used to be refused by
-        // master and loaded silently here, with the filter just never applied.
-        let why =
-            problem_for(json!({"enabled": true, "interval": "daily", "title_exclude": ["intern"]}), "hn-whoishiring");
-        assert!(why.contains("title_exclude"), "{why}");
     }
 
     #[test]
@@ -661,7 +629,7 @@ mod tests {
 
     #[test]
     fn a_bad_interval_fails_at_load_time_not_on_the_first_tick() {
-        let why = problem_for(json!({"enabled": true, "interval": "fortnightly"}), "hn-whoishiring");
+        let why = problem_for(json!({"enabled": true, "interval": "fortnightly", "kind": "hn-whoishiring"}), "my-hn");
         assert!(why.contains("interval"), "{why}");
     }
 
@@ -676,9 +644,11 @@ mod tests {
     }
 
     #[test]
-    fn a_misspelled_source_id_fails_at_load_time_not_on_the_first_tick() {
-        let why = problem_for(json!({"enabled": true, "interval": "daily"}), "hn-whoishirign");
-        assert!(why.contains("hn-whoishiring"), "the reason should name the real ids: {why}");
+    fn a_source_with_no_kind_at_all_fails_at_load_time() {
+        // ADR 0028 §10 -- there is no fixed, compiled-in registry to fall back to; every
+        // source must name a kind, however it is spelled.
+        let why = problem_for(json!({"enabled": true, "interval": "daily"}), "my-hn");
+        assert!(why.contains("kind"), "{why}");
     }
 
     #[test]
@@ -690,7 +660,7 @@ mod tests {
             ),
         )
         .unwrap();
-        assert_eq!(cfg.kind.as_deref(), Some("rss"));
+        assert_eq!(cfg.kind, "rss");
     }
 
     #[test]
@@ -730,17 +700,6 @@ mod tests {
     }
 
     #[test]
-    fn a_kind_entry_whose_id_collides_with_a_fixed_source_fails_at_load_time() {
-        for id in ["hn-whoishiring", "weworkremotely"] {
-            let why = problem_for(
-                json!({"enabled": true, "interval": "hourly", "kind": "rss", "url": "https://example.test/feed.xml"}),
-                id,
-            );
-            assert!(why.contains("collides"), "id {id}: {why}");
-        }
-    }
-
-    #[test]
     fn an_unknown_kind_is_rejected() {
         let why = problem_for(json!({"enabled": true, "interval": "hourly", "kind": "carrier-pigeon"}), "my-team-blog");
         assert!(why.contains("carrier-pigeon"), "{why}");
@@ -757,7 +716,7 @@ mod tests {
             })),
         )
         .unwrap();
-        assert_eq!(cfg.kind.as_deref(), Some("json-api"));
+        assert_eq!(cfg.kind, "json-api");
     }
 
     #[test]
@@ -799,7 +758,7 @@ mod tests {
             &source_file(&raw(json!({"page_size": 50, "url": "https://example.test/jobs?offset={offset}"}))),
         )
         .unwrap();
-        assert_eq!(good.kind.as_deref(), Some("json-api"));
+        assert_eq!(good.kind, "json-api");
     }
 
     #[test]
@@ -847,7 +806,7 @@ mod tests {
             label: None,
             enabled,
             interval: IntervalSpec::Seconds(interval_s),
-            kind: None,
+            kind: "rss".into(),
             filter: None,
             kind_params: Map::new(),
         }
@@ -901,9 +860,9 @@ mod tests {
             title.insert(op.to_owned(), json!(""));
             let mut filter = Map::new();
             filter.insert("title".to_owned(), Value::Object(title));
-            let mut fields = json!({"enabled": true, "interval": "daily"});
+            let mut fields = json!({"enabled": true, "interval": "daily", "kind": "hn-whoishiring"});
             fields.as_object_mut().unwrap().insert("filter".to_owned(), Value::Object(filter));
-            let why = problem_for(fields, "hn-whoishiring");
+            let why = problem_for(fields, "my-hn");
             assert!(why.contains(op), "{op}: {why}");
         }
     }
@@ -963,7 +922,7 @@ mod tests {
         let filter = json!({"title": {"contains": "junior", "not_contains": "staff"}}).as_object().unwrap().clone();
         let text = render(
             Some("My Team's Blog"),
-            Some("rss"),
+            "rss",
             true,
             &IntervalSpec::Preset("hourly".into()),
             &json!({"url": "https://example.test/feed.xml"}).as_object().unwrap().clone(),
@@ -972,7 +931,7 @@ mod tests {
         .unwrap();
         let cfg = SourceConfig::parse("my-team-blog", &text).unwrap();
         assert_eq!(cfg.label.as_deref(), Some("My Team's Blog"));
-        assert_eq!(cfg.kind.as_deref(), Some("rss"));
+        assert_eq!(cfg.kind, "rss");
         assert!(cfg.enabled);
         assert_eq!(cfg.interval, IntervalSpec::Preset("hourly".into()));
         assert_eq!(cfg.kind_params.get("url").and_then(Value::as_str), Some("https://example.test/feed.xml"));
@@ -980,11 +939,14 @@ mod tests {
     }
 
     #[test]
-    fn render_omits_label_and_kind_entirely_when_absent_so_a_built_in_source_still_parses() {
-        let text = render(None, None, false, &IntervalSpec::Seconds(MIN_INTERVAL_API_S), &Map::new(), None).unwrap();
-        let cfg = SourceConfig::parse("hn-whoishiring", &text).unwrap();
+    fn render_omits_label_and_filter_entirely_when_absent_but_kind_is_always_written() {
+        // ADR 0028 §10: no fixed, compiled-in registry any more -- `hn-whoishiring` is an
+        // ordinary kind, with no fields of its own.
+        let text = render(None, "hn-whoishiring", false, &IntervalSpec::Seconds(MIN_INTERVAL_API_S), &Map::new(), None)
+            .unwrap();
+        let cfg = SourceConfig::parse("my-hn", &text).unwrap();
         assert_eq!(cfg.label, None);
-        assert_eq!(cfg.kind, None);
+        assert_eq!(cfg.kind, "hn-whoishiring");
         assert_eq!(cfg.filter, None);
     }
 }

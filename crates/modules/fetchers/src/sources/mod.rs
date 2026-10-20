@@ -1,7 +1,6 @@
-//! One file per `Source`. `hn` and `wwr` are the fixed, compiled-in sources (ADR 0028 §10),
-//! registered in [`crate::source::registry`]. `rss` and `json_api` are *kinds* (ADR 0028
-//! §2a/§15) -- never in `registry`, built on demand per configured instance by
-//! [`crate::source::resolve`].
+//! One file per `Source`. All four are *kinds* (ADR 0028 §2a/§3/§10/§15), registered in
+//! [`crate::kind::kinds`] and built on demand per configured instance by
+//! [`crate::source::resolve`] -- there is no fixed, compiled-in registry any more.
 
 pub mod hn;
 pub mod json_api;
