@@ -30,5 +30,6 @@ pub mod robots;
 mod schedule;
 pub mod source;
 mod sources;
+mod template;
 
 pub use module::Fetchers;

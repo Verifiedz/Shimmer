@@ -41,6 +41,8 @@ pub const ENABLE_OP: &str = "fetchers.enable";
 pub const DISABLE_OP: &str = "fetchers.disable";
 pub const RENAME_OP: &str = "fetchers.rename";
 pub const COPY_OP: &str = "fetchers.copy";
+pub const TEMPLATES_OP: &str = "fetchers.templates";
+pub const PEEK_OP: &str = "fetchers.peek";
 
 /// Caps `fetchers.item.found`'s `raw_data` (ADR 0028 §3) -- big enough for a job posting's
 /// text, small enough that one large item can't become the next cache-bloat problem.
@@ -187,8 +189,20 @@ impl Module for Fetchers {
             },
             CommandSpec {
                 op: NEW_OP.into(),
-                summary: "Make a new source".into(),
-                params_schema: source_input_schema(),
+                summary: "Make a new source, from its own kind/interval or from a template's answers".into(),
+                params_schema: new_input_schema(),
+                execution: Execution::Inline,
+            },
+            CommandSpec {
+                op: TEMPLATES_OP.into(),
+                summary: "Ready-made sources to make from a few answers, by category".into(),
+                params_schema: json!({"type": "object", "properties": {}}),
+                execution: Execution::Inline,
+            },
+            CommandSpec {
+                op: PEEK_OP.into(),
+                summary: "Everything about one template: what it does, what to know, its questions".into(),
+                params_schema: json!({"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}}),
                 execution: Execution::Inline,
             },
             CommandSpec {
@@ -286,8 +300,13 @@ impl Module for Fetchers {
                 Ok(json!({"sources": st.sources.len(), "problems": problems_of(&st)}))
             }
             NEW_OP => {
-                let p: SourceInput = decode(params)?;
+                let p: NewParams = decode(params)?;
                 self.create(ctx, p)
+            }
+            TEMPLATES_OP => templates_reply(None),
+            PEEK_OP => {
+                let p: Id = decode(params)?;
+                templates_reply(Some(&p.id))
             }
             EDIT_OP => {
                 let p: EditInput = decode(params)?;
@@ -373,9 +392,44 @@ struct SourceInput {
     filter: Option<Map<String, Value>>,
 }
 
-fn source_input_schema() -> Value {
+/// `fetchers.edit`'s params (ADR 0028 §9, amended by #305's review): the whole replacement
+/// file text, same shape as `automations.edit`'s -- not a `SourceInput`, so nothing not
+/// explicitly retyped is silently reset.
+#[derive(Deserialize)]
+struct EditInput {
+    id: String,
+    text: String,
+}
+
+/// `fetchers.new`'s own params (ADR 0028 §9/§10): the same shape as [`SourceInput`] above, or
+/// `{"id","template","values","preview"?}` -- the two are mutually exclusive, which
+/// `Fetchers::create` is what actually enforces. `kind`/`interval` are `Option` here, unlike
+/// `SourceInput`, precisely so a template-only payload (naming neither) still decodes.
+#[derive(Deserialize)]
+struct NewParams {
+    id: String,
+    #[serde(default)]
+    label: Option<String>,
+    kind: Option<String>,
+    #[serde(default)]
+    enabled: bool,
+    interval: Option<schedule::IntervalSpec>,
+    #[serde(default)]
+    params: Map<String, Value>,
+    #[serde(default)]
+    filter: Option<Map<String, Value>>,
+    /// The template path (ADR 0028 §10): mutually exclusive with `kind`/`interval`/`params`.
+    template: Option<String>,
+    #[serde(default)]
+    values: Map<String, Value>,
+    /// With a template: the source it would make, without making it.
+    #[serde(default)]
+    preview: bool,
+}
+
+fn new_input_schema() -> Value {
     json!({
-        "type": "object", "required": ["id", "kind", "interval"],
+        "type": "object", "required": ["id"],
         "properties": {
             "id": {"type": "string"},
             "label": {"type": "string"},
@@ -384,17 +438,32 @@ fn source_input_schema() -> Value {
             "interval": {},
             "params": {"type": "object"},
             "filter": {"type": "object"},
+            "template": {"type": "string"},
+            "values": {"type": "object"},
+            "preview": {"type": "boolean"},
         },
     })
 }
 
-/// `fetchers.edit`'s params (ADR 0028 §9, amended by #305's review): the whole replacement
-/// file text, same shape as `automations.edit`'s -- not a `SourceInput`, so nothing not
-/// explicitly retyped is silently reset.
-#[derive(Deserialize)]
-struct EditInput {
-    id: String,
-    text: String,
+/// `fetchers.templates`/`.peek` (ADR 0028 §10): every built-in template, or (with `id`) one of
+/// them -- `not_found` naming the others when there's no such template. One function for both
+/// ops, the same way `automations::templates` handles its own optional id.
+fn templates_reply(id: Option<&str>) -> Result<Value> {
+    let all = crate::template::builtin();
+    let templates: Vec<Value> = match id {
+        None => all.iter().map(crate::template::Template::to_wire).collect(),
+        Some(id) => {
+            let names: Vec<&str> = all.iter().map(|t| t.id.as_str()).collect();
+            vec![all
+                .iter()
+                .find(|t| t.id == id)
+                .ok_or_else(|| Error::not_found(format!("no template '{id}' (there are: {})", names.join(", "))))?
+                .to_wire()]
+        }
+    };
+    let categories: Vec<Value> =
+        crate::template::CATEGORIES.iter().map(|(id, label)| json!({"id": id, "label": label})).collect();
+    Ok(json!({"categories": categories, "templates": templates}))
 }
 
 #[derive(Deserialize)]
@@ -757,16 +826,77 @@ impl Fetchers {
 /// the two modules store one definition per named thing the same way, so the same shape of
 /// code handles it (CLAUDE.md §8).
 impl Fetchers {
-    /// A new source (ADR 0028 §9): validated the same way a hand-edited file is, through
-    /// `schedule::render` then `SourceConfig::parse` -- one validation path for both a
-    /// structured command and `fetchers.reload`. Unlike `automations.new`, there is no
-    /// starter/template path yet (ADR 0028 §10 is a later step).
-    fn create(&self, ctx: &Ctx, p: SourceInput) -> Result<Value> {
-        let _g = self.write.lock();
-        if ctx.store.read(&schedule::path(&p.id))?.is_some() {
-            return Err(Error::conflict(format!("source '{}' already exists", p.id)));
+    /// A new source (ADR 0028 §9/§10): either its own kind/interval, validated the same way a
+    /// hand-edited file is (through `schedule::render` then `SourceConfig::parse` -- one
+    /// validation path for both a structured command and `fetchers.reload`), or a template's
+    /// answers (§10), mirroring `automations.new`'s own dual shape almost verbatim.
+    fn create(&self, ctx: &Ctx, p: NewParams) -> Result<Value> {
+        if let Some(template) = &p.template {
+            if p.kind.is_some()
+                || p.interval.is_some()
+                || p.label.is_some()
+                || !p.params.is_empty()
+                || p.filter.is_some()
+            {
+                return Err(Error::invalid_params("a source comes from a template or from its own kind, not both"));
+            }
+            return self.create_from_template(ctx, &p.id, template, &p.values, p.preview);
         }
-        self.write_source(ctx, p, false, "fetchers.source.created")
+        if p.preview || !p.values.is_empty() {
+            return Err(Error::invalid_params("values and preview go with a template"));
+        }
+        let kind = p.kind.ok_or_else(|| Error::invalid_params("needs a kind (or a template)"))?;
+        let interval = p.interval.ok_or_else(|| Error::invalid_params("needs an interval (or a template)"))?;
+        let input = SourceInput {
+            id: p.id,
+            label: p.label,
+            kind,
+            enabled: p.enabled,
+            interval,
+            params: p.params,
+            filter: p.filter,
+        };
+        let _g = self.write.lock();
+        if ctx.store.read(&schedule::path(&input.id))?.is_some() {
+            return Err(Error::conflict(format!("source '{}' already exists", input.id)));
+        }
+        self.write_source(ctx, input, false, "fetchers.source.created")
+    }
+
+    /// The source `template` makes with these answers (§10), checked like any source; with
+    /// `preview`, only shown, never written.
+    fn create_from_template(
+        &self,
+        ctx: &Ctx,
+        id: &str,
+        template: &str,
+        values: &Map<String, Value>,
+        preview: bool,
+    ) -> Result<Value> {
+        let t = crate::template::builtin()
+            .into_iter()
+            .find(|t| t.id == template)
+            .ok_or_else(|| Error::not_found(format!("no template '{template}' (shimmer fetchers templates)")))?;
+        let answers = t.answers(values).map_err(Error::invalid_params)?;
+        let text = t.fill(&answers);
+        let cfg = schedule::SourceConfig::parse(id, &text).map_err(|m| Error::invalid_params(format!("{id}: {m}")))?;
+        if preview {
+            return Ok(json!({"preview": true, "template": template, "source": {"id": id, "text": text}}));
+        }
+        let _g = self.write.lock();
+        if ctx.store.read(&schedule::path(id))?.is_some() {
+            return Err(Error::conflict(format!("source '{id}' already exists")));
+        }
+        ctx.store.transaction(|tx| {
+            tx.put(&schedule::path(id), text.as_str())?;
+            tx.emit("fetchers.source.created", json!({"source": id, "template": template}))
+        })?;
+        let mut st = self.state();
+        st.problems.remove(id);
+        st.sources.insert(id.to_owned(), cfg.clone());
+        drop(st);
+        self.reconcile_schedule(ctx, id, false, &cfg)?;
+        Ok(json!({"template": template, "source": view(id, &cfg)}))
     }
 
     /// Replace a source's file text wholesale, after checking it (same rule `automations.edit`
@@ -1840,7 +1970,7 @@ mod tests {
         let fetchers = Fetchers::default();
         let mut input = rss_input("blog", "https://example.test/f.xml");
         input.interval = schedule::IntervalSpec::Seconds(3600);
-        fetchers.create(&env.ctx, input).unwrap();
+        fetchers.create(&env.ctx, as_new_params(input)).unwrap();
         let first = pending_schedule(&env, "blog").expect("create schedules the first run");
 
         // Time passes before the (eventually cancelled) run fires. `blog` never actually
@@ -1938,11 +2068,29 @@ mod tests {
         }
     }
 
+    /// `fetchers.new`'s structured shape, as [`SourceInput`] -- `Fetchers::create` itself
+    /// takes [`NewParams`] (ADR 0028 §10's dual shape), so every test below that built a
+    /// `SourceInput` before that split now converts through this.
+    fn as_new_params(i: SourceInput) -> NewParams {
+        NewParams {
+            id: i.id,
+            label: i.label,
+            kind: Some(i.kind),
+            enabled: i.enabled,
+            interval: Some(i.interval),
+            params: i.params,
+            filter: i.filter,
+            template: None,
+            values: Map::new(),
+            preview: false,
+        }
+    }
+
     #[test]
     fn create_makes_a_new_source_and_refuses_a_duplicate_id() {
         let env = TestEnv::new("fetchers");
         let fetchers = Fetchers::default();
-        let v = fetchers.create(&env.ctx, rss_input("blog", "https://example.test/f.xml")).unwrap();
+        let v = fetchers.create(&env.ctx, as_new_params(rss_input("blog", "https://example.test/f.xml"))).unwrap();
         assert_eq!(v["id"], "blog");
         assert_eq!(v["kind"], "rss");
         assert!(fetchers.state().sources.contains_key("blog"));
@@ -1950,7 +2098,8 @@ mod tests {
         let cfg = schedule::SourceConfig::parse("blog", &saved).unwrap();
         assert_eq!(cfg.kind_params.get("url").and_then(Value::as_str), Some("https://example.test/f.xml"));
 
-        let err = fetchers.create(&env.ctx, rss_input("blog", "https://example.test/f.xml")).unwrap_err();
+        let err =
+            fetchers.create(&env.ctx, as_new_params(rss_input("blog", "https://example.test/f.xml"))).unwrap_err();
         assert_eq!(err.code, shimmer_core::ErrorCode::Conflict);
     }
 
@@ -1960,9 +2109,91 @@ mod tests {
         let fetchers = Fetchers::default();
         let mut bad = rss_input("blog", "https://example.test/f.xml");
         bad.params = Map::new(); // rss needs a url
-        let err = fetchers.create(&env.ctx, bad).unwrap_err();
+        let err = fetchers.create(&env.ctx, as_new_params(bad)).unwrap_err();
         assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams);
         assert!(env.ctx.store.read(&schedule::path("blog")).unwrap().is_none());
+    }
+
+    #[test]
+    fn templates_lists_every_built_in_and_peek_finds_one_by_id_or_reports_the_others() {
+        let all = templates_reply(None).unwrap();
+        let ids: Vec<&str> = all["templates"].as_array().unwrap().iter().map(|t| t["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["hn-whoishiring", "wwr", "greenhouse", "lever", "rss"]);
+        assert!(!all["categories"].as_array().unwrap().is_empty());
+
+        let one = templates_reply(Some("rss")).unwrap();
+        assert_eq!(one["templates"].as_array().unwrap().len(), 1);
+        assert_eq!(one["templates"][0]["id"], "rss");
+
+        let err = templates_reply(Some("nope")).unwrap_err();
+        assert_eq!(err.code, shimmer_core::ErrorCode::NotFound);
+        assert!(err.message.contains("rss"), "{}", err.message);
+    }
+
+    #[test]
+    fn create_from_a_template_previews_without_writing_then_makes_the_real_source() {
+        let env = TestEnv::new("fetchers");
+        let fetchers = Fetchers::default();
+        let values = json!({"URL": "https://example.test/feed.xml"}).as_object().unwrap().clone();
+        let params = NewParams {
+            id: "my-feed".into(),
+            label: None,
+            kind: None,
+            enabled: false,
+            interval: None,
+            params: Map::new(),
+            filter: None,
+            template: Some("rss".into()),
+            values: values.clone(),
+            preview: true,
+        };
+        let preview = fetchers.create(&env.ctx, params).unwrap();
+        assert_eq!(preview["preview"], true);
+        assert!(env.ctx.store.read(&schedule::path("my-feed")).unwrap().is_none(), "a preview writes nothing");
+
+        let made = fetchers
+            .create(
+                &env.ctx,
+                NewParams {
+                    id: "my-feed".into(),
+                    label: None,
+                    kind: None,
+                    enabled: false,
+                    interval: None,
+                    params: Map::new(),
+                    filter: None,
+                    template: Some("rss".into()),
+                    values,
+                    preview: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(made["source"]["id"], "my-feed");
+        assert_eq!(made["source"]["kind"], "rss");
+        assert!(env.ctx.store.read(&schedule::path("my-feed")).unwrap().is_some());
+
+        // Mixing a template with the structured shape, or sending a template's own
+        // values/preview without one, are both refused (ADR 0028 §10's dual shape, same
+        // posture `automations.new` already takes).
+        let mixed = NewParams {
+            id: "x".into(),
+            label: None,
+            kind: Some("rss".into()),
+            enabled: false,
+            interval: None,
+            params: Map::new(),
+            filter: None,
+            template: Some("rss".into()),
+            values: Map::new(),
+            preview: false,
+        };
+        assert!(fetchers.create(&env.ctx, mixed).unwrap_err().message.contains("not both"));
+        let stray_values = NewParams {
+            template: None,
+            values: json!({"URL": "x"}).as_object().unwrap().clone(),
+            ..as_new_params(rss_input("y", "https://e.test/f"))
+        };
+        assert!(fetchers.create(&env.ctx, stray_values).unwrap_err().message.contains("go with a template"));
     }
 
     #[test]
@@ -2282,13 +2513,13 @@ mod tests {
         let fetchers = Fetchers::default();
         let mut enabled = rss_input("blog", "https://example.test/f.xml");
         enabled.interval = schedule::IntervalSpec::Seconds(3600);
-        fetchers.create(&env.ctx, enabled).unwrap();
+        fetchers.create(&env.ctx, as_new_params(enabled)).unwrap();
         let state = pending_schedule(&env, "blog").expect("an enabled source schedules its first run");
         assert_eq!(state.due_at, env.ctx.clock.now() + chrono::Duration::seconds(3600));
 
         let mut disabled = rss_input("quiet-blog", "https://example.test/g.xml");
         disabled.enabled = false;
-        fetchers.create(&env.ctx, disabled).unwrap();
+        fetchers.create(&env.ctx, as_new_params(disabled)).unwrap();
         assert!(pending_schedule(&env, "quiet-blog").is_none());
     }
 
@@ -2317,7 +2548,7 @@ mod tests {
         let fetchers = Fetchers::default();
         let mut input = rss_input("blog", "https://example.test/f.xml");
         input.interval = schedule::IntervalSpec::Seconds(3600);
-        fetchers.create(&env.ctx, input).unwrap();
+        fetchers.create(&env.ctx, as_new_params(input)).unwrap();
         let first = pending_schedule(&env, "blog").unwrap();
         let first_trigger_count = env.schedules.added.lock().unwrap().len();
 
@@ -2347,7 +2578,7 @@ mod tests {
         let fetchers = Fetchers::default();
         let mut input = rss_input("blog", "https://example.test/f.xml");
         input.interval = schedule::IntervalSpec::Seconds(3600);
-        fetchers.create(&env.ctx, input).unwrap();
+        fetchers.create(&env.ctx, as_new_params(input)).unwrap();
         assert!(pending_schedule(&env, "blog").is_some());
 
         fetchers.remove(&env.ctx, "blog").unwrap();
@@ -2363,7 +2594,7 @@ mod tests {
         let fetchers = Fetchers::default();
         let mut input = rss_input("blog", "https://example.test/f.xml");
         input.interval = schedule::IntervalSpec::Seconds(3600);
-        fetchers.create(&env.ctx, input).unwrap();
+        fetchers.create(&env.ctx, as_new_params(input)).unwrap();
         let before = pending_schedule(&env, "blog").unwrap();
 
         fetchers.rename(&env.ctx, MoveParams { id: "blog".into(), to: "team-blog".into() }).unwrap();

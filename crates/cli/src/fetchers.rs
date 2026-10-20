@@ -18,8 +18,14 @@ commands:
   list [--removed]      every known source and its configured state; --removed: the ones you
                         removed, to restore or purge
   show SOURCE           one source in full, with its file text
-  new SOURCE --interval SPEC [--kind KIND] [--label TEXT] [--enabled] [--set KEY=VALUE]…
+  new SOURCE --kind KIND --interval SPEC [--label TEXT] [--enabled] [--set KEY=VALUE]…
                         [--filter JSON]    make a new source
+  new SOURCE --from TEMPLATE [--set QUESTION=ANSWER]… [--yes]
+                        a source from a template: asks its questions (or takes --set), shows
+                        it, and makes it once you say yes (--yes: without asking)
+  templates [CATEGORY]  ready-made sources to start from, by category
+  peek TEMPLATE         everything about a template before you use it: what it makes, what
+                        to know, its questions
   edit SOURCE [--file FILE]   replace a source's whole file text; interactively, opens $EDITOR
                         on a copy of the current file; a broken edit is refused and the old
                         one kept
@@ -52,15 +58,16 @@ A source is a file in your data folder, data/fetchers/sources/SOURCE.toml:
   [source]
   enabled = true
   interval = \"daily\"             # a preset (hourly, daily, weekly) or a number of seconds
-  kind = \"rss\"                   # absent: SOURCE must be one of the built-in ones
+  kind = \"rss\"
   filter = { title = { contains = \"senior\" } }
   [kind]
   url = \"https://example.test/feed.xml\"
 
-new's --set KEY=VALUE fills in [kind]'s own fields (e.g. --set url=https://example.test/feed.xml);
---kind omitted means SOURCE must already be one of the built-in ones. --interval takes a preset
-(hourly, daily, weekly) or a number of seconds; --set's value is read as JSON when it parses as
-a number or true/false, otherwise as plain text.
+new's --set KEY=VALUE fills in [kind]'s own fields (e.g. --set url=https://example.test/feed.xml).
+--interval takes a preset (hourly, daily, weekly) or a number of seconds; --set's value is read
+as JSON when it parses as a number or true/false, otherwise as plain text. A fresh install has
+no sources at all -- start from a template (see 'shimmer fetchers templates') or write --kind/
+--interval/--set yourself.
 
 Add --json to any command for raw output.";
 
@@ -96,6 +103,19 @@ pub enum FetchersCmd {
     /// `fetchers.new`'s structured params (ADR 0028 §9): there's no existing file to lose
     /// anything from, so flags are fine.
     New(SourceInput),
+    /// `new SOURCE --from TEMPLATE [--set Q=A]… [--yes]` (ADR 0028 §10).
+    FromTemplate {
+        id: String,
+        template: String,
+        set: Vec<(String, String)>,
+        yes: bool,
+    },
+    Templates {
+        which: Option<String>,
+    },
+    Peek {
+        template: String,
+    },
     /// A whole-file replace (ADR 0028 §9, amended by #305's review): `--file FILE`, or
     /// (interactively) `$EDITOR` on a copy of the source's current text -- same shape as
     /// `automations edit`/`workspaces edit`, not `new`'s flags, so nothing you don't retype
@@ -188,6 +208,9 @@ fn title_matches(title: &str, contains: &[String], excludes: &[String]) -> bool 
 
 /// `words` are what follows `shimmer fetchers`.
 pub fn parse(words: Vec<String>) -> std::result::Result<FetchersCmd, String> {
+    if words.first().is_some_and(|w| w == "new") && words.iter().any(|w| w == "--from" || w.starts_with("--from=")) {
+        return parse_from_template(words.into_iter().skip(1));
+    }
     let mut words = words.into_iter();
     let Some(sub) = words.next() else { return Ok(FetchersCmd::List { removed: false }) };
     let rest: Vec<String> = words.collect();
@@ -202,6 +225,15 @@ pub fn parse(words: Vec<String>) -> std::result::Result<FetchersCmd, String> {
             };
             Ok(FetchersCmd::Edit { id, file: flags.value("--file").map(std::path::PathBuf::from) })
         }
+        "templates" => match rest.as_slice() {
+            [] => Ok(FetchersCmd::Templates { which: None }),
+            [which] => Ok(FetchersCmd::Templates { which: Some(which.clone()) }),
+            _ => Err("usage: shimmer fetchers templates [CATEGORY]".into()),
+        },
+        "peek" => match rest.as_slice() {
+            [template] => Ok(FetchersCmd::Peek { template: template.clone() }),
+            _ => Err("usage: shimmer fetchers peek TEMPLATE".into()),
+        },
         "list" | "show" | "remove" | "restore" | "purge" | "enable" | "disable" | "rename" | "copy" => {
             parse_source_command(&sub, rest)
         }
@@ -299,6 +331,29 @@ fn set_value(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| json!(raw))
 }
 
+/// `new SOURCE --from TEMPLATE [--set QUESTION=ANSWER]… [--yes]` (ADR 0028 §10) -- detected by
+/// `parse` before `new`'s structured shape ([`parse_source_input`]) ever sees it, the same way
+/// `automations new RULE --from TEMPLATE` is detected.
+fn parse_from_template(words: impl Iterator<Item = String>) -> std::result::Result<FetchersCmd, String> {
+    let usage = "usage: shimmer fetchers new SOURCE --from TEMPLATE [--set QUESTION=ANSWER]… [--yes]";
+    let (mut id, mut template, mut set, mut yes) = (None, None, Vec::new(), false);
+    let mut words = words.into_iter();
+    while let Some(word) = words.next() {
+        match word.as_str() {
+            "--from" => template = Some(words.next().ok_or("--from needs a TEMPLATE")?),
+            "--set" => set.push(crate::workspaces::set_answer(&words.next().ok_or("--set needs QUESTION=ANSWER")?)?),
+            "--yes" => yes = true,
+            w if w.starts_with("--from=") => template = w.strip_prefix("--from=").map(String::from),
+            w if w.starts_with("--set=") => set.push(crate::workspaces::set_answer(&w["--set=".len()..])?),
+            w if !w.starts_with('-') && id.is_none() => id = Some(w.to_owned()),
+            other => return Err(format!("'fetchers new' takes --from, --set and --yes, not '{other}'")),
+        }
+    }
+    let id = id.ok_or(usage)?;
+    let template = template.ok_or("fetchers new needs --from TEMPLATE; see 'shimmer fetchers templates'")?;
+    Ok(FetchersCmd::FromTemplate { id, template, set, yes })
+}
+
 /// `new SOURCE --interval SPEC [--kind KIND] [--label TEXT] [--enabled] [--set KEY=VALUE]…
 /// [--filter JSON]`.
 fn parse_source_input(words: Vec<String>) -> std::result::Result<FetchersCmd, String> {
@@ -377,6 +432,25 @@ pub async fn run(client: &mut Client, cmd: &FetchersCmd, json_out: bool, prompt:
                 true => format!("✓ saved source {id}"),
                 false => format!("no changes to {id}"),
             })
+        }
+        FetchersCmd::Templates { which } => {
+            let data = client.call("fetchers.templates", json!({})).await?;
+            let text = render::templates_by_category(
+                &data,
+                which.as_deref(),
+                "fetchers",
+                ("make a source from it:", "shimmer fetchers new SOURCE --from TEMPLATE"),
+                in_full,
+            )?;
+            Ok(if json_out { render::json(&render::templates_selected(&data, which.as_deref())) } else { text })
+        }
+        FetchersCmd::Peek { template } => {
+            let data = client.call("fetchers.peek", json!({"id": template})).await?;
+            let t = render::template_named(&data, template, "fetchers")?;
+            Ok(if json_out { render::json(t) } else { in_full(t, render::categories(&data)) })
+        }
+        FetchersCmd::FromTemplate { id, template, set, yes } => {
+            from_template_run(client, id, template, set, *yes, json_out, prompt).await
         }
         FetchersCmd::Remove { id } => {
             let data = client.call("fetchers.remove", one(id)).await?;
@@ -613,12 +687,138 @@ fn interval_value(s: &str) -> Value {
     }
 }
 
+/// Ask the template's questions, show the source it would make, and make it once agreed
+/// (ADR 0028 §10, ADR 0025 §6a): nothing is written before the person has seen it, unless
+/// they said --yes.
+async fn from_template_run(
+    client: &mut Client,
+    id: &str,
+    template: &str,
+    set: &[(String, String)],
+    yes: bool,
+    json_out: bool,
+    prompt: &mut impl Prompt,
+) -> Result<String> {
+    let data = client.call("fetchers.peek", json!({"id": template})).await?;
+    let t = render::template_named(&data, template, "fetchers")?.clone();
+    if prompt.interactive() && set.is_empty() {
+        eprintln!("{} — {}", paint(Role::Heading, &full(&t["label"])), full(&t["description"]));
+    }
+    let values = crate::workspaces::answers(&t["questions"], set, prompt, &crate::workspaces::Paths::from_env())?;
+    let mut params = json!({"id": id, "template": template, "values": values, "preview": true});
+    let shown =
+        client.call("fetchers.new", params.clone()).await.map_err(|e| crate::workspaces::how_to_answer(e, prompt))?;
+    let text = shown["source"]["text"].as_str().unwrap_or_default().to_owned();
+    // Nobody to ask (a script) and no --yes: refuse, never write a source unseen (ADR 0025
+    // §6a, same posture `automations new --from` already takes).
+    if !yes && !prompt.interactive() {
+        return Err(Error::invalid_params("refusing to make a source without confirmation; pass --yes"));
+    }
+    if !yes {
+        eprintln!(
+            "
+── {id} ──
+{}",
+            text.trim_end()
+        );
+        if !prompt.confirm(
+            "
+Make this source? It's switched off until you enable it.",
+        ) {
+            return Ok("nothing made".into());
+        }
+    }
+    params["preview"] = json!(false);
+    let made = client.call("fetchers.new", params).await?;
+    if json_out {
+        return Ok(render::json(&made));
+    }
+    Ok(format!("✓ made {id} from {template}, switched off\n  turn it on when it's ready: shimmer fetchers enable {id}"))
+}
+
+/// One template as `peek` shows it: what it makes, what to know, its questions, its source.
+fn in_full(t: &Value, categories: &[Value]) -> String {
+    let category = categories.iter().find(|c| c["id"] == t["category"]);
+    let mut out = format!(
+        "{}  {}
+{}
+",
+        paint(Role::Name, &full(&t["id"])),
+        full(&t["label"]),
+        full(&t["description"])
+    );
+    if let Some(c) = category {
+        out.push_str(&format!(
+            "category: {} ({})
+",
+            full(&c["label"]),
+            full(&c["id"])
+        ));
+    }
+    out.push_str(&format!(
+        "writes: kind {}
+",
+        render::cell(&t["kind"])
+    ));
+    out.push_str(&format!(
+        "
+{}
+",
+        paint(Role::Heading, "Good to know")
+    ));
+    for g in t["good_to_know"].as_array().into_iter().flatten() {
+        out.push_str(&format!(
+            "  · {}
+",
+            full(g)
+        ));
+    }
+    out.push_str(&format!(
+        "
+{}
+",
+        paint(Role::Heading, "Questions")
+    ));
+    for q in t["questions"].as_array().into_iter().flatten() {
+        let mut how = full(&q["kind"]);
+        if q["required"] == true {
+            how.push_str(", required");
+        }
+        if let Some(d) = q["default"].as_str() {
+            how.push_str(&format!(", default {d}"));
+        }
+        out.push_str(&format!(
+            "  {}  {} ({how})
+",
+            full(&q["name"]),
+            full(&q["prompt"])
+        ));
+    }
+    out.push_str(&format!(
+        "
+{}
+
+── SOURCE ──
+{}
+",
+        paint(Role::Heading, "The source it makes"),
+        t["text"].as_str().unwrap_or_default().trim_end()
+    ));
+    out.push_str(&format!(
+        "
+${{NAME}} is your answer.
+make it: shimmer fetchers new SOURCE --from {}",
+        full(&t["id"])
+    ));
+    out
+}
+
 /// `id` (kind): enabled/disabled, for a one-line confirmation after `new`/`edit`/`restore`.
 fn source_summary(source: &Value) -> String {
     format!(
         "{} ({}): {}",
         full(&source["id"]),
-        source["kind"].as_str().unwrap_or("built in"),
+        source["kind"].as_str().unwrap_or_default(),
         if source["enabled"] == true { "on" } else { "off" }
     )
 }
@@ -902,6 +1102,18 @@ mod tests {
         assert_eq!(
             p(&["edit", "blog", "--file", "source.toml"]),
             Ok(FetchersCmd::Edit { id: "blog".into(), file: Some("source.toml".into()) })
+        );
+        assert_eq!(p(&["templates"]), Ok(FetchersCmd::Templates { which: None }));
+        assert_eq!(p(&["templates", "job-boards"]), Ok(FetchersCmd::Templates { which: Some("job-boards".into()) }));
+        assert_eq!(p(&["peek", "rss"]), Ok(FetchersCmd::Peek { template: "rss".into() }));
+        assert_eq!(
+            p(&["new", "my-feed", "--from", "rss", "--set", "URL=https://e.test/f.xml", "--yes"]),
+            Ok(FetchersCmd::FromTemplate {
+                id: "my-feed".into(),
+                template: "rss".into(),
+                set: vec![("URL".into(), "https://e.test/f.xml".into())],
+                yes: true,
+            })
         );
         assert_eq!(p(&["remove", "blog"]), Ok(FetchersCmd::Remove { id: "blog".into() }));
         assert_eq!(p(&["restore", "blog"]), Ok(FetchersCmd::Restore { id: "blog".into() }));

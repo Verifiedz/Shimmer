@@ -1,0 +1,29 @@
+[template]
+label = "A Greenhouse job board"
+description = "Open roles from a company's public Greenhouse job board"
+category = "job-boards"
+kind = "json-api"
+good_to_know = [
+    "Works for any public Greenhouse board -- the board token is usually the company's name as it appears in its own careers url, after /boards/",
+]
+
+[[question]]
+name = "BOARD"
+prompt = "The company's Greenhouse board token (e.g. figma)"
+kind = "name"
+required = true
+
+[source]
+text = '''
+[source]
+enabled = false
+interval = "daily"
+kind = "json-api"
+
+[kind]
+url = "https://boards-api.greenhouse.io/v1/boards/${BOARD}/jobs"
+items_path = "jobs"
+id_field = "id"
+title_field = "title"
+url_field = "absolute_url"
+'''

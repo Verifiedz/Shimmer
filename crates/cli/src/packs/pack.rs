@@ -126,6 +126,8 @@ pub const TARGETS: &[Target] = &[
     Target { op: "fetchers.list", words: &["fetchers", "list"] },
     Target { op: "fetchers.show", words: &["fetchers", "show"] },
     Target { op: "fetchers.new", words: &["fetchers", "new"] },
+    Target { op: "fetchers.templates", words: &["fetchers", "templates"] },
+    Target { op: "fetchers.peek", words: &["fetchers", "peek"] },
     Target { op: "fetchers.edit", words: &["fetchers", "edit"] },
     Target { op: "fetchers.remove", words: &["fetchers", "remove"] },
     Target { op: "fetchers.restore", words: &["fetchers", "restore"] },
@@ -483,7 +485,7 @@ label = "My Pack"
 
     #[test]
     fn every_target_is_an_op_with_its_command_words() {
-        assert_eq!(TARGETS.len(), 105);
+        assert_eq!(TARGETS.len(), 107);
         // Every command's word is its op's verb (ADR 0038 §6): no exceptions are left.
         for t in TARGETS {
             let (module, verb) = t.op.split_once('.').unwrap();
