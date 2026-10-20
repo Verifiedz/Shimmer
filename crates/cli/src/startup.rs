@@ -55,7 +55,7 @@ pub fn parse(rest: Vec<String>) -> std::result::Result<StartupCmd, String> {
         "off" => Ok(StartupCmd::Off),
         "status" => Ok(StartupCmd::Status),
         other if other.starts_with('-') => Err(format!("unknown option '{other}' for 'startup'")),
-        other => Err(format!("unknown startup command '{other}': it's on, off or status")),
+        other => Err(crate::suggest::unknown_command(Some("startup"), other, USAGE)),
     }
 }
 
