@@ -361,18 +361,52 @@ impl IntervalSpec {
 /// together rather than one file per source.
 pub(crate) const LAST_RUN_PATH: &str = "last_run.toml";
 
-/// A corrupt or unparseable `last_run.toml` is logged and treated as empty, never an error
-/// (#126's review, B1). The next successful run rewrites the file cleanly.
-/// Individual unparseable *entries* are dropped the same way, keeping the good ones.
+/// One source's entry in `last_run.toml`: when it last ran, and -- when that run failed --
+/// why (ADR 0028 §11). `error`/`reason` are `None` exactly when the most recent run
+/// succeeded; the next successful run clears them, so this is always the *most recent*
+/// outcome, never a history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct LastRunEntry {
+    at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+/// A corrupt or unparseable `last_run.toml` is treated as empty, never an error (#126's
+/// review, B1). The next successful run rewrites the file cleanly.
+fn load_raw(ctx: &Ctx) -> BTreeMap<String, LastRunEntry> {
+    let Ok(Some(text)) = ctx.store.read_string(LAST_RUN_PATH) else { return BTreeMap::new() };
+    toml::from_str(&text).unwrap_or_default()
+}
+
+fn write_raw(ctx: &Ctx, all: &BTreeMap<String, LastRunEntry>) -> Result<()> {
+    ctx.store.write(LAST_RUN_PATH, toml::to_string(all).unwrap_or_default())
+}
+
+/// Individual unparseable *entries* (an unreadable timestamp) are dropped, keeping the good
+/// ones -- that source reads as due, which is the safe direction.
 pub fn load_last_run(ctx: &Ctx) -> Result<BTreeMap<String, DateTime<Utc>>> {
-    let Some(text) = ctx.store.read_string(LAST_RUN_PATH)? else { return Ok(BTreeMap::new()) };
-    let Ok(raw) = toml::from_str::<BTreeMap<String, String>>(&text) else { return Ok(BTreeMap::new()) };
-    // An entry whose timestamp doesn't parse is dropped, keeping the good ones -- that source
-    // reads as due, which is the safe direction.
-    Ok(raw
+    Ok(load_raw(ctx)
         .into_iter()
-        .filter_map(|(id, at)| DateTime::parse_from_rfc3339(&at).ok().map(|at| (id, at.with_timezone(&Utc))))
+        .filter_map(|(id, e)| DateTime::parse_from_rfc3339(&e.at).ok().map(|at| (id, at.with_timezone(&Utc))))
         .collect())
+}
+
+/// Every source whose most recent run failed, with when and why (ADR 0028 §11) --
+/// `fetchers.health`'s own reading of `last_run.toml`. Cleared by that source's next
+/// successful run; an entry with an unreadable timestamp is dropped, same as
+/// [`load_last_run`].
+pub fn load_last_failures(ctx: &Ctx) -> BTreeMap<String, (DateTime<Utc>, String, String)> {
+    load_raw(ctx)
+        .into_iter()
+        .filter_map(|(id, e)| {
+            let (error, reason) = (e.error?, e.reason?);
+            let at = DateTime::parse_from_rfc3339(&e.at).ok()?.with_timezone(&Utc);
+            Some((id, (at, error, reason)))
+        })
+        .collect()
 }
 
 /// Why `last_run.toml` could not be read, if it exists and is unreadable -- reported by
@@ -381,33 +415,46 @@ pub fn load_last_run(ctx: &Ctx) -> Result<BTreeMap<String, DateTime<Utc>>> {
 /// deliberately doesn't care, because "treat everything as due" is already the safe answer.
 pub fn last_run_problem(ctx: &Ctx) -> Option<String> {
     let text = ctx.store.read_string(LAST_RUN_PATH).ok()??;
-    match toml::from_str::<BTreeMap<String, String>>(&text) {
+    match toml::from_str::<BTreeMap<String, LastRunEntry>>(&text) {
         Ok(raw) => raw
             .iter()
-            .find(|(_, at)| DateTime::parse_from_rfc3339(at).is_err())
+            .find(|(_, e)| DateTime::parse_from_rfc3339(&e.at).is_err())
             .map(|(id, _)| format!("last_run.toml: '{id}' has an unreadable timestamp; that source reads as due")),
         Err(e) => Some(format!("last_run.toml is unreadable ({e}); every source reads as due")),
     }
 }
 
-/// Records that `source` ran at `now`; every other source's record is left untouched.
+/// Records that `source` ran, successfully, at `now` -- clearing any previous failure of
+/// its (ADR 0028 §11: health reports only the *most recent* outcome). Every other source's
+/// record is left untouched.
 pub fn record_run(ctx: &Ctx, source: &str, now: DateTime<Utc>) -> Result<()> {
-    let mut all = load_last_run(ctx)?;
-    all.insert(source.to_owned(), now);
-    let raw: BTreeMap<&str, String> = all.iter().map(|(id, at)| (id.as_str(), at.to_rfc3339())).collect();
-    ctx.store.write(LAST_RUN_PATH, toml::to_string(&raw).unwrap_or_default())
+    let mut all = load_raw(ctx);
+    all.insert(source.to_owned(), LastRunEntry { at: now.to_rfc3339(), error: None, reason: None });
+    write_raw(ctx, &all)
+}
+
+/// Records that `source`'s run at `now` failed, with `error` (`Error::message`) and `reason`
+/// (`fetchers.fetch.failed`'s own classification, ADR 0028 §9) -- the same payload shape that
+/// event already carries, so `fetchers.health` needs no new failure taxonomy of its own.
+pub fn record_failure(ctx: &Ctx, source: &str, now: DateTime<Utc>, error: &str, reason: &str) -> Result<()> {
+    let mut all = load_raw(ctx);
+    all.insert(
+        source.to_owned(),
+        LastRunEntry { at: now.to_rfc3339(), error: Some(error.to_owned()), reason: Some(reason.to_owned()) },
+    );
+    write_raw(ctx, &all)
 }
 
 /// `last_run.toml`'s text with `from`'s entry moved to `to`, if `from` had one; `None` if
 /// `from` never ran -- a never-run source being renamed needs no `last_run.toml` write at all
 /// (ADR 0028 §7). The caller puts the result in the same `ctx.store.transaction` as the
-/// source file's own move, so the rename is one atomic unit (CLAUDE.md §7.1).
+/// source file's own move, so the rename is one atomic unit (CLAUDE.md §7.1). Carries a
+/// pending failure (if any) over to the new id too -- a rename is not a successful run.
 pub(crate) fn rename_last_run(ctx: &Ctx, from: &str, to: &str) -> Result<Option<String>> {
-    let mut all = load_last_run(ctx)?;
-    let Some(at) = all.remove(from) else { return Ok(None) };
-    all.insert(to.to_owned(), at);
-    let raw: BTreeMap<&str, String> = all.iter().map(|(id, at)| (id.as_str(), at.to_rfc3339())).collect();
-    Ok(Some(toml::to_string(&raw).unwrap_or_default()))
+    let mut all = load_raw(ctx);
+    let Some(entry) = all.remove(from) else { return Ok(None) };
+    all.insert(to.to_owned(), entry);
+    Ok(Some(toml::to_string(&all).unwrap_or_default()))
 }
 
 /// `last_run.toml`'s text with every id in `ids` dropped, if any of them had an entry;
@@ -888,7 +935,10 @@ mod tests {
         assert!(last_run_problem(&env.ctx).is_some(), "but it is reported, not silent");
 
         // A single unreadable entry keeps the good ones.
-        env.ctx.store.write(LAST_RUN_PATH, "good = \"2026-01-01T00:00:00Z\"\nbad = \"not a date\"\n").unwrap();
+        env.ctx
+            .store
+            .write(LAST_RUN_PATH, "good = { at = \"2026-01-01T00:00:00Z\" }\nbad = { at = \"not a date\" }\n")
+            .unwrap();
         let runs = load_last_run(&env.ctx).unwrap();
         assert_eq!(runs.keys().collect::<Vec<_>>(), vec!["good"]);
         assert!(last_run_problem(&env.ctx).is_some_and(|p| p.contains("bad")));
@@ -915,6 +965,43 @@ mod tests {
     fn load_last_run_with_nothing_recorded_yet_is_empty_not_an_error() {
         let env = TestEnv::new("fetchers");
         assert!(load_last_run(&env.ctx).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_failure_is_recorded_and_cleared_by_the_next_success_leaving_other_sources_alone() {
+        let env = TestEnv::new("fetchers");
+        record_run(&env.ctx, "blog", at("2026-01-01T00:00:00Z")).unwrap();
+        record_failure(&env.ctx, "hn-whoishiring", at("2026-01-02T00:00:00Z"), "boom", "network").unwrap();
+
+        let failures = load_last_failures(&env.ctx);
+        assert_eq!(failures.len(), 1);
+        let (failed_at, error, reason) = failures.get("hn-whoishiring").unwrap();
+        assert_eq!(*failed_at, at("2026-01-02T00:00:00Z"));
+        assert_eq!(error, "boom");
+        assert_eq!(reason, "network");
+        // A failed run still updates last_run_at (ADR 0028 §6: a broken source still waits a
+        // full interval, not retried immediately).
+        assert_eq!(load_last_run(&env.ctx).unwrap().get("hn-whoishiring"), Some(&at("2026-01-02T00:00:00Z")));
+        // The other source's own record is untouched.
+        assert!(!failures.contains_key("blog"));
+
+        // The next success clears it -- health reports only the most recent outcome.
+        record_run(&env.ctx, "hn-whoishiring", at("2026-01-03T00:00:00Z")).unwrap();
+        assert!(load_last_failures(&env.ctx).is_empty());
+    }
+
+    #[test]
+    fn renaming_a_source_carries_its_pending_failure_to_the_new_id() {
+        let env = TestEnv::new("fetchers");
+        record_failure(&env.ctx, "blog", at("2026-01-01T00:00:00Z"), "boom", "network").unwrap();
+        let text = rename_last_run(&env.ctx, "blog", "team-blog").unwrap().expect("blog had a record");
+        env.ctx.store.write(LAST_RUN_PATH, text).unwrap();
+
+        let failures = load_last_failures(&env.ctx);
+        assert!(!failures.contains_key("blog"));
+        let (_, error, reason) = failures.get("team-blog").expect("the failure followed the rename");
+        assert_eq!(error, "boom");
+        assert_eq!(reason, "network");
     }
 
     #[test]

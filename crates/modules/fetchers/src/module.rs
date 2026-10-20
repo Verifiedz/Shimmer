@@ -43,6 +43,7 @@ pub const RENAME_OP: &str = "fetchers.rename";
 pub const COPY_OP: &str = "fetchers.copy";
 pub const TEMPLATES_OP: &str = "fetchers.templates";
 pub const PEEK_OP: &str = "fetchers.peek";
+pub const HEALTH_OP: &str = "fetchers.health";
 
 /// Caps `fetchers.item.found`'s `raw_data` (ADR 0028 §3) -- big enough for a job posting's
 /// text, small enough that one large item can't become the next cache-bloat problem.
@@ -273,6 +274,12 @@ impl Module for Fetchers {
                 }),
                 execution: Execution::Inline,
             },
+            CommandSpec {
+                op: HEALTH_OP.into(),
+                summary: "Check every source for problems; changes nothing (ADR 0033)".into(),
+                params_schema: json!({"type": "object"}),
+                execution: Execution::Inline,
+            },
         ]
     }
 
@@ -344,6 +351,7 @@ impl Module for Fetchers {
                 let p: CopyParams = decode(params)?;
                 self.copy(ctx, p)
             }
+            HEALTH_OP => self.health(ctx),
             _ => Err(Error::unknown_op(format!("fetchers has no op '{op}'"))),
         }
     }
@@ -606,7 +614,14 @@ impl Fetchers {
         // full interval (a day, for `daily`) having fetched nothing.
         let _g = self.write.lock();
         if !ctx.cancel.is_cancelled() {
-            schedule::record_run(ctx, &source_id, ctx.clock.now())?;
+            match &outcome {
+                Ok(_) => schedule::record_run(ctx, &source_id, ctx.clock.now())?,
+                // `fetchers.health`'s own reading of this file (ADR 0028 §11) -- the same
+                // classification `fetchers.fetch.failed` emits below, never a second one.
+                Err(e) => {
+                    schedule::record_failure(ctx, &source_id, ctx.clock.now(), &e.message, classify_failure(ctx, e))?
+                }
+            }
         }
         // Rescheduled regardless of cancellation (#306's review, blocking; the same root
         // issue as #299's review point 1): the one-time schedule that fired to start this
@@ -660,6 +675,7 @@ impl Fetchers {
             return Ok(json!({"removed": schedule::removed(ctx)?}));
         }
         let last_run = schedule::load_last_run(ctx)?;
+        let last_failures = schedule::load_last_failures(ctx);
         let st = self.state();
         let sources: Vec<Value> = source::known(&st)
             .iter()
@@ -677,6 +693,9 @@ impl Fetchers {
                     "interval_s": cfg.and_then(|c| c.interval.resolve(0).ok()),
                     "filter": cfg.and_then(|c| c.filter.clone()),
                     "last_run_at": last_run.get(id),
+                    // `None` once the next run succeeds (ADR 0028 §11) -- the most recent
+                    // outcome only, never a history.
+                    "last_error": last_failures.get(id).map(|(_, error, reason)| json!({"error": error, "reason": reason})),
                     "running": self.running.is_running(id),
                 })
             })
@@ -701,6 +720,40 @@ impl Fetchers {
         drop(st);
         problems.extend(schedule::last_run_problem(ctx).map(|why| json!({"id": "last_run", "problem": why})));
         Ok(json!({"sources": total, "enabled": enabled, "disabled": total - enabled, "problems": problems}))
+    }
+
+    /// `shimmer doctor`'s own check (ADR 0033, ADR 0028 §11): two kinds of problem, both
+    /// read fresh from current state every call, never accumulated -- a fixed source simply
+    /// stops appearing next time. A source file that doesn't parse (§5's `problems`) is
+    /// `fail`: nothing about it can be used until it's fixed. A source whose most recent run
+    /// failed is `warn`: it still has a valid, working file, and the next scheduled run may
+    /// well succeed on its own.
+    fn health(&self, ctx: &Ctx) -> Result<Value> {
+        let st = self.state();
+        let mut checks: Vec<Value> = st
+            .problems
+            .iter()
+            .map(|(id, why)| {
+                json!({"status": "fail", "subject": id,
+                    "message": format!("{id} can't be used: {why}"),
+                    "fix": {"summary": format!("fix or remove its file: data/fetchers/sources/{id}.toml")}})
+            })
+            .collect();
+        let total = st.sources.len();
+        drop(st);
+        for (id, (at, error, reason)) in schedule::load_last_failures(ctx) {
+            checks.push(json!({"status": "warn", "subject": id,
+                "message": format!("{id}'s last run ({at}) failed: {error} ({reason})"),
+                "fix": {"summary": "see what happened", "op": SHOW_OP, "params": {"id": id}}}));
+        }
+        if let Some(why) = schedule::last_run_problem(ctx) {
+            checks.push(json!({"status": "warn", "message": why}));
+        }
+        if checks.is_empty() {
+            checks.push(json!({"status": "ok",
+                "message": format!("{total} {}, all fine", if total == 1 { "source" } else { "sources" })}));
+        }
+        Ok(json!({"checks": checks}))
     }
 
     /// Fetches exactly one page from a source and returns its parsed items -- never the
@@ -954,6 +1007,9 @@ impl Fetchers {
         let last_run = schedule::load_last_run(ctx)?;
         let mut v = view(id, &cfg);
         v["last_run_at"] = json!(last_run.get(id));
+        v["last_error"] = json!(schedule::load_last_failures(ctx)
+            .get(id)
+            .map(|(_, error, reason)| json!({"error": error, "reason": reason})));
         v["running"] = json!(self.running.is_running(id));
         v["text"] = json!(text);
         Ok(v)
@@ -1803,6 +1859,7 @@ mod tests {
         let sources = out["sources"].as_array().unwrap();
         let hn = sources.iter().find(|s| s["id"] == "hn-whoishiring").unwrap();
         assert_eq!(hn["last_run_at"], json!(env.ctx.clock.now()));
+        assert!(hn["last_error"].is_null(), "a successful run has no last error");
         assert_eq!(hn["running"], false);
 
         let wwr = sources.iter().find(|s| s["id"] == "weworkremotely").unwrap();
@@ -1823,6 +1880,49 @@ mod tests {
 
         let out = fetchers.status(&env.ctx).unwrap();
         assert_eq!(out, json!({"sources": 2, "enabled": 1, "disabled": 1, "problems": []}));
+    }
+
+    #[test]
+    fn health_is_one_ok_check_when_nothing_is_wrong() {
+        let env = TestEnv::new("fetchers");
+        write_source(&env, "my-hn", json!({"enabled": true, "interval": "daily", "kind": "hn-whoishiring"}));
+        let fetchers = Fetchers::default();
+        fetchers.load(&env.ctx).unwrap();
+
+        let out = fetchers.health(&env.ctx).unwrap();
+        let checks = out["checks"].as_array().unwrap();
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0]["status"], "ok");
+        assert!(checks[0]["message"].as_str().unwrap().contains("1 source"), "{}", checks[0]["message"]);
+    }
+
+    #[test]
+    fn health_reports_a_broken_file_and_a_failed_run_and_a_fix_clears_each() {
+        let env = TestEnv::new("fetchers");
+        write_source(&env, "my-hn", json!({"enabled": true, "interval": "daily", "kind": "hn-whoishiring"}));
+        env.ctx.store.write(&schedule::path("broken"), "not valid toml [[[").unwrap();
+        schedule::record_failure(&env.ctx, "my-hn", env.ctx.clock.now(), "boom", "network").unwrap();
+        let fetchers = Fetchers::default();
+        fetchers.load(&env.ctx).unwrap();
+
+        let out = fetchers.health(&env.ctx).unwrap();
+        let checks = out["checks"].as_array().unwrap();
+        assert_eq!(checks.len(), 2);
+        let broken = checks.iter().find(|c| c["subject"] == "broken").expect("the broken file is reported");
+        assert_eq!(broken["status"], "fail");
+        let failed = checks.iter().find(|c| c["subject"] == "my-hn").expect("the failed run is reported");
+        assert_eq!(failed["status"], "warn");
+        assert!(failed["message"].as_str().unwrap().contains("boom"), "{}", failed["message"]);
+        assert_eq!(failed["fix"]["op"], SHOW_OP);
+        assert_eq!(failed["fix"]["params"], json!({"id": "my-hn"}));
+
+        // Fixing each -- removing the broken file, a fresh successful run -- clears it from
+        // the next call; health is read fresh every time, never accumulated.
+        env.ctx.store.delete(&schedule::path("broken")).unwrap();
+        fetchers.load(&env.ctx).unwrap();
+        schedule::record_run(&env.ctx, "my-hn", env.ctx.clock.now()).unwrap();
+        let out = fetchers.health(&env.ctx).unwrap();
+        assert_eq!(out["checks"][0]["status"], "ok");
     }
 
     #[tokio::test]
@@ -1881,6 +1981,13 @@ mod tests {
         let failed: Vec<_> = env.backend.events().into_iter().filter(|e| e.topic == "fetchers.fetch.failed").collect();
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].payload["reason"], "network");
+
+        // The same classification lands in `last_run.toml` (ADR 0028 §11), for
+        // `fetchers.health` to read back without a second one.
+        let failures = schedule::load_last_failures(&env.ctx);
+        let (_, error, reason) = failures.get("hn-whoishiring").expect("the failure is recorded");
+        assert_eq!(reason, "network");
+        assert_eq!(error, &failed[0].payload["error"].as_str().unwrap().to_owned());
     }
 
     #[tokio::test]
@@ -2254,6 +2361,11 @@ mod tests {
         let v = fetchers.show(&env.ctx, "blog").unwrap();
         assert_eq!(v["id"], "blog");
         assert_eq!(v["text"].as_str().unwrap(), text);
+        assert!(v["last_error"].is_null(), "never run yet");
+
+        schedule::record_failure(&env.ctx, "blog", env.ctx.clock.now(), "boom", "network").unwrap();
+        let v = fetchers.show(&env.ctx, "blog").unwrap();
+        assert_eq!(v["last_error"], json!({"error": "boom", "reason": "network"}));
 
         let err = fetchers.show(&env.ctx, "nope").unwrap_err();
         assert_eq!(err.code, shimmer_core::ErrorCode::NotFound);
