@@ -1,26 +1,52 @@
 name: ci
+# Faster without checking less (#298). PRs into master, integration/* and post-* still run the
+# required `check (ubuntu-latest)` and `check (macos-latest)` (the rulesets name them, so the job
+# and its matrix keep those names).
 on:
+  # A branch with a PR is checked by its PR; a push runs only where nothing else would check it.
   push:
+    branches: [master, "integration/**", "post-**"]
   pull_request:
+
+# A new push to a PR cancels the run it replaces. Pushes to master and integration/* are never
+# cancelled, so every commit there keeps its result.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
+  # File and line in backtraces, without the full debug info: much faster linking and a smaller
+  # cache.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
   check:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # macOS where it's required (pushes, and PRs into master, integration/* and post-*);
+        # Linux only for a PR stacked on another PR, which the base's own PR checks on macOS later.
+        os: ${{ fromJSON((github.event_name == 'push' || github.base_ref == 'master' || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'post-')) && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      # Seconds, before any build: a format or dependency mistake fails here.
       - name: Dependency rules (CLAUDE.md §3)
         run: python3 .dev/check-deps.py
       - run: cargo fmt --all -- --check
+      # Saved only by pushes (master, integration/*), so every PR starts from one warm cache
+      # instead of branches pushing each other's out.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'push' }}
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      # nextest runs the test programs side by side, where `cargo test` runs them one after
+      # another (65 s → 22 s locally). The repo has no doc tests, which nextest doesn't run.
+      # No retries: a flaky test should fail and be fixed, not be hidden.
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run --workspace --no-fail-fast
