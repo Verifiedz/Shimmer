@@ -232,6 +232,12 @@ fn validate_source(id: &str, source: &SourceConfig) -> Result<()> {
                     known.join(", ")
                 )));
             };
+            // A fixed, compiled-in source has no `kind` and so no `Kind::parse` of its own to
+            // reject a stray key -- without this, dropping the old struct-level
+            // `deny_unknown_fields` (see `kind_params`'s doc comment) silently accepted typos
+            // like `title_exclude` (missing the `s`) that master used to refuse outright.
+            crate::kind::reject_unknown(&source.kind_params, &[])
+                .map_err(|m| Error::invalid_params(format!("sources.{id}: {m}")))?;
             match found.method() {
                 crate::source::Method::Api => MIN_INTERVAL_API_S,
                 crate::source::Method::Scrape => MIN_INTERVAL_SCRAPE_S,
@@ -396,6 +402,23 @@ mod tests {
             "sources": {"hn-whoishiring": {"enabled": true, "interval": 3600}}
         }))
         .unwrap();
+    }
+
+    #[test]
+    fn a_typo_d_field_on_a_fixed_source_is_rejected_not_silently_ignored() {
+        // #302's review: dropping the struct-level `deny_unknown_fields` (needed for
+        // `kind_params`'s `#[serde(flatten)]`) stopped catching a typo on a *fixed*,
+        // kind-less source -- `title_exclude` (missing the `s`) used to be refused by
+        // master and loaded silently here, with the filter just never applied.
+        let why = problem_for(
+            json!({
+                "sources": {
+                    "hn-whoishiring": {"enabled": true, "interval": "daily", "title_exclude": ["intern"]},
+                },
+            }),
+            "hn-whoishiring",
+        );
+        assert!(why.contains("title_exclude"), "{why}");
     }
 
     #[test]
