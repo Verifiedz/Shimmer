@@ -828,6 +828,14 @@ fn show(s: &Value) -> String {
     line("kind", s["kind"].as_str().unwrap_or("built in").to_owned());
     line("label", full(&s["label"]));
     line("interval", s["interval_s"].as_u64().map(when::format_duration).unwrap_or_else(|| "-".into()));
+    // Same wording `fetchers.health` uses for `shimmer doctor`'s warn line (module.rs), so a
+    // person who reaches for `show` instead of `doctor` still sees why a source stopped
+    // working, not just a healthy-looking file.
+    if let Some(err) = s["last_error"].as_object() {
+        let error = err.get("error").and_then(Value::as_str).unwrap_or_default();
+        let reason = err.get("reason").and_then(Value::as_str).unwrap_or_default();
+        line("last error", format!("{error} ({reason})"));
+    }
     out.push('\n');
     out.push_str(s["text"].as_str().unwrap_or_default().trim_end());
     out
@@ -1218,6 +1226,19 @@ mod tests {
     #[test]
     fn list_with_nothing_known_says_so() {
         assert_eq!(list(&json!({"sources": []}), Utc::now()), "no sources known");
+    }
+
+    #[test]
+    fn show_surfaces_last_error_so_a_broken_source_does_not_look_healthy() {
+        let healthy = json!({"id": "my-feed", "enabled": true, "kind": "rss", "label": null,
+            "interval_s": 3600, "last_error": null, "text": "[source]\nkind = \"rss\"\n"});
+        assert!(!show(&healthy).contains("last error"), "{}", show(&healthy));
+
+        let broken = json!({"id": "my-feed", "enabled": true, "kind": "rss", "label": null,
+            "interval_s": 3600, "last_error": {"error": "connection refused", "reason": "network"},
+            "text": "[source]\nkind = \"rss\"\n"});
+        let out = show(&broken);
+        assert!(out.contains("last error  connection refused (network)"), "{out}");
     }
 
     #[test]
