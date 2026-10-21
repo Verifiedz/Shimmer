@@ -1355,7 +1355,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_secret_value_never_appears_in_a_log_line() {
-        let server = TestServer::start(vec![OK]);
+        let server = TestServer::start(vec![OK, OK]);
         let url = server.url("/a");
         let host = host_key(&reqwest::Url::parse(&url).unwrap()).unwrap();
         let credentials = HashMap::from([("my-cred".to_owned(), credential("test", &host, "Authorization"))]);
@@ -1366,6 +1366,13 @@ mod tests {
         let subscriber = CapturingSubscriber { messages: messages.clone() };
         let resp = {
             let _guard = tracing::subscriber::set_default(subscriber);
+            // `tracing` decides once per log line whether anyone listens, and remembers it. A test
+            // on another thread can reach "http: sending" first, before this listener exists, and
+            // it's remembered as unheard (this failed about 1 run in 4). So: reach the line once,
+            // have tracing decide again with this listener there, and only then look.
+            b.get(&ModuleId::new("test"), &server.url("/warm-up"), None).await.unwrap();
+            tracing::callsite::rebuild_interest_cache();
+            messages.lock().unwrap().clear();
             b.get(&ModuleId::new("test"), &url, Some("my-cred")).await.unwrap()
         };
 

@@ -702,15 +702,23 @@ fn free_disk_previews_then_removes_only_old_rebuildable_folders() {
 
 #[test]
 fn health_reports_warnings_first_and_notifies_only_then() {
+    // Only the checks this test controls: memory, load, uptime and the rest depend on the
+    // machine running it, and one warning there (a busy CI runner's load) set off the
+    // notification this test expects not to see.
+    const MACHINE: &str = "memory load uptime battery temperature services updates ports docker";
     let sb = Sandbox::new();
-    sb.create("hc", "health", &[("DISK_WARN_PERCENT", "1"), ("NOTIFY", "on-warning"), ("BIGGEST_FOLDERS", "2")]);
+    sb.create(
+        "hc",
+        "health",
+        &[("SKIP", MACHINE), ("DISK_WARN_PERCENT", "1"), ("NOTIFY", "on-warning"), ("BIGGEST_FOLDERS", "2")],
+    );
     let out = sb.activate("hc");
     let first = out.lines().nth(1).unwrap_or_default();
     assert!(first.trim_start().starts_with("! disk"), "warnings first: {out}");
     assert!(out.contains("✓ workspaces: none dirty"), "it asks the daemon: {out}");
     assert!(sb.calls().contains("notify-send Shimmer health"), "{}", sb.calls());
 
-    set_answer(&sb, "hc", "SKIP", "disk");
+    set_answer(&sb, "hc", "SKIP", &format!("{MACHINE} disk"));
     std::fs::write(sb.path("calls.log"), "").unwrap();
     let out = sb.activate("hc");
     assert!(!out.contains("disk /") && !sb.calls().contains("notify-send"), "{out}");
