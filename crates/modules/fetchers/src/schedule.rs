@@ -419,6 +419,24 @@ pub(crate) fn rename_last_run(ctx: &Ctx, from: &str, to: &str) -> Result<Option<
     Ok(Some(toml::to_string(&raw).unwrap_or_default()))
 }
 
+/// `last_run.toml`'s text with every id in `ids` dropped, if any of them had an entry;
+/// `None` if none did -- a purge of sources that never ran needs no `last_run.toml` write at
+/// all. Same "the caller puts this in its own transaction" contract as [`rename_last_run`]
+/// (#305's review, should-fix: `purge` left this behind, so a new source reusing a purged
+/// id inherited its old last-run time and had its first run delayed).
+pub(crate) fn remove_last_run(ctx: &Ctx, ids: &[String]) -> Result<Option<String>> {
+    let mut all = load_last_run(ctx)?;
+    let mut changed = false;
+    for id in ids {
+        changed |= all.remove(id).is_some();
+    }
+    if !changed {
+        return Ok(None);
+    }
+    let raw: BTreeMap<&str, String> = all.iter().map(|(id, at)| (id.as_str(), at.to_rfc3339())).collect();
+    Ok(Some(toml::to_string(&raw).unwrap_or_default()))
+}
+
 /// Shared across this crate's own tests (`schedule`, `source`, `module`): a source file's text
 /// from one flat JSON fixture, the same shape tests wrote before sources moved to files, split
 /// into `[source]`/`[kind]` by whether a key is part of the shared envelope.

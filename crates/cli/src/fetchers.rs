@@ -20,9 +20,9 @@ commands:
   show SOURCE           one source in full, with its file text
   new SOURCE --interval SPEC [--kind KIND] [--label TEXT] [--enabled] [--set KEY=VALUE]…
                         [FILTER]    make a new source
-  edit SOURCE --interval SPEC [--kind KIND] [--label TEXT] [--enabled] [--set KEY=VALUE]…
-                        [FILTER]    replace a source's settings; a broken edit is refused and
-                        the old one kept
+  edit SOURCE [--file FILE]   replace a source's whole file text; interactively, opens $EDITOR
+                        on a copy of the current file; a broken edit is refused and the old
+                        one kept
   remove SOURCE         remove a source (restore brings it back)
   restore SOURCE        bring a removed source back
   purge [SOURCE] [--yes]      delete a removed source for good, or every removed one (asks first)
@@ -37,13 +37,13 @@ commands:
   items [SOURCE] [--contains W,W] [--excludes W,W]  items a real run has actually found and kept,
                         most recent first
 
-FILTER (new, edit, test and run):
+FILTER (new, test and run):
   --contains W,W,...    keep only a title containing at least one of these (case-insensitive)
   --excludes W,W,...    drop a title containing any of these, even one --contains would keep
 
 On test/run, FILTER replaces -- never merges with -- whatever the source's own file
-configures, for that one call only. On new/edit, it's the source's own setting, same as
---label/--interval/etc.
+configures, for that one call only. On new, it's the source's own setting, same as
+--label/--interval/etc. (edit replaces the whole file, title_contains/_excludes included.)
 
 items' own --contains/--excludes are a separate, client-side narrowing of what's already
 been found and saved.
@@ -94,10 +94,17 @@ pub enum FetchersCmd {
     Show {
         id: String,
     },
-    /// `fetchers.new`/`.edit`'s structured params (ADR 0028 §9), shared by both since `edit` is
-    /// a full replace, the same shape `new` creates with.
+    /// `fetchers.new`'s structured params (ADR 0028 §9): there's no existing file to lose
+    /// anything from, so flags are fine.
     New(SourceInput),
-    Edit(SourceInput),
+    /// A whole-file replace (ADR 0028 §9, amended by #305's review): `--file FILE`, or
+    /// (interactively) `$EDITOR` on a copy of the source's current text -- same shape as
+    /// `automations edit`/`workspaces edit`, not `new`'s flags, so nothing you don't retype
+    /// is silently reset.
+    Edit {
+        id: String,
+        file: Option<std::path::PathBuf>,
+    },
     Remove {
         id: String,
     },
@@ -174,7 +181,15 @@ pub fn parse(words: Vec<String>) -> std::result::Result<FetchersCmd, String> {
     let rest: Vec<String> = words.collect();
     match sub.as_str() {
         "help" => Ok(FetchersCmd::Help),
-        "new" | "edit" => parse_source_input(&sub, rest),
+        "new" => parse_source_input(rest),
+        "edit" => {
+            let flags = Flags::split(rest, &["--file"], &[]).map_err(|e| format!("fetchers edit: {e}"))?;
+            let id = match flags.positional.as_slice() {
+                [id] => id.clone(),
+                _ => return Err("usage: shimmer fetchers edit SOURCE [--file FILE]".into()),
+            };
+            Ok(FetchersCmd::Edit { id, file: flags.value("--file").map(std::path::PathBuf::from) })
+        }
         "list" | "show" | "remove" | "restore" | "purge" | "enable" | "disable" | "rename" | "copy" => {
             parse_source_command(&sub, rest)
         }
@@ -284,13 +299,11 @@ fn set_value(raw: &str) -> Value {
 }
 
 /// `new SOURCE --interval SPEC [--kind KIND] [--label TEXT] [--enabled] [--set KEY=VALUE]…
-/// [--contains W,W] [--excludes W,W]` -- `edit` takes the identical shape (ADR 0028 §9: `edit`
-/// is a full replace, not a patch, so there is no reason for its flags to differ from `new`'s).
-fn parse_source_input(sub: &str, words: Vec<String>) -> std::result::Result<FetchersCmd, String> {
-    let usage = format!(
-        "usage: shimmer fetchers {sub} SOURCE --interval SPEC [--kind KIND] [--label TEXT] [--enabled] \
+/// [--contains W,W] [--excludes W,W]`.
+fn parse_source_input(words: Vec<String>) -> std::result::Result<FetchersCmd, String> {
+    let usage = "usage: shimmer fetchers new SOURCE --interval SPEC [--kind KIND] [--label TEXT] [--enabled] \
          [--set KEY=VALUE]… [--contains W,W] [--excludes W,W]"
-    );
+        .to_owned();
     let mut words = words.into_iter();
     let id = words.next().ok_or_else(|| usage.clone())?;
     if id.starts_with('-') {
@@ -314,11 +327,11 @@ fn parse_source_input(sub: &str, words: Vec<String>) -> std::result::Result<Fetc
                 let (k, v) = kv.split_once('=').ok_or_else(|| "--set needs KEY=VALUE".to_owned())?;
                 params.insert(k.to_owned(), set_value(v));
             }
-            other => return Err(format!("unknown option '{other}' for 'fetchers {sub}'")),
+            other => return Err(format!("unknown option '{other}' for 'fetchers new'")),
         }
     }
     let interval = interval.ok_or(usage)?;
-    let input = SourceInput {
+    Ok(FetchersCmd::New(SourceInput {
         id,
         kind,
         label,
@@ -327,8 +340,7 @@ fn parse_source_input(sub: &str, words: Vec<String>) -> std::result::Result<Fetc
         params,
         title_contains: terms(contains.as_deref()),
         title_excludes: terms(excludes.as_deref()),
-    };
-    Ok(if sub == "new" { FetchersCmd::New(input) } else { FetchersCmd::Edit(input) })
+    }))
 }
 
 pub async fn run(client: &mut Client, cmd: &FetchersCmd, json_out: bool, prompt: &mut impl Prompt) -> Result<String> {
@@ -351,9 +363,22 @@ pub async fn run(client: &mut Client, cmd: &FetchersCmd, json_out: bool, prompt:
             let data = client.call("fetchers.new", source_params(input)).await?;
             Ok(if json_out { render::json(&data) } else { format!("✓ made source {}", source_summary(&data)) })
         }
-        FetchersCmd::Edit(input) => {
-            let data = client.call("fetchers.edit", source_params(input)).await?;
+        FetchersCmd::Edit { id, file: Some(file) } => {
+            let data = client.call("fetchers.edit", json!({"id": id, "text": read_file(file)?})).await?;
             Ok(if json_out { render::json(&data) } else { format!("✓ saved source {}", source_summary(&data)) })
+        }
+        FetchersCmd::Edit { id, file: None } => {
+            if !prompt.interactive() {
+                return Err(Error::invalid_params(format!(
+                    "fetchers edit needs a terminal; replace the source from a file instead: \
+                     shimmer fetchers edit {id} --file FILE"
+                )));
+            }
+            let text = source_text(client, id).await?;
+            edit_loop(client, id, text, prompt).await.map(|saved| match saved {
+                true => format!("✓ saved source {id}"),
+                false => format!("no changes to {id}"),
+            })
         }
         FetchersCmd::Remove { id } => {
             let data = client.call("fetchers.remove", one(id)).await?;
@@ -491,10 +516,79 @@ pub async fn run(client: &mut Client, cmd: &FetchersCmd, json_out: bool, prompt:
     }
 }
 
-/// `fetchers.new`/`.edit`'s params from a [`SourceInput`] (ADR 0028 §9): structured, not raw
-/// file text -- the daemon validates `kind`'s own fields through `Kind::parse`, the same as a
-/// hand-edited file. `interval` is sent as a JSON number when it parses as one, otherwise as a
-/// string (a preset name) -- `IntervalSpec`'s own untagged `Preset(String) | Seconds(u64)`.
+/// Read a local file for `fetchers edit --file FILE`; a missing or unreadable one is
+/// `invalid_params`, not a panic.
+fn read_file(file: &std::path::Path) -> Result<String> {
+    std::fs::read_to_string(file).map_err(|e| Error::invalid_params(format!("can't read {}: {e}", file.display())))
+}
+
+async fn source_text(client: &mut Client, id: &str) -> Result<String> {
+    let data = client.call("fetchers.show", json!({"id": id})).await?;
+    Ok(data["text"].as_str().unwrap_or_default().to_owned())
+}
+
+/// Edit a copy of the source's file in `$EDITOR` and send it with `fetchers.edit`; a refused
+/// edit can be tried again with your text kept, same as `automations edit` (ADR 0035 §8).
+/// True when something was saved.
+async fn edit_loop(client: &mut Client, id: &str, text: String, prompt: &mut impl Prompt) -> Result<bool> {
+    let path = new_private_file(id, &text)?;
+    loop {
+        crate::editor::open(&path)?;
+        let edited = read_file(&path)?;
+        if edited == text {
+            let _ = std::fs::remove_file(&path);
+            return Ok(false);
+        }
+        match client.call("fetchers.edit", json!({"id": id, "text": edited})).await {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&path);
+                return Ok(true);
+            }
+            Err(e) if e.code == ErrorCode::InvalidParams => {
+                eprintln!("{} {}", paint(Role::Error, "✗ not saved:"), e.message);
+                if !prompt.confirm("Edit it again?") {
+                    return Err(Error::invalid_params(format!(
+                        "{id} not saved (the old source is unchanged); your text is in {}",
+                        path.display()
+                    )));
+                }
+            }
+            // Whatever went wrong (the source removed meanwhile, the daemon restarted), the
+            // edit isn't lost: say where it is (#253's review).
+            Err(e) => {
+                return Err(Error::new(
+                    e.code,
+                    format!("{}; {id} not saved, your text is in {}", e.message, path.display()),
+                ))
+            }
+        }
+    }
+}
+
+/// A new file in the temp folder holding `text`, readable only by you, at a name nobody else
+/// can have made first: it's created with `create_new`, so a file or link someone planted
+/// there is refused rather than written through (#253's review).
+fn new_private_file(id: &str, text: &str) -> Result<std::path::PathBuf> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let path = std::env::temp_dir().join(format!("shimmer-source-{id}-{}-{stamp}.toml", std::process::id()));
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| Error::internal(format!("can't create {}: {e}", path.display())))?;
+    f.write_all(text.as_bytes()).map_err(|e| Error::internal(format!("can't write {}: {e}", path.display())))?;
+    Ok(path)
+}
+
+/// `fetchers.new`'s params from a [`SourceInput`] (ADR 0028 §9): structured, not raw file
+/// text -- there's no existing file for `new` to merge onto, so flags are fine (unlike
+/// `edit`, which takes the whole file text, see [`FetchersCmd::Edit`]). The daemon validates
+/// `kind`'s own fields through `Kind::parse`, the same as a hand-edited file. `interval` is
+/// sent as a JSON number when it parses as one, otherwise as a string (a preset name) --
+/// `IntervalSpec`'s own untagged `Preset(String) | Seconds(u64)`.
 fn source_params(input: &SourceInput) -> Value {
     let mut p = json!({
         "id": input.id,
@@ -816,18 +910,10 @@ mod tests {
                 title_excludes: Some(vec!["senior".into()]),
             }))
         );
+        assert_eq!(p(&["edit", "blog"]), Ok(FetchersCmd::Edit { id: "blog".into(), file: None }));
         assert_eq!(
-            p(&["edit", "blog", "--interval", "daily"]),
-            Ok(FetchersCmd::Edit(SourceInput {
-                id: "blog".into(),
-                kind: None,
-                label: None,
-                interval: "daily".into(),
-                enabled: false,
-                params: Map::new(),
-                title_contains: None,
-                title_excludes: None,
-            }))
+            p(&["edit", "blog", "--file", "source.toml"]),
+            Ok(FetchersCmd::Edit { id: "blog".into(), file: Some("source.toml".into()) })
         );
         assert_eq!(p(&["remove", "blog"]), Ok(FetchersCmd::Remove { id: "blog".into() }));
         assert_eq!(p(&["restore", "blog"]), Ok(FetchersCmd::Restore { id: "blog".into() }));
@@ -917,6 +1003,8 @@ mod tests {
         assert!(p(&["new", "blog", "--interval", "daily", "--bogus"])
             .unwrap_err()
             .contains("unknown option '--bogus' for 'fetchers new'"));
+        assert!(p(&["edit"]).unwrap_err().contains("usage: shimmer fetchers edit SOURCE [--file FILE]"));
+        assert!(p(&["edit", "blog", "extra"]).unwrap_err().contains("usage: shimmer fetchers edit SOURCE"));
     }
 
     #[test]

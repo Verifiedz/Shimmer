@@ -200,8 +200,11 @@ impl Module for Fetchers {
             },
             CommandSpec {
                 op: EDIT_OP.into(),
-                summary: "Replace a source's settings".into(),
-                params_schema: source_input_schema(),
+                summary: "Replace a source's whole file text".into(),
+                params_schema: json!({
+                    "type": "object", "required": ["id", "text"],
+                    "properties": {"id": {"type": "string"}, "text": {"type": "string"}},
+                }),
                 execution: Execution::Inline,
             },
             CommandSpec {
@@ -295,8 +298,8 @@ impl Module for Fetchers {
                 self.create(ctx, p)
             }
             EDIT_OP => {
-                let p: SourceInput = decode(params)?;
-                self.edit(ctx, p)
+                let p: EditInput = decode(params)?;
+                self.edit(ctx, &p.id, &p.text)
             }
             SHOW_OP => {
                 let p: Id = decode(params)?;
@@ -393,6 +396,15 @@ fn source_input_schema() -> Value {
             "title_excludes": {"type": "array", "items": {"type": "string"}},
         },
     })
+}
+
+/// `fetchers.edit`'s params (ADR 0028 §9, amended by #305's review): the whole replacement
+/// file text, same shape as `automations.edit`'s -- not a `SourceInput`, so nothing not
+/// explicitly retyped is silently reset.
+#[derive(Deserialize)]
+struct EditInput {
+    id: String,
+    text: String,
 }
 
 #[derive(Deserialize)]
@@ -736,15 +748,28 @@ impl Fetchers {
         self.write_source(ctx, p, "fetchers.source.created")
     }
 
-    /// Replace a source's settings, after checking them: a broken edit is refused and the old
-    /// file kept (same rule `automations.edit` uses). A full replace, not a merge -- the
-    /// caller sends the complete desired state, same as `automations.edit`'s full file text.
-    fn edit(&self, ctx: &Ctx, p: SourceInput) -> Result<Value> {
+    /// Replace a source's file text wholesale, after checking it (same rule `automations.edit`
+    /// uses): a broken edit is refused and the old file kept. Takes the *whole* file, not a
+    /// `SourceInput` built from flags -- `new`'s structured params are fine for a source that
+    /// doesn't exist yet, but re-deriving them for `edit` meant re-passing every flag just to
+    /// change one, with whatever you forgot to retype silently reset (#305's review,
+    /// blocking). The CLI reads the current text first (`fetchers.show`) so this is a
+    /// $EDITOR-on-a-copy flow, same as `automations edit`/`workspaces edit`.
+    fn edit(&self, ctx: &Ctx, id: &str, text: &str) -> Result<Value> {
         let _g = self.write.lock();
-        if ctx.store.read(&schedule::path(&p.id))?.is_none() {
-            return Err(Error::not_found(format!("no source '{}'", p.id)));
+        if ctx.store.read(&schedule::path(id))?.is_none() {
+            return Err(Error::not_found(format!("no source '{id}'")));
         }
-        self.write_source(ctx, p, "fetchers.source.edited")
+        let cfg = schedule::SourceConfig::parse(id, text).map_err(Error::invalid_params)?;
+        ctx.store.transaction(|tx| {
+            tx.put(&schedule::path(id), text)?;
+            tx.emit("fetchers.source.edited", json!({"source": id}))
+        })?;
+        let mut st = self.state();
+        st.problems.remove(id);
+        st.sources.insert(id.to_owned(), cfg.clone());
+        drop(st);
+        Ok(view(id, &cfg))
     }
 
     fn write_source(&self, ctx: &Ctx, p: SourceInput, topic: &str) -> Result<Value> {
@@ -790,6 +815,9 @@ impl Fetchers {
     /// (ADR 0038 §1).
     fn remove(&self, ctx: &Ctx, id: &str) -> Result<Value> {
         let _g = self.write.lock();
+        if self.running.is_running(id) {
+            return Err(Error::conflict(format!("'{id}' is fetching right now -- wait for it to finish first")));
+        }
         let Some(text) = ctx.store.read(&schedule::path(id))? else {
             return Err(Error::not_found(format!("no source '{id}'")));
         };
@@ -835,9 +863,18 @@ impl Fetchers {
         if let Some(id) = &p.id {
             event["source"] = json!(id);
         }
+        // A purged id's dedup state and last-run time go too (#305's review, should-fix) --
+        // left behind, a new source reusing that id inherits them: its first run is "due"
+        // later than it should be, and whatever it already "saw" under the old source stays
+        // hidden forever.
+        let last_run = schedule::remove_last_run(ctx, &ids)?;
         ctx.store.transaction(|tx| {
             for id in &ids {
                 tx.delete(&schedule::removed_path(id))?;
+                tx.delete(&dedup::path(id))?;
+            }
+            if let Some(last_run) = &last_run {
+                tx.put(schedule::LAST_RUN_PATH, last_run.as_str())?;
             }
             tx.emit("fetchers.source.purged", event)
         })?;
@@ -882,6 +919,12 @@ impl Fetchers {
         };
         let topic = if on { "fetchers.source.enabled" } else { "fetchers.source.disabled" };
         let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|e| Error::internal(e.to_string()))?;
+        // A hand-edited `source = "x"` is not a table -- index into it and this panics
+        // (#305's review, should-fix; the same class #255's review flagged). Refuse it
+        // like any other broken file, rather than crash the daemon over one.
+        if !doc.get("source").is_some_and(toml_edit::Item::is_table_like) {
+            return Err(Error::invalid_params(format!("'{id}': [source] is not a table")));
+        }
         doc["source"]["enabled"] = toml_edit::value(on);
         let text = doc.to_string();
         let cfg = schedule::SourceConfig::parse(id, &text).map_err(Error::invalid_params)?;
@@ -900,6 +943,14 @@ impl Fetchers {
         let _g = self.write.lock();
         if p.id == p.to {
             return Err(Error::invalid_params(format!("'{}' is already its id", p.to)));
+        }
+        // A run in flight loads `seen` at the start and writes it back, at the end, under
+        // the *old* id (`dedup::path`) -- renaming out from under it would make the new id
+        // miss this run's items while the old id's dedup state (moved away already) still
+        // gets written to, so next run re-reports them as new: duplicate
+        // `fetchers.item.found`, duplicate automation messages (#305's review, blocking).
+        if self.running.is_running(&p.id) {
+            return Err(Error::conflict(format!("'{}' is fetching right now -- wait for it to finish first", p.id)));
         }
         if ctx.store.read(&schedule::path(&p.to))?.is_some() {
             return Err(Error::conflict(format!("a source '{}' exists: pick another id", p.to)));
@@ -938,6 +989,9 @@ impl Fetchers {
         if p.id == p.to {
             return Err(Error::invalid_params(format!("'{}' is already its id", p.to)));
         }
+        if self.running.is_running(&p.id) {
+            return Err(Error::conflict(format!("'{}' is fetching right now -- wait for it to finish first", p.id)));
+        }
         if ctx.store.read(&schedule::path(&p.to))?.is_some() {
             return Err(Error::conflict(format!("a source '{}' exists: pick another id", p.to)));
         }
@@ -945,6 +999,9 @@ impl Fetchers {
             return Err(Error::not_found(format!("no source '{}'", p.id)));
         };
         let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|e| Error::internal(e.to_string()))?;
+        if !doc.get("source").is_some_and(toml_edit::Item::is_table_like) {
+            return Err(Error::invalid_params(format!("'{}': [source] is not a table", p.id)));
+        }
         doc["source"]["enabled"] = toml_edit::value(false);
         if let Some(label) = &p.label {
             doc["source"]["label"] = toml_edit::value(label.as_str());
@@ -1857,12 +1914,37 @@ mod tests {
         );
         fetchers.load(&env.ctx).unwrap();
 
-        let v = fetchers.edit(&env.ctx, rss_input("blog", "https://b.test/f.xml")).unwrap();
+        let v = fetchers.edit(&env.ctx, "blog", &rss_text("https://b.test/f.xml")).unwrap();
         assert_eq!(v["kind_params"]["url"], "https://b.test/f.xml");
         assert!(fetchers.state().sources.get("blog").unwrap().enabled);
 
-        let err = fetchers.edit(&env.ctx, rss_input("nope", "https://c.test/f.xml")).unwrap_err();
+        let err = fetchers.edit(&env.ctx, "nope", &rss_text("https://c.test/f.xml")).unwrap_err();
         assert_eq!(err.code, shimmer_core::ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn edit_rejects_a_broken_replacement_and_keeps_the_old_file() {
+        // #305's review, blocking: a full replace must mean the caller sends the *whole*
+        // file (so nothing not retyped is silently reset), not a structured `SourceInput`
+        // the CLI would have to reassemble from flags, forgetting whatever it didn't
+        // re-pass.
+        let env = TestEnv::new("fetchers");
+        let fetchers = Fetchers::default();
+        let original = rss_text("https://a.test/f.xml");
+        write_source(
+            &env,
+            "blog",
+            json!({"enabled": true, "interval": "hourly", "kind": "rss", "url": "https://a.test/f.xml"}),
+        );
+        fetchers.load(&env.ctx).unwrap();
+
+        let err = fetchers.edit(&env.ctx, "blog", "not [[[ valid toml").unwrap_err();
+        assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams);
+        assert_eq!(
+            env.ctx.store.read_string(&schedule::path("blog")).unwrap().unwrap(),
+            original,
+            "the old file must survive a rejected edit"
+        );
     }
 
     #[test]
@@ -1935,6 +2017,29 @@ mod tests {
     }
 
     #[test]
+    fn purge_also_deletes_the_sources_dedup_state_and_last_run_entry() {
+        // #305's review, should-fix: left behind, a new source reusing a purged id inherits
+        // its old dedup state (hiding every item it already "saw") and last-run time (its
+        // first run delayed instead of running right away).
+        let env = TestEnv::new("fetchers");
+        let fetchers = Fetchers::default();
+        write_source(
+            &env,
+            "blog",
+            json!({"enabled": true, "interval": "hourly", "kind": "rss", "url": "https://example.test/f.xml"}),
+        );
+        fetchers.load(&env.ctx).unwrap();
+        env.ctx.store.write(&dedup::path("blog"), "c-1 = \"2026-01-01T00:00:00Z\"\n").unwrap();
+        schedule::record_run(&env.ctx, "blog", env.ctx.clock.now()).unwrap();
+
+        fetchers.remove(&env.ctx, "blog").unwrap();
+        fetchers.purge(&env.ctx, Purge { id: Some("blog".into()), confirm: Some(json!({"sources": 1})) }).unwrap();
+
+        assert!(env.ctx.store.read(&dedup::path("blog")).unwrap().is_none(), "seen.toml must go with it");
+        assert!(!schedule::load_last_run(&env.ctx).unwrap().contains_key("blog"), "and its last_run.toml entry");
+    }
+
+    #[test]
     fn enable_and_disable_toggle_the_flag_and_keep_the_rest_of_the_file() {
         let env = TestEnv::new("fetchers");
         let fetchers = Fetchers::default();
@@ -1955,6 +2060,22 @@ mod tests {
 
         let err = fetchers.set_enabled(&env.ctx, "nope", true).unwrap_err();
         assert_eq!(err.code, shimmer_core::ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn set_enabled_and_copy_refuse_a_hand_edited_non_table_source_instead_of_panicking() {
+        // #305's review, should-fix (the same class #255's review flagged): indexing
+        // `doc["source"]["enabled"]` into a `source = "x"` panics instead of erroring.
+        let env = TestEnv::new("fetchers");
+        let fetchers = Fetchers::default();
+        env.ctx.store.write(&schedule::path("blog"), "source = \"not a table\"\n").unwrap();
+
+        let err = fetchers.set_enabled(&env.ctx, "blog", true).unwrap_err();
+        assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams);
+
+        let err =
+            fetchers.copy(&env.ctx, CopyParams { id: "blog".into(), to: "blog-2".into(), label: None }).unwrap_err();
+        assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams);
     }
 
     #[test]
@@ -2004,6 +2125,34 @@ mod tests {
 
         let err = fetchers.rename(&env.ctx, MoveParams { id: "blog".into(), to: "other".into() }).unwrap_err();
         assert_eq!(err.code, shimmer_core::ErrorCode::Conflict);
+    }
+
+    #[test]
+    fn rename_copy_and_remove_all_refuse_a_source_that_is_fetching_right_now() {
+        // #305's review, blocking: `run_source` loads `seen` at the start and writes it back,
+        // at the end, under the *old* id -- renaming mid-fetch makes the new id miss that
+        // run's items while the old id's moved-away dedup state still gets written to, so
+        // next run re-reports them as new (duplicate `fetchers.item.found`, duplicate
+        // automation messages).
+        let env = TestEnv::new("fetchers");
+        let fetchers = Fetchers::default();
+        write_source(
+            &env,
+            "blog",
+            json!({"enabled": true, "interval": "hourly", "kind": "rss", "url": "https://a.test/f.xml"}),
+        );
+        fetchers.load(&env.ctx).unwrap();
+        let _permit = fetchers.running.try_acquire("blog").unwrap();
+
+        let err = fetchers.rename(&env.ctx, MoveParams { id: "blog".into(), to: "team-blog".into() }).unwrap_err();
+        assert_eq!(err.code, shimmer_core::ErrorCode::Conflict);
+        let err =
+            fetchers.copy(&env.ctx, CopyParams { id: "blog".into(), to: "blog-2".into(), label: None }).unwrap_err();
+        assert_eq!(err.code, shimmer_core::ErrorCode::Conflict);
+        let err = fetchers.remove(&env.ctx, "blog").unwrap_err();
+        assert_eq!(err.code, shimmer_core::ErrorCode::Conflict);
+        // Untouched: the file is still there under its original id.
+        assert!(env.ctx.store.read(&schedule::path("blog")).unwrap().is_some());
     }
 
     #[test]
