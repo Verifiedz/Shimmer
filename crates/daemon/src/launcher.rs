@@ -412,11 +412,53 @@ mod tests {
         }
     }
 
+    /// Polls until `path` exists (empty is fine), up to 5s.
+    async fn wait_for_file_to_exist(path: &Path) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !path.exists() {
+            assert!(tokio::time::Instant::now() < deadline, "{} never appeared", path.display());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A script line that starts a grandchild in the script's process group and writes its pid
+    /// to `pid_file` (atomically, so a reader never sees half of it). The grandchild sleeps
+    /// far longer than any test waits, so it's only gone if something killed it.
+    fn grandchild_writing_pid(pid_file: &Path) -> String {
+        let p = pid_file.display();
+        format!("sh -c 'echo $$ > {p}.tmp && mv {p}.tmp {p}; exec sleep 30' &\nsleep 30\n")
+    }
+
+    /// Polls until `pid` no longer exists, up to 5s, instead of a fixed sleep: the kill tests
+    /// were flaky on macOS CI because they guessed how long a kill takes.
+    async fn gone_within_5s(pid: i32) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
     #[tokio::test]
     async fn detached_script_outlives_the_backend_that_spawned_it() {
         let home = TempDir::new().unwrap();
         let marker = home.path().join("marker");
-        write_step_script(home.path(), "deep-work", "setup", &format!("sleep 0.3 && touch {}\n", marker.display()));
+        let release = home.path().join("release");
+        // The script waits for the test to say go, rather than a guessed 0.3 s that a slow
+        // runner could spend just spawning it; it gives up after 10 s so it never lingers.
+        write_step_script(
+            home.path(),
+            "deep-work",
+            "setup",
+            &format!(
+                "i=0; while [ ! -e {r} ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done; touch {m}\n",
+                r = release.display(),
+                m = marker.display()
+            ),
+        );
 
         {
             let backend = backend(&home);
@@ -428,8 +470,8 @@ mod tests {
         }
 
         assert!(!marker.exists(), "script should not have finished yet");
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        assert!(marker.exists(), "detached process did not outlive the backend that spawned it");
+        std::fs::write(&release, "").unwrap();
+        wait_for_file_to_exist(&marker).await;
     }
 
     const ECHO_ALL_INJECTED: &str = "echo \"$SHIMMER_WORKSPACE_ID|$SHIMMER_WORKSPACE_DIR|$SHIMMER_HOME|$SHIMMER_SOCKET|$SHIMMER_SESSION_ID|$SHIMMER_PLATFORM\"";
@@ -703,54 +745,49 @@ mod tests {
     #[tokio::test]
     async fn timeout_kills_the_whole_process_group_not_just_the_immediate_child() {
         let home = TempDir::new().unwrap();
-        let grandchild_marker = home.path().join("grandchild_marker");
-        // The backgrounded subshell inherits the script's process group (no setsid of its
-        // own), so a process-group kill must take it down too — proving §10's "kills the
-        // grandchild too (proves process-group kill, not just the immediate child)".
-        write_step_script(
-            home.path(),
-            "deep-work",
-            "setup",
-            &format!("(sleep 1 && touch {}) &\nsleep 5\n", grandchild_marker.display()),
-        );
+        let pid_file = home.path().join("grandchild.pid");
+        // The backgrounded `sh -c` inherits the script's process group (no setsid of its own),
+        // so a process-group kill must take it down too — proving §10's "kills the grandchild
+        // too (proves process-group kill, not just the immediate child)". The timeout is long
+        // enough that the grandchild is running, not being started, when the kill lands.
+        write_step_script(home.path(), "deep-work", "setup", &grandchild_writing_pid(&pid_file));
 
         let backend = backend(&home);
         let outcome = backend
-            .run(&supervised_step("deep-work", "setup", Duration::from_millis(200)), &CancellationToken::new())
+            .run(&supervised_step("deep-work", "setup", Duration::from_secs(2)), &CancellationToken::new())
             .await
             .unwrap();
 
         assert!(outcome.timed_out);
         assert_eq!(outcome.exit_code, None);
-        tokio::time::sleep(Duration::from_millis(1200)).await;
-        assert!(!grandchild_marker.exists(), "grandchild survived the process-group kill");
+        let pid: i32 = wait_for_file(&pid_file).await.trim().parse().unwrap();
+        assert!(gone_within_5s(pid).await, "grandchild {pid} survived the process-group kill");
     }
 
     #[tokio::test]
     async fn cancellation_kills_the_group_and_is_not_reported_as_timed_out() {
         let home = TempDir::new().unwrap();
-        let grandchild_marker = home.path().join("grandchild_marker");
-        write_step_script(
-            home.path(),
-            "deep-work",
-            "setup",
-            &format!("(sleep 1 && touch {}) &\nsleep 5\n", grandchild_marker.display()),
-        );
+        let pid_file = home.path().join("grandchild.pid");
+        write_step_script(home.path(), "deep-work", "setup", &grandchild_writing_pid(&pid_file));
 
         let backend = backend(&home);
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        let pid_path = pid_file.clone();
+        // Cancelled once the grandchild is running, not at a guessed moment: a kill that lands
+        // while the script is still starting it is the race this test kept losing on macOS CI.
+        let waiter = tokio::spawn(async move {
+            let pid: i32 = wait_for_file(&pid_path).await.trim().parse().unwrap();
             cancel_clone.cancel();
+            pid
         });
         let outcome =
-            backend.run(&supervised_step("deep-work", "setup", Duration::from_secs(5)), &cancel).await.unwrap();
+            backend.run(&supervised_step("deep-work", "setup", Duration::from_secs(10)), &cancel).await.unwrap();
+        let pid = waiter.await.unwrap();
 
         assert!(!outcome.timed_out, "a cancelled step is not timed out (callers distinguish via cancel)");
         assert_eq!(outcome.exit_code, None);
-        tokio::time::sleep(Duration::from_millis(1200)).await;
-        assert!(!grandchild_marker.exists(), "grandchild survived the process-group kill");
+        assert!(gone_within_5s(pid).await, "grandchild {pid} survived the process-group kill");
     }
 
     async fn launch_once(backend: &RealLaunchBackend) -> StepOutcome {
