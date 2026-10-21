@@ -244,6 +244,7 @@ impl SourceConfig {
             .as_ref()
             .map(|t| serde_json::to_value(t).ok().and_then(|v| v.as_object().cloned()).unwrap_or_default());
         if let Some(f) = &filter {
+            only_title_keys(f)?;
             // `Filter::parse`'s own errors already name the key ("filter on 'title': …").
             Filter::parse(f)?;
         }
@@ -304,6 +305,35 @@ impl SourceConfig {
     pub fn matches_title(&self, title: &str, today: NaiveDate, tz: Tz) -> bool {
         matches_title(self.filter.as_ref(), title, today, tz)
     }
+}
+
+/// `filter` must check only `title`, plain or inside an `"or"` alternative -- `Filter` has no
+/// schema behind it (its own doc comment), so a key like `company = {"contains": "x"}` parses
+/// as a perfectly good filter and then silently matches nothing, every time, once it's
+/// checked against `{"title": …}` only below (#311's review, blocking; #299's review point
+/// 5). Shared by [`SourceConfig::parse`] (a source's own file) and `module::validate_filter`
+/// (an ad-hoc `fetchers.run`/`.test`/`.new` override), so neither path can drift from the
+/// other's idea of what a filter here is allowed to name.
+pub(crate) fn only_title_keys(filter: &Map<String, Value>) -> std::result::Result<(), String> {
+    for (key, value) in filter {
+        if key == "or" {
+            // A malformed "or" (not a list, an empty alternative) is left to `Filter::parse`'s
+            // own, better-worded error -- this only needs to recurse into whatever alternatives
+            // *are* shaped like filters.
+            if let Some(list) = value.as_array() {
+                for alt in list {
+                    if let Some(obj) = alt.as_object() {
+                        only_title_keys(obj)?;
+                    }
+                }
+            }
+            continue;
+        }
+        if key != "title" {
+            return Err(format!("filter on '{key}': only 'title' is checked against an item; nothing else matches"));
+        }
+    }
+    Ok(())
 }
 
 /// Whether `title` passes `filter` (ADR 0028 §8) -- `None` keeps everything. A free function,
@@ -564,6 +594,24 @@ mod tests {
         .unwrap();
         assert!(cfg.matches_title("Junior Engineer", today(), chrono_tz::UTC));
         assert!(!cfg.matches_title("Senior Engineer", today(), chrono_tz::UTC));
+    }
+
+    #[test]
+    fn a_filter_on_any_field_but_title_is_rejected_at_load_not_silently_matching_nothing() {
+        // #311's review, blocking: `Filter` has no schema, so `company = {"contains": "Acme"}`
+        // used to load fine and then match nothing, forever -- the filter is checked against
+        // `{"title": …}` only. Same for a key inside an "or" alternative.
+        let why = problem_for(
+            json!({"enabled": true, "interval": "daily", "filter": {"company": {"contains": "Acme"}}}),
+            "hn-whoishiring",
+        );
+        assert!(why.contains("company"), "{why}");
+
+        let why = problem_for(
+            json!({"enabled": true, "interval": "daily", "filter": {"or": [{"company": {"contains": "Acme"}}]}}),
+            "hn-whoishiring",
+        );
+        assert!(why.contains("company"), "{why}");
     }
 
     #[test]

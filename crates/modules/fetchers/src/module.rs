@@ -426,6 +426,7 @@ struct Purge {
 /// (an automation, `shimmer call`) is rejected here too, not just at file-load time.
 fn validate_filter(filter: Option<Map<String, Value>>) -> Result<Option<Map<String, Value>>> {
     if let Some(f) = &filter {
+        schedule::only_title_keys(f).map_err(Error::invalid_params)?;
         Filter::parse(f).map_err(Error::invalid_params)?;
     }
     Ok(filter)
@@ -1306,6 +1307,17 @@ mod tests {
         let err = validate_filter(Some(bad)).unwrap_err();
         assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams);
         assert!(err.message.contains("contains"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_caller_supplied_filter_on_any_field_but_title_is_also_rejected() {
+        // #311's review, blocking, through the same ad-hoc override path as above -- a
+        // `fetchers.run`/`.test`/`.new` filter that only names a field no one checks must be
+        // caught here too, not just at file-load time (`schedule::only_title_keys`).
+        let bad = json!({"company": {"contains": "Acme"}}).as_object().unwrap().clone();
+        let err = validate_filter(Some(bad)).unwrap_err();
+        assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams);
+        assert!(err.message.contains("company"), "{}", err.message);
     }
 
     #[tokio::test]
