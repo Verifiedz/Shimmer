@@ -44,10 +44,24 @@ pub const COPY_OP: &str = "fetchers.copy";
 pub const TEMPLATES_OP: &str = "fetchers.templates";
 pub const PEEK_OP: &str = "fetchers.peek";
 pub const HEALTH_OP: &str = "fetchers.health";
+/// Inline, answered from [`ITEMS`] alone -- never the event log (ADR 0042: a module has no way
+/// to read that back; `core.events.list` reaches a client, not code running inside the daemon).
+pub const ITEMS_OP: &str = "fetchers.items";
 
 /// Caps `fetchers.item.found`'s `raw_data` (ADR 0028 §3) -- big enough for a job posting's
 /// text, small enough that one large item can't become the next cache-bloat problem.
 const MAX_RAW_DATA_CHARS: usize = 8 * 1024;
+/// Every source's found items, oldest first, capped: `automations.history`'s precedent (ADR
+/// 0042), not a second copy of `core.events.list`'s own query path. `fetchers.item.found` stays
+/// the source of truth -- this is a convenience that answers "what did I just find" fast and
+/// for free, same posture `automations`' own `history.json` already takes ("the event log has
+/// everything").
+const ITEMS: &str = "items.json";
+/// Oldest dropped past this many. Twenty sources each finding a full `dedup::MAX_NEW_PER_RUN`
+/// in one run would alone fill this -- the cap exists so one noisy run across many sources
+/// can't make `fetchers.items` an ever-growing file, not to comfortably hold every source's
+/// entire backlog at once.
+const ITEMS_KEPT: usize = 1000;
 /// However many fields an item has, each still keeps enough characters to be recognisable
 /// rather than being cut to nothing.
 const MIN_FIELD_CHARS: usize = 64;
@@ -280,6 +294,19 @@ impl Module for Fetchers {
                 params_schema: json!({"type": "object"}),
                 execution: Execution::Inline,
             },
+            CommandSpec {
+                op: ITEMS_OP.into(),
+                summary: "Items a real run has actually found and kept, most recent first".into(),
+                params_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "source": {"type": "string"},
+                        "contains": {"type": "array", "items": {"type": "string"}},
+                        "excludes": {"type": "array", "items": {"type": "string"}},
+                    },
+                }),
+                execution: Execution::Inline,
+            },
         ]
     }
 
@@ -352,6 +379,10 @@ impl Module for Fetchers {
                 self.copy(ctx, p)
             }
             HEALTH_OP => self.health(ctx),
+            ITEMS_OP => {
+                let p: ItemsParams = decode(params)?;
+                Ok(items_reply(ctx, p))
+            }
             _ => Err(Error::unknown_op(format!("fetchers has no op '{op}'"))),
         }
     }
@@ -493,6 +524,20 @@ struct Purge {
     id: Option<String>,
     #[serde(default)]
     confirm: Option<Value>,
+}
+
+/// `fetchers.items` (ADR 0042): `contains`/`excludes` are a plain case-insensitive substring
+/// narrowing of what's already in [`ITEMS`] -- deliberately not a `core::filter::Filter`
+/// (ADR 0028 §8), the same "that's a different, simpler thing" distinction the CLI's own
+/// doc comment drew before this moved server-side.
+#[derive(Default, Deserialize)]
+struct ItemsParams {
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    contains: Vec<String>,
+    #[serde(default)]
+    excludes: Vec<String>,
 }
 
 /// `FetchParams.filter`/`SourceInput.filter`, checked the same way `SourceConfig::parse`
@@ -870,6 +915,26 @@ impl Fetchers {
             }
             Ok(())
         })?;
+        // A separate write, after the transaction above has committed: [`ITEMS`] is a
+        // convenience cache (ADR 0042), not the source of truth the previous transaction's
+        // events already are, so a crash between the two loses at most this cache's copy of
+        // what just happened, never the record of it happening. Held only across this call --
+        // up to 8 fetches finish around the same time on this lane, and this file's own
+        // read-modify-write must not interleave with another source's, the same reasoning
+        // `fetch`'s own `last_run.toml` update already uses this lock for.
+        if !found.is_empty() {
+            let _g = self.write.lock();
+            let mut items = item_log(ctx);
+            for item in &found {
+                let mut entry = item_payload(source_id, item);
+                entry["at"] = json!(now);
+                items.push(entry);
+            }
+            let drop = items.len().saturating_sub(ITEMS_KEPT);
+            items.drain(..drop);
+            let text = serde_json::to_string_pretty(&items).map_err(|e| Error::internal(e.to_string()))?;
+            ctx.store.write(ITEMS, text)?;
+        }
         Ok(new_count)
     }
 }
@@ -1317,6 +1382,42 @@ fn item_payload(source_id: &str, item: &RawItem) -> Value {
     })
 }
 
+/// [`ITEMS`], oldest first. A broken file reads as empty, the same convenience-not-truth
+/// posture `automations::history` already takes -- `fetchers.item.found` events are what
+/// actually happened; this is only a fast, capped way to show it.
+fn item_log(ctx: &Ctx) -> Vec<Value> {
+    ctx.store
+        .read_string(ITEMS)
+        .ok()
+        .flatten()
+        .and_then(|t| serde_json::from_str::<Vec<Value>>(&t).ok())
+        .unwrap_or_default()
+}
+
+/// `fetchers.items` (ADR 0042): matched, most recent first. Reads [`ITEMS`] fresh on every
+/// call rather than through `self.state()` -- it is small and capped, and a plain read keeps
+/// this op from needing any lock a concurrent `run_source` write might contend with.
+fn items_reply(ctx: &Ctx, p: ItemsParams) -> Value {
+    let matching: Vec<Value> = item_log(ctx)
+        .into_iter()
+        .rev()
+        .filter(|e| p.source.as_deref().is_none_or(|s| e["source_name"] == s))
+        .filter(|e| title_matches(e["title"].as_str().unwrap_or_default(), &p.contains, &p.excludes))
+        .collect();
+    json!({"items": matching})
+}
+
+/// Same matching rule the CLI's own `items` used to apply client-side, before this moved
+/// server-side (ADR 0042): a plain case-insensitive substring match, OR'd within each list --
+/// deliberately simpler than `core::filter::Filter` (ADR 0028 §8), which is for a source's own
+/// standing configuration, not a one-off "show me the ones about X" narrowing of history.
+fn title_matches(title: &str, contains: &[String], excludes: &[String]) -> bool {
+    let lower = title.to_lowercase();
+    let included = contains.is_empty() || contains.iter().any(|w| lower.contains(&w.to_lowercase()));
+    let excluded = excludes.iter().any(|w| lower.contains(&w.to_lowercase()));
+    included && !excluded
+}
+
 /// Caps an item's `raw_data` (ADR 0028 §3) **without changing its shape** (#126's review,
 /// B12). Replacing an over-long object with `{"truncated": true, "preview": "<json text>"}`
 /// meant an automation reading `{raw_data.company}` broke on exactly the long postings and
@@ -1586,6 +1687,82 @@ mod tests {
         assert_eq!(second["new_items"].as_u64(), Some(0));
         let found_after_second = env.backend.events().iter().filter(|e| e.topic == "fetchers.item.found").count();
         assert_eq!(found_after_second, 1, "an already-seen item must never be emitted twice");
+
+        // The same run also appended to fetchers.items' own log (ADR 0042) -- fetchers.items
+        // answers from this, not from re-querying the events above.
+        let log = item_log(&env.ctx);
+        assert_eq!(log.len(), 1, "the already-seen second run must not append a duplicate");
+        assert_eq!(
+            (log[0]["source_name"].as_str(), log[0]["source_id"].as_str()),
+            (Some("hn-whoishiring"), Some("10"))
+        );
+        assert!(log[0]["at"].is_string(), "each entry carries when it was found");
+    }
+
+    #[tokio::test]
+    async fn the_items_log_drops_the_oldest_past_its_cap() {
+        let env = TestEnv::new("fetchers");
+        write_source(&env, "hn-whoishiring", json!({"enabled": true, "interval": "daily", "kind": "hn-whoishiring"}));
+        stub_one_hn_comment(&env, 10, "<p>Acme | Remote<p>Hiring Rust engineers.");
+
+        let padding: Vec<Value> = (0..ITEMS_KEPT)
+            .map(|i| json!({"source_name": "old", "title": format!("old {i}"), "url": "https://x", "at": "2020-01-01T00:00:00Z"}))
+            .collect();
+        env.ctx.store.write(ITEMS, serde_json::to_string(&padding).unwrap()).unwrap();
+
+        let fetchers = Fetchers::default();
+        fetchers.load(&env.ctx).unwrap();
+        fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None).await.unwrap();
+
+        let log = item_log(&env.ctx);
+        assert_eq!(log.len(), ITEMS_KEPT, "stays capped, the oldest dropped to make room for the new one");
+        assert_eq!(log.last().unwrap()["source_name"], "hn-whoishiring", "the newest item lands at the end");
+        assert_eq!(log.first().unwrap()["title"], "old 1", "\"old 0\", the very oldest, was the one dropped");
+    }
+
+    #[test]
+    fn title_matches_is_case_insensitive_and_excludes_win_over_contains() {
+        assert!(title_matches("Junior Rust Engineer", &[], &[]), "no filter at all keeps everything");
+        assert!(title_matches("Junior Rust Engineer", &["junior".into()], &[]));
+        assert!(!title_matches("Senior Rust Engineer", &["junior".into()], &[]), "contains must actually match");
+        assert!(
+            !title_matches("Junior Rust Engineer", &["junior".into()], &["engineer".into()]),
+            "an excludes match drops it even though contains would have kept it"
+        );
+    }
+
+    #[test]
+    fn items_reply_filters_by_source_and_title_most_recent_first() {
+        let env = TestEnv::new("fetchers");
+        let log = vec![
+            json!({"source_name": "a", "title": "Junior Rust Engineer", "url": "https://x/1"}),
+            json!({"source_name": "b", "title": "Senior Rust Engineer", "url": "https://x/2"}),
+            json!({"source_name": "a", "title": "Staff Python Engineer", "url": "https://x/3"}),
+        ];
+        env.ctx.store.write(ITEMS, serde_json::to_string(&log).unwrap()).unwrap();
+
+        let all = items_reply(&env.ctx, ItemsParams::default());
+        let titles: Vec<&str> = all["items"].as_array().unwrap().iter().map(|i| i["title"].as_str().unwrap()).collect();
+        assert_eq!(
+            titles,
+            vec!["Staff Python Engineer", "Senior Rust Engineer", "Junior Rust Engineer"],
+            "oldest-first on disk, most recent first in the reply"
+        );
+
+        let a_only = items_reply(&env.ctx, ItemsParams { source: Some("a".into()), ..Default::default() });
+        assert_eq!(a_only["items"].as_array().unwrap().len(), 2);
+
+        let rust_only = items_reply(&env.ctx, ItemsParams { contains: vec!["rust".into()], ..Default::default() });
+        assert_eq!(rust_only["items"].as_array().unwrap().len(), 2);
+
+        let no_senior = items_reply(&env.ctx, ItemsParams { excludes: vec!["senior".into()], ..Default::default() });
+        assert_eq!(no_senior["items"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn items_reply_with_no_log_yet_is_empty_not_an_error() {
+        let env = TestEnv::new("fetchers");
+        assert_eq!(items_reply(&env.ctx, ItemsParams::default()), json!({"items": []}));
     }
 
     #[tokio::test]
