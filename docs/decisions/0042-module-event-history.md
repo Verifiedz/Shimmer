@@ -1,8 +1,8 @@
-# 0039. Can a module read its own event history, not just emit?
+# 0042. Can a module read its own event history, not just emit?
 
-Status: proposed · Raised by Dev B · Needs sign-off: Dev A (changes `core`, possibly `daemon`)
-· Dev C notified if decided yes (a new `Ctx` field) · Open for wider discussion before a
-decision is made — this document lays out the question, not a settled answer.
+Status: accepted · Raised by Dev B · Decided by Dev B (#314's review) and Dev A · No `core`
+change (Option A, below, needs none) · Dev C not notified · Renumbered from 0039, which #293
+(socket-per-home) already took on master; 0040 and 0041 are also spoken for (#309, #312).
 
 ## Context
 
@@ -46,13 +46,13 @@ Should a module be able to read back the event log (its own topics, or any), or 
 module that wants "show me what happened" keep its own capped copy, the way `automations`
 already does?
 
-## Options considered
+## Decision
 
-### A. `fetchers` keeps its own capped items log (follows the `automations.history` precedent)
-
-A new file under `data/fetchers/` (shape and retention undecided — e.g. last N per source, or
-last 90 days), written in the same transaction `run_source` already uses to emit
-`fetchers.item.found`. `fetchers.items` reads only this file. No `core` change at all.
+**A. `fetchers` keeps its own capped items log**, following the `automations.history`
+precedent exactly: a new file under `data/fetchers/` (shape and retention — last N per source,
+or last 90 days — left to the implementing PR), written in the same transaction `run_source`
+already uses to emit `fetchers.item.found`. `fetchers.items` reads only this file. No `core`
+change at all.
 
 - **For:** zero blast radius; proven precedent; ships inside the `fetchers` PR with no
   cross-team sign-off. Keeps modules strictly decoupled from the event-log's own storage
@@ -61,7 +61,15 @@ last 90 days), written in the same transaction `run_source` already uses to emit
 - **Against:** duplicates data that already exists, verbatim, in the event log files — a
   second on-disk copy of the same facts, with its own retention bug surface, repeated per
   module. If `records`, `workspaces`, or a future module wants the same "recent activity"
-  shape, each one reinvents it.
+  shape, each one reinvents it. Accepted anyway: Option B is the real fix for that, but it's a
+  `Ctx`-wide capability decision that deserves its own design pass (#214), not something to
+  back into for one module's convenience.
+
+Closes ADR 0028 §9/#277 item 6 ("decide where found items go"): `fetchers.items` moves
+server-side, backed by this log, in the `fetchers-277-health` branch — no longer the CLI's own
+client-side filter over `core.events.list`.
+
+## Not chosen
 
 ### B. A read-only `Ctx` capability: modules can query the event log, not just emit to it
 
@@ -91,6 +99,9 @@ Something like `ctx.events.query(topic, limit) -> Vec<Event>`, backed by the sam
     option means a module's own code — not just a client with socket access — now relies on it
     holding, so it's worth re-stating rather than inheriting silently.
 
+Deferred, not rejected: revisit at M4, with `fetchers.items` noted as a second real consumer
+alongside whatever #214's own step 2 is already solving for.
+
 ### C. Don't move `fetchers.items` server-side; leave it as the CLI's own client-side query
 
 `shimmer fetchers items` keeps calling `core.events.list` itself and filtering client-side,
@@ -103,8 +114,11 @@ exactly as it does today. No `core` change, no new module storage either.
   logic ("match by source, apply the title-filter rule") that arguably belongs server-side,
   the same complaint issue item 6 originally raised about it.
 
-## Not decided here
+## Consequences
 
-This document exists to put the question in front of the people who need to weigh in, not to
-settle it. `fetchers.items` (ADR 0028's step 8) is paused on this — step 8's other half,
-`fetchers.health`, has no such dependency and proceeds independently.
+- `fetchers` gets its own capped items log under `data/fetchers/`; no `core`/`proto` change.
+- `fetchers.items` (ADR 0028's step 8, second half — `fetchers.health`, the first half, already
+  shipped independently) is unblocked and proceeds in `fetchers-277-health`.
+- The real "can a module read back the shared event log" question (Option B) is not closed,
+  only deferred — revisit at M4 against #214's own step 2, with this ADR as the first recorded
+  case that wanted it.
