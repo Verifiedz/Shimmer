@@ -251,8 +251,19 @@ async fn lock_home(home: &Path) -> Result<File> {
 
 /// Bind the socket, clearing a stale one left by a daemon that died without cleanup.
 fn bind(path: &Path) -> Result<UnixListener> {
+    // A path the OS can't take as a socket says so plainly (ADR 0039 §5).
+    if let Some(why) = shimmer_proto::paths::too_long(path) {
+        return Err(Error::invalid_params(why));
+    }
     if let Some(parent) = path.parent().filter(|p| !p.exists()) {
         fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+    }
+    // The short folder is in a shared `/tmp`: someone else may have made it first.
+    let uid = shimmer_proto::paths::owner_uid();
+    if shimmer_proto::paths::in_short_socket_dir(path, uid) {
+        if let Some(parent) = path.parent() {
+            shimmer_proto::paths::check_private_dir(parent, uid).map_err(Error::conflict)?;
+        }
     }
     if path.exists() {
         if std::os::unix::net::UnixStream::connect(path).is_ok() {
