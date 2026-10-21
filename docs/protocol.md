@@ -14,8 +14,15 @@ Unix domain socket, stream mode.
 
 | Platform | Socket path |
 |---|---|
-| Linux | `$XDG_RUNTIME_DIR/shimmer/daemon.sock`, falling back to `$SHIMMER_HOME/daemon.sock` |
+| Linux | `$XDG_RUNTIME_DIR/shimmer/<id>.sock`, falling back to `$SHIMMER_HOME/daemon.sock` |
 | macOS | `$SHIMMER_HOME/daemon.sock` |
+
+One daemon per Shimmer folder, each on its own socket (ADR 0039). `<id>` is 16 hex digits of a
+64-bit FNV-1a hash of the folder's resolved path (absolute; the longest existing part with
+symlinks followed). A default path longer than a socket allows (103 bytes on macOS, 107 on Linux)
+becomes `/tmp/shimmer-<uid>/<id>.sock`, in a folder that must be owned by the user and closed to
+everyone else. `SHIMMER_SOCKET` overrides all of this, and is never shortened: one that's too long
+is an error saying so.
 | Windows | Named pipe `\\.\pipe\shimmer-daemon` (deferred; not before M6) |
 
 The path is also exported to workspace scripts as `SHIMMER_SOCKET`. A client reads that
@@ -59,7 +66,7 @@ The client sends `hello` first, before anything else. The daemon replies `welcom
 {"v": 2, "kind": "hello", "client": "tui", "client_version": "0.3.1"}
 
 // ←
-{"v": 2, "kind": "welcome", "daemon_version": "0.3.0", "session": "01JD2K…"}
+{"v": 2, "kind": "welcome", "daemon_version": "0.3.0", "session": "01JD2K…", "home": "/home/me/.local/share/shimmer"}
 ```
 
 - `v` is the **protocol** version, an integer, bumped only on breaking changes.
@@ -71,6 +78,9 @@ The client sends `hello` first, before anything else. The daemon replies `welcom
     `records.item.purged`, `scheduler.trigger.paused` / `.resumed` became `.disabled` / `.enabled`.
 - Daemon rejects an unknown `v` with `unsupported_version` and closes.
 - `daemon_version` and `client_version` are informational. Never branch on them.
+- `home` (ADR 0039 §2) is the resolved Shimmer folder the daemon serves; absent from an older
+  daemon and from `shimmer mockd`. A client that knows which folder it means refuses a daemon
+  naming another (the CLI does, with `unavailable`). Additive, so no version bump.
 
 ---
 
