@@ -2225,7 +2225,10 @@ mod tests {
     fn templates_lists_every_built_in_and_peek_finds_one_by_id_or_reports_the_others() {
         let all = templates_reply(None).unwrap();
         let ids: Vec<&str> = all["templates"].as_array().unwrap().iter().map(|t| t["id"].as_str().unwrap()).collect();
-        assert_eq!(ids, vec!["hn-whoishiring", "wwr", "greenhouse", "lever", "rss"]);
+        assert_eq!(
+            ids,
+            vec!["hn-whoishiring", "wwr", "greenhouse", "lever", "rss", "steam-news", "cheapshark-deals", "itch-tag"]
+        );
         assert!(!all["categories"].as_array().unwrap().is_empty());
 
         let one = templates_reply(Some("rss")).unwrap();

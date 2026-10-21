@@ -1,0 +1,36 @@
+[template]
+label = "Steam game news"
+description = "Patch notes and announcements for one game, from Steam's own news feed"
+category = "gaming"
+kind = "json-api"
+good_to_know = [
+    "The app id is the number in the game's own Steam store url, e.g. store.steampowered.com/app/730 is 730",
+    "Steam's own API, no key needed",
+]
+
+[[question]]
+name = "APPID"
+prompt = "The game's Steam app id (e.g. 730 for Counter-Strike 2)"
+kind = "name"
+required = true
+
+[[question]]
+name = "TITLE_FILTER"
+prompt = "Only show titles containing (comma-separated, optional)"
+kind = "filter"
+
+[source]
+text = '''
+[source]
+enabled = false
+interval = "hourly"
+kind = "json-api"
+filter = ${TITLE_FILTER} # if TITLE_FILTER
+
+[kind]
+url = "https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid=${APPID}&count=10&format=json"
+items_path = "appnews.newsitems"
+id_field = "gid"
+title_field = "title"
+url_field = "url"
+'''
