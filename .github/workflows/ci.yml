@@ -5,7 +5,7 @@ name: ci
 on:
   # A branch with a PR is checked by its PR; a push runs only where nothing else would check it.
   push:
-    branches: [master, "integration/**", "post-*"]
+    branches: [master, "integration/**", "post-**"]
   pull_request:
 
 # A new push to a PR cancels the run it replaces. Pushes to master and integration/* are never
