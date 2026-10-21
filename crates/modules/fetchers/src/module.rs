@@ -557,17 +557,34 @@ impl Fetchers {
         // The one exception is cancellation (#126's review, B11): the user stopping a run
         // isn't the source having been fetched, and recording it made the next run wait a
         // full interval (a day, for `daily`) having fetched nothing.
+        let _g = self.write.lock();
         if !ctx.cancel.is_cancelled() {
-            let _g = self.write.lock();
             schedule::record_run(ctx, &source_id, ctx.clock.now())?;
-            // Next run scheduled from here, success or failure (ADR 0028 §6) -- whether this
-            // run was the source's own schedule firing or a person's manual `fetchers.run`,
-            // there is always exactly one pending schedule per source, pointing at its last
-            // actual run plus its interval.
-            if let Some(cfg) = configured {
-                self.reconcile_schedule(ctx, &source_id, cfg.enabled, cfg)?;
-            }
         }
+        // Rescheduled regardless of cancellation (#306's review, blocking; the same root
+        // issue as #299's review point 1): the one-time schedule that fired to start this
+        // run is already consumed by the time this runs, so skipping this whole block on
+        // cancel -- as it used to -- left the source with no pending schedule at all,
+        // forever, until some unrelated write (an edit, enable/disable) happened to touch
+        // it. A task's cancel token is `shutdown.child_token()` (`queue/mod.rs`), so any
+        // daemon shutdown mid-fetch did this, not just an explicit `queue cancel`. Not
+        // recording the run above already means a cancelled run isn't treated as fetched,
+        // so the reschedule below computes the same due time as before -- due again right
+        // away, not after a full extra interval.
+        //
+        // The consumed state is cancelled first, unconditionally, rather than left for
+        // `reconcile_schedule` to notice: that function skips rescheduling when the due
+        // time hasn't moved, assuming the existing state is still a *live, pending* entry --
+        // true when it's reconciling a settings change, false here, where it's reconciling
+        // a trigger that already fired. On a cancelled run the due time doesn't move
+        // (above), so without this, `reconcile_schedule` would see its own stale, already-
+        // fired state and skip, keeping the source permanently un-scheduled -- exactly the
+        // bug this is fixing.
+        self.cancel_schedule(ctx, &source_id)?;
+        if let Some(cfg) = configured {
+            self.reconcile_schedule(ctx, &source_id, cfg.enabled, cfg)?;
+        }
+        drop(_g);
 
         match outcome {
             Ok(new_items) => {
@@ -1800,6 +1817,42 @@ mod tests {
         assert_eq!(classify_failure(&env.ctx, &err), "cancelled");
         let failed: Vec<_> = env.backend.events().into_iter().filter(|e| e.topic == "fetchers.fetch.failed").collect();
         assert_eq!(failed[0].payload["reason"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_fetch_still_reschedules_the_next_run() {
+        // #306's review, blocking (the same root issue as #299's review point 1): the
+        // one-time schedule that fired to start this run is already consumed by the time
+        // `fetch` runs, so skipping the reschedule entirely on cancellation -- as it used
+        // to -- left the source with no pending schedule at all, forever. A task's cancel
+        // token is `shutdown.child_token()`, so any daemon shutdown mid-fetch did this, not
+        // just an explicit `queue cancel`.
+        let env = TestEnv::new("fetchers");
+        let fetchers = Fetchers::default();
+        let mut input = rss_input("blog", "https://example.test/f.xml");
+        input.interval = schedule::IntervalSpec::Seconds(3600);
+        fetchers.create(&env.ctx, input).unwrap();
+        let first = pending_schedule(&env, "blog").expect("create schedules the first run");
+
+        // Time passes before the (eventually cancelled) run fires. `blog` never actually
+        // ran, so a reconcile computes its due time from `now`, not `last_run` -- if the
+        // stale state were left untouched (the bug), its `due_at` would still read as it
+        // did at creation; a genuine reschedule must move it forward by this same amount.
+        env.ctx.clock.advance(chrono::Duration::seconds(10).to_std().unwrap());
+        env.ctx.cancel.cancel();
+        let err = fetchers.fetch(&env.ctx, "blog".into(), None).await.unwrap_err();
+        assert_eq!(classify_failure(&env.ctx, &err), "cancelled");
+
+        assert!(
+            !schedule::load_last_run(&env.ctx).unwrap().contains_key("blog"),
+            "a cancelled run must not be recorded as fetched"
+        );
+        let second = pending_schedule(&env, "blog").expect("still scheduled after a cancelled run, not abandoned");
+        assert_eq!(
+            second.due_at,
+            first.due_at + chrono::Duration::seconds(10),
+            "the stale, already-fired schedule must be replaced by a freshly computed one, not left in place"
+        );
     }
 
     #[test]
