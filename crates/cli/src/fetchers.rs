@@ -124,7 +124,7 @@ pub fn parse(words: Vec<String>) -> std::result::Result<FetchersCmd, String> {
                 title_excludes: terms(flags.value("--excludes")),
             })
         }
-        other => Err(format!("unknown fetchers command '{other}'; see 'shimmer fetchers --help'")),
+        other => Err(crate::suggest::unknown_command(Some("fetchers"), other, USAGE)),
     }
 }
 
