@@ -477,6 +477,9 @@ fn status(env: &Env, services: &mut impl Services) -> Result<String> {
         }
         Os::Other => {}
     }
+    if let Some(warning) = old_socket(&text, env)? {
+        warnings.push(warning);
+    }
     match program_in(&text) {
         Some(exe) if !exe.exists() => {
             warnings.push(format!("it runs {}, which no longer exists: run 'shimmer startup on' again", exe.display()))
@@ -491,6 +494,18 @@ fn status(env: &Env, services: &mut impl Services) -> Result<String> {
     }
     out.extend(warnings.iter().map(|w| warning_line(w)));
     Ok(out.join("\n"))
+}
+
+/// A unit or plist written before ADR 0039 pins the old shared socket, while commands now use
+/// their folder's own (ADR 0039 §6): say so, and how to fix it.
+fn old_socket(text: &str, env: &Env) -> Result<Option<String>> {
+    let Some((_, socket)) = env.pinned.iter().find(|(k, _)| k == "SHIMMER_SOCKET") else { return Ok(None) };
+    let unit = format!("Environment={}", systemd_quote(&format!("SHIMMER_SOCKET={socket}"))?);
+    let plist = format!("<key>SHIMMER_SOCKET</key><string>{}</string>", xml(socket));
+    let pins_another = text.contains("SHIMMER_SOCKET") && !text.contains(&unit) && !text.contains(&plist);
+    Ok(pins_another.then(|| {
+        "the login service uses a different socket than your commands (an older Shimmer wrote it): run 'shimmer startup on' again".to_owned()
+    }))
 }
 
 fn running(by_service: bool, up: bool) -> String {
@@ -909,6 +924,17 @@ mod tests {
         let out = status(&t.env, &mut fine).unwrap();
         assert!(out.starts_with("on: starts with your desktop"), "{out}");
         assert!(out.contains("running now, started at login") && !out.contains("warning"), "{out}");
+
+        // A unit from before ADR 0039 pins another socket than commands now use: say so.
+        let before = t.env.pinned.clone();
+        t.env.pinned = vec![("SHIMMER_SOCKET".into(), "/run/user/1000/shimmer/daemon.sock".into())];
+        on(&t.env, &mut Fake::default()).unwrap();
+        assert!(!status(&t.env, &mut fine).unwrap().contains("different socket"), "the same socket: no warning");
+        t.env.pinned = vec![("SHIMMER_SOCKET".into(), "/run/user/1000/shimmer/0123456789abcdef.sock".into())];
+        let out = status(&t.env, &mut fine).unwrap();
+        assert!(out.contains("warning: the login service uses a different socket"), "{out}");
+        t.env.pinned = before;
+        on(&t.env, &mut Fake::default()).unwrap();
 
         // Not enabled, no display in the service, a daemon a command started, and a moved binary.
         t.env.daemon_up = true;

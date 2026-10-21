@@ -77,13 +77,29 @@ fn a_daemon_still_starting_up_counts_as_running() {
     std::fs::create_dir_all(&dir).unwrap();
     let lock = std::fs::File::create(dir.join(".daemon.lock")).unwrap();
     lock.try_lock().unwrap();
-    // It starts answering a second later, as a daemon finishing its start-up would.
+    let dir = dir.clone();
+    // It starts answering a second later, as a daemon finishing its start-up would, with a
+    // `welcome` naming this folder (ADR 0039 §2): only this folder's daemon counts.
     let socket = home.socket();
     let listener = std::thread::spawn(move || {
+        use std::io::{BufRead as _, Write as _};
         std::thread::sleep(Duration::from_secs(1));
         let l = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        std::thread::sleep(Duration::from_secs(8));
-        drop(l);
+        l.set_nonblocking(true).unwrap();
+        let welcome = shimmer_proto::ServerFrame::welcome_for("test", "s1", &dir);
+        let line = format!("{}\n", serde_json::to_string(&welcome).unwrap());
+        let until = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < until {
+            match l.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    let mut hello = String::new();
+                    let _ = std::io::BufReader::new(&stream).read_line(&mut hello);
+                    let _ = (&stream).write_all(line.as_bytes());
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
     });
 
     let o = daemon(&home, &[]);
