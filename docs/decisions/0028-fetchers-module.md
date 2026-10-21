@@ -155,29 +155,62 @@ PR #297) gives every module a way to schedule a one-time run of its own, kept by
 across restarts. This replaces the fixed 5-minute `fetchers.tick` heartbeat entirely:
 
 - **A source schedules its own next run** at three moments: when it's created enabled, when it's
-  switched from disabled to enabled, and when a run of it finishes (success or failure) — at
+  switched from disabled to enabled, and when a run of it finishes — success, failure, *or
+  cancellation* (#306's review, blocking: a cancelled run must still reschedule, from the same
+  basis as if it had never started, or it never fires again) — at
   `now + interval` for the first two, at `last_run_at + interval` (or `now` if that's already past)
   for the third.
-- **No bootstrap step is needed at daemon start.** `ctx.schedules` entries are kept by the scheduler
-  across restarts — a source with a pending schedule from before a restart still has it after. The
-  only moment a source could lack one is right after it's created or re-enabled, and both of those
-  already call `add_once` directly, inside the `handle()` call that does the creating/enabling
-  (never inside `init`, where `ctx.schedules` answers `unavailable` until the scheduler has started —
-  ADR 0035 §5.6).
+- **A manual run replaces the pending schedule rather than adding to it.** `fetchers run SOURCE`
+  finishing books a next run exactly like the source's own schedule firing does, through the same
+  reconcile path below — so the two never coexist as two separate pending entries for one source
+  (this ADR's own review, point 2: "a manual `fetchers run` finishing also books a next run while
+  the scheduled one is still pending").
+- **No bootstrap step is needed at daemon start, for the common case.** `ctx.schedules` entries are
+  kept by the scheduler across restarts — a source with a pending schedule from before a restart
+  still has it after. The only moment a source could lack one is right after it's created or
+  re-enabled, and both of those already call `add_once` directly, inside the `handle()` call that
+  does the creating/enabling (never inside `init`, where `ctx.schedules` answers `unavailable` until
+  the scheduler has started — ADR 0035 §5.6).
+
+  **Known gap, not closed by this rework:** a schedule that fires but whose task is never recorded
+  as having run at all — the daemon killed between the trigger firing and `fetchers.run_task`
+  reaching this module's `handle`, or `add_once` itself failing (e.g. the scheduler's own 1000-entry
+  cap) — still leaves a source with nothing pending, forever, until some unrelated write (an edit,
+  enable/disable) happens to touch it. A slow, recurring repair trigger that re-books any enabled
+  source with nothing pending would close this properly; it is not built here. The one case this
+  rework *does* close is a run that starts and is then cancelled (above), which is the common real
+  path (`shimmer shutdown`, a daemon restart, `queue cancel` mid-fetch) — covered because the run
+  actually reaches this module's code, unlike the gap above.
 - **Each source's file tracks its own current schedule.** A sibling `data/fetchers/sources/<id>.state.toml`
   (written by the module, not hand-edited, same spirit as workspaces' `state.toml`) holds
   `{trigger_id, due_at}` for whatever `ctx.schedules` entry is currently pending for that source.
+  **Not a source itself** — `Sources::load`'s scan of `sources/*.toml` skips any file whose name
+  ends `.state.toml` before trying to parse it as one, rather than reporting every source's own
+  state file as a broken source (this ADR's own review, point 3; resolved by exclusion, not by
+  moving the file to its own `data/fetchers/<id>/` folder as first suggested — `seen.toml`/
+  `last_run.toml` already live under `sources/`'s *sibling* per-source folders, and `<id>.state.toml`
+  staying a flat sibling of `<id>.toml` keeps rename/remove/purge's existing per-id file list
+  unchanged).
+
   This is what makes `edit`/`rename`/`disable` able to reconcile deterministically:
   - **`edit`** changing `interval`: if the new interval would move the next due time, `remove` the
     old `trigger_id` and `add_once` a new one; otherwise leave it alone.
   - **`disable`**: `remove` the pending `trigger_id`, if any, so a disabled source never fires.
   - **`rename`**: `remove` the old pending schedule and `add_once` a new one under the new id's
     params, at the same `due_at` — simpler than automations' `renamed.toml`-follows-the-chain
-    mechanism (ADR 0035, PR #287), because a fetchers schedule's payload is just `{"source": id}`
-    with no chain/cause history to carry forward; re-creating it under the new id is sufficient and
-    exactly reproduces today's due time.
+    mechanism (ADR 0035, PR #287), because a fetchers schedule's payload has no chain/cause history
+    to carry forward; re-creating it under the new id is sufficient and exactly reproduces today's
+    due time. The op fired is always `fetchers.run_task` with just `{"id": source_id}` — a scheduled
+    run always uses the source's own configured filter, never an ad-hoc override, so there is
+    nothing else to put in the schedule's own params.
   - **`remove`** (moved to `removed/`, not deleted): same as `disable` — nothing should fire for a
     removed source. **`restore`** re-adds a schedule the same way enabling does.
+  - **Visibility, not yet addressed:** since PR #295, `scheduler list` shows every module's
+    one-time schedules by default, labelled `fetchers: <id>`. Running `scheduler remove` on one of
+    these silently desyncs it from the source's own `<id>.state.toml` — the source's file still
+    says it's booked, `fetchers show` still reports a `last_run_at`-derived next-run time, but
+    nothing will actually fire. There is no detection or repair for this yet; it is the same class
+    of problem as the bootstrap gap above and could share a fix (a periodic reconciliation pass).
 - **This removes the double-queue race for real**, not just its symptom. Today's heartbeat has to
   guess "is this due" on a schedule-blind poll; moving scheduling to the thing that's actually due
   (via the scheduler's own single-fire guarantee) means there's no second, independent timer that
@@ -234,6 +267,17 @@ to coexist with an inclusion list.) Applied once, in the same place today's `tit
 `title_excludes` check runs (`Fetchers::run_source`/`Fetchers::test`), against `RawItem::title`
 only, same as before — `Filter` itself is schema-free, so no per-kind wiring needed.
 
+**`Filter`'s own schema-free-ness is exactly the gap this ADR's own review caught (point 5,
+echoed again as #311's review, blocking)**: because it has no
+schema behind it, a filter naming any key but `title` (e.g. `company = { contains = "Acme" }`)
+parses as a perfectly well-formed `Filter` and then matches nothing, forever, once it is checked
+against `{"title": …}` only — with no error, just a source that silently never keeps anything.
+Closed by checking the raw filter JSON at load (and on the ad-hoc `--filter` override below) before
+`Filter::parse`: every key must be `title`, including inside each `"or"` alternative, or the filter
+is refused with a message naming the bad key. This is the one schema `fetchers`' filter has, and it
+is enforced here rather than in `core::filter` itself, since `Filter` is deliberately schema-free
+for every other caller (automations' `when`, records).
+
 The ad-hoc `--contains`/`--excludes` override on `fetchers test`/`run` (prior §14) becomes a
 `--filter` flag taking the same JSON shape inline, replacing — never merging with — the source's own
 configured `filter` for that one call, same override semantics as before.
@@ -246,7 +290,8 @@ configured `filter` for that one call, same override semantics as before.
 | `fetchers.show` | inline | `{"id"}` | One source in full: its config, last result **or error**, next scheduled run. Was `fetchers.status` for a single id; that word now means the feature-wide view below. |
 | `fetchers.status` | inline | `{}` | The whole feature at a glance: source count, how many enabled/disabled/broken, which are failing, soonest next runs. Not per-source — matches `automations.status`'s shape. |
 | `fetchers.new` | inline | `{"id","label"?,"kind","params"}` or `{"id","template","values","preview"?}` | Validated by that kind's `Kind::parse` before any file is written; a template path follows ADR 0025 §6a (required questions, a preview, never partial). |
-| `fetchers.edit` | inline | `{"id","label"?,"kind"?,"params"?}` | Re-validated the same way; a refused edit changes nothing (old file kept), same posture as automations' `save`. |
+| `fetchers.edit` | inline | `{"id","text"}` | **Amended by #305's review, blocking.** Not a structured shape like `fetchers.new`'s: the *whole* replacement file text, same as `automations.edit`. A structured shape meant re-passing every field just to change one, with whatever wasn't re-passed silently reset to its default — most visibly, an edit that didn't repeat `enabled` would switch a running source off. Taking the full text instead means the CLI reads the current file first (`fetchers.show`) and opens `$EDITOR` on a copy of it, so nothing not explicitly retyped changes. Re-validated the same way as `new`; a refused edit changes nothing (old file kept), same posture as automations' `save`. |
+| `fetchers.reload` | inline | `{}` | Re-reads every `data/fetchers/sources/*.toml` (§5) — needed after hand-editing a source file, since the module otherwise only reads them at daemon start. Omitted from an earlier draft of this table despite being built in §5; listed here for real. |
 | `fetchers.remove` | inline | `{"id"}` | Moves to `removed/`; cancels its pending schedule (§6). |
 | `fetchers.restore` | inline | `{"id"}` | Brings it back; re-schedules if enabled. |
 | `fetchers.purge` | inline | `{"id"?}` | Confirmed with `{"sources": N}`, same shape as `records.purge`/`automations.purge`. |
@@ -304,7 +349,9 @@ recent run failed (tracked alongside `last_run.toml`, carrying the failure's `re
 **No automatic migration from `config.toml`.** Consistent with ADR 0038's own posture for its op
 renames ("nothing depends on the old names yet... so they're renamed outright rather than kept as
 second names") — no dogfooded installs or outside clients depend on today's `[modules.fetchers.sources.*]`
-shape either. Upgrading means re-creating each source by hand (`fetchers new` or a template);
+shape either, **as of this ADR being written**; that stops being true the moment anyone starts
+dogfooding against the pre-rework shape, so this whole rework should land before dogfooding does,
+not be left to trail behind it. Upgrading means re-creating each source by hand (`fetchers new` or a template);
 `config.toml`'s `[modules.fetchers]` section becomes unrecognized and is left alone (unknown
 sections are already ignored, not rejected). Worth a line in the next release's notes, not a code
 change.
@@ -315,6 +362,14 @@ change.
 - Headless-browser scraping, the `html-list` kind — still undone, unrelated to this rework.
 - A template marketplace — §10 only confirms the design doesn't block one later.
 - Tier-2/3 credentials (session cookies, automated login) — ADR 0036's own deferral, unchanged here.
+- **A fresh install's zero-sources state, filled in by `shimmer setup`, not here.** §10 deletes the
+  fixed `hn-whoishiring`/`wwr` registry on purpose (ADR 0023's "no seeding" rule), so a brand-new
+  install genuinely has nothing until someone runs `fetchers new --from TEMPLATE`. The planned
+  `shimmer setup` onboarding kit is where a first-run prompt (or a default profile) would offer to
+  make the HN/WWR sources from their templates, if that is wanted — this ADR only makes that
+  possible, it doesn't build the prompt.
+- The scheduling repair sweep and the `scheduler list`/`remove` desync (§6) — both flagged there as
+  known gaps this rework does not close.
 
 ## Sequencing
 
