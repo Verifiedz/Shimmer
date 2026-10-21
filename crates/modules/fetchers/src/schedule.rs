@@ -72,8 +72,16 @@ impl Sources {
         let prefix = format!("{SOURCES_DIR}/");
         for file in ctx.store.list(SOURCES_DIR)? {
             let Some(id) = file.strip_prefix(&prefix).and_then(|f| f.strip_suffix(".toml")) else { continue };
-            let text = ctx.store.read_string(&file)?.unwrap_or_default();
-            match SourceConfig::parse(id, &text) {
+            // Read raw bytes, not `read_string` -- that errors on non-UTF-8, and the `?` this
+            // used to be written with failed `Module::init` for every source over one bad
+            // file, against this function's own "one bad file is recorded in problems"
+            // contract (#303's review, blocking).
+            let bytes = ctx.store.read(&file)?.unwrap_or_default();
+            let result = match String::from_utf8(bytes) {
+                Ok(text) => SourceConfig::parse(id, &text),
+                Err(_) => Err("not UTF-8".to_owned()),
+            };
+            match result {
                 Ok(config) => {
                     sources.insert(id.to_owned(), config);
                 }
@@ -448,6 +456,18 @@ mod tests {
         let loaded = Sources::load(&env.ctx).unwrap();
         assert!(loaded.sources.is_empty());
         assert!(loaded.problems.get("broken").is_some_and(|p| p.contains("not a source file")));
+    }
+
+    #[test]
+    fn a_non_utf8_source_file_is_a_problem_not_a_load_failure() {
+        // #303's review, blocking: `Sources::load` used `read_string`, which errors on
+        // non-UTF-8 and propagated via `?`, failing `Module::init` -- and with it every
+        // other source -- over one bad byte sequence in one file.
+        let env = TestEnv::new("fetchers");
+        env.ctx.store.write(&format!("{SOURCES_DIR}/latin1.toml"), vec![b's', 0xe9]).unwrap();
+        let loaded = Sources::load(&env.ctx).expect("one non-UTF-8 file must not fail the whole load");
+        assert!(loaded.sources.is_empty());
+        assert!(loaded.problems.get("latin1").is_some_and(|p| p.contains("UTF-8")), "{:?}", loaded.problems);
     }
 
     #[test]
