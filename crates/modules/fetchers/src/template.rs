@@ -5,8 +5,7 @@
 //! several, so there is no `${RULE}`-style generated id and no `suffix`; and only the three
 //! question kinds a starter template actually needs, not automations' six.
 //!
-//! `builtin()` is the built-in starters (§10's table, plus a local "gaming" category added for
-//! manual testing): each one's `[kind]` table names only fields
+//! `builtin()` is the five starters (§10's table): each one's `[kind]` table names only fields
 //! `crate::kind` already validates, so a broken template is a bug this crate's own tests catch,
 //! the same posture `automations::template::builtin` already takes.
 
@@ -16,7 +15,7 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 /// `(id, heading)`, in the order `fetchers.templates` lists them.
-pub const CATEGORIES: &[(&str, &str)] = &[("job-boards", "Job boards"), ("feeds", "Feeds"), ("gaming", "Gaming")];
+pub const CATEGORIES: &[(&str, &str)] = &[("job-boards", "Job boards"), ("feeds", "Feeds")];
 
 /// Every built-in template, by id.
 const BUILTIN: &[(&str, &str)] = &[
@@ -25,12 +24,9 @@ const BUILTIN: &[(&str, &str)] = &[
     ("greenhouse", include_str!("../templates/greenhouse.toml")),
     ("lever", include_str!("../templates/lever.toml")),
     ("rss", include_str!("../templates/rss.toml")),
-    ("steam-news", include_str!("../templates/steam-news.toml")),
-    ("cheapshark-deals", include_str!("../templates/cheapshark-deals.toml")),
-    ("itch-tag", include_str!("../templates/itch-tag.toml")),
 ];
 
-/// What an answer may be -- only what the built-in starters need, not automations' full set.
+/// What an answer may be -- only what the five starters need, not automations' full set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
