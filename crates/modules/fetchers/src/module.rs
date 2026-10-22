@@ -1214,7 +1214,9 @@ impl Fetchers {
 
     /// Give a source a new id (ADR 0038 §6): its dedup state (`<id>/seen.toml`) and
     /// `last_run.toml` entry move with it (ADR 0028 §7), so a renamed source is never
-    /// mistaken for brand new on its next run.
+    /// mistaken for brand new on its next run. Its `items.json` entries (ADR 0042) are
+    /// relabelled too (#315's review), so `fetchers.items` under the new id still finds what
+    /// it found under the old one.
     fn rename(&self, ctx: &Ctx, p: MoveParams) -> Result<Value> {
         let _g = self.write.lock();
         if p.id == p.to {
@@ -1237,6 +1239,7 @@ impl Fetchers {
         let renamed = schedule::SourceConfig::parse(&p.to, &text).map_err(Error::invalid_params)?;
         let seen = ctx.store.read(&dedup::path(&p.id))?;
         let last_run = schedule::rename_last_run(ctx, &p.id, &p.to)?;
+        let renamed_items = rename_items(ctx, &p.id, &p.to);
         let old_schedule = schedule::load_schedule_state(ctx, &p.id)?;
         ctx.store.transaction(|tx| {
             tx.put(&schedule::path(&p.to), text.as_str())?;
@@ -1247,6 +1250,9 @@ impl Fetchers {
             }
             if let Some(last_run) = &last_run {
                 tx.put(schedule::LAST_RUN_PATH, last_run.as_str())?;
+            }
+            if let Some(items) = &renamed_items {
+                tx.put(ITEMS, items.as_str())?;
             }
             tx.emit("fetchers.source.renamed", json!({"from": p.id, "to": p.to}))
         })?;
@@ -1392,6 +1398,24 @@ fn item_log(ctx: &Ctx) -> Vec<Value> {
         .flatten()
         .and_then(|t| serde_json::from_str::<Vec<Value>>(&t).ok())
         .unwrap_or_default()
+}
+
+/// [`ITEMS`]'s entries for `from` relabelled `to` (ADR 0038 §6's own review on #315): a rename
+/// moves a source's dedup state and `last_run.toml` entry already (ADR 0028 §7), but left
+/// `items.json` filing everything under the old id, so `fetchers.items NEW_ID` reported
+/// nothing found even right after a rename. `None` when there is nothing to rewrite -- no
+/// item was ever found under `from`, or it aged out of the capped log already -- so the
+/// caller can skip the write entirely, same contract `schedule::rename_last_run` already uses.
+fn rename_items(ctx: &Ctx, from: &str, to: &str) -> Option<String> {
+    let mut items = item_log(ctx);
+    let mut changed = false;
+    for item in &mut items {
+        if item["source_name"] == from {
+            item["source_name"] = json!(to);
+            changed = true;
+        }
+    }
+    changed.then(|| serde_json::to_string_pretty(&items).unwrap_or_default())
 }
 
 /// `fetchers.items` (ADR 0042): matched, most recent first. Reads [`ITEMS`] fresh on every
@@ -2687,6 +2711,40 @@ mod tests {
 
         let err = fetchers.rename(&env.ctx, MoveParams { id: "team-blog".into(), to: "team-blog".into() }).unwrap_err();
         assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn rename_relabels_its_items_json_entries_too() {
+        // #315's review: `items.json` (ADR 0042) still filed everything under the old id
+        // after a rename, so `fetchers.items NEW_ID` reported nothing found even though the
+        // items were right there, under the name nothing pointed at any more.
+        let env = TestEnv::new("fetchers");
+        let fetchers = Fetchers::default();
+        write_source(
+            &env,
+            "jobs",
+            json!({"enabled": true, "interval": "hourly", "kind": "rss", "url": "https://example.test/f.xml"}),
+        );
+        fetchers.load(&env.ctx).unwrap();
+        let log = vec![
+            json!({"source_name": "jobs", "title": "Rust Engineer", "url": "https://x/1", "at": "2026-01-01T00:00:00Z"}),
+            json!({"source_name": "other", "title": "Unrelated", "url": "https://x/2", "at": "2026-01-01T00:00:00Z"}),
+        ];
+        env.ctx.store.write(ITEMS, serde_json::to_string(&log).unwrap()).unwrap();
+
+        fetchers.rename(&env.ctx, MoveParams { id: "jobs".into(), to: "rust-jobs".into() }).unwrap();
+
+        let items =
+            items_reply(&env.ctx, ItemsParams { source: Some("rust-jobs".into()), contains: vec![], excludes: vec![] });
+        assert_eq!(items["items"].as_array().unwrap().len(), 1, "{items:?}");
+        assert_eq!(items["items"][0]["title"], "Rust Engineer");
+        let under_old_id =
+            items_reply(&env.ctx, ItemsParams { source: Some("jobs".into()), contains: vec![], excludes: vec![] });
+        assert!(under_old_id["items"].as_array().unwrap().is_empty(), "{under_old_id:?}");
+        // The other source's own items are untouched.
+        let other =
+            items_reply(&env.ctx, ItemsParams { source: Some("other".into()), contains: vec![], excludes: vec![] });
+        assert_eq!(other["items"].as_array().unwrap().len(), 1);
     }
 
     #[test]
