@@ -60,7 +60,17 @@ pub async fn run(args: &Args, pack_warnings: &[String]) -> ExitCode {
     if let Some(mut client) = connect(args, &mut checks).await {
         checks.extend(packs(pack_warnings));
         checks.extend(modules(&mut client).await);
-        checks.extend(saves(&shimmer_proto::paths::shimmer_home()));
+        // Read from this folder's own `.staging/`: with --socket, the daemon asked may serve
+        // another folder, so the check would describe the wrong one (#309's review). Until the
+        // daemon answers it itself, it's skipped there and says so.
+        match &args.socket {
+            None => checks.extend(saves(&shimmer_proto::paths::shimmer_home())),
+            Some(_) => checks.push(Check::new(
+                "store",
+                Status::Warn,
+                "saves not checked: with --socket, doctor may be asking another folder's daemon",
+            )),
+        }
     }
     let failed = checks.iter().any(|c| c.status == Status::Fail);
     println!("{}", if args.json { render::json(&to_json(&checks)) } else { report(&checks) });

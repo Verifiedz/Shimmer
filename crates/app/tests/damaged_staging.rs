@@ -23,3 +23,17 @@ fn a_damaged_save_left_by_a_crash_is_kept_aside_and_the_daemon_starts() {
     assert!(out.contains("1 damaged save(s) couldn't be applied and were kept in"), "{out}");
     home.shimmer(&["shutdown"]);
 }
+
+/// #309's review: with --socket, doctor may be asking another folder's daemon, so it doesn't
+/// report this folder's saves as if they were that one's: it says they weren't checked.
+#[test]
+fn doctor_with_socket_says_saves_werent_checked() {
+    let home = Home::new();
+    assert!(home.shimmer(&["ping"]).status.success());
+    let socket = home.socket();
+    let out = home.shimmer(&["--socket", socket.to_str().unwrap(), "doctor"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("saves not checked: with --socket"), "{text}");
+    assert!(!text.contains("every save finished"), "{text}");
+    home.shimmer(&["shutdown"]);
+}
