@@ -8,10 +8,11 @@
 //! need their own `Source`.
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use shimmer_core::{Ctx, Error, Result};
 
 use crate::http;
+use crate::kind::{self, Kind, KindConfig};
 use crate::source::{Method, Page, RawItem, Source};
 
 /// How to walk through more than one page. `rss`-shaped feeds and most ATS boards return
@@ -47,22 +48,102 @@ pub struct JsonApi {
     /// sees it. `None` means no such field is configured, so nothing is dropped on this
     /// basis.
     active_field: Option<String>,
+    /// A named credential (ADR 0036, ADR 0028 §4) to attach to every request, for an endpoint
+    /// that needs an auth header. `None` for every public, unauthenticated board.
+    credential: Option<String>,
 }
 
-impl JsonApi {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        id: String,
-        url: String,
-        items_path: String,
-        id_field: String,
-        title_field: String,
-        url_field: String,
-        url_base: Option<String>,
-        pagination: Pagination,
-        active_field: Option<String>,
-    ) -> Self {
-        Self { id, url, items_path, id_field, title_field, url_field, url_base, pagination, active_field }
+/// The `json-api` kind (ADR 0028 §15): a declarative, field-path-mapped source for any
+/// endpoint that answers with a JSON array of job-shaped objects.
+pub struct JsonApiKind;
+
+const JSON_API_FIELDS: &[&str] = &[
+    "url",
+    "items_path",
+    "id_field",
+    "title_field",
+    "url_field",
+    "url_base",
+    "pagination",
+    "page_size",
+    "active_field",
+    "credential",
+];
+
+impl Kind for JsonApiKind {
+    fn name(&self) -> &'static str {
+        "json-api"
+    }
+
+    fn method(&self) -> Method {
+        Method::Api
+    }
+
+    fn parse(&self, params: &Map<String, Value>) -> std::result::Result<Box<dyn KindConfig>, String> {
+        kind::reject_unknown(params, JSON_API_FIELDS)?;
+        let url = kind::required_url(params, "url")?;
+        let items_path = kind::optional_str(params, "items_path")?.unwrap_or_default();
+        let id_field = kind::required_str(params, "id_field")?;
+        let title_field = kind::required_str(params, "title_field")?;
+        let url_field = kind::required_str(params, "url_field")?;
+        let url_base = kind::optional_str(params, "url_base")?;
+        let active_field = kind::optional_str(params, "active_field")?;
+        let credential = kind::optional_str(params, "credential")?;
+        let pagination = match params.get("pagination").and_then(Value::as_str).unwrap_or("none") {
+            "none" => Pagination::None,
+            "offset" => {
+                let page_size = match params.get("page_size").and_then(Value::as_u64) {
+                    Some(n) if n > 0 => n as u32,
+                    _ => return Err("pagination \"offset\" needs page_size > 0".into()),
+                };
+                if !url.contains("{offset}") {
+                    return Err("pagination \"offset\" needs a literal '{offset}' placeholder in url".into());
+                }
+                Pagination::Offset { page_size }
+            }
+            other => return Err(format!("unknown pagination \"{other}\" (known: none, offset)")),
+        };
+        Ok(Box::new(JsonApiConfig {
+            url,
+            items_path,
+            id_field,
+            title_field,
+            url_field,
+            url_base,
+            pagination,
+            active_field,
+            credential,
+        }))
+    }
+}
+
+#[derive(Debug)]
+struct JsonApiConfig {
+    url: String,
+    items_path: String,
+    id_field: String,
+    title_field: String,
+    url_field: String,
+    url_base: Option<String>,
+    pagination: Pagination,
+    active_field: Option<String>,
+    credential: Option<String>,
+}
+
+impl KindConfig for JsonApiConfig {
+    fn build(&self, id: String) -> std::sync::Arc<dyn Source> {
+        std::sync::Arc::new(JsonApi {
+            id,
+            url: self.url.clone(),
+            items_path: self.items_path.clone(),
+            id_field: self.id_field.clone(),
+            title_field: self.title_field.clone(),
+            url_field: self.url_field.clone(),
+            url_base: self.url_base.clone(),
+            pagination: self.pagination,
+            active_field: self.active_field.clone(),
+            credential: self.credential.clone(),
+        })
     }
 }
 
@@ -91,7 +172,10 @@ impl Source for JsonApi {
         let url =
             if page_size.is_some() { self.url.replace("{offset}", &offset.to_string()) } else { self.url.clone() };
 
-        let resp = http::require_ok(http::get(ctx, &url).await?, &url)?;
+        let resp = match &self.credential {
+            Some(c) => http::require_ok(http::get_with_credential(ctx, &url, c).await?, &url)?,
+            None => http::require_ok(http::get(ctx, &url).await?, &url)?,
+        };
         let body: Value = serde_json::from_slice(&resp.body)
             .map_err(|e| Error::module_error(format!("json-api: could not parse response from {url}: {e}")))?;
         let array = select_array(&body, &self.items_path).ok_or_else(|| {
@@ -194,17 +278,18 @@ mod tests {
     }
 
     fn greenhouse(id: &str, url: &str) -> JsonApi {
-        JsonApi::new(
-            id.to_string(),
-            url.to_string(),
-            "jobs".to_string(),
-            "id".to_string(),
-            "title".to_string(),
-            "absolute_url".to_string(),
-            None,
-            Pagination::None,
-            None,
-        )
+        JsonApi {
+            id: id.to_string(),
+            url: url.to_string(),
+            items_path: "jobs".to_string(),
+            id_field: "id".to_string(),
+            title_field: "title".to_string(),
+            url_field: "absolute_url".to_string(),
+            url_base: None,
+            pagination: Pagination::None,
+            active_field: None,
+            credential: None,
+        }
     }
 
     const GREENHOUSE_PAGE: &str = r#"{"jobs": [
@@ -218,17 +303,18 @@ mod tests {
         // inactive/thin ones, so one closed posting on an otherwise full page read as a short
         // page and silently abandoned the rest of the board.
         let env = TestEnv::new("fetchers");
-        let source = JsonApi::new(
-            "acme".into(),
-            "https://acme.test/jobs?offset={offset}".into(),
-            String::new(),
-            "id".into(),
-            "title".into(),
-            "url".into(),
-            None,
-            Pagination::Offset { page_size: 2 },
-            Some("active".into()),
-        );
+        let source = JsonApi {
+            id: "acme".into(),
+            url: "https://acme.test/jobs?offset={offset}".into(),
+            items_path: String::new(),
+            id_field: "id".into(),
+            title_field: "title".into(),
+            url_field: "url".into(),
+            url_base: None,
+            pagination: Pagination::Offset { page_size: 2 },
+            active_field: Some("active".into()),
+            credential: None,
+        };
         // A full page (2 items, page_size 2) where one is inactive: one item survives, but the
         // *page* was full, so there must be a next cursor.
         env.http.responses.lock().unwrap().insert(
@@ -292,17 +378,18 @@ mod tests {
         ]"#;
         let env = TestEnv::new("fetchers");
         stub(&env, "https://example.test/postings", ok(LEVER_PAGE));
-        let api = JsonApi::new(
-            "acme-lever".into(),
-            "https://example.test/postings".into(),
-            String::new(),
-            "id".into(),
-            "text".into(),
-            "hostedUrl".into(),
-            None,
-            Pagination::None,
-            None,
-        );
+        let api = JsonApi {
+            id: "acme-lever".into(),
+            url: "https://example.test/postings".into(),
+            items_path: String::new(),
+            id_field: "id".into(),
+            title_field: "text".into(),
+            url_field: "hostedUrl".into(),
+            url_base: None,
+            pagination: Pagination::None,
+            active_field: None,
+            credential: None,
+        };
 
         let page = api.fetch_page(&env.ctx, None).await.unwrap();
         assert_eq!(page.items.len(), 1);
@@ -315,17 +402,18 @@ mod tests {
         const AMAZON_PAGE: &str = r#"{"jobs": [{"id": "req-1", "title": "SDE", "job_path": "/en/jobs/1/sde"}]}"#;
         let env = TestEnv::new("fetchers");
         stub(&env, "https://example.test/search.json?offset=0", ok(AMAZON_PAGE));
-        let api = JsonApi::new(
-            "amazon-swe".into(),
-            "https://example.test/search.json?offset={offset}".into(),
-            "jobs".into(),
-            "id".into(),
-            "title".into(),
-            "job_path".into(),
-            Some("https://example.test".into()),
-            Pagination::Offset { page_size: 50 },
-            None,
-        );
+        let api = JsonApi {
+            id: "amazon-swe".into(),
+            url: "https://example.test/search.json?offset={offset}".into(),
+            items_path: "jobs".into(),
+            id_field: "id".into(),
+            title_field: "title".into(),
+            url_field: "job_path".into(),
+            url_base: Some("https://example.test".into()),
+            pagination: Pagination::Offset { page_size: 50 },
+            active_field: None,
+            credential: None,
+        };
 
         let page = api.fetch_page(&env.ctx, None).await.unwrap();
         assert_eq!(page.items.len(), 1);
@@ -344,17 +432,18 @@ mod tests {
         };
         stub(&env, "https://example.test/jobs?offset=0", ok(&page_fn(&[1, 2])));
         stub(&env, "https://example.test/jobs?offset=2", ok(&page_fn(&[3])));
-        let api = JsonApi::new(
-            "paged".into(),
-            "https://example.test/jobs?offset={offset}".into(),
-            "jobs".into(),
-            "id".into(),
-            "title".into(),
-            "url".into(),
-            None,
-            Pagination::Offset { page_size: 2 },
-            None,
-        );
+        let api = JsonApi {
+            id: "paged".into(),
+            url: "https://example.test/jobs?offset={offset}".into(),
+            items_path: "jobs".into(),
+            id_field: "id".into(),
+            title_field: "title".into(),
+            url_field: "url".into(),
+            url_base: None,
+            pagination: Pagination::Offset { page_size: 2 },
+            active_field: None,
+            credential: None,
+        };
 
         let first = api.fetch_page(&env.ctx, None).await.unwrap();
         assert_eq!(first.items.len(), 2);
@@ -374,17 +463,18 @@ mod tests {
         ]}"#;
         let env = TestEnv::new("fetchers");
         stub(&env, "https://example.test/jobs", ok(PAGE));
-        let api = JsonApi::new(
-            "acme-jobs".into(),
-            "https://example.test/jobs".into(),
-            "jobs".into(),
-            "id".into(),
-            "title".into(),
-            "absolute_url".into(),
-            None,
-            Pagination::None,
-            Some("active".into()),
-        );
+        let api = JsonApi {
+            id: "acme-jobs".into(),
+            url: "https://example.test/jobs".into(),
+            items_path: "jobs".into(),
+            id_field: "id".into(),
+            title_field: "title".into(),
+            url_field: "absolute_url".into(),
+            url_base: None,
+            pagination: Pagination::None,
+            active_field: Some("active".into()),
+            credential: None,
+        };
 
         let page = api.fetch_page(&env.ctx, None).await.unwrap();
         let ids: Vec<&str> = page.items.iter().map(|i| i.source_id.as_str()).collect();
@@ -436,5 +526,88 @@ mod tests {
         let err = api.fetch_page(&env.ctx, None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::ModuleError);
         assert!(err.message.contains("could not parse response"), "{}", err.message);
+    }
+
+    fn params(v: Value) -> Map<String, Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn json_api_kind_parses_every_field_including_offset_pagination_and_credential() {
+        let cfg = JsonApiKind
+            .parse(&params(json!({
+                "url": "https://example.test/jobs?offset={offset}",
+                "items_path": "jobs", "id_field": "id", "title_field": "title", "url_field": "url",
+                "url_base": "https://example.test", "pagination": "offset", "page_size": 50,
+                "active_field": "active", "credential": "my-key",
+            })))
+            .unwrap();
+        let source = cfg.build("acme".into());
+        assert_eq!(source.id(), "acme");
+        assert_eq!(source.method(), Method::Api);
+    }
+
+    #[test]
+    fn json_api_kind_defaults_items_path_and_pagination_when_absent() {
+        let cfg = JsonApiKind
+            .parse(&params(
+                json!({"url": "https://x.test/jobs", "id_field": "id", "title_field": "title", "url_field": "url"}),
+            ))
+            .unwrap();
+        cfg.build("acme".into()); // doesn't panic with every optional field left out
+    }
+
+    #[test]
+    fn json_api_kind_rejects_missing_required_fields_bad_pagination_and_unknown_fields() {
+        let base = json!({"url": "https://x.test/jobs", "id_field": "id", "title_field": "title", "url_field": "url"});
+        for missing in ["id_field", "title_field", "url_field"] {
+            let mut fields = base.clone();
+            fields.as_object_mut().unwrap().remove(missing);
+            let err = JsonApiKind.parse(&params(fields)).unwrap_err();
+            assert!(err.contains(missing), "missing {missing}: {err}");
+        }
+
+        let mut offset_no_size = base.clone();
+        offset_no_size.as_object_mut().unwrap().insert("pagination".into(), json!("offset"));
+        let err = JsonApiKind.parse(&params(offset_no_size)).unwrap_err();
+        assert!(err.contains("page_size"), "{err}");
+
+        let mut offset_no_placeholder = base.clone();
+        offset_no_placeholder.as_object_mut().unwrap().insert("pagination".into(), json!("offset"));
+        offset_no_placeholder.as_object_mut().unwrap().insert("page_size".into(), json!(50));
+        let err = JsonApiKind.parse(&params(offset_no_placeholder)).unwrap_err();
+        assert!(err.contains("{offset}"), "{err}");
+
+        let mut bad_pagination = base.clone();
+        bad_pagination.as_object_mut().unwrap().insert("pagination".into(), json!("cursor"));
+        let err = JsonApiKind.parse(&params(bad_pagination)).unwrap_err();
+        assert!(err.contains("cursor"), "{err}");
+
+        let mut typo = base;
+        typo.as_object_mut().unwrap().insert("id_fieldd".into(), json!("id"));
+        let err = JsonApiKind.parse(&params(typo)).unwrap_err();
+        assert!(err.contains("id_fieldd"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_configured_credential_is_attached_to_every_request() {
+        let env = TestEnv::new("fetchers");
+        stub(&env, "https://example.test/jobs", ok(r#"{"jobs": []}"#));
+        let api = JsonApi {
+            id: "acme".into(),
+            url: "https://example.test/jobs".into(),
+            items_path: "jobs".into(),
+            id_field: "id".into(),
+            title_field: "title".into(),
+            url_field: "url".into(),
+            url_base: None,
+            pagination: Pagination::None,
+            active_field: None,
+            credential: Some("my-key".into()),
+        };
+
+        api.fetch_page(&env.ctx, None).await.unwrap();
+        let calls = env.http.calls.lock().unwrap();
+        assert_eq!(calls.last(), Some(&("https://example.test/jobs".to_string(), Some("my-key".to_string()))));
     }
 }
