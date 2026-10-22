@@ -1,3 +1,6 @@
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -7,7 +10,7 @@ use shimmer_core::{
 };
 
 use crate::dedup::{self, RunGuard};
-use crate::schedule::{self, FetchersConfig, FETCH_OP, TICK_OP};
+use crate::schedule::{self, Sources, FETCH_OP, TICK_OP};
 use crate::source::{self, RawItem, Source};
 
 /// Network-bound and slow, same reasoning as every other fetch-shaped lane (CLAUDE.md §6.1).
@@ -16,6 +19,7 @@ pub const LANE: &str = "fetchers";
 pub const LIST_OP: &str = "fetchers.list";
 pub const STATUS_OP: &str = "fetchers.status";
 pub const TEST_OP: &str = "fetchers.test";
+pub const RELOAD_OP: &str = "fetchers.reload";
 
 /// Caps `fetchers.item.found`'s `raw_data` (ADR 0028 §3) -- big enough for a job posting's
 /// text, small enough that one large item can't become the next cache-bloat problem.
@@ -36,6 +40,22 @@ pub struct Fetchers {
     /// lock from `running`: that one is per-source exclusivity for a whole run, this one is
     /// held only across the few lines that touch the shared last-run file.
     write: WriteLock,
+    /// Every source file, read once at `init` and re-read only on `fetchers.reload` (ADR 0028
+    /// §5) -- never re-scanned on every op call, the same shape `automations`' own rule cache
+    /// uses.
+    state: Mutex<Sources>,
+}
+
+impl Fetchers {
+    fn state(&self) -> std::sync::MutexGuard<'_, Sources> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Re-read every source file.
+    fn load(&self, ctx: &Ctx) -> Result<()> {
+        *self.state() = Sources::load(ctx)?;
+        Ok(())
+    }
 }
 
 /// Every topic fetchers emits, with a line on it for `shimmer automations events` (ADR 0035 §5.5).
@@ -59,8 +79,8 @@ impl Module for Fetchers {
         }
     }
 
-    async fn init(&self, _ctx: &Ctx) -> Result<()> {
-        Ok(())
+    async fn init(&self, ctx: &Ctx) -> Result<()> {
+        self.load(ctx)
     }
 
     fn lanes(&self) -> Vec<LaneConfig> {
@@ -121,6 +141,12 @@ impl Module for Fetchers {
                 }),
                 execution: Execution::Queued { lane: LANE.into() },
             },
+            CommandSpec {
+                op: RELOAD_OP.into(),
+                summary: "Re-read the source files after editing them by hand".into(),
+                params_schema: json!({"type": "null"}),
+                execution: Execution::Inline,
+            },
         ]
     }
 
@@ -139,6 +165,11 @@ impl Module for Fetchers {
                 let filter = TitleFilterOverride::from_params(p.title_contains, p.title_excludes)?;
                 self.test(ctx, p.source, filter).await
             }
+            RELOAD_OP => {
+                self.load(ctx)?;
+                let st = self.state();
+                Ok(json!({"sources": st.sources.len(), "problems": problems_of(&st)}))
+            }
             _ => Err(Error::unknown_op(format!("fetchers has no op '{op}'"))),
         }
     }
@@ -155,7 +186,7 @@ struct FetchParams {
 
 /// An ad-hoc title filter from a `fetchers.run`/`fetchers.test` caller (the CLI's
 /// `--contains`/`--excludes` flags), scoped to one call -- it replaces, never merges with,
-/// whatever `[modules.fetchers.sources.<id>]` configures for this source (ADR 0028 §14).
+/// whatever this source's own file configures (ADR 0028 §14).
 /// `None` means neither flag was given at all, so the configured filter (if any) applies
 /// exactly as before this existed.
 struct TitleFilterOverride {
@@ -188,14 +219,15 @@ impl TitleFilterOverride {
 
 impl Fetchers {
     async fn tick(&self, ctx: &Ctx) -> Result<Value> {
-        self.run_due(ctx, &FetchersConfig::load(ctx)?).await
+        let sources = self.state().sources.clone();
+        self.run_due(ctx, &sources).await
     }
 
     /// Split from [`Fetchers::tick`] so the enqueue-and-skip-if-running logic is testable
-    /// against a hand-built config, without needing to read `ctx.config` at all.
-    async fn run_due(&self, ctx: &Ctx, config: &FetchersConfig) -> Result<Value> {
+    /// against a hand-built map, without needing to write any source files at all.
+    async fn run_due(&self, ctx: &Ctx, sources: &BTreeMap<String, schedule::SourceConfig>) -> Result<Value> {
         let last_run = schedule::load_last_run(ctx)?;
-        let due = schedule::due_sources(config, &last_run, ctx.clock.now());
+        let due = schedule::due_sources(sources, &last_run, ctx.clock.now());
 
         let (mut enqueued, mut already_running) = (Vec::new(), Vec::new());
         for source in due {
@@ -215,14 +247,16 @@ impl Fetchers {
         if source_id.trim().is_empty() {
             return Err(Error::invalid_params("source must not be empty"));
         }
-        let source =
-            source::resolve(ctx, &source_id)?.ok_or_else(|| Error::not_found(format!("no source '{source_id}'")))?;
+        let sources = self.state().clone();
+        let source = source::resolve(&sources, &source_id)?
+            .ok_or_else(|| Error::not_found(format!("no source '{source_id}'")))?;
         let _permit = self
             .running
             .try_acquire(&source_id)
             .ok_or_else(|| Error::module_error(format!("source '{source_id}' is already fetching")))?;
 
-        let outcome = self.run_source(ctx, source.as_ref(), filter_override.as_ref()).await;
+        let configured = sources.sources.get(&source_id);
+        let outcome = self.run_source(ctx, source.as_ref(), filter_override.as_ref(), configured).await;
         // Recorded regardless of outcome -- including failure -- so a broken source is
         // retried at most once per interval (ADR 0028 §5, §6: "after that, wait for the
         // next trigger"), not hammered every tick. Held only across this call -- up to 8
@@ -253,15 +287,15 @@ impl Fetchers {
     }
 
     /// Every source the user has actually opted into seeing: a fixed-registry source once it
-    /// has its own config entry, plus every configured `kind` instance (ADR 0028 §2a/§19),
+    /// has its own file, plus every configured `kind` instance (ADR 0028 §2a/§19),
     /// cross-referenced with that entry.
-    async fn list(&self, ctx: &Ctx) -> Result<Value> {
-        let config = FetchersConfig::load(ctx)?;
-        let sources: Vec<Value> = source::known(ctx)?
+    async fn list(&self, _ctx: &Ctx) -> Result<Value> {
+        let st = self.state();
+        let sources: Vec<Value> = source::known(&st)
             .iter()
             .map(|s| {
                 let id = s.id();
-                let cfg = config.sources.get(id);
+                let cfg = st.sources.get(id);
                 json!({
                     "id": id,
                     "method": match s.method() { source::Method::Api => "api", source::Method::Scrape => "scrape" },
@@ -275,23 +309,25 @@ impl Fetchers {
                 })
             })
             .collect();
-        // A source whose own entry couldn't be read is reported here rather than being
+        // A source whose own file couldn't be read is reported here rather than being
         // invisible (or, as before, failing this whole op) -- #126's review, B1.
-        Ok(json!({"sources": sources, "problems": problems_of(&config)}))
+        Ok(json!({"sources": sources, "problems": problems_of(&st)}))
     }
 
     /// Per-source last-run time and whether it is currently mid-fetch (ADR 0028 §5's
     /// `RunGuard`) -- the same source universe [`Fetchers::list`] enumerates.
     async fn status(&self, ctx: &Ctx) -> Result<Value> {
         let last_run = schedule::load_last_run(ctx)?;
-        let sources: Vec<Value> = source::known(ctx)?
+        let st = self.state();
+        let sources: Vec<Value> = source::known(&st)
             .iter()
             .map(|s| {
                 let id = s.id();
                 json!({"id": id, "last_run_at": last_run.get(id), "running": self.running.is_running(id)})
             })
             .collect();
-        let mut problems = problems_of(&FetchersConfig::load(ctx)?);
+        let mut problems = problems_of(&st);
+        drop(st);
         problems.extend(schedule::last_run_problem(ctx).map(|why| json!({"id": "last_run", "problem": why})));
         Ok(json!({"sources": sources, "problems": problems}))
     }
@@ -305,13 +341,13 @@ impl Fetchers {
         if source_id.trim().is_empty() {
             return Err(Error::invalid_params("source must not be empty"));
         }
-        let source =
-            source::resolve(ctx, &source_id)?.ok_or_else(|| Error::not_found(format!("no source '{source_id}'")))?;
+        let sources = self.state().clone();
+        let source = source::resolve(&sources, &source_id)?
+            .ok_or_else(|| Error::not_found(format!("no source '{source_id}'")))?;
         let page = source.fetch_page(ctx, None).await?;
         // Applied here too (§13/§14), not just in `run_source` -- a preview that shows items
         // a real run would never keep is a misleading preview.
-        let config = FetchersConfig::load(ctx)?;
-        let configured = config.sources.get(&source_id);
+        let configured = sources.sources.get(&source_id);
         let items: Vec<Value> = page
             .items
             .into_iter()
@@ -333,6 +369,7 @@ impl Fetchers {
         ctx: &Ctx,
         source: &dyn Source,
         filter_override: Option<&TitleFilterOverride>,
+        configured: Option<&schedule::SourceConfig>,
     ) -> Result<usize> {
         let source_id = source.id();
         let mut seen = dedup::load(ctx, source_id)?;
@@ -343,8 +380,6 @@ impl Fetchers {
         // this one call (§13/§14), is marked seen like any other examined item, so it is
         // never re-examined on a later run -- but it is a deliberate exclusion, not a
         // capacity miss, so (unlike the cap below) it is never retried.
-        let config = FetchersConfig::load(ctx)?;
-        let configured = config.sources.get(source_id);
 
         for page_index in 0..source::MAX_PAGES {
             // A full run can issue up to `MAX_PAGES * PAGE_SIZE` HTTP calls (CLAUDE.md §12
@@ -452,10 +487,10 @@ fn passes_title_filter(
     }
 }
 
-/// Sources whose own config entry could not be read, as `[{id, problem}]` (#126's review,
-/// B1). Empty in the normal case, so a client can show it only when there is something wrong.
-fn problems_of(config: &FetchersConfig) -> Vec<Value> {
-    config.problems.iter().map(|(id, why)| json!({"id": id, "problem": why})).collect()
+/// Sources whose own file could not be read, as `[{id, problem}]` (#126's review, B1). Empty
+/// in the normal case, so a client can show it only when there is something wrong.
+fn problems_of(state: &Sources) -> Vec<Value> {
+    state.problems.iter().map(|(id, why)| json!({"id": id, "problem": why})).collect()
 }
 
 /// `fetchers.item.found`'s payload (ADR 0028 §3, §9).
@@ -506,9 +541,10 @@ fn cap_value(v: &Value, budget: usize) -> Value {
 #[cfg(test)]
 mod tests {
     use shimmer_core::testing::TestEnv;
-    use shimmer_core::{HttpResponse, ModuleConfig};
+    use shimmer_core::HttpResponse;
 
     use super::*;
+    use crate::schedule::test_support::write_source;
     use crate::schedule::IntervalSpec;
 
     #[test]
@@ -543,6 +579,38 @@ mod tests {
     async fn init_succeeds_with_nothing_registered() {
         let env = TestEnv::new("fetchers");
         Fetchers::default().init(&env.ctx).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn init_loads_every_source_file_so_list_sees_them_with_no_reload_needed() {
+        let env = TestEnv::new("fetchers");
+        write_source(&env, "hn-whoishiring", json!({"enabled": true, "interval": "daily"}));
+        let fetchers = Fetchers::default();
+        fetchers.init(&env.ctx).await.unwrap();
+
+        let out = fetchers.list(&env.ctx).await.unwrap();
+        let sources = out["sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 1, "{sources:?}");
+        assert_eq!(sources[0]["id"], "hn-whoishiring");
+    }
+
+    #[tokio::test]
+    async fn reload_picks_up_a_file_written_after_init_and_reports_a_broken_one() {
+        let env = TestEnv::new("fetchers");
+        let fetchers = Fetchers::default();
+        fetchers.init(&env.ctx).await.unwrap();
+        assert!(fetchers.list(&env.ctx).await.unwrap()["sources"].as_array().unwrap().is_empty());
+
+        write_source(&env, "hn-whoishiring", json!({"enabled": true, "interval": "daily"}));
+        env.ctx.store.write(&format!("{}/broken.toml", schedule::SOURCES_DIR), "this is not [[[ valid toml").unwrap();
+
+        let out = fetchers.handle(RELOAD_OP, Value::Null, &env.ctx).await.unwrap();
+        assert_eq!(out["sources"], 1);
+        assert_eq!(out["problems"].as_array().unwrap().len(), 1);
+
+        let listed = fetchers.list(&env.ctx).await.unwrap();
+        assert_eq!(listed["sources"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["problems"].as_array().unwrap().len(), 1, "{listed:?}");
     }
 
     #[tokio::test]
@@ -605,6 +673,7 @@ mod tests {
 
     fn source_config(enabled: bool, interval_s: u64) -> schedule::SourceConfig {
         schedule::SourceConfig {
+            label: None,
             enabled,
             interval: IntervalSpec::Seconds(interval_s),
             kind: None,
@@ -617,12 +686,12 @@ mod tests {
     #[tokio::test]
     async fn tick_enqueues_every_due_source_and_only_those() {
         let env = TestEnv::new("fetchers");
-        let mut config = FetchersConfig::default();
-        config.sources.insert("hn-whoishiring".into(), source_config(true, schedule::MIN_INTERVAL_API_S));
-        config.sources.insert("weworkremotely".into(), source_config(false, schedule::MIN_INTERVAL_API_S));
+        let mut sources = BTreeMap::new();
+        sources.insert("hn-whoishiring".into(), source_config(true, schedule::MIN_INTERVAL_API_S));
+        sources.insert("weworkremotely".into(), source_config(false, schedule::MIN_INTERVAL_API_S));
 
         let fetchers = Fetchers::default();
-        let result = fetchers.run_due(&env.ctx, &config).await.unwrap();
+        let result = fetchers.run_due(&env.ctx, &sources).await.unwrap();
         assert_eq!(result["enqueued"], json!(["hn-whoishiring"]));
         assert_eq!(result["already_running"], json!([]));
 
@@ -635,12 +704,12 @@ mod tests {
     #[tokio::test]
     async fn tick_skips_a_source_it_already_sees_running() {
         let env = TestEnv::new("fetchers");
-        let mut config = FetchersConfig::default();
-        config.sources.insert("hn-whoishiring".into(), source_config(true, schedule::MIN_INTERVAL_API_S));
+        let mut sources = BTreeMap::new();
+        sources.insert("hn-whoishiring".into(), source_config(true, schedule::MIN_INTERVAL_API_S));
 
         let fetchers = Fetchers::default();
         let _permit = fetchers.running.try_acquire("hn-whoishiring").unwrap();
-        let result = fetchers.run_due(&env.ctx, &config).await.unwrap();
+        let result = fetchers.run_due(&env.ctx, &sources).await.unwrap();
 
         assert_eq!(result["enqueued"], json!([]));
         assert_eq!(result["already_running"], json!(["hn-whoishiring"]));
@@ -736,10 +805,12 @@ mod tests {
 
     #[tokio::test]
     async fn run_source_drops_an_excluded_title_and_never_retries_it() {
-        let mut env = TestEnv::new("fetchers");
-        env.ctx.config = ModuleConfig::new(json!({
-            "sources": {"hn-whoishiring": {"enabled": true, "interval": "daily", "title_excludes": ["senior"]}}
-        }));
+        let env = TestEnv::new("fetchers");
+        write_source(
+            &env,
+            "hn-whoishiring",
+            json!({"enabled": true, "interval": "daily", "title_excludes": ["senior"]}),
+        );
         const BASE: &str = "https://hacker-news.firebaseio.com/v0";
         {
             let mut responses = env.http.responses.lock().unwrap();
@@ -759,6 +830,7 @@ mod tests {
         }
 
         let fetchers = Fetchers::default();
+        fetchers.load(&env.ctx).unwrap();
         let out = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None).await.unwrap();
         assert_eq!(out["new_items"], 1, "only the junior posting should count as new");
 
@@ -779,10 +851,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_applies_the_same_title_filter_a_real_run_would() {
-        let mut env = TestEnv::new("fetchers");
-        env.ctx.config = ModuleConfig::new(json!({
-            "sources": {"hn-whoishiring": {"enabled": true, "interval": "daily", "title_contains": ["junior"]}}
-        }));
+        let env = TestEnv::new("fetchers");
+        write_source(
+            &env,
+            "hn-whoishiring",
+            json!({"enabled": true, "interval": "daily", "title_contains": ["junior"]}),
+        );
         const BASE: &str = "https://hacker-news.firebaseio.com/v0";
         {
             let mut responses = env.http.responses.lock().unwrap();
@@ -801,7 +875,9 @@ mod tests {
             );
         }
 
-        let out = Fetchers::default().test(&env.ctx, "hn-whoishiring".into(), None).await.unwrap();
+        let fetchers = Fetchers::default();
+        fetchers.load(&env.ctx).unwrap();
+        let out = fetchers.test(&env.ctx, "hn-whoishiring".into(), None).await.unwrap();
         let items = out["items"].as_array().unwrap();
         assert_eq!(items.len(), 1, "{items:?}");
         assert!(items[0]["title"].as_str().unwrap().contains("Junior"));
@@ -809,12 +885,14 @@ mod tests {
 
     #[tokio::test]
     async fn an_override_filter_replaces_rather_than_merges_with_the_configured_one() {
-        let mut env = TestEnv::new("fetchers");
+        let env = TestEnv::new("fetchers");
         // Configured to want only "junior" titles -- the override below asks for the
         // opposite (anything but "junior") and must win outright, not combine with this.
-        env.ctx.config = ModuleConfig::new(json!({
-            "sources": {"hn-whoishiring": {"enabled": true, "interval": "daily", "title_contains": ["junior"]}}
-        }));
+        write_source(
+            &env,
+            "hn-whoishiring",
+            json!({"enabled": true, "interval": "daily", "title_contains": ["junior"]}),
+        );
         const BASE: &str = "https://hacker-news.firebaseio.com/v0";
         {
             let mut responses = env.http.responses.lock().unwrap();
@@ -833,8 +911,10 @@ mod tests {
             );
         }
 
+        let fetchers = Fetchers::default();
+        fetchers.load(&env.ctx).unwrap();
         let override_filter = TitleFilterOverride { contains: vec!["senior".into()], excludes: Vec::new() };
-        let out = Fetchers::default().test(&env.ctx, "hn-whoishiring".into(), Some(override_filter)).await.unwrap();
+        let out = fetchers.test(&env.ctx, "hn-whoishiring".into(), Some(override_filter)).await.unwrap();
         let items = out["items"].as_array().unwrap();
         assert_eq!(items.len(), 1, "{items:?}");
         assert!(items[0]["title"].as_str().unwrap().contains("Senior"), "the override must win, not merge with config");
@@ -842,7 +922,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_override_filter_on_a_real_run_leaves_the_items_it_drops_findable_later() {
-        let env = TestEnv::new("fetchers"); // no config.toml filter at all -- the override is the only one
+        let env = TestEnv::new("fetchers"); // no configured filter at all -- the override is the only one
         const BASE: &str = "https://hacker-news.firebaseio.com/v0";
         {
             let mut responses = env.http.responses.lock().unwrap();
@@ -894,17 +974,12 @@ mod tests {
   </entry>
 </feed>"#;
 
-        let mut env = TestEnv::new("fetchers");
-        env.ctx.config = ModuleConfig::new(json!({
-            "sources": {
-                "my-team-blog": {
-                    "enabled": true,
-                    "interval": "hourly",
-                    "kind": "rss",
-                    "url": "https://example.test/feed.xml",
-                },
-            }
-        }));
+        let env = TestEnv::new("fetchers");
+        write_source(
+            &env,
+            "my-team-blog",
+            json!({"enabled": true, "interval": "hourly", "kind": "rss", "url": "https://example.test/feed.xml"}),
+        );
         env.http.responses.lock().unwrap().insert(
             "https://example.test/feed.xml".to_string(),
             HttpResponse {
@@ -917,6 +992,7 @@ mod tests {
         );
 
         let fetchers = Fetchers::default();
+        fetchers.load(&env.ctx).unwrap();
         let out = fetchers.fetch(&env.ctx, "my-team-blog".into(), None).await.unwrap();
         assert_eq!((out["source"].as_str(), out["new_items"].as_u64()), (Some("my-team-blog"), Some(1)));
 
@@ -935,15 +1011,17 @@ mod tests {
 
     #[tokio::test]
     async fn list_shows_only_an_opted_into_fixed_source_and_a_configured_kind() {
-        let mut env = TestEnv::new("fetchers");
-        env.ctx.config = ModuleConfig::new(json!({
-            "sources": {
-                "hn-whoishiring": {"enabled": true, "interval": "daily"},
-                "my-team-blog": {"enabled": true, "interval": "hourly", "kind": "rss", "url": "https://example.test/feed.xml"},
-            }
-        }));
+        let env = TestEnv::new("fetchers");
+        write_source(&env, "hn-whoishiring", json!({"enabled": true, "interval": "daily"}));
+        write_source(
+            &env,
+            "my-team-blog",
+            json!({"enabled": true, "interval": "hourly", "kind": "rss", "url": "https://example.test/feed.xml"}),
+        );
 
-        let out = Fetchers::default().list(&env.ctx).await.unwrap();
+        let fetchers = Fetchers::default();
+        fetchers.load(&env.ctx).unwrap();
+        let out = fetchers.list(&env.ctx).await.unwrap();
         let sources = out["sources"].as_array().unwrap();
         // weworkremotely is compiled in but never configured here, so a user with no
         // interest in job hunting never sees it (ADR 0028 §19).
@@ -966,17 +1044,14 @@ mod tests {
 
     #[tokio::test]
     async fn status_reports_last_run_and_whether_a_source_is_mid_fetch() {
-        let mut env = TestEnv::new("fetchers");
+        let env = TestEnv::new("fetchers");
         // Both must have their own entry to show up in status at all (ADR 0028 §19) --
         // fetching hn-whoishiring works regardless (resolve() needs none), but seeing it
         // and weworkremotely listed afterward does not.
-        env.ctx.config = ModuleConfig::new(json!({
-            "sources": {
-                "hn-whoishiring": {"enabled": true, "interval": "daily"},
-                "weworkremotely": {"enabled": false, "interval": schedule::MIN_INTERVAL_SCRAPE_S},
-            }
-        }));
+        write_source(&env, "hn-whoishiring", json!({"enabled": true, "interval": "daily"}));
+        write_source(&env, "weworkremotely", json!({"enabled": false, "interval": schedule::MIN_INTERVAL_SCRAPE_S}));
         let fetchers = Fetchers::default();
+        fetchers.load(&env.ctx).unwrap();
         stub_one_hn_comment(&env, 10, "<p>Acme | Remote<p>Hiring.");
         fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None).await.unwrap();
 
@@ -1048,7 +1123,7 @@ mod tests {
         let fetchers = Fetchers::default();
 
         let tick = fetchers.handle(TICK_OP, Value::Null, &env.ctx).await.unwrap();
-        assert_eq!(tick["enqueued"], json!([]), "no sources configured in ctx.config by default");
+        assert_eq!(tick["enqueued"], json!([]), "no source files at all by default");
 
         let fetch = fetchers.handle(FETCH_OP, json!({"source": "hn-whoishiring"}), &env.ctx).await.unwrap();
         assert_eq!(fetch["source"], "hn-whoishiring");
@@ -1065,7 +1140,7 @@ mod tests {
         let fetchers = Fetchers::default();
 
         let source = source::find("hn-whoishiring").unwrap();
-        let err = fetchers.run_source(&env.ctx, source.as_ref(), None).await.unwrap_err();
+        let err = fetchers.run_source(&env.ctx, source.as_ref(), None, None).await.unwrap_err();
         assert!(env.ctx.cancel.is_cancelled());
         assert_eq!(classify_failure(&env.ctx, &err), "cancelled");
     }
@@ -1110,7 +1185,7 @@ mod tests {
         let fetchers = Fetchers::default();
 
         let source = source::find("hn-whoishiring").unwrap();
-        fetchers.run_source(&ctx, source.as_ref(), None).await.unwrap();
+        fetchers.run_source(&ctx, source.as_ref(), None, None).await.unwrap();
 
         let reported = progress.lock().unwrap();
         assert!(!reported.is_empty(), "at least the first page must report progress");

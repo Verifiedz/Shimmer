@@ -470,6 +470,9 @@ $SHIMMER_HOME/
   data/scheduler/triggers/<id>.json  One per trigger, JSON because params are JSON (ADR 0004).
   data/scheduler/removed/<id>.json   Removed schedules, until restored or purged (ADR 0038).
   data/automations/rules/<id>.toml  One per rule; settings.toml, history.json, removed/ (ADR 0035).
+  data/fetchers/sources/<id>.toml  One per source: [source] (enabled, interval, kind, title
+                           filters) + [kind] (that kind's own fields) (ADR 0028 §4). Also
+                           <id>/seen.toml (dedup) and last_run.toml, per source.
   data/notify/             Notify's inbox (inbox/<id>.toml, one file per message), settings.toml,
                            and held/ markers (ADR 0032). A message no sink could deliver stays in
                            the inbox as failed (§11.3).

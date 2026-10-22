@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use shimmer_core::{Ctx, Error, Result};
 
-use crate::schedule::FetchersConfig;
+use crate::schedule::Sources;
 
 /// The host loops [`Source::fetch_page`] at most this many times per run, following
 /// `next_cursor` -- a `Source` never loops itself.
@@ -117,7 +117,7 @@ pub struct Page {
 pub trait Source: Send + Sync {
     /// Also `fetchers.item.found`'s `source_name` and `data/fetchers/<id>/...`'s directory
     /// name. Borrowed from `&self`, not `&'static` (ADR 0028 §2a) -- a configured-kind
-    /// instance's id comes from `config.toml`, not a compile-time literal.
+    /// instance's id comes from its own source file, not a compile-time literal.
     fn id(&self) -> &str;
     fn method(&self) -> Method;
     /// One page, given the previous page's `next_cursor` (`None` for the first page).
@@ -142,18 +142,17 @@ pub fn find(id: &str) -> Option<std::sync::Arc<dyn Source>> {
 }
 
 /// The two-layered lookup ADR 0028 §2a describes: a configured `kind` builds a brand-new
-/// instance from that config entry's own settings; no `kind` (or no config entry at all)
-/// falls back to the fixed [`registry`]. `FetchersConfig::from_value` has already validated
-/// every entry's `kind` and its required fields at load time, so a config-shape error here
-/// would mean that validation has a gap, not that this run should report one -- hence
-/// `Error::internal`, not `invalid_params`, on the "known kind but missing its own field"
-/// branches.
-pub fn resolve(ctx: &Ctx, id: &str) -> Result<Option<std::sync::Arc<dyn Source>>> {
-    resolve_from(&FetchersConfig::load(ctx)?, id)
+/// instance from that source's own file; no `kind` (or no source file at all) falls back to
+/// the fixed [`registry`]. Pure -- `sources` is whatever `Sources::load` already read and
+/// validated (CLAUDE.md §12 rule 10), so a config-shape error here would mean that
+/// validation has a gap, not that this call should report one -- hence `Error::internal`,
+/// not `invalid_params`, on the "known kind but missing its own field" branches.
+pub fn resolve(sources: &Sources, id: &str) -> Result<Option<std::sync::Arc<dyn Source>>> {
+    resolve_from(sources, id)
 }
 
-fn resolve_from(config: &FetchersConfig, id: &str) -> Result<Option<std::sync::Arc<dyn Source>>> {
-    let Some(cfg) = config.sources.get(id) else { return Ok(find(id)) };
+fn resolve_from(sources: &Sources, id: &str) -> Result<Option<std::sync::Arc<dyn Source>>> {
+    let Some(cfg) = sources.sources.get(id) else { return Ok(find(id)) };
     let Some(kind_name) = cfg.kind.as_deref() else { return Ok(find(id)) };
     let kind = crate::kind::kind(kind_name).ok_or_else(|| {
         Error::internal(format!("sources.{id}: unknown kind \"{kind_name}\" despite passing load-time validation"))
@@ -165,31 +164,31 @@ fn resolve_from(config: &FetchersConfig, id: &str) -> Result<Option<std::sync::A
 }
 
 /// Every source `fetchers.list`/`fetchers.status` surface *unprompted*: a fixed [`registry`]
-/// source only once the user has given it a `[modules.fetchers.sources.<id>]` entry of its
-/// own (even a bare, disabled one), plus one instance per configured `kind` entry (ADR 0028
-/// §2a) -- never the whole fixed registry regardless of interest (ADR 0028 §19). This is
-/// *not* the universe [`resolve`] can build something for -- that still falls back to the
-/// fixed registry by id with zero config at all, so `fetchers test hn-whoishiring` keeps
-/// working for anyone who already knows the id; this only governs what shows up for someone
-/// who never asked.
-pub fn known(ctx: &Ctx) -> Result<Vec<std::sync::Arc<dyn Source>>> {
-    let config = FetchersConfig::load(ctx)?;
-    let mut sources: Vec<_> = registry().into_iter().filter(|s| config.sources.contains_key(s.id())).collect();
-    for (id, cfg) in &config.sources {
+/// source only once the user has given it its own source file (even a bare, disabled one),
+/// plus one instance per configured `kind` entry (ADR 0028 §2a) -- never the whole fixed
+/// registry regardless of interest (ADR 0028 §19). This is *not* the universe [`resolve`] can
+/// build something for -- that still falls back to the fixed registry by id with zero config
+/// at all, so `fetchers test hn-whoishiring` keeps working for anyone who already knows the
+/// id; this only governs what shows up for someone who never asked.
+pub fn known(sources: &Sources) -> Vec<std::sync::Arc<dyn Source>> {
+    let mut out: Vec<_> = registry().into_iter().filter(|s| sources.sources.contains_key(s.id())).collect();
+    for (id, cfg) in &sources.sources {
         if cfg.kind.is_some() {
-            if let Some(s) = resolve_from(&config, id)? {
-                sources.push(s);
+            if let Ok(Some(s)) = resolve_from(sources, id) {
+                out.push(s);
             }
         }
     }
-    Ok(sources)
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use serde_json::json;
     use shimmer_core::testing::TestEnv;
-    use shimmer_core::ModuleConfig;
+
+    use crate::schedule::test_support::write_source;
+    use crate::schedule::Sources;
 
     use super::*;
 
@@ -263,42 +262,45 @@ mod tests {
         // must not see hn-whoishiring/weworkremotely show up unprompted just because they're
         // compiled in (ADR 0028 §19).
         let env = TestEnv::new("fetchers");
-        let ids: Vec<_> = known(&env.ctx).unwrap().iter().map(|s| s.id().to_string()).collect();
+        let sources = Sources::load(&env.ctx).unwrap();
+        let ids: Vec<_> = known(&sources).iter().map(|s| s.id().to_string()).collect();
         assert_eq!(ids, Vec::<String>::new());
         // Explicit invocation by id is a separate, unaffected path.
-        assert!(resolve(&env.ctx, "hn-whoishiring").unwrap().is_some());
+        assert!(resolve(&sources, "hn-whoishiring").unwrap().is_some());
     }
 
     #[test]
     fn known_includes_a_fixed_source_only_once_it_has_its_own_entry() {
-        let mut env = TestEnv::new("fetchers");
-        env.ctx.config = ModuleConfig::new(serde_json::json!({
-            "sources": {
-                "hn-whoishiring": {"enabled": false, "interval": "daily"},
-                "my-team-blog": {"enabled": true, "interval": "hourly", "kind": "rss", "url": "https://example.test/feed.xml"},
-            }
-        }));
-        let ids: Vec<_> = known(&env.ctx).unwrap().iter().map(|s| s.id().to_string()).collect();
+        let env = TestEnv::new("fetchers");
+        write_source(&env, "hn-whoishiring", json!({"enabled": false, "interval": "daily"}));
+        write_source(
+            &env,
+            "my-team-blog",
+            json!({"enabled": true, "interval": "hourly", "kind": "rss", "url": "https://example.test/feed.xml"}),
+        );
+        let sources = Sources::load(&env.ctx).unwrap();
+        let ids: Vec<_> = known(&sources).iter().map(|s| s.id().to_string()).collect();
         assert_eq!(ids, vec!["hn-whoishiring", "my-team-blog"], "weworkremotely was never configured");
     }
 
     #[test]
     fn resolve_builds_a_json_api_instance_from_its_own_config_entry() {
-        let mut env = TestEnv::new("fetchers");
-        env.ctx.config = ModuleConfig::new(serde_json::json!({
-            "sources": {
-                "figma-jobs": {
-                    "enabled": true, "interval": "daily", "kind": "json-api",
-                    "url": "https://boards-api.greenhouse.io/v1/boards/figma/jobs",
-                    "items_path": "jobs", "id_field": "id", "title_field": "title", "url_field": "absolute_url",
-                },
-            }
-        }));
-        let source = resolve(&env.ctx, "figma-jobs").unwrap().expect("a configured json-api kind must resolve");
+        let env = TestEnv::new("fetchers");
+        write_source(
+            &env,
+            "figma-jobs",
+            json!({
+                "enabled": true, "interval": "daily", "kind": "json-api",
+                "url": "https://boards-api.greenhouse.io/v1/boards/figma/jobs",
+                "items_path": "jobs", "id_field": "id", "title_field": "title", "url_field": "absolute_url",
+            }),
+        );
+        let sources = Sources::load(&env.ctx).unwrap();
+        let source = resolve(&sources, "figma-jobs").unwrap().expect("a configured json-api kind must resolve");
         assert_eq!(source.id(), "figma-jobs");
         assert_eq!(source.method(), Method::Api);
 
-        let ids: Vec<_> = known(&env.ctx).unwrap().iter().map(|s| s.id().to_string()).collect();
+        let ids: Vec<_> = known(&sources).iter().map(|s| s.id().to_string()).collect();
         assert_eq!(ids, vec!["figma-jobs"]);
     }
 }
