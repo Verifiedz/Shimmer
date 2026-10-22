@@ -88,6 +88,7 @@ label = "Anime Tropes"
 "utsushi"        = "fetchers.copy"
 "mihon"          = "fetchers.templates"
 "nozoku"         = "fetchers.peek"
+"yomikomi"       = "fetchers.reload"
 # automations (ADR 0035)
 "keikaku"   = "automations.list"
 "dore"      = "automations.show"
