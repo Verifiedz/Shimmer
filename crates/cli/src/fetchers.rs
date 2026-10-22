@@ -935,7 +935,9 @@ fn task_error(payload: &Value) -> Error {
 fn list(data: &Value, now: DateTime<Utc>) -> String {
     let sources = data["sources"].as_array().cloned().unwrap_or_default();
     if sources.is_empty() {
-        return "no sources known".into();
+        return "no sources yet: see 'shimmer fetchers templates', then \
+                'shimmer fetchers new SOURCE --from TEMPLATE'"
+            .into();
     }
     let rows: Vec<Vec<String>> = sources
         .iter()
@@ -1230,8 +1232,12 @@ mod tests {
     }
 
     #[test]
-    fn list_with_nothing_known_says_so() {
-        assert_eq!(list(&json!({"sources": []}), Utc::now()), "no sources known");
+    fn list_with_nothing_known_points_at_templates() {
+        let out = list(&json!({"sources": []}), Utc::now());
+        assert!(
+            out.contains("shimmer fetchers templates") && out.contains("shimmer fetchers new SOURCE --from TEMPLATE"),
+            "{out}"
+        );
     }
 
     #[test]
