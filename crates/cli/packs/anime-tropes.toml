@@ -86,6 +86,7 @@ label = "Anime Tropes"
 "teishi"         = "fetchers.disable"
 "tsukekae"       = "fetchers.rename"
 "utsushi"        = "fetchers.copy"
+"yomikomi"       = "fetchers.reload"
 # automations (ADR 0035)
 "keikaku"   = "automations.list"
 "dore"      = "automations.show"

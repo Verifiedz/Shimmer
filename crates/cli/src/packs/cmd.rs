@@ -43,7 +43,7 @@ An alias stands for shimmer plus a whole command. In pack.toml it names one of t
   scheduler.enable  scheduler.remove  scheduler.restore  scheduler.purge
   fetchers.list  fetchers.show  fetchers.new  fetchers.edit  fetchers.remove
   fetchers.restore  fetchers.purge  fetchers.enable  fetchers.disable  fetchers.rename
-  fetchers.copy  fetchers.status  fetchers.test  fetchers.run  fetchers.items
+  fetchers.copy  fetchers.status  fetchers.reload  fetchers.test  fetchers.run  fetchers.items
   automations.list  automations.show  automations.new  automations.edit  automations.remove
   automations.restore  automations.purge  automations.rename  automations.copy
   automations.enable  automations.disable  automations.test

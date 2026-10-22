@@ -85,6 +85,7 @@ label = "Starship"
 "power-down"        = "fetchers.disable"
 "retag-source"      = "fetchers.rename"
 "duplicate-source"  = "fetchers.copy"
+"recalibrate-sensors" = "fetchers.reload"
 # automations (ADR 0035)
 "protocols"         = "automations.list"
 "briefing"          = "automations.show"
