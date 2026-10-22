@@ -23,8 +23,14 @@ fn a_damaged_schedule_shows_in_scheduler_list_and_doctor() {
     assert!(out.contains("shimmer scheduler remove usr-damaged"), "{out}");
 
     let removed = home.shimmer(&["scheduler", "remove", "usr-damaged"]);
+    let out = String::from_utf8_lossy(&removed.stdout);
     assert!(removed.status.success(), "{}", String::from_utf8_lossy(&removed.stderr));
+    assert!(out.contains("moved usr-damaged's unreadable file to data/scheduler/removed/usr-damaged.json"), "{out}");
+    assert!(out.contains("shimmer scheduler restore usr-damaged"), "{out}");
     assert!(!dir.join("usr-damaged.json").exists());
+    // Kept, not deleted (#308's review).
+    let aside = home.dir.path().join("home/data/scheduler/removed/usr-damaged.json");
+    assert_eq!(std::fs::read_to_string(aside).unwrap(), "{\"spec\": {");
     let doctor = home.shimmer(&["doctor"]);
     assert!(String::from_utf8_lossy(&doctor.stdout).contains("every file readable"));
     home.shimmer(&["shutdown"]);

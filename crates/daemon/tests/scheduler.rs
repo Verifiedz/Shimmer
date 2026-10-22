@@ -989,8 +989,77 @@ async fn a_damaged_schedule_file_is_listed_as_broken_and_can_be_removed() {
     assert_eq!(std::fs::read_to_string(dir.join("usr-damaged.json")).unwrap(), "{\"spec\": {", "never overwritten");
 
     let removed = c.call("scheduler.remove", json!({"trigger_id": "usr-damaged"})).await.unwrap();
-    assert_eq!(removed["removed"], true);
+    assert_eq!((removed["removed"].clone(), removed["was"].clone()), (json!(true), json!("broken")));
     assert!(!dir.join("usr-damaged.json").exists());
+    // Moved aside unchanged, not deleted (#308's review): it's the person's schedule with a typo.
+    let aside = env.home.path().join("data/scheduler/removed/usr-damaged.json");
+    assert_eq!(std::fs::read_to_string(&aside).unwrap(), "{\"spec\": {", "kept byte for byte");
+    assert_eq!(removed["file"], "data/scheduler/removed/usr-damaged.json");
     assert_eq!(c.call("scheduler.list", json!({})).await.unwrap()["broken"], json!([]));
+    // Purge leaves it alone while it can't be read.
+    assert_eq!(c.call("scheduler.purge", json!({})).await.unwrap(), json!({"purged": 0}));
+    assert!(aside.exists());
+    stop(d).await;
+}
+
+/// Waits until `topic` has been logged for an event about `op`, up to 5 s.
+async fn until_logged_for_op(env: &Env, topic: &str, op: &str) {
+    for _ in 0..500 {
+        if !logged_for_op(env, topic, op).is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("{topic} for {op} never logged");
+}
+
+/// #308's review: a scheduled task running when the daemon is *stopped* (shimmer shutdown,
+/// logout, a reboot), not just killed, is reported as interrupted after the restart, not forgotten.
+#[tokio::test]
+async fn a_firing_cut_off_by_a_normal_stop_is_reported_as_interrupted() {
+    let env = Env::fake_clock();
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    let id = add(&mut c, json!({"once": iso(60)}), "demo.spin", "run_once").await;
+    advance(&env, 120);
+    until_logged_for_op(&env, "queue.task.started", "demo.spin").await;
+    stop(d).await;
+    let cancelled = logged_for_op(&env, "queue.task.cancelled", "demo.spin");
+    assert_eq!(cancelled.len(), 1);
+    assert_eq!(cancelled[0].payload["by"], "shutdown", "the stop cut it off: {:?}", cancelled[0].payload);
+
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    settle(&mut c).await;
+    assert_eq!(logged(&env, "scheduler.trigger.interrupted").len(), 1, "reported, not forgotten");
+    assert_eq!(logged_for_op(&env, "queue.task.started", "demo.spin").len(), 1, "not run again");
+    let t = trigger(&mut c, &id).await.unwrap();
+    assert!(t["interrupted"].is_object() && t["waiting"] == 0, "{t}");
+    stop(d).await;
+}
+
+/// The other side: a scheduled task a person cancels ended because they asked; after a restart
+/// it's neither reported nor run again.
+#[tokio::test]
+async fn a_firing_a_person_cancelled_is_forgotten_not_reported() {
+    let env = Env::fake_clock();
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    c.subscribe(&["scheduler.trigger.*"]).await;
+    let id = add(&mut c, json!({"once": iso(60)}), "demo.spin", "run_once").await;
+    advance(&env, 120);
+    let task = c.event("scheduler.trigger.fired").await.payload["task_id"].clone();
+    until_logged_for_op(&env, "queue.task.started", "demo.spin").await;
+    c.call("queue.cancel", json!({"task_id": task})).await.unwrap();
+    until_logged_for_op(&env, "queue.task.cancelled", "demo.spin").await;
+    assert!(logged_for_op(&env, "queue.task.cancelled", "demo.spin")[0].payload.get("by").is_none());
+    stop(d).await;
+
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    settle(&mut c).await;
+    assert!(logged(&env, "scheduler.trigger.interrupted").is_empty());
+    assert_eq!(logged_for_op(&env, "queue.task.started", "demo.spin").len(), 1);
+    assert!(trigger(&mut c, &id).await.is_none_or(|t| t["interrupted"].is_null()));
     stop(d).await;
 }

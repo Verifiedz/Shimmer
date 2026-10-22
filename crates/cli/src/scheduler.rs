@@ -173,20 +173,7 @@ pub async fn run(client: &mut Client, cmd: &SchedulerCmd, json: bool, prompt: &m
         SchedulerCmd::Edit { id, plan } => return crate::schedule::edit(client, id, plan, json, prompt).await,
         SchedulerCmd::Disable { id } => one(id, "scheduler.disable"),
         SchedulerCmd::Enable { id } => one(id, "scheduler.enable"),
-        SchedulerCmd::Remove { id } => {
-            // A file the daemon couldn't read has no schedule to show first: removing it deletes
-            // the file, by the id `scheduler list` gave it (#263 finding 5).
-            let list = client.call("scheduler.list", json!({})).await?;
-            let broken = list["broken"].as_array().into_iter().flatten().any(|b| b["id"] == id.as_str());
-            if broken {
-                let data = client.call("scheduler.remove", json!({"trigger_id": id})).await?;
-                if json {
-                    return Ok(render::json(&data));
-                }
-                return Ok(format!("✓ deleted {id}'s unreadable file (there was no schedule in it to restore)"));
-            }
-            one(id, "scheduler.remove")
-        }
+        SchedulerCmd::Remove { id } => one(id, "scheduler.remove"),
         SchedulerCmd::Restore { id } => {
             let data = client.call("scheduler.restore", json!({"trigger_id": id})).await?;
             if json {
@@ -200,7 +187,23 @@ pub async fn run(client: &mut Client, cmd: &SchedulerCmd, json: bool, prompt: &m
     };
     // Find the trigger first, then act on its full id, and say which one it was and what it runs:
     // never just echo what was typed (#183's review). A removed trigger can't be looked up after.
-    let trigger = client.call("scheduler.show", params).await?;
+    let trigger = match client.call("scheduler.show", params.clone()).await {
+        Ok(t) => t,
+        // A file the daemon couldn't read has no schedule to show (#263 finding 5): removing it by
+        // the id `scheduler list` gave it moves the file aside, and the daemon says so.
+        Err(e) if e.code == shimmer_core::ErrorCode::NotFound && op == "scheduler.remove" => {
+            let data = client.call(op, params).await.map_err(|_| e)?;
+            if json {
+                return Ok(render::json(&data));
+            }
+            let id = render::cell(&data["trigger_id"]);
+            return Ok(format!(
+                "✓ moved {id}'s unreadable file to {}: fix it there, then shimmer scheduler restore {id}",
+                render::cell(&data["file"])
+            ));
+        }
+        Err(e) => return Err(e),
+    };
     let full = trigger["id"].as_str().unwrap_or("?").to_string();
     let data = client.call(op, json!({ "trigger_id": full })).await?;
     if json {
@@ -322,7 +325,7 @@ fn broken(data: &Value) -> String {
                 paint(
                     Role::Warning,
                     &format!(
-                        "! {} can't be read: {} ({}). Fix the file, or: shimmer scheduler remove {}",
+                        "! {} can't be read: {} ({}). Fix it and restart (shimmer shutdown), or move it aside: shimmer scheduler remove {}",
                         render::cell(&b["id"]),
                         render::cell(&b["problem"]),
                         render::cell(&b["file"]),

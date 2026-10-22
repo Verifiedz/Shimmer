@@ -33,11 +33,17 @@ injected clock). These are the points it left open.
   - never handed to the queue, or handed and never **started** → queued again
     (`scheduler.trigger.fired` with `after_restart: true`). It never ran, so this can't
     repeat anything;
-  - **started** and never ended (the daemon died mid-run) → **not** run again: it may have
-    half sent something. It's recorded on the trigger (`interrupted`) and reported
+  - **started** and never ended → **not** run again: it may have half sent something. That's
+    a crash mid-run, and also the daemon **stopping** mid-run (`shimmer shutdown`, logout, a
+    reboot): stopping cancels the running task, and the queue marks that cancel `"by":
+    "shutdown"` so it isn't taken for one a person asked for. It's recorded on the trigger (`interrupted`) and reported
     (`scheduler.trigger.interrupted`, which the built-in `scheduled-task-interrupted` rule
     turns into a message, ADR 0035 §10);
-  - ended (finished, failed or cancelled) → forgotten.
+  - ended (finished, failed, or cancelled by a person or module) → forgotten.
+
+  One gap remains: if the daemon dies in the instant between handing a firing to the queue
+  and logging `scheduler.trigger.fired`, nothing links the firing to its task, and it runs
+  again. Narrow, but it means "never repeats" holds except for that instant.
   A module's finished one-time schedule is deleted once its task has ended, not when it
   fires. A paused trigger's waiting firing is still run: it fired before the pause. This is
   scheduled work only; whether *every* queued task should survive a restart is #236.

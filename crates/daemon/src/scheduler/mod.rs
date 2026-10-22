@@ -8,8 +8,11 @@
 //!   firing. Duplicate emails are the worse failure (§6.3).
 //! * A firing is remembered on disk (`unfinished`) until its task ends, so a stop while the task
 //!   still waits in its lane doesn't lose it: on the next start, a task the event log says never
-//!   started is queued again, and one that started but never ended is reported as interrupted,
-//!   never run twice (#263 finding 1, ADR 0004 amendment).
+//!   started is queued again, and one that started but never ended (a crash, or the daemon
+//!   stopping mid-run) is reported as interrupted, never run twice (#263 finding 1, ADR 0004
+//!   amendment). The one gap: the daemon dying in the instant between handing a firing to the
+//!   queue and logging `scheduler.trigger.fired` leaves nothing linking them, so that firing runs
+//!   again (#308's review).
 //! * A schedule file that can't be read is skipped but listed as broken, never overwritten
 //!   (#263 finding 5).
 //! * A trigger never overlaps itself: if a task from an earlier firing is still queued or
@@ -512,7 +515,12 @@ impl Scheduler {
                 "queue.task.started" => {
                     started.insert(task);
                 }
-                "queue.task.finished" | "queue.task.failed" | "queue.task.cancelled" => {
+                "queue.task.finished" | "queue.task.failed" => {
+                    ended.insert(task);
+                }
+                // A person's (or a module's) cancel ended it; the daemon stopping only cut it off,
+                // which is reported like a crash mid-run (#308's review).
+                "queue.task.cancelled" if ev.payload["by"] != "shutdown" => {
                     ended.insert(task);
                 }
                 _ => {}
@@ -753,16 +761,30 @@ impl Scheduler {
         Ok(json!({"removed": true, "trigger_id": id}))
     }
 
-    /// A schedule file that can't be read is deleted, not moved aside: there's no schedule in it
-    /// to restore (#263 finding 5). Only by its full id, as `scheduler list` shows it.
+    /// A schedule file that can't be read is moved aside, byte for byte, like any removed
+    /// schedule (#263 finding 5, #308's review): it's most often the person's own schedule with one
+    /// typo, so it's kept to fix. Fixed in `removed/`, `scheduler restore` brings it back; `purge`
+    /// never deletes it while it can't be read. Only by its full id, as `scheduler list` shows it.
+    /// One fixed in place since the daemon started isn't broken any more: it's refused, and loads
+    /// on the next start.
     fn remove_broken(&self, id: &str) -> Result<Value> {
         let _st = self.lock();
+        let bytes = self.store.read(&path(id))?.ok_or_else(|| Error::not_found(format!("no trigger '{id}'")))?;
+        let readable = std::str::from_utf8(&bytes).ok().and_then(|t| serde_json::from_str::<Stored>(t).ok());
+        if readable.is_some() {
+            return Err(Error::conflict(format!(
+                "{id}'s file is readable again; restart the daemon (shimmer shutdown) to load it"
+            )));
+        }
         self.store.transaction(|tx| {
+            tx.put(&removed_path(id), bytes.clone())?;
             tx.delete(&path(id))?;
-            tx.emit("scheduler.trigger.removed", json!({"trigger_id": id, "reason": "unreadable file removed"}))
+            tx.emit("scheduler.trigger.removed", json!({"trigger_id": id, "reason": "unreadable file moved aside"}))
         })?;
         self.broken().remove(id);
-        Ok(json!({"removed": true, "trigger_id": id}))
+        Ok(
+            json!({"removed": true, "trigger_id": id, "was": "broken", "file": format!("data/scheduler/{}", removed_path(id))}),
+        )
     }
 
     /// Bring a removed trigger back as it was, paused or not (ADR 0038 §3). Like `resume`, it
