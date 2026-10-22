@@ -24,10 +24,12 @@ impl StoreBackend for Backend {
         self.store.list(namespace, prefix)
     }
 
+    /// Published only once logged: a transaction whose last step failed is committed, but its
+    /// events wait with it and are published when a later commit lands them (ADR 0040, #309's
+    /// review). Recovery at start lands them before anything subscribes; the indexer reads them
+    /// from the log.
     fn commit(&self, namespace: &str, plan: TxPlan) -> Result<()> {
-        let events = plan.events.clone();
-        self.store.commit(namespace, plan)?;
-        for e in events {
+        for e in self.store.commit_logged(namespace, plan)? {
             self.bus.publish(e);
         }
         Ok(())

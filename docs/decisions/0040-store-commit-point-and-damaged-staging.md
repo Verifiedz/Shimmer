@@ -29,6 +29,17 @@ wrong:
    before the next commit, and rolled forward by recovery on the next start. `shimmer doctor`
    warns about one still waiting after a minute. A caller is never told "failed" about a write
    that happened, so it never retries one into two.
+   - **Durable first, published second still holds** (#309's review). A waiting transaction's
+     events aren't in the log, so they aren't published either: `Store::commit_logged` hands
+     back only the events that reached the log in that call (waiting ones that landed, oldest
+     first, then its own), and the daemon publishes exactly those. Modules and the index see
+     a waiting save's events when it lands, never before. One that lands through recovery at
+     start is read by the indexer from the log; modules don't see it (as with any crash).
+   - **Commit order holds** (#309's review). While a transaction waits, every later one waits
+     behind it, staged (even a lone file write, which otherwise skips staging), and they land
+     oldest first, stopping at the first that still fails. Recovery applies folders in the
+     order they were made: a folder is named `<nanoseconds, never repeating>-<txid>`, since a
+     ULID alone is ordered only to the millisecond.
 2. **Recovery takes each staging folder on its own.** A marked one that can't be applied is moved
    to `.staging/broken/<txid>/`, whole: never deleted, since it may hold committed data. It's
    logged with the reason, returned in `Recovery::broken`, and reported by `shimmer doctor` (which
@@ -54,7 +65,9 @@ the caller as a failed write."
 - A write can return success while its last step is still pending, in practice only when the disk
   is failing or a permission was changed under the daemon. Until it's finished, its event isn't in
   the log yet and some of its files may not be in place, the same state a crash leaves, finished
-  the same way. Doctor makes it visible.
+  the same way. Doctor makes it visible. While one waits, later writes wait behind it: they
+  succeed, but nothing they change is visible until the problem is fixed and the next write (or
+  the next start) lands them all, in order.
 - A damaged staging folder needs a person to look at it once; nothing reads `broken/` again.
 - Tests: a corrupt manifest and a missing staged file each leave a running daemon, a kept
   `broken/` folder and a doctor warning; an unwritable log gives a successful add, one record and

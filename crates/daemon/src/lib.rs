@@ -94,7 +94,9 @@ impl Daemon {
         // One writer: a second daemon on the same home would corrupt the ordering guarantees.
         let lock = lock_home(store.home()).await?;
         let recovered = store.recover()?;
-        if recovered != Default::default() {
+        if !recovered.broken.is_empty() {
+            tracing::warn!(?recovered, "some committed saves couldn't be applied; kept in .staging/broken/");
+        } else if recovered != Default::default() {
             tracing::info!(?recovered, "recovered interrupted transactions");
         }
 

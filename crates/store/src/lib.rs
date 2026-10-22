@@ -77,6 +77,21 @@ impl Store {
         log::append(&self.home, event)
     }
 
+    /// [`StoreBackend::commit`], returning the events that reached the log in this call, in log
+    /// order: earlier transactions that were waiting and have now landed, then this one's. A
+    /// transaction whose last step failed is committed (it happens), but its events aren't
+    /// logged yet, so they aren't returned until a later call or recovery lands them (#309's
+    /// review). The daemon publishes exactly these, so nothing reaches the bus before the log.
+    pub fn commit_logged(&self, namespace: &str, plan: TxPlan) -> Result<Vec<Event>> {
+        let dir = self.namespace_dir(namespace)?;
+        for w in &plan.writes {
+            let (shimmer_core::Write::Put { path, .. } | shimmer_core::Write::Delete { path }) = w;
+            validate_path(path)?;
+        }
+        let mut pending = self.lock();
+        tx::commit(&self.home, &dir, namespace, plan, &mut pending)
+    }
+
     /// Every logged event, oldest first, tolerating torn or corrupt lines.
     pub fn read_events(&self) -> Result<EventScan> {
         log::read_all(&self.home)
@@ -121,12 +136,6 @@ impl StoreBackend for Store {
     }
 
     fn commit(&self, namespace: &str, plan: TxPlan) -> Result<()> {
-        let dir = self.namespace_dir(namespace)?;
-        for w in &plan.writes {
-            let (shimmer_core::Write::Put { path, .. } | shimmer_core::Write::Delete { path }) = w;
-            validate_path(path)?;
-        }
-        let mut pending = self.lock();
-        tx::commit(&self.home, &dir, namespace, plan, &mut pending)
+        self.commit_logged(namespace, plan).map(|_| ())
     }
 }

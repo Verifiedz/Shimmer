@@ -61,39 +61,74 @@ pub struct Recovery {
     pub broken: Vec<(String, String)>,
 }
 
-/// `pending`: committed transactions whose step 3 failed earlier in this run, retried first.
-pub fn commit(home: &Path, ns_dir: &Path, namespace: &str, plan: TxPlan, pending: &mut Vec<PathBuf>) -> Result<()> {
-    retry(home, pending);
+/// `pending`: committed transactions whose step 3 failed earlier in this run, oldest first,
+/// retried before anything else. Returns the events that reached the log in this call, in log
+/// order: the retried transactions' first, then this one's. Only these may be published (#309's
+/// review: durable first, published second); a transaction still waiting publishes nothing yet.
+pub fn commit(
+    home: &Path,
+    ns_dir: &Path,
+    namespace: &str,
+    plan: TxPlan,
+    pending: &mut Vec<PathBuf>,
+) -> Result<Vec<Event>> {
+    let mut logged = retry(home, pending);
+    // While an older transaction still waits, this one waits behind it, staged, even a lone file
+    // write: applied now, an older one landing later would overwrite it (#309's review).
+    if !pending.is_empty() {
+        pending.push(stage(home, namespace, &plan)?);
+        return Ok(logged);
+    }
     // Fast path: a lone file write needs no staging (§7.1, first bullet).
     if plan.events.is_empty() {
         if let [Write::Put { path, bytes }] = plan.writes.as_slice() {
-            return write_atomic(&ns_dir.join(path), bytes).map_err(Into::into);
+            write_atomic(&ns_dir.join(path), bytes)?;
+            return Ok(logged);
         }
     }
     let dir = stage(home, namespace, &plan)?;
     // Committed: it has happened. A failure from here is finished later, never reported as a
     // failed write, which a caller would retry into a second copy.
-    if let Err(e) = apply(home, &dir, None) {
-        tracing::error!(tx = %dir.display(), error = %e, "a committed write couldn't be finished; retried before the next one");
-        pending.push(dir);
+    match apply(home, &dir, None) {
+        Ok(events) => logged.extend(events),
+        Err(e) => {
+            tracing::error!(tx = %dir.display(), error = %e, "a committed write couldn't be finished; retried before the next one");
+            pending.push(dir);
+        }
     }
-    Ok(())
+    Ok(logged)
 }
 
-/// Finish what earlier commits couldn't. Still failing: kept, tried again next time (and by
-/// recovery on the next start).
-fn retry(home: &Path, pending: &mut Vec<PathBuf>) {
-    if pending.is_empty() {
-        return;
-    }
+/// Finish what earlier commits couldn't, oldest first, stopping at the first that still fails:
+/// a later one landing before it would break commit order. What's left is tried again next time
+/// (and by recovery on the next start). Returns the events that reached the log.
+fn retry(home: &Path, pending: &mut Vec<PathBuf>) -> Vec<Event> {
+    let mut events = Vec::new();
     let mut logged = log::Logged::default();
-    pending.retain(|dir| match apply(home, dir, Some(&mut logged)) {
-        Ok(()) => false,
-        Err(e) => {
-            tracing::warn!(tx = %dir.display(), error = %e, "a committed write still can't be finished");
-            true
+    while let Some(dir) = pending.first() {
+        match apply(home, dir, Some(&mut logged)) {
+            Ok(applied) => {
+                events.extend(applied);
+                pending.remove(0);
+            }
+            Err(e) => {
+                tracing::warn!(tx = %dir.display(), error = %e, "a committed write still can't be finished");
+                break;
+            }
         }
-    });
+    }
+    events
+}
+
+/// Names a staging folder so they sort in the order they were made, which recovery relies on
+/// (#309's review): nanoseconds since 1970, never repeating or going back within a run. A
+/// transaction's ULID alone is ordered only to the millisecond.
+fn order_key() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+    let prev = LAST.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| Some(now.max(last + 1))).unwrap_or(0);
+    now.max(prev + 1)
 }
 
 fn staging_root(home: &Path) -> PathBuf {
@@ -102,7 +137,7 @@ fn staging_root(home: &Path) -> PathBuf {
 
 /// Steps 1 and 2. Returns the staging directory, committed.
 fn stage(home: &Path, namespace: &str, plan: &TxPlan) -> Result<PathBuf> {
-    let dir = staging_root(home).join(plan.id.to_string());
+    let dir = staging_root(home).join(format!("{:020}-{}", order_key(), plan.id));
     fs::create_dir(&dir).map_err(|e| Error::conflict(format!("cannot create staging dir: {e}")))?;
     fs::create_dir(dir.join("files"))?;
 
@@ -134,7 +169,7 @@ fn stage(home: &Path, namespace: &str, plan: &TxPlan) -> Result<PathBuf> {
 /// Step 3. Safe to run any number of times on a committed staging directory. `logged`: check
 /// each event against the log before appending it, for a transaction a crash or a failure may
 /// have half applied; `None` for a fresh commit, whose events can't be logged yet.
-fn apply(home: &Path, dir: &Path, logged: Option<&mut log::Logged>) -> Result<()> {
+fn apply(home: &Path, dir: &Path, logged: Option<&mut log::Logged>) -> Result<Vec<Event>> {
     let staged: Staged = serde_json::from_slice(&fs::read(dir.join(MANIFEST))?)
         .map_err(|e| Error::internal(format!("corrupt staged transaction {}: {e}", dir.display())))?;
     let ns_dir = home.join("data").join(&staged.namespace);
@@ -174,21 +209,25 @@ fn apply(home: &Path, dir: &Path, logged: Option<&mut log::Logged>) -> Result<()
     }
     fs::remove_dir_all(dir)?;
     fsync_dir(&staging_root(home))?;
-    Ok(())
+    Ok(staged.events)
 }
 
 pub fn recover(home: &Path) -> Result<Recovery> {
     let mut r = Recovery::default();
     let mut logged = log::Logged::default();
-    for entry in fs::read_dir(staging_root(home))? {
-        let dir = entry?.path();
+    // Oldest first: folders are named to sort in the order they were made (`order_key`), and two
+    // waiting transactions to one file must land in that order (#309's review).
+    let mut dirs: Vec<PathBuf> =
+        fs::read_dir(staging_root(home))?.map(|e| e.map(|e| e.path())).collect::<std::io::Result<_>>()?;
+    dirs.sort();
+    for dir in dirs {
         if !dir.is_dir() || dir.file_name().is_some_and(|n| n == BROKEN) {
             continue;
         }
         let id = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         if dir.join(COMMITTED).exists() {
             match apply(home, &dir, Some(&mut logged)) {
-                Ok(()) => r.rolled_forward += 1,
+                Ok(_) => r.rolled_forward += 1,
                 Err(e) => {
                     let why = e.message.clone();
                     let to = staging_root(home).join(BROKEN).join(&id);
@@ -429,5 +468,89 @@ mod tests {
         assert!(got.iter().all(|b| *b == got[0]), "one writer's content, whole");
         let left: Vec<_> = fs::read_dir(file.parent().unwrap()).unwrap().flatten().map(|e| e.file_name()).collect();
         assert_eq!(left, [std::ffi::OsString::from("one.bin")], "no temp files left");
+    }
+
+    fn one(path: &str, bytes: &[u8], events: Vec<Event>) -> TxPlan {
+        TxPlan { id: Ulid::new(), writes: vec![Write::Put { path: path.into(), bytes: bytes.to_vec() }], events }
+    }
+
+    /// Makes `home`'s event log unwritable. False when that can't be done (running as root).
+    #[cfg(unix)]
+    fn block_log(home: &Path, blocked: bool) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let events = home.join("events");
+        fs::set_permissions(&events, fs::Permissions::from_mode(if blocked { 0o500 } else { 0o700 })).unwrap();
+        !blocked || File::create(events.join("probe")).is_err()
+    }
+
+    /// #309's review: a save whose last step failed hands back no events (nothing to publish),
+    /// and they come back, in order, from the commit that finally lands them.
+    #[cfg(unix)]
+    #[test]
+    fn only_events_that_reached_the_log_are_handed_back() {
+        let home = TempDir::new().unwrap();
+        let store = Store::open(home.path()).unwrap();
+        if !block_log(home.path(), true) {
+            return;
+        }
+        let first = event("records.item.created");
+        assert_eq!(
+            store.commit_logged("records", one("a.toml", b"1", vec![first.clone()])).unwrap(),
+            [],
+            "not logged yet"
+        );
+        block_log(home.path(), false);
+        let second = event("records.item.updated");
+        let got = store.commit_logged("records", one("b.toml", b"2", vec![second.clone()])).unwrap();
+        assert_eq!(got, [first, second], "the waiting one first, then this one");
+    }
+
+    /// #309's review: while an older save waits, a newer one to the same file (even a lone write,
+    /// the fast path) waits behind it, so the file ends up with the newer content.
+    #[cfg(unix)]
+    #[test]
+    fn a_newer_save_never_lands_before_an_older_one_still_waiting() {
+        let home = TempDir::new().unwrap();
+        let store = Store::open(home.path()).unwrap();
+        if !block_log(home.path(), true) {
+            return;
+        }
+        let older = event("records.item.created");
+        store.commit_logged("records", one("a.toml", b"old", vec![older.clone()])).unwrap();
+        store.commit_logged("records", one("a.toml", b"new", vec![])).unwrap();
+        assert_ne!(
+            store.read("records", "a.toml").unwrap().as_deref(),
+            Some(&b"new"[..]),
+            "waits behind the older one"
+        );
+        block_log(home.path(), false);
+        let later = event("records.item.updated");
+        store.commit_logged("records", one("b.toml", b"x", vec![later.clone()])).unwrap();
+        assert_eq!(store.read("records", "a.toml").unwrap().unwrap(), b"new", "the newer content, not the older");
+        assert_eq!(logged(&store), [older, later]);
+        assert_eq!(fs::read_dir(home.path().join(".staging")).unwrap().count(), 0);
+    }
+
+    /// #309's review: recovery applies waiting saves in the order they were made, whatever order
+    /// the folder listing comes in, so the newer content of a file wins and events stay in order.
+    #[test]
+    fn recovery_applies_waiting_saves_oldest_first() {
+        let home = TempDir::new().unwrap();
+        let store = Store::open(home.path()).unwrap();
+        let (e1, e2, e3) =
+            (event("records.item.created"), event("records.item.updated"), event("records.item.completed"));
+        // Staged in this order, within the same millisecond as far as their ULIDs know.
+        for (bytes, ev) in [(&b"1"[..], &e1), (b"2", &e2), (b"3", &e3)] {
+            stage(home.path(), "records", &one("a.toml", bytes, vec![ev.clone()])).unwrap();
+        }
+        let mut names: Vec<String> = fs::read_dir(home.path().join(".staging"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 3);
+        store.recover().unwrap();
+        assert_eq!(store.read("records", "a.toml").unwrap().unwrap(), b"3");
+        assert_eq!(logged(&store), [e1, e2, e3]);
     }
 }
