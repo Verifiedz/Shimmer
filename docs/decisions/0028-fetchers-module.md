@@ -1,731 +1,400 @@
-# 0028. The fetchers module: `Source`, scheduling, dedup
+# 0028. The fetchers module: sources as files, one command set, no built-ins
 
-Status: proposed · Raised by Dev A (taking over the `fetchers` module from Dev B's territory
-per handoff) · Needs sign-off: Dev A · Dev C notified (protocol change: a new op, two payload
-shapes — see §9) · No `core` change · Amended (issue #127, source kinds): §2's `Source::id()`
-signature and the registry's construction model change — see §2a. Still no `core` change and
-no `docs/protocol.md` change — `fetchers.item.found`'s payload shape (§3) is unaffected.
-Amended (issue #128, CLI surface): the "Not done here" CLI/TUI deferral below is only ever
-true for the TUI now — see §11. Three additive ops, `docs/protocol.md` updated, no `core`
-change, no version bump (additive, same as §9's own ops).
-Amended (`shimmer fetchers items`): §11's own deferred `items` command, built — see §12.
-One new, module-agnostic op (`core.events.list`), `docs/protocol.md` updated, no version
-bump, no `crates/proto` *type* change beyond the new op's own response struct (`Event`
-itself, already shared and already serializable, is unchanged).
-Amended (per-source title filtering): `title_contains`/`title_excludes` on every source's
-config entry — see §13. No `core`/`proto` change, no new op; `SourceConfig` and
-`fetchers.list`'s existing payload only.
-Amended (ad-hoc filter override): `--contains`/`--excludes` on `shimmer fetchers test`/`run`
-— see §14. No `core`/`proto` change; two new optional params on two existing ops.
-Amended (issue #127's own follow-up): the `json-api` kind, named in §2a and never built
-until now — see §15. No `core`/`proto` change, no new op.
-Amended (configurable search term): `jobbank-canada`'s query is no longer a compiled-in
-constant — see §16. No `core`/`proto` change, no new op; one new `SourceConfig` field.
-Amended (ad-hoc search term override): `--search-term` on `shimmer fetchers test`/`run`
-— see §17. No `core`/`proto` change; one new optional param on two existing ops.
-Amended (unconfigured fixed source visibility): a fixed source only shows up in `fetchers
-list`/`status` once it has its own config entry — see §19. No `core`/`proto` change.
-Amended (retraction): `jobbank-canada` and its `search_term` feature (§16, §17) removed
-entirely — redundant with `weworkremotely` as the `Method::Scrape` reference — see §20. No
-`core`/`proto` change.
+Status: proposed · Raised by Dev B · Needs sign-off: Dev A (daemon-side command/scheduling wiring;
+one small, additive `core::filter` operator, §8) · Dev C notified (new ops, new topics,
+`docs/protocol.md` additions — additive, no version bump) · `ctx.schedules` and `core::filter`
+(ADR 0035 §5.3, §5.6) are already on master as of PR #297 — this rework builds directly on them,
+nothing to extract or wait for
+
+**Supersedes the amended version of this document** (20 amendments, #116–#280, covering the
+original `Source`/dedup/scheduling design and every kind added since). That history is not repeated
+here — `git log -p -- docs/decisions/0028-fetchers-module.md` has it — this rewrite describes the
+resulting design as one document, per issue #277's own request ("against a rewritten ADR 0028 that
+describes the resulting design rather than accumulating another amendment"). Everything below that
+isn't called out as new is carried over unchanged from the prior design.
 
 ## Context
 
-`fetchers` is the last unbuilt host module from CLAUDE.md's M6 scope (CLAUDE.md:831). ADR
-0027 (`docs/decisions/0027-real-http-gateway.md`, merged via PR #109) already built the part
-of this that used to be fetchers' own job — rate limiting, caching, redirects, cooldown —
-behind `ctx.http`. What ADR 0027's own "Dev B's side" section left for this module: `Source`,
-scheduling and dedup (`docs/decisions/0027-real-http-gateway.md` §"Dev B's side").
+Issue #277 (raised against the shipped, amended version of this ADR) found that fetchers is the one
+host module that doesn't follow the rest of Shimmer's own conventions:
 
-Everything here lives inside `crates/modules/fetchers`, `core`-only, because
-`.dev/check-deps.py` grants a `module`-role crate a dependency on `core` alone and bans
-module-to-module dependencies outright (`.dev/check-deps.py:27-36`) — there is nowhere else
-in the dependency graph for a `Source` impl or a scraping helper to live.
+| | records / workspaces / automations | fetchers, before this rewrite |
+|---|---|---|
+| Where a thing a person makes lives | its own file, through `ctx.store` | a section of global `config.toml` |
+| Changing one | immediately, no restart | hand-edit `config.toml`, restart the daemon |
+| Command set | new/edit/remove/restore/purge/enable/disable/rename/copy/show/list/templates/health | `run`/`list`/`status`/`test` only |
+| What ships on a fresh install | nothing (ADR 0023) | two sources, compiled in, runnable with zero config |
+| Adding a new kind | one new file | three: the struct, `schedule.rs`'s validator, `source.rs`'s resolver |
+
+ADR 0038 (remove/restore/purge, naming convention) already did the one fetchers change that needed
+no redesign — `fetchers.fetch` became `fetchers.run` — and explicitly deferred the rest here:
+"the rest needs sources to be files, which is #277." This ADR is that rework.
 
 ## Decision
 
-### 1. Crate and dependency shape
+### 1. Crate and dependency shape — unchanged
 
-`crates/modules/fetchers`, one new workspace member, `core`-only. One registration line in
-`crates/app/src/main.rs:95` (`Arc::new(shimmer_fetchers::Fetchers::default())`), the same
-shape the two existing modules already use there.
+Still `crates/modules/fetchers`, `core`-only. Still one registration line in
+`crates/app/src/main.rs`. Nothing here changes the dependency graph `.dev/check-deps.py` enforces.
 
-### 2. The `Source` trait — paginated, in-crate, method-tagged
+### 2. The `Source` trait — unchanged
 
 ```rust
 pub enum Method { Api, Scrape }
-
 pub struct Page { pub items: Vec<RawItem>, pub next_cursor: Option<String> }
-
-pub struct RawItem {
-    pub source_id: String,   // dedup key (§4) -- never a content hash
-    pub title: String,
-    pub url: String,
-    pub raw_data: Value,     // capped, see §3
-}
+pub struct RawItem { pub source_id: String, pub title: String, pub url: String, pub raw_data: Value }
 
 #[async_trait]
 pub trait Source: Send + Sync {
-    fn id(&self) -> &'static str;
+    fn id(&self) -> &str;
     fn method(&self) -> Method;
     async fn fetch_page(&self, ctx: &Ctx, cursor: Option<&str>) -> Result<Page>;
 }
 ```
 
-The host loops `fetch_page` up to a fixed max-pages cap, following `next_cursor` until it's
-`None` or the cap is hit. One trait, no API-then-scrape fallback inside a single `Source` —
-a source that genuinely wants both is two `Source` impls, each ~40 lines, matching CLAUDE.md
-§8's "one `impl Source` of about forty lines."
+The host still loops `fetch_page` up to a fixed max-pages cap. Retry (§6 of the prior design),
+scraping/robots.txt politeness (§7), the per-run item cap and first-run flood mitigation (§8) are
+all unchanged and not repeated here.
 
-### 2a. Amendment (#127): source kinds and a config-driven registry
+### 3. The `Kind` trait — new, replaces the flat `SourceConfig`
 
-**Why.** §2's own answer to wanting a variant — "two `Source` impls" — is fine for "API vs.
-scrape of the same site," but doesn't scale to "watch five RSS feeds" or "two job-board
-searches for two companies." Raised in review of the fetchers PR stack (#116–#126); full
-reasoning in issue #127.
-
-**Trait change.** `Source::id` stops returning a `'static` string:
+**The problem this fixes, concretely.** Today one struct (`schedule.rs`'s `SourceConfig`) holds
+every kind's fields in one flat namespace (`url`, `items_path`, `id_field`, `title_field`,
+`url_field`, `url_base`, `pagination`, `page_size`, `active_field`, each commented "`json-api`
+only" or similar), and two independent `match kind` blocks both need a new arm for a new kind
+(`schedule.rs`'s `validate_source`, `source.rs`'s `resolve_from`). Adding a fifth kind today touches
+three shared files, which is exactly the CLAUDE.md §8 violation issue #277 names.
 
 ```rust
-pub trait Source: Send + Sync {
-    fn id(&self) -> &str;    // was: &'static str
-    fn method(&self) -> Method;
-    async fn fetch_page(&self, ctx: &Ctx, cursor: Option<&str>) -> Result<Page>;
+/// One source type: parses and validates its own config, builds a `Source`. Adding a kind is
+/// adding one file that implements this, registered in one place (`sources::all()`) — never an
+/// edit to another kind's file.
+pub trait Kind: Send + Sync {
+    /// The config-file word, e.g. `"rss"`, `"json-api"`, `"hn-whoishiring"`, `"wwr"`.
+    fn name(&self) -> &'static str;
+
+    /// Parse and validate this kind's own `[kind]` table from a source file (§4). Checked at
+    /// load time — a missing required field or a malformed URL is a load-time error here, never
+    /// discovered lazily on first fetch, matching the prior design's own validation posture.
+    fn parse(&self, params: &Value) -> Result<Box<dyn KindConfig>>;
+}
+
+/// One kind's own, already-validated settings, opaque to everything outside that kind's file.
+pub trait KindConfig: Send + Sync {
+    /// Build the `Source` this config describes, for one source `id`.
+    fn build(&self, id: String) -> Arc<dyn Source>;
+    /// Back to JSON, for `fetchers.show`/`list` to include in a source's own view.
+    fn to_value(&self) -> Value;
 }
 ```
 
-A runtime-built instance can't hand back a `&'static str` for an id it only learns from
-`config.toml`. `hn-whoishiring`/`weworkremotely` need only this mechanical signature change
-— each still returns its existing literal, which borrows fine as `&str` — nothing else about
-either one moves. No `core` change: `Source` lives entirely in `crates/modules/fetchers`.
+- **Existing kinds, migrated, logic unchanged:** `hn-whoishiring` and `wwr` keep their exact
+  `fetch_page` implementations (the multi-stage HN fetch, the WWR scrape-plus-robots-check) — only
+  their config moves from "a few flat fields read out of `SourceConfig`" to "this kind's own
+  `KindConfig` impl, parsed from its own `[kind]` table." `rss` and `json-api` migrate the same way;
+  `json-api`'s existing fields (`items_path`, `id_field`, `title_field`, `url_field`, `url_base`,
+  `pagination`, `page_size`, `active_field`) become that kind's own struct, validated by that kind's
+  own `parse`, nobody else's.
+- **A new kind is one new file plus one registration line**, the shape CLAUDE.md §8 asks for — no
+  edit to `schedule.rs` or `source.rs` (those files, after this rewrite, no longer contain any
+  per-kind knowledge at all; see §9).
+- **Id collision, unknown kind, missing required field:** all still load-time `invalid_params`
+  errors, same posture as before — just raised by the kind's own `parse` now, not a shared `match`.
 
-**Config change.** `SourceConfig` (§5) gains an optional `kind`:
+### 4. Source storage — one file per source
+
+```
+data/fetchers/sources/<id>.toml
+```
 
 ```toml
-[modules.fetchers.sources.hn-whoishiring]
-enabled = true
-interval = "daily"            # no `kind` -- this id must already exist in the fixed,
-                               # compiled-in registry (unchanged, today's behavior)
+[source]
+label = "My Team's Blog"      # optional, free text, like a workspace's or automation's label
+kind = "rss"
+enabled = false                # same default-disabled posture as before (§5 of the prior design)
+interval = "daily"              # a preset, or an integer seconds count >= the kind's own floor
 
-[modules.fetchers.sources.my-team-blog]
-kind = "rss"                  # `kind` present -- the registry builds a brand-new
-enabled = true                # instance of this kind, with this id and this entry's
-interval = "hourly"           # own settings, instead of looking up a built-in
+[kind]
 url = "https://example.com/feed.xml"
 ```
 
-`kind` absent means today's path exactly: the id must resolve against the fixed, compiled-in
-list (`hn-whoishiring`, `weworkremotely`), checked at load time (already shipped: a
-misspelled or unknown id with no `kind` is rejected at `FetchersConfig::from_value`, not left
-to fail `not_found` on the first tick). `kind` present means a new instance, validated the
-same way — a kind's own required fields (e.g. `rss`'s `url`) must be checked at load time
-too, not discovered lazily on first fetch.
+`[kind]`'s shape is entirely up to that kind's `Kind::parse` — `rss` needs `url`; `json-api` needs
+`url`/`items_path`/`id_field`/`title_field`/`url_field` and the rest optional; `hn-whoishiring` and
+`wwr` need nothing beyond `enabled`/`interval` (and whatever filter fields land per §8). Written and
+read through `ctx.store`, same atomicity guarantees as every other module's files (CLAUDE.md §7.1) —
+no more `config.toml` section, no more daemon restart to pick up a change.
 
-**Registry becomes two-layered**, not a single flat list:
+**Credentials (ADR 0036), wired in now rather than later.** `[kind]` for `json-api`/`rss` gains an
+optional `credential = "name"` — the named `[credentials.<name>]` binding ADR 0036 already built.
+`JsonApi`/`Rss`'s `fetch_page` calls `ctx.http.get_with_credential(url, credential)` instead of
+`ctx.http.get(url)` when present. This is the natural moment: the `Kind` trait rework already touches
+every call site that builds a request, and ADR 0036 was written and merged anticipating exactly this
+caller ("nothing in `fetchers` needs to change to use this once it does" — it still doesn't *need*
+to, this is additive). `hn-whoishiring`/`wwr` don't gain this field; neither reference source is
+key-gated, and there is no reason to validate a field a kind never reads.
 
-1. The fixed, compiled-in sources (`hn-whoishiring`, `weworkremotely`) — unchanged, always
-   present, no `kind` needed, exactly as §2/§10 describe them today.
-2. A config-driven layer: for every `[modules.fetchers.sources.<id>]` entry that has a
-   `kind`, dispatch on that string (`"rss"` → build an `Rss` instance; any other value is
-   rejected at load time, same as an unknown interval preset) to construct a `Source` with
-   this entry's id and params.
-
-**Id collision is rejected, not shadowed.** A config entry whose `kind` is set and whose id
-equals one of the fixed, compiled-in ids (e.g. `[modules.fetchers.sources.hn-whoishiring]`
-with `kind = "rss"`) is a load-time error, the same `invalid_params` path as an unknown
-`kind` or a missing required field — never a silent shadow of the built-in. The two layers
-share one id namespace; a `kind`-bearing entry only ever *adds* an id, it never overrides
-one the fixed layer already owns. (Validation code lands in the sibling PR, #131, not here.)
-
-This needs no `core` change — the registry is built where `fetch()` already holds a `Ctx`,
-not inside `Module::triggers()` (§5's finding about `triggers()` having no config access is
-unaffected and unrelated to this).
-
-**The `rss` kind (issue #127, first batch — `json-api`/`html-list` are a later batch, not
-decided here):**
-
-- Settings beyond `enabled`/`interval`/`kind`: one required field, `url` — the feed's URL,
-  RSS or Atom. Checked at load time per the same "a kind's own required fields are checked
-  at load time" rule stated above, and checked as more than "non-empty": `url` must parse
-  as a well-formed `http://` or `https://` URL. Empty, malformed, or a non-`http(s)` scheme
-  (`ftp://`, `file://`, etc.) is a load-time `invalid_params` error, same as a missing
-  `url` entirely. (Validation code lands in #131, not here.)
-- Parsing via **`feed-rs` 3.0.0** (MIT, pure Rust — no `-sys` dependency in its tree
-  (`chrono`, `mediatype`, `quick-xml`, `regex`, `serde`, `serde_json`, `siphasher`, `url`,
-  `uuid`, `ammonia`) — handles RSS 0.x/1.0/2.0 and Atom from one parse call, 2.4M downloads,
-  last published 2026-09-27 — verified live against crates.io on 2026-10-07, same bar §7
-  already held `scraper`/`texting_robots` to.
-- `Method::Api`, not `Scrape` — a feed URL is a known, fetcher-maintained endpoint the same
-  way `hn-whoishiring`'s Firebase API is (§10); it is not a crawled site in the robots.txt
-  sense, so no robots.txt check applies.
-- Dedup key (`RawItem::source_id`): the entry's own `id`/`guid` field when the feed sets one,
-  else its `link` URL. Stated now so this isn't invented differently mid-implementation.
-  **Caveat found during #131's implementation:** `feed-rs` does not leave an entry's `id`
-  empty when the underlying feed omits one — it synthesizes a non-empty id itself (a hash
-  of link+title, or, when an entry has neither, a **random UUID that changes on every
-  parse**). Taking `feed-rs`'s id at face value would make such an entry look "new" on
-  every single run, defeating the entire point of dedup. So the `rss` kind must not use
-  `feed-rs`'s default id generation: it overrides it with its own `id_generator`
-  (`feed_rs::parser::Builder` supports supplying one) so the fallback is deterministic —
-  always the entry's own first `link` when there is no feed-supplied id, never a random
-  value — and an entry that still has neither a usable id nor a link is skipped rather than
-  ever emitted with an unstable key. (Implemented in #131, not here.)
-- Pagination: out of scope for a feed. `fetch_page` returns every entry the feed has in one
-  `Page` with `next_cursor: None`, always a single page.
-
-**Orphaned per-source state on removal is fine, left as-is.** When a configured `kind`
-entry is later deleted from `config.toml`, its `data/fetchers/<id>/seen.toml` and its entry
-in `last_run.toml` are left behind on disk, unreferenced by anything. This is expected and
-acceptable, not a leak to fix: CLAUDE.md's "SQLite is disposable" philosophy (§1.4) doesn't
-apply to these — they're files, not the derived index — but the underlying principle does:
-unreferenced state just sits unused, it does not corrupt anything or affect a source that
-is still configured. No automatic cleanup is done, and none is proposed here; a user who
-cares can delete the directory/entry by hand, consistent with "files the user could edit by
-hand" (CLAUDE.md §1.4).
-
-**Not done in this amendment:**
-
-- The `json-api` and `html-list` kinds — a later batch (issue #127, umbrella PR's own
-  done-when). `json-api` is built later, in §15; `html-list` remains undone.
-- Migrating `hn-whoishiring`/`weworkremotely` onto the new kind system — they stay hand-written
-  `Source` impls exactly as today; only `id()`'s return type changes.
-- §7's per-method rate-limit floor (currently a uniform, provisional 900s) — a kind-aware
-  registry could eventually expose each instance's `Method` to the scheduling layer and make
-  this precise, but that's not decided or built here.
-- CLI/TUI surface — out of scope for this amendment specifically; the CLI half later shipped
-  separately (issue #128) — see §11. TUI is still untouched.
-
-### 3. Item event
-
-`fetchers.item.found` payload: `{source_name, source_id, title, url, raw_data}`. `raw_data`
-capped at 8 KiB — enough for a job posting's text, small enough that one large item can't
-turn into the next cache-bloat problem. This is a protocol.md addition (§9).
-
-### 4. Dedup
-
-`data/fetchers/<source>/seen.toml`: a map `id -> last_seen` (RFC3339), through `ctx.store`,
-never the index (CLAUDE.md §1.4/§7 — nothing that isn't a file is truth). One
-`ctx.store.transaction` per **run**, not per item: the final `seen.toml` is written once and
-`tx.emit("fetchers.item.found", ...)` is called once per new item inside that same
-transaction — the pattern `records::import` already uses for "many writes, many events, one
-transaction" (`crates/modules/records/src/lib.rs:864-872`). This makes "a failed or partial
-run never prunes" free: nothing commits until the whole run's result is known.
-
-Pruning: at the end of a successful run, drop `seen.toml` entries whose `last_seen` is older
-than 90 days. Per-run cap: at most 50 new items processed (and thus emitted) per run; items
-beyond the cap are left unmarked and picked up by a later run — see §7.
-
-**Amendment (#126 review): a kid skipped before fetching is not touched.** §8's fix for HN
-getting stuck at comment 200 reads this source's own `SeenSet` *inside* `fetch_page`
-(`crate::dedup::load`, read-only) to skip an already-seen kid with zero HTTP calls, before
-the orchestration above ever sees it — so that kid's `last_seen` is not refreshed on that
-run, unlike every item this orchestration actually examines, which this section's own
-"touch everything examined" rule covers. In practice this is harmless here: HN's
-"who is hiring" threads are monthly and don't live anywhere near the 90-day pruning window
-regardless of how many runs pass without a given old comment being re-examined. Noted so a
-future reader isn't surprised that `last_seen` on an old, already-dedup'd item can lag.
-
-### 5. Scheduling
-
-**Finding:** `Module::triggers()` is `fn triggers(&self) -> Vec<TriggerSpec>` — synchronous,
-`&self`-only (`crates/core/src/module.rs:25-27`) — called once at registry-build time,
-*before* `Config::load` and *before* `Module::init(&ctx)` run
-(`crates/daemon/src/lib.rs:95-96,98-102,120`). Module construction is also config-blind
-(`crates/app/src/main.rs:95`, plain `::default()`). So a literal "one `TriggerSpec` per
-*configured* source" is not implementable: nothing at the point `triggers()` runs has seen
-`config.toml` yet. This is reported, not worked around by changing `core` — no `core` edit is
-in this ADR.
-
-**Decision:** one fixed `TriggerSpec` — a heartbeat, needing no config to exist:
-`op: "fetchers.tick"`, `lane: "fetchers"`, `catch_up: Skip`, default period 300s. Its handler
-(which gets a full `Ctx`, including `ctx.config`) reads `[modules.fetchers]` on every firing
-and decides which sources are due, tracking each source's own `last_run_at` itself in
-`ctx.store` — not the scheduler's per-trigger bookkeeping. This gives correct catch-up
-behaviour at the *source* level for free: a "daily" source whose last run was 3 days ago
-(daemon asleep) is simply overdue whenever a tick notices it, however many ticks were
-skipped getting there. `fetchers.tick` is a protocol.md addition (§9) — discoverable like
-any op via `core.manifest`, even though only the scheduler calls it in practice.
-
-Config lives in the already-generic `[modules.fetchers]` section (plain JSON via
-`ModuleConfig`, `crates/core/src/ctx.rs:30-51`) — unlike `[http]`
-(`crates/daemon/src/config.rs:97-99`), which the daemon parses specially because the real
-`HttpBackend` must exist before any `Ctx`, module config needs no daemon change at all:
-
-```toml
-[modules.fetchers]
-tick_interval_s = 300
-
-[modules.fetchers.sources.hn-whoishiring]
-enabled = true
-interval = "daily"        # a preset, or an integer seconds count >= the method's floor
-
-[modules.fetchers.sources.weworkremotely]
-enabled = false
-interval = "daily"
-```
-
-Presets: `hourly` = 3600, `daily` = 86400, `weekly` = 604800. Floors (§7): 1800s for `Api`,
-21600s for `Scrape`. Sources default **disabled**. Overlap guard: an in-process
-`Mutex<HashSet<SourceId>>` on the `Fetchers` struct — the same shape as `records`'
-`WriteLock` (`crates/core/src/sync.rs:13-20`), but keyed. `fetchers.fetch`'s handler tries to
-insert the source id and fails fast (`module_error`) if another run (tick-triggered or
-manual) already holds it; the tick handler additionally skips enqueuing a source it already
-sees as running, as an optimization only, not the actual guarantee.
-
-### 6. Retry
-
-`ctx.http.get` returns `Ok(HttpResponse)` for *every* in-band HTTP status, including
-4xx/429/503 (`crates/core/src/http.rs:14-26`; `crates/daemon/src/http_backend.rs`'s `finish`
-and cooldown paths never return `Err` for a status code) — only a transport-level failure is
-`Err(unavailable)`, and only `Unavailable` is retryable
-(`crates/core/src/error.rs:98-99`). So the module's retry wrapper branches on `resp.status`
-itself:
+### 5. In-memory state and reload — the same shape automations already uses
 
 ```rust
-let resp = ctx.retry_with_backoff(RetryPolicy::standard(), |_| async {
-    let r = ctx.http.get(&url).await?;
-    if r.status >= 500 { return Err(Error::unavailable(format!("http {}", r.status))); }
-    Ok(r)
-}).await?;
+struct State {
+    sources: HashMap<String, Entry>,   // id -> parsed config + its Kind's Source instance
+    problems: Vec<(String, String)>,   // file path -> why it doesn't parse, same as automations
+}
 ```
 
-A `retry_after_secs` on the result means the gateway has this host in cooldown: stop this
-source's run now, no further attempt, let the next tick try again. A `4xx` is a terminal
-failure for this run (`reason: "http_error"`, no retry). `RetryPolicy::standard()` (3
-attempts, 1s/2s, `crates/core/src/retry.rs:15-17`) is already documented as "what a fetcher
-wants" — reused as-is.
+Loaded once in `init()` by reading every `data/fetchers/sources/*.toml`, re-read on `fetchers.reload`
+(new op, §9) and after any write (`new`/`edit`/`remove`/`restore`/`rename`/`copy`/`enable`/
+`disable`). A file that fails to parse is reported as a problem (surfaced in `fetchers.list` and
+`fetchers.health`, §12), not a daemon-start failure — one broken source file must not take every
+other source down, the same posture automations' rule files already have.
 
-### 7. Scraping and politeness
+### 6. Scheduling — per source, via `ctx.schedules`, no heartbeat
 
-A shared parse helper inside the crate, built on **`scraper` 0.27.0** (pure Rust, ISC
-license, 31M+ downloads, actively maintained, no system/C dependency — verified live against
-crates.io; builds identically on `ubuntu-latest` and `macos-latest`,
-`.github/workflows/ci.yml:10`). `select_or_fail(doc, selector, what)` returns
-`Err(module_error)` when a selector matches zero elements on an otherwise-200 response — a
-distinct `reason: "parse_empty"` in `fetchers.fetch.failed` (§9), so a source's health is
-visible instead of silently reporting "0 new items" the same way a genuinely quiet board
-would. JS-rendered pages are out of scope; a headless-browser subprocess is a follow-up (its
-own ADR — §12 rule 8 bans raw process spawning outside `Launcher`, itself gated to the
-`"process"` capability only `workspaces` uses today).
+`ctx.schedules.add_once(op, params, at, label)` / `.remove(id)` (ADR 0035 §5.6, on master since
+PR #297) gives every module a way to schedule a one-time run of its own, kept by the scheduler
+across restarts. This replaces the fixed 5-minute `fetchers.tick` heartbeat entirely:
 
-Politeness lives in **fetchers**, not the gateway: robots.txt is a crawling-ethics judgment
-tied to "is this traversing a site's pages," which only a `Source` can know, and ADR 0027 is
-already merged scoped to rate-limit/cache/redirect only. Applies to `Method::Scrape` sources
-only, fetched once through the existing `ctx.http` (so it gets the same cache/rate-limit
-treatment as everything else) via **`texting_robots` 0.2.2** (pure Rust, zero dependencies,
-dual MIT/Apache-2.0 — verified live, more recently touched than the alternative `robotstxt`
-crate). A `Disallow` match is a hard refusal, never a soft warning. User-Agent identifies the
-bot, never spoofs a browser.
-Scrape sources get the longer config floor from §5 as their "more conservative default
-interval."
+- **A source schedules its own next run** at three moments: when it's created enabled, when it's
+  switched from disabled to enabled, and when a run of it finishes — success, failure, *or
+  cancellation* (#306's review, blocking: a cancelled run must still reschedule, from the same
+  basis as if it had never started, or it never fires again) — at
+  `now + interval` for the first two, at `last_run_at + interval` (or `now` if that's already past)
+  for the third.
+- **A manual run replaces the pending schedule rather than adding to it.** `fetchers run SOURCE`
+  finishing books a next run exactly like the source's own schedule firing does, through the same
+  reconcile path below — so the two never coexist as two separate pending entries for one source
+  (this ADR's own review, point 2: "a manual `fetchers run` finishing also books a next run while
+  the scheduled one is still pending").
+- **No bootstrap step is needed at daemon start, for the common case.** `ctx.schedules` entries are
+  kept by the scheduler across restarts — a source with a pending schedule from before a restart
+  still has it after. The only moment a source could lack one is right after it's created or
+  re-enabled, and both of those already call `add_once` directly, inside the `handle()` call that
+  does the creating/enabling (never inside `init`, where `ctx.schedules` answers `unavailable` until
+  the scheduler has started — ADR 0035 §5.6).
 
-**Amendment (#126 review): the User-Agent is daemon-wide, not fetchers-specific.** The
-original text above promised `Shimmer-Fetchers/<version>`, specific to this module. In
-practice the UA is set once on `RealHttpBackend`'s shared `reqwest::Client`
-(`crates/daemon/src/http_backend.rs`), which every network-capable module uses — there is no
-per-module custom-header plumbing (ADR 0027 deferred it). The actual, current value is
-`Shimmer/<version>`, and `robots.rs`'s own `USER_AGENT` constant (used only to *check*
-robots.txt rules) is kept identical to it on purpose, so "what we check" and "what we send"
-never drift apart again.
+  **Known gap, not closed by this rework:** a schedule that fires but whose task is never recorded
+  as having run at all — the daemon killed between the trigger firing and `fetchers.run_task`
+  reaching this module's `handle`, or `add_once` itself failing (e.g. the scheduler's own 1000-entry
+  cap) — still leaves a source with nothing pending, forever, until some unrelated write (an edit,
+  enable/disable) happens to touch it. A slow, recurring repair trigger that re-books any enabled
+  source with nothing pending would close this properly; it is not built here. The one case this
+  rework *does* close is a run that starts and is then cancelled (above), which is the common real
+  path (`shimmer shutdown`, a daemon restart, `queue cancel` mid-fetch) — covered because the run
+  actually reaches this module's code, unlike the gap above.
+- **Each source's file tracks its own current schedule.** A sibling `data/fetchers/sources/<id>.state.toml`
+  (written by the module, not hand-edited, same spirit as workspaces' `state.toml`) holds
+  `{trigger_id, due_at}` for whatever `ctx.schedules` entry is currently pending for that source.
+  **Not a source itself** — `Sources::load`'s scan of `sources/*.toml` skips any file whose name
+  ends `.state.toml` before trying to parse it as one, rather than reporting every source's own
+  state file as a broken source (this ADR's own review, point 3; resolved by exclusion, not by
+  moving the file to its own `data/fetchers/<id>/` folder as first suggested — `seen.toml`/
+  `last_run.toml` already live under `sources/`'s *sibling* per-source folders, and `<id>.state.toml`
+  staying a flat sibling of `<id>.toml` keeps rename/remove/purge's existing per-id file list
+  unchanged).
 
-### 8. First-run flood
+  This is what makes `edit`/`rename`/`disable` able to reconcile deterministically:
+  - **`edit`** changing `interval`: if the new interval would move the next due time, `remove` the
+    old `trigger_id` and `add_once` a new one; otherwise leave it alone.
+  - **`disable`**: `remove` the pending `trigger_id`, if any, so a disabled source never fires.
+  - **`rename`**: `remove` the old pending schedule and `add_once` a new one under the new id's
+    params, at the same `due_at` — simpler than automations' `renamed.toml`-follows-the-chain
+    mechanism (ADR 0035, PR #287), because a fetchers schedule's payload has no chain/cause history
+    to carry forward; re-creating it under the new id is sufficient and exactly reproduces today's
+    due time. The op fired is always `fetchers.run_task` with just `{"id": source_id}` — a scheduled
+    run always uses the source's own configured filter, never an ad-hoc override, so there is
+    nothing else to put in the schedule's own params.
+  - **`remove`** (moved to `removed/`, not deleted): same as `disable` — nothing should fire for a
+    removed source. **`restore`** re-adds a schedule the same way enabling does.
+  - **Visibility, not yet addressed:** since PR #295, `scheduler list` shows every module's
+    one-time schedules by default, labelled `fetchers: <id>`. Running `scheduler remove` on one of
+    these silently desyncs it from the source's own `<id>.state.toml` — the source's file still
+    says it's booked, `fetchers show` still reports a `last_run_at`-derived next-run time, but
+    nothing will actually fire. There is no detection or repair for this yet; it is the same class
+    of problem as the bootstrap gap above and could share a fix (a periodic reconciliation pass).
+- **This removes the double-queue race for real**, not just its symptom. Today's heartbeat has to
+  guess "is this due" on a schedule-blind poll; moving scheduling to the thing that's actually due
+  (via the scheduler's own single-fire guarantee) means there's no second, independent timer that
+  could ever race the first into enqueuing the same source twice. `dedup.rs`'s `RunGuard` stays as
+  the defense-in-depth for the one remaining case — a person manually running `fetchers run SOURCE`
+  while its own schedule is also about to fire.
+- **`fetchers.tick` is deleted**, along with `TICK_OP`/`TICK_INTERVAL` and the `Module::triggers()`
+  override — fetchers registers no fixed triggers at all once this lands. `fetchers.fetch.finished`/
+  `.failed` keep their names (§9's topic table), only how a run gets *started* changes.
 
-The per-run item cap (§4) is the whole mitigation: a board with hundreds of unseen items on
-first contact surfaces only the cap's worth per run; the rest stay unmarked and are picked
-up on later ticks, spreading both the event volume (against the 1024-event per-connection
-backpressure queue, `docs/protocol.md:175`) and the event-log growth across time instead of
-one burst. Not hypothetical: the reference HN source (§9) can have 500+ top-level comments
-on one month's thread, each needing its own fetch — at `ctx.http`'s default 2 req/s per
-host, an uncapped cold-start run would take minutes before the event-queue angle is even
-considered.
+### 7. Dedup — unchanged mechanism, rename made safe
 
-### 9. Protocol changes needed (additive, Dev C notified)
+`seen.toml`/`last_run.toml` (prior §4) are unchanged in shape and pruning behavior. The one addition:
+**`fetchers rename OLD NEW`** moves `data/fetchers/<OLD>/` to `data/fetchers/<NEW>/` (both `seen.toml`
+and `last_run.toml`'s entry) in the same store transaction that moves the source's own config file —
+so dedup history and cadence tracking survive a rename instead of silently resetting, closing the gap
+#277 flagged.
 
-- New op `fetchers.tick` (§5) — scheduler-only in practice, discoverable like any op.
-- `fetchers.item.found`'s actual payload (§3) — the existing illustrative example
-  (`docs/protocol.md:550`, `{"source":"hn-whoishiring","id":"c-41883"}`) is superseded by
-  `{source_name, source_id, title, url, raw_data}`.
-- `fetchers.fetch.failed`'s payload gains a `reason` enum:
-  `"network" | "http_error" | "parse_empty" | "cancelled"`, plus `{source, error, attempt}`.
+### 8. Filtering — adopts `core::filter`, one small additive operator needed
 
-### 10. Reference sources
+Issue item 5 offered two options: a general field-condition filter (automations' `when` shape,
+`core::filter`) or leaving filtering to automation rules entirely. `core::filter` is on master now
+(ADR 0035 §5.3, via PR #297), so this rework takes the first option — one filter mechanism, shared
+with automations, instead of fetchers' own bespoke `title_contains`/`title_excludes` pair.
 
-Both public, no login, no API key, verified live on 2026-10-06:
+**The gap found evaluating this:** `core::filter::Op` has `Contains(String)` (case-insensitive
+substring) but nothing for "does not contain" — `Ne` is equality-negation, not substring-negation.
+`title_contains`'s "any of these terms" maps cleanly onto `Filter`'s existing `or` combinator
+(`{"or": [{"title": {"contains": "senior"}}, {"title": {"contains": "staff"}}]}`), but
+`title_excludes`'s "none of these terms" has no equivalent without a new operator.
 
-- **`hn-whoishiring`** (`Method::Api`). Hacker News's official, public, unauthenticated
-  Firebase API (`hacker-news.firebaseio.com`). No robots.txt applies — it's an API host, not
-  a crawled site, and the API is explicitly meant for third-party clients. Flow:
-  `user/whoishiring.json` for submitted story ids → the latest "Who is hiring?" thread →
-  `item/<thread>.json`'s `kids` as the paginated item list → one `item/<id>.json` fetch per
-  comment. HN states no hard rate limit beyond "be reasonable"; `ctx.http`'s own per-host
-  default (2 req/s) is the actual governor.
-- **`weworkremotely`** (`Method::Scrape`). `weworkremotely.com/categories/*`: confirmed
-  static, server-rendered HTML (fetched and read listings directly out of the raw page, no
-  JS needed). `robots.txt` is `Allow: /`, disallowing only `/admin/`, `/account/`,
-  `/job-seekers/.../profile`, `/manage-company/` — the category paths used here are not
-  disallowed. No login wall. No `?page=` on a category page (confirmed: 48 jobs, no visible
-  pager), so pagination walks the site's own category slugs
-  (`remote-programming-jobs` → `remote-devops-sysadmin-jobs` → …) as the trait's
-  `next_cursor`, rather than inventing a page number the site doesn't have.
-- **`jobbank-canada`** (`Method::Scrape`, added later, same reference-source bar). Job Bank
-  Canada (`jobbank.gc.ca`), the federal job board — confirmed live on 2026-10-08:
-  `robots.txt` is `User-agent: *` / `Crawl-delay: 5`, no `Disallow` at all; no login wall on
-  search results. Unlike `weworkremotely`, this site does paginate (`?page=N` on a search),
-  and its results container is present even past the last page, so an empty page of
-  listings ends pagination cleanly rather than looking like a structure change. A listing's
-  own link carries a session id that changes on every fetch, so the dedup key and canonical
-  URL are built from the listing's numeric posting id instead, confirmed to resolve on its
-  own with no session id needed. Live testing against this host is what surfaced §6's
-  `RealHttpBackend` gap (PR #126 review): a request with no `User-Agent` header at all was
-  503'd by this host's bot-defense outright, while the identical request with any
-  ordinary-looking `User-Agent` succeeded — not a problem with this source's own code.
-  **Retracted — see §20.** The finding above (the `User-Agent` gap) stands regardless; only
-  the source itself and its `search_term` feature (§16, §17) were removed.
+**Decision: add `Op::NotContains`, a tenth operator, alongside the existing nine** (`eq, ne, lt,
+lte, gt, gte, in, set, contains, has`). Small and additive — `core::filter::Op::parse`'s `match`
+gains one arm (`"not_contains" => Op::NotContains(s.to_lowercase())`), `Op::holds` gains one arm
+(the negation of `Contains`'s own check), and records (the other consumer of `core::filter::Op`,
+via its own schema-driven `Field`/`query.rs`) is unaffected unless a collection's own schema opts a
+field into it — this is purely an added capability, no existing behavior changes. Needs Dev A
+sign-off per CLAUDE.md §4 since it touches `crates/core`, but it's the smallest possible version of
+that change: one operator, no new combinator, no change to `Filter::parse`'s structure.
 
-### 11. Amendment (issue #128): CLI surface
-
-The CLI deferral in this ADR's original "Not done here" was correct when written but is no
-longer the whole story — the CLI half shipped in a later, separate PR. Three new, additive
-ops, all `Inline` except `test` (consistent with `fetch` already being queued — a real
-network call never answers inline):
-
-- **`fetchers.list`** — every source `fetch`/`status` could ever resolve (the fixed
-  registry, §10, plus every configured `kind` instance, §2a), cross-referenced with its
-  `config.toml` state: `{id, method, kind, enabled, interval_s}`. `kind`/`interval_s` are
-  `null` for a fixed source with no config entry of its own.
-- **`fetchers.status`** — the same source universe, but `{id, last_run_at, running}`:
-  per-source last-run time and whether it is currently mid-fetch (the §4/§5 overlap guard).
-- **`fetchers.test`** — fetches exactly one page from a source and returns its parsed items
-  (`{source, items}`), touching none of `seen.toml`, `last_run.toml`, or the overlap guard,
-  and emitting no `fetchers.item.found`. A dry run with no state of its own to protect, so
-  (unlike `fetch`) it can run alongside a real fetch of the same source without conflict.
-
-`crates/cli/src/fetchers.rs` gives these, plus the pre-existing `fetchers.fetch`, a real
-`shimmer fetchers list|status|test|run` subcommand — `list`/`status` render as tables,
-`test`/`run` support `--wait` to follow a queued op to completion client-side (the same
-subscribe-then-follow pattern `workspaces.rs` already established).
-
-**Not done in this amendment either:** `fetchers.item.found` events themselves still have no
-CLI-visible history — "`shimmer fetchers items`" (recent found items, e.g. for "what did the
-last run actually find") needs a new, module-agnostic op backed by the index's events table,
-which is a `crates/proto` change. Built in §12. The TUI surface remains entirely out of
-scope, as originally stated.
-
-### 12. Amendment: `core.events.list`, and `shimmer fetchers items`
-
-§11's deferred `items` command, built. Confirmed live-testing need (ADR 0028's own reference
-sources turned up real postings worth re-reading after the fact), and resolved exactly as
-§11 flagged: a new, module-agnostic op, not a `fetchers`-owned one — any module's event
-history is the same shape, and `fetchers` has no more special claim to "list recent events"
-than `records` or `workspaces` do.
-
-- **`core.events.list`** (inline): `{"topic"?, "limit"?}` → `{"events":[Event…]}`, oldest
-  first, capped to the `limit` most recent matches (default 100, max 1000 —
-  `crates/daemon/src/core.rs`'s `DEFAULT_EVENTS_LIMIT`/`MAX_EVENTS_LIMIT`). `topic` is a
-  subscription-style pattern (`a.b.c`, `a.*`, `*`, default `*`; `crates/proto/src/topic.rs`'s
-  `is_valid_pattern`, the same grammar a live subscription already uses) —
-  `invalid_params` on anything else. Backed by `crates/store/src/index.rs`'s
-  `events_matching_recent`, a sibling to the already-existing `events_matching` that answers
-  "most recent," not "oldest" — the derived index, not a log scan, so it answers fast
-  regardless of how much history has piled up (CLAUDE.md §1.4). `crates/daemon/src/core.rs`'s
-  `Core` now holds the shared index handle (`SharedIndex`) the indexer task already kept
-  current, opened before `Core::new` instead of only after it.
-- **Found along the way, fixed at the `store` layer, not here:** `events_matching`'s own
-  `ORDER BY id` assumed a `Ulid`'s sort order reflects insertion order, which is only true
-  *between* milliseconds — `Ulid::from_datetime` (`crates/core/src/event.rs`) fills the rest
-  of the id with random bits, so two events applied within the same millisecond (a real
-  shape: one `fetchers` run's items all commit in a single transaction, §4) can sort in
-  either order relative to each other. Caught by this amendment's own test coming back
-  shuffled. Fixed by sorting on SQLite's own implicit `rowid` instead, which always reflects
-  insertion order — `events_matching`'s existing behavior and tests are unaffected (nothing
-  depended on same-millisecond tie order; `events_matching_recent` is new).
-- **`shimmer fetchers items [SOURCE]`** (`crates/cli/src/fetchers.rs`): calls
-  `core.events.list` with `topic: "fetchers.item.found"` (a literal, not an import —
-  `crates/cli` must not depend on `crates/modules/fetchers`, CLAUDE.md §3's dependency
-  rules), then filters client-side by `payload.source_name` when `SOURCE` is given. Displays
-  newest-first (reversed from the op's own oldest-first convention — a feed/log-tail
-  reads naturally newest-on-top; the raw op keeps the event-log's own ordering). No
-  `fetchers`-side change at all: every new behavior lives in `core.events.list` or the CLI.
-- **Additive, no `docs/protocol.md` version bump** — same reasoning §9's own ops used: `v`
-  is bumped only for breaking changes (`docs/protocol.md`'s own header), and an unknown
-  client never asked for `core.events.list` before, so nothing it already does changes.
-
-### 13. Amendment: per-source title filtering
-
-Live testing against real job-board data (§10) turned up the obvious next want: most
-postings a source returns are not ones worth tracking. Rather than a `jobbank-canada`-only
-fix, this generalizes to every current and future source, config-only, no code per source:
-
-- **`title_contains`/`title_excludes`** (`SourceConfig`, `crates/modules/fetchers/src/
-  schedule.rs`): two optional string lists under a source's existing
-  `[modules.fetchers.sources.<id>]` entry. Matching is case-insensitive substring, OR'd
-  within each list: an item's title must contain *at least one* `title_contains` term when
-  that list is non-empty (empty means no inclusion filter at all), and must contain *none*
-  of `title_excludes` — which always applies, and always wins over `title_contains` when
-  both would otherwise keep an item. Checked against `RawItem::title` only, nothing in
-  `raw_data` — a source whose parsed title doesn't carry the distinguishing word (e.g. a
-  level buried only in a longer description field) needs a source-level change to surface
-  it in the title first, not a smarter filter here.
-- **Applied once, in `Fetchers::run_source`**, not inside any `Source::fetch_page` — the
-  same mechanism covers every source, present and future (an email source, say), with zero
-  source-specific code. A title that fails the filter is marked seen in the same statement
-  as a kept one (so it is never re-examined on a later run) but never pushed into `found`,
-  so it is never counted toward the per-run cap (§4/§8) and never emitted. Distinct from a
-  cap-overflow miss, which is deliberately left *unmarked* so a later run retries it (§8) —
-  an excluded title is a decision, not a capacity problem, so it is never retried.
-- **`Fetchers::test` applies the identical filter** before returning its preview. A dry run
-  that shows items a real run would never keep is a misleading preview of what `run` would
-  actually do.
-- **Surfaced in `fetchers.list`'s existing payload** (`title_contains`/`title_excludes`
-  alongside `enabled`/`interval_s`) rather than a new op — it is config state about a
-  source, the same category of thing `fetchers.list` already answers.
-- **Not done here:** matching against anything beyond the title (a longer description in
-  `raw_data`, location, salary); a smarter-than-substring match (synonyms, stemming, an
-  actual seniority classifier). Keyword substring matching cannot tell "mentors junior
-  engineers" in a senior posting from an actual junior posting — a known, accepted limit,
-  not a gap to close here. Both are explicitly deferred, not ruled out, if a source's real
-  data later makes title-only filtering insufficient.
-
-### 14. Amendment: an ad-hoc `--contains`/`--excludes` override
-
-§13's filter is config-only by design, which has a real cost: trying a different filter
-means editing `config.toml` and restarting the daemon (`CONTRIBUTING.md`: "the daemon keeps
-running the binary it was started from"). Exploring a filter interactively needs a lighter
-path.
-
-- **`fetchers.fetch`/`fetchers.test` gain optional `title_contains`/`title_excludes`
-  params**, alongside the existing `source`. Present (either one, or both): **replaces**
-  the source's configured filter outright for this one call, never merges with it — asking
-  for "senior" when the config says "junior" must show senior postings, not the
-  intersection (empty) or the union (confusing). Absent (neither given): behavior is
-  unchanged from §13, the configured filter (if any) applies exactly as before this existed.
-- `Fetchers::run_source`/`Fetchers::test` take this override as a parameter rather than
-  reading it from `config.toml` a second way — one `passes_title_filter` decision point,
-  not two filter code paths to keep in sync. A dropped item is marked seen exactly as in
-  §13, override or not: an ad-hoc exclusion is still a decision, not a capacity miss, so it
-  is never retried either.
-- **`shimmer fetchers test SOURCE --contains W,W --excludes W,W`** and
-  **`shimmer fetchers run SOURCE [--wait] --contains W,W --excludes W,W`**
-  (`crates/cli/src/fetchers.rs`): comma-separated term lists, parsed client-side, sent only
-  when the flag was actually given — an absent flag must send nothing at all, not an empty
-  array (an empty `title_contains` array is itself meaningful: "no inclusion filter," which
-  is not the same as "use whatever `config.toml` says").
-- **No `core`/`proto` change** — two new optional fields on two existing module ops' own
-  params, already advisory-schema (`CommandSpec.params_schema`, CLAUDE.md §5: "JSON Schema;
-  advisory before M3").
-
-### 15. Amendment (issue #127's own follow-up): the `json-api` kind
-
-§2a named `json-api` as a later batch and did not build it. Built now: a declarative,
-field-path-mapped kind for any endpoint that answers with a JSON array of job-shaped
-objects — an ATS's public job-board API (Greenhouse, Lever) or a company's own public job
-search endpoint (Amazon) — covering each with configuration, not a new `Source` impl, the
-same "point at data, not code" `rss` already established for feeds.
-
-**Config** (`SourceConfig`, `crates/modules/fetchers/src/schedule.rs`): reuses the existing
-`url` field (already there for `rss`) as the endpoint, plus five new fields —
-`items_path`, `id_field`, `title_field`, `url_field`, `url_base`, `pagination`, `page_size`.
-`id_field`/`title_field`/`url_field` are required and checked non-empty at load time, same
-as `rss`'s `url`.
+**A source's filter**, in its file's `[source]` table:
 
 ```toml
-[modules.fetchers.sources.figma-jobs]        # Greenhouse: one response, already-absolute urls
-kind = "json-api"
-enabled = true
-interval = "daily"
-url = "https://boards-api.greenhouse.io/v1/boards/figma/jobs"
-items_path = "jobs"
-id_field = "id"
-title_field = "title"
-url_field = "absolute_url"
-
-[modules.fetchers.sources.amazon-swe]        # Amazon: paginated, relative urls
-kind = "json-api"
-enabled = true
-interval = "daily"
-url = "https://www.amazon.jobs/en/search.json?base_query=software+engineer&offset={offset}&result_limit=50"
-items_path = "jobs"
-id_field = "id"
-title_field = "title"
-url_field = "job_path"
-url_base = "https://www.amazon.jobs"
-pagination = "offset"
-page_size = 50
+[source]
+filter = { or = [
+  { title = { contains = "senior" } },
+  { title = { contains = "staff" } },
+], title = { not_contains = "intern" } }
 ```
 
-- **`items_path`** — a dot-separated path of object keys from the response root to the
-  items array. Empty (the default) means the response root is already that array (Lever's
-  bare `[...]`, unlike Greenhouse's `{"jobs": [...]}`). Nested field mapping stops there
-  deliberately: `raw_data` is the whole matched item object, unfiltered, so a field that
-  isn't `id`/`title`/`url` never needs its own path — only those three are ever extracted
-  individually, and in every real case checked so far (Greenhouse, Lever, Amazon) all three
-  are flat, top-level fields, so the path language stays "one key" for them, not a general
-  JSONPath.
-- **`id_field`/`title_field`/`url_field`** — top-level field names; a missing field on one
-  item skips just that item (same "a page is a reported failure only when something
-  structural broke, not when one row happens to be thin" posture `jobbank-canada` already
-  takes), not the whole page. A JSON number (Greenhouse's own numeric `id`) is coerced to a
-  string, the same way a string field already is — anything else (an object, an array,
-  `null`) is treated as absent.
-- **`url_base`**, when present, is prepended to `url_field`'s value — for an API (Amazon's)
-  whose own url field is a site-relative path, not already absolute. Omitted means the
-  field is already a full url, used as-is (Greenhouse, Lever).
-- **`pagination`**: `"none"` (default — one response has everything, e.g. Greenhouse,
-  Lever) or `"offset"` (e.g. Amazon). `"offset"` requires `page_size > 0` and a literal
-  `{offset}` placeholder in `url`, both checked at load time — the `Source` substitutes
-  `0`, then `page_size`, then `2 * page_size`, … until a response returns fewer than
-  `page_size` items, the same "a short page is the last page" signal `jobbank-canada`'s own
-  `page=N` scheme uses, just expressed as a running offset instead of a page number.
-- **`Method::Api`** always — a url the caller configured deliberately, the same reasoning
-  as `rss` (§2a) and `hn-whoishiring` (§10): not a crawled page, so no robots.txt check
-  applies.
-- **Where this stops being generic, on purpose:** an HTML response (`weworkremotely`,
-  `jobbank-canada` stay hand-written `Method::Scrape` sources — `html-list`, §2a's other
-  deferred kind, remains undone); an endpoint needing an auth header, a POST body, or
-  cursor-token pagination (a response-supplied token to echo back, rather than a
-  client-computed offset) — none of those fit the "GET a url, get back a flat JSON array"
-  shape this kind covers, and none are built here.
-- **No `core`/`proto` change, no new op** — `SourceConfig`, `crate::source::resolve`, and a
-  new `crates/modules/fetchers/src/sources/json_api.rs`, the same shape `rss` already
-  established.
+(`Filter`'s existing dotted-key/AND-of-conditions shape means a bare `title = {...}` alongside `or`
+is already "AND this with whatever the `or` block decided" — no new combinator needed for excludes
+to coexist with an inclusion list.) Applied once, in the same place today's `title_contains`/
+`title_excludes` check runs (`Fetchers::run_source`/`Fetchers::test`), against `RawItem::title`
+only, same as before — `Filter` itself is schema-free, so no per-kind wiring needed.
 
-### 16. Amendment: a configurable `search_term` for `jobbank-canada`
+**`Filter`'s own schema-free-ness is exactly the gap this ADR's own review caught (point 5,
+echoed again as #311's review, blocking)**: because it has no
+schema behind it, a filter naming any key but `title` (e.g. `company = { contains = "Acme" }`)
+parses as a perfectly well-formed `Filter` and then matches nothing, forever, once it is checked
+against `{"title": …}` only — with no error, just a source that silently never keeps anything.
+Closed by checking the raw filter JSON at load (and on the ad-hoc `--filter` override below) before
+`Filter::parse`: every key must be `title`, including inside each `"or"` alternative, or the filter
+is refused with a message naming the bad key. This is the one schema `fetchers`' filter has, and it
+is enforced here rather than in `core::filter` itself, since `Filter` is deliberately schema-free
+for every other caller (automations' `when`, records).
 
-**Retracted — see §20.** This amendment added a free-text `search_term` field to
-`SourceConfig`, read only by `jobbank-canada` (§10), so its search query could be set in
-`config.toml` instead of being a compiled-in constant. Removed along with that source: no
-other source ever read it.
+The ad-hoc `--contains`/`--excludes` override on `fetchers test`/`run` (prior §14) becomes a
+`--filter` flag taking the same JSON shape inline, replacing — never merging with — the source's own
+configured `filter` for that one call, same override semantics as before.
 
-### 17. Amendment: an ad-hoc `--search-term` override
+### 9. Commands — the full set, named by CLAUDE.md §15 / ADR 0038's convention
 
-**Retracted — see §20.** This amendment added a `--search-term` flag to `shimmer fetchers
-test`/`run` (an ad-hoc, one-call override of §16's field) and the `ctx_with_search_term_override`
-plumbing behind it. Removed along with §16's field — nothing else used either.
+| Op | Execution | Params | Notes |
+|---|---|---|---|
+| `fetchers.list` | inline | `{"removed"?}` | Every source (or, with `removed`, every removed one): id, label, kind, enabled, interval, last run, running, last error. Merges today's `list` + `status` into one per-source table (issue comment #1). |
+| `fetchers.show` | inline | `{"id"}` | One source in full: its config, last result **or error**, next scheduled run. Was `fetchers.status` for a single id; that word now means the feature-wide view below. |
+| `fetchers.status` | inline | `{}` | The whole feature at a glance: source count, how many enabled/disabled/broken, which are failing, soonest next runs. Not per-source — matches `automations.status`'s shape. |
+| `fetchers.new` | inline | `{"id","label"?,"kind","params"}` or `{"id","template","values","preview"?}` | Validated by that kind's `Kind::parse` before any file is written; a template path follows ADR 0025 §6a (required questions, a preview, never partial). |
+| `fetchers.edit` | inline | `{"id","text"}` | **Amended by #305's review, blocking.** Not a structured shape like `fetchers.new`'s: the *whole* replacement file text, same as `automations.edit`. A structured shape meant re-passing every field just to change one, with whatever wasn't re-passed silently reset to its default — most visibly, an edit that didn't repeat `enabled` would switch a running source off. Taking the full text instead means the CLI reads the current file first (`fetchers.show`) and opens `$EDITOR` on a copy of it, so nothing not explicitly retyped changes. Re-validated the same way as `new`; a refused edit changes nothing (old file kept), same posture as automations' `save`. |
+| `fetchers.reload` | inline | `{}` | Re-reads every `data/fetchers/sources/*.toml` (§5) — needed after hand-editing a source file, since the module otherwise only reads them at daemon start. Omitted from an earlier draft of this table despite being built in §5; listed here for real. |
+| `fetchers.remove` | inline | `{"id"}` | Moves to `removed/`; cancels its pending schedule (§6). |
+| `fetchers.restore` | inline | `{"id"}` | Brings it back; re-schedules if enabled. |
+| `fetchers.purge` | inline | `{"id"?}` | Confirmed with `{"sources": N}`, same shape as `records.purge`/`automations.purge`. |
+| `fetchers.enable` / `.disable` | inline | `{"id"}` | Schedules or cancels (§6). A source shows `enabled` in `list`/`show`. |
+| `fetchers.rename` | inline | `{"id","to"}` | Moves the config file, `data/fetchers/<id>/`, and the pending schedule (§6, §7). |
+| `fetchers.copy` | inline | `{"id","to","label"?}` | Starts disabled, same reasoning as an automation's copy (one event must not fire both before the copy is reviewed). |
+| `fetchers.templates` / `.peek` | inline | `{}` / `{"id"}` | The five starter templates (§10), same shape as every other module's. |
+| `fetchers.test` | queued (`fetchers`) | `{"id","filter"?}` | One page, no state touched, no events emitted. `filter` (a `core::filter::Filter`, §8) overrides the source's own for this call only. |
+| `fetchers.run` | queued (`fetchers`) | `{"id","filter"?}` | Checks the source exists **before** returning a task id (fixes the "says queued, then fails silently" bug from issue comment #3), the same inline-existence-check pattern `workspaces.activate` already uses. |
+| `fetchers.health` | inline | `{}` | New (issue comment #1). Broken source files (parse problems, §5) and sources whose last run failed, each reported once until fixed — not every run — discovered generically by `shimmer doctor` via `core.manifest`, same as records/workspaces already are. |
+| `fetchers.items` | inline | `{"id"?,"limit"?}` | New — answers what the CLI's `fetchers items` used to compute itself (issue item 6): matches by source and reuses the same title-filter rule `fetchers.run` already applies, in one place. The CLI command becomes a thin call-and-render, like every other inline op. |
 
-### 18. Amendment: `active_field` for the `json-api` kind
+Every op's CLI word is its own verb (ADR 0038's rule), gets an alias in all four built-in packs, Tab
+completion, and help text. Topics follow `fetchers.<thing>.<past-tense verb>` for everything new:
+`fetchers.source.created` / `.edited` / `.removed` / `.restored` / `.purged` / `.renamed` /
+`.copied` / `.enabled` / `.disabled`. `fetchers.item.found` and `fetchers.fetch.finished`/`.failed`
+are unchanged.
 
-Configuring `kind = "json-api"` against a community-maintained listings archive (e.g.
-SimplifyJobs' New-Grad-Positions `listings.json`, confirmed live) surfaced a gap: that feed
-keeps already-closed postings in the same array as open ones, flagged only by its own
-boolean `active` field, rather than dropping them. With no way to read that field, `fetch`
-and `test` reported a long-closed posting as "new" exactly like a live one — a dead link
-the first time anyone clicked it.
+### 10. No built-in sources — templates instead
 
-- **`SourceConfig` gains an optional `active_field`** (`json-api` only): the field within
-  each item marking it still open. Validated at load time only for non-emptiness when
-  given — the field name is no more special than `id_field`/`title_field`/`url_field`.
-- **`JsonApi::fetch_page` drops an item when, and only when, `active_field`'s value there
-  is the boolean `false`.** Missing, non-boolean, or `true` all pass through unfiltered —
-  deliberately conservative: a feed that omits the field sometimes (or always, for every
-  other configured source) must never have items silently dropped because of a guess.
-  Checked before dedup, same stage `title_contains`/`title_excludes` already runs at.
-- **No change to `Source`, `RawItem`, or any other kind.** `rss` and every fixed source are
-  unaffected; `active_field` is meaningless, and left unvalidated, unless `kind =
-  "json-api"`.
+`source::registry()`/`find()` (the fixed, compiled-in list) are deleted outright. `hn-whoishiring`
+and `wwr` become ordinary `Kind` impls (§3) — real Rust code stays exactly as real Rust code, same
+fetch logic, same `Method`; only the "exists with zero config" shortcut goes. A fresh install's
+`fetchers list` shows nothing, with a hint pointing at `fetchers templates`, matching ADR 0023's "no
+seeding" rule every other module already follows.
 
-Confirmed live: `simplify-newgrad` configured with `active_field = "active"` dropped from
-4236 title-matching items to 894 once already-closed postings were excluded, and the first
-real `fetchers run` against it reported 50 new items, all genuinely open.
+Five starter templates (ADR 0025 §6a's rules: required questions, a preview, an end-to-end test
+each):
 
-### 19. Amendment: an unconfigured fixed source is not `known`
+| Template | `kind` it writes | Questions |
+|---|---|---|
+| Hacker News "Who is hiring?" | `hn-whoishiring` | title filters (optional) |
+| We Work Remotely | `wwr` | category, title filters (optional) |
+| A Greenhouse job board | `json-api` | the company's board token |
+| A Lever job board | `json-api` | the company's id |
+| An RSS / Atom feed | `rss` | the feed URL |
 
-§10's three reference sources are all job boards, and §2a's `registry()` made them "always
-present whether or not it has a `[modules.fetchers.sources.*]` entry at all" — so every
-Shimmer user saw `hn-whoishiring`, `weworkremotely`, and `jobbank-canada` in `fetchers list`/
-`fetchers status` from a fresh install, regardless of whether they have any interest in job
-hunting. That's the opposite of CLAUDE.md §1's "general before specific": job hunting is one
-`fetchers` use case among several (tech news, docs sites, transcript APIs), not one the
-compiled binary should privilege by always showing up unprompted.
+A template is data (questions plus a filled-in `[kind]` table), never code — the same "packs are
+data" posture CLAUDE.md §15.1 already holds command packs to. This also answers the forward-looking
+question of a later template marketplace cleanly: a third-party template can only ever name a `kind`
+this binary already ships (so `rss`/`json-api` templates — a new feed, a new board — are exactly
+what a marketplace contributor can add with zero Rust); a genuinely new fetch mechanism still needs
+a `Kind` impl shipped with Shimmer itself, same as `hn-whoishiring`/`wwr` today. Nothing in this ADR
+builds a marketplace; this is just confirming the design doesn't foreclose one.
 
-The three got hand-written `Source` impls for a reason that has nothing to do with being job
-boards: `hn-whoishiring` needs a two-stage fetch (a thread, then each comment) the generic
-`json-api` kind's flat-array model can't express, and `weworkremotely`/`jobbank-canada` are
-`Method::Scrape` (crawled HTML, needing a `robots.txt` check), which neither generic kind
-covers at all (both are `Method::Api`-only). Every other job source added since (§15's
-`figma-jobs`, `robinhood-jobs`, `simplify-newgrad`, …) needed zero Rust — plain `kind =
-"json-api"`/`"rss"` config, same as a tech-news or weather-alerts source. So "jobs" was never
-privileged in the *mechanism* — only in these three ids always being listed regardless of
-configuration.
+### 11. Health — `fetchers.health`
 
-- **`source::known` now requires a `[modules.fetchers.sources.<id>]` entry — even a bare,
-  disabled one — before a fixed-registry source is included.** `registry()`, `find()`, and
-  `resolve()` are unchanged: `fetchers test hn-whoishiring`/`fetchers run weworkremotely`
-  still work with zero config at all, exactly as before. Only what `fetchers.list`/
-  `fetchers.status` surface *unprompted* changed.
-- **§5's "sources default disabled" is a different axis and is untouched.** An entry with no
-  `enabled` key still starts `false`. This amendment is about whether a source is *listed at
-  all* with no entry, not what an entry's own default is.
-- **No config schema change.** The same bare entry that already worked for adjusting a fixed
-  source's `interval`/filters now does double duty as the opt-in.
+Covered in §9's table. Two kinds of problem, both reported once until resolved rather than on every
+`shimmer doctor` run: a source file that doesn't parse (§5's `problems`), and a source whose most
+recent run failed (tracked alongside `last_run.toml`, carrying the failure's `reason` from
+`fetchers.fetch.failed`'s existing payload shape — no new failure taxonomy needed).
 
-Not done here: a one-command "job template" that writes `hn-whoishiring`/`weworkremotely`
-entries into `config.toml` in one step, the way `records`/`workspaces` templates (ADR 0022,
-ADR 0025) already work for their own modules. Worth doing — it's the natural way someone who
-*does* want job sources turns them on without hand-typing TOML blocks — but it is its own,
-separable piece of work, not a prerequisite for this fix. (`jobbank-canada` was a third
-candidate for this template until §20 retracted it entirely — reintroducing it, if ever
-wanted, means writing a new `Source` impl again, not just adding a config entry.)
+## Migration
 
-### 20. Retraction: `jobbank-canada` and its `search_term` feature
-
-Review discussion on §19 asked a fair follow-up: now that an unconfigured fixed source isn't
-shown by default, why keep ~1,000 lines of code (`jobbank.rs`, its tests, and its fixtures)
-for a source most users will never turn on? Two separate answers came out of that:
-
-- **Binary/runtime bloat from keeping it was negligible** — a user who never configures a
-  source pays nothing at runtime, and §19 already stopped it showing up unprompted.
-- **But `weworkremotely` and `jobbank-canada` were redundant with each other.** Both are
-  `Method::Scrape` + a `robots.txt` check + `html.rs`'s scraping helpers — the only two
-  things in this module exercising that path at all, since every other source (including
-  every other job board — `figma-jobs`, `robinhood-jobs`, `simplify-newgrad`) is
-  `Method::Api` via the generic `rss`/`json-api` kinds. Keeping both taught the identical
-  lesson twice. `weworkremotely` alone still proves `Method::Scrape` end to end;
-  `hn-whoishiring`'s two-stage fetch remains the separate, still-needed proof that a
-  non-flat-array `Method::Api` source is possible.
-
-So, unlike §19 (a visibility change with no deletions), this amendment actually removes
-`jobbank-canada` and everything that existed solely for it:
-
-- `crates/modules/fetchers/src/sources/jobbank.rs` and its tests, `sources/mod.rs`'s
-  `jobbank` module declaration, its entry in `source::registry()`, and its HTML test
-  fixtures (`tests/fixtures/jobbank/`).
-- **The entire `search_term` feature (§16, §17)** — `SourceConfig.search_term`, the
-  `fetchers.fetch`/`fetchers.test` `search_term` param, the CLI's `--search-term` flag on
-  `test`/`run`, and the `ctx_with_search_term_override` plumbing behind it. Nothing else
-  ever read `search_term`; it existed solely for `jobbank-canada`'s own free-text query, so
-  removing the source left the whole feature with no caller.
-- Every test, doc comment, and `ADR` paragraph that existed only to describe `jobbank-canada`
-  or `search_term` (this file's own §16/§17 bodies, now retraction notes; §10's reference
-  entry, now flagged retracted in place rather than deleted, since its `User-Agent`/bot
-  defense finding — the thing that surfaced §6's `RealHttpBackend` gap — is still true and
-  still worth keeping as history).
-- Incidental mentions of `jobbank-canada`/`jobbank.gc.ca` used purely as an arbitrary example
-  string in CLI rendering tests (e.g. `items`'s source-filter tests) are untouched — they
-  test generic logic that never depended on the real source existing.
-
-**No `core`/`proto` change, no version bump** — this is a pure subtraction inside
-`crates/modules/fetchers` and `crates/cli/src/fetchers.rs`, both already change-controlled
-only by Dev B's own module/CLI ownership (CLAUDE.md §13), not §4's shared-contract rule.
-
-Not done here, still: reintroducing a Canada-specific (or any other) job board. If wanted
-later, it needs a new `Source` impl — the "job template" idea above doesn't bring this one
-back, since there's no compiled-in source left for a config entry to opt into.
+**No automatic migration from `config.toml`.** Consistent with ADR 0038's own posture for its op
+renames ("nothing depends on the old names yet... so they're renamed outright rather than kept as
+second names") — no dogfooded installs or outside clients depend on today's `[modules.fetchers.sources.*]`
+shape either, **as of this ADR being written**; that stops being true the moment anyone starts
+dogfooding against the pre-rework shape, so this whole rework should land before dogfooding does,
+not be left to trail behind it. Upgrading means re-creating each source by hand (`fetchers new` or a template);
+`config.toml`'s `[modules.fetchers]` section becomes unrecognized and is left alone (unknown
+sections are already ignored, not rejected). Worth a line in the next release's notes, not a code
+change.
 
 ## Not done here
 
-- Credentials/secret storage for a future authenticated source. **Not** blocked by the
-  `Source` trait or the `[modules.fetchers.sources.*]` config shape (both take `ctx`, which
-  can carry a key via `ctx.config` later). **Is** blocked by `HttpBackend::get`'s current
-  signature (`crates/core/src/http.rs:29-32`), which takes no custom headers — no module can
-  set an `Authorization` header through `ctx.http` today. ADR 0027 already named this as its
-  own open question ("Not done here": "Request headers on `HttpBackend::get`... deferred
-  until a real consumer defines the actual need"). A credentialed source needs that ADR's
-  follow-up before it can exist, regardless of anything here.
-- `records` inbox/triage (matching a found item to a saved record) — a `records` feature,
-  separate from this module.
-- TUI surface — out of scope for this ADR. (CLI surface shipped later — see §11.)
-- Headless-browser scraping for JS-rendered sites.
-- A `core` change that would let `Module::triggers()` read config directly (§5's finding) —
-  would affect every module, not just this one; not proposed here.
-- A "job template" that opts into the three fixed sources in one command (§19) — separable
-  follow-up, not a prerequisite for §19's own fix.
+- A TUI surface — out of scope, as always.
+- Headless-browser scraping, the `html-list` kind — still undone, unrelated to this rework.
+- A template marketplace — §10 only confirms the design doesn't block one later.
+- Tier-2/3 credentials (session cookies, automated login) — ADR 0036's own deferral, unchanged here.
+- **A fresh install's zero-sources state, filled in by `shimmer setup`, not here.** §10 deletes the
+  fixed `hn-whoishiring`/`wwr` registry on purpose (ADR 0023's "no seeding" rule), so a brand-new
+  install genuinely has nothing until someone runs `fetchers new --from TEMPLATE`. The planned
+  `shimmer setup` onboarding kit is where a first-run prompt (or a default profile) would offer to
+  make the HN/WWR sources from their templates, if that is wanted — this ADR only makes that
+  possible, it doesn't build the prompt.
+- The scheduling repair sweep and the `scheduler list`/`remove` desync (§6) — both flagged there as
+  known gaps this rework does not close.
+
+## Sequencing
+
+Landed as separate PRs, in this order, each independently reviewable. Nothing here is blocked on
+anything outside this module anymore — `ctx.schedules` and `core::filter` are already on master.
+
+1. **`Op::NotContains`** (§8) — the one small `core` addition, on its own so it gets focused
+   sign-off independent of everything fetchers-specific.
+2. **The `Kind` trait** (§3) — internal refactor, `SourceConfig`'s fields redistributed into each
+   kind's own `KindConfig`, `schedule.rs`/`source.rs` lose all per-kind knowledge. No behavior change,
+   no new ops, no storage change yet — config stays in `config.toml` for this step only, so the diff
+   is reviewable on its own terms before storage moves too.
+3. **File storage** (§4, §5) — sources move to `data/fetchers/sources/<id>.toml`; `init()`/`reload`
+   read them; no new CLI commands yet beyond what's needed to exercise this (tests write files
+   directly).
+4. **The command set** (§9) — `new`/`edit`/`remove`/`restore`/`purge`/`list --removed`/`enable`/
+   `disable`/`rename`/`copy`/`show`, plus the existing-bug fix on `run`'s inline existence check.
+5. **Scheduling** (§6) — the heartbeat removed, per-source `ctx.schedules` wired in.
+6. **Filtering** (§8) — a source's `filter` field replaces `title_contains`/`title_excludes`;
+   depends on #1 and #2.
+7. **Templates** (§10) — the five starters, the built-in registry deleted.
+8. **`fetchers.health` and `fetchers.items`** (§9, §11) — can land any time after #4; independent of
+   each other.
+9. **Credentials** (§4's addendum) — can land any time after #2 wires `json-api`/`rss` as `Kind`
+   impls; small enough to fold into #2 or ship separately.
+
+Steps 2-9 all depend on the Kind trait landing first except #1, which has no dependency at all and
+can land immediately.
