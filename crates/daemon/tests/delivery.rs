@@ -112,3 +112,27 @@ async fn a_panic_on_one_event_doesnt_stop_the_rest() {
     assert_eq!(seen, (1..11).collect::<Vec<_>>(), "all 10 after the panic");
     stop(d).await;
 }
+
+/// #310's review: a module that falls behind right after a restart catches up from the log, but
+/// never from before it started listening: the previous run's last events were given to it then,
+/// and giving them again would fire its rules twice.
+#[tokio::test]
+async fn a_lag_right_after_a_restart_never_replays_the_previous_runs_events() {
+    let env = Env::new();
+    let d = env.try_start(vec![Arc::new(Counter::default())]).await.unwrap();
+    let mut c = Client::connect(&env.sock).await;
+    c.call("counter.burst", json!({"from": 90000, "n": 5})).await.unwrap();
+    assert_eq!(seen_until(&mut c, 5).await.len(), 5);
+    stop(d).await;
+
+    // Started again at once, with a fresh module, and made to fall behind straight away.
+    let d = env.try_start(vec![Arc::new(Counter::default())]).await.unwrap();
+    let mut c = Client::connect(&env.sock).await;
+    c.call("counter.burst", json!({"n": 2000})).await.unwrap();
+    let seen = seen_until(&mut c, 2000).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let seen_after: Vec<u64> = serde_json::from_value(c.call("counter.seen", json!({})).await.unwrap()).unwrap();
+    assert!(seen.iter().all(|i| *i < 90000), "the previous run's events came again");
+    assert_eq!(seen_after, (0..2000).collect::<Vec<_>>(), "this run's, once each, in order");
+    stop(d).await;
+}

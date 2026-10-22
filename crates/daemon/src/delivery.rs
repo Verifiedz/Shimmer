@@ -6,6 +6,9 @@
 //!   log from just before the last event the module was given, as the indexer does, so "the log
 //!   has them all" holds for modules too. A short memory of what was given (by id) keeps the
 //!   replay and the bus from giving an event twice: a rule firing twice is a duplicate email.
+//!   A replay never reaches back before the module started listening: events from before that
+//!   were the previous run's, already given to it then (#310's review). Each lag reads the day
+//!   files from `since` on again; fine at today's sizes, a byte offset could replace it later.
 //! * **A panic is one event's (#261 finding 2).** Each `on_event` runs in its own task, as each
 //!   queued op does: a panic is logged with the module and topic, and the module keeps getting
 //!   events, where before it got none until a restart.
@@ -18,6 +21,7 @@ use shimmer_core::{Ctx, Event, Module, ModuleId};
 use shimmer_store::Store;
 use tokio::sync::broadcast::{error::RecvError, Receiver};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use ulid::Ulid;
 
 /// How far before the last given event a replay starts: two transactions committed at once can
@@ -49,6 +53,9 @@ impl Given {
     }
 }
 
+/// `listening_since`: when the module was subscribed to the bus, taken just before subscribing.
+/// `tracker`: the daemon's, so `Daemon::wait` also waits for an `on_event` still running.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     id: ModuleId,
     module: Arc<dyn Module>,
@@ -56,10 +63,12 @@ pub async fn run(
     mut rx: Receiver<Event>,
     store: Arc<Store>,
     shutdown: CancellationToken,
+    listening_since: DateTime<Utc>,
+    tracker: TaskTracker,
 ) {
     let mut given = Given::default();
     // Nothing given yet: a lag before the first event replays from when listening began.
-    let mut last: DateTime<Utc> = ctx.clock.now();
+    let mut last: DateTime<Utc> = listening_since;
     loop {
         let ev = tokio::select! {
             _ = shutdown.cancelled() => return,
@@ -69,11 +78,12 @@ pub async fn run(
             Ok(ev) => {
                 if given.first_time(ev.id) {
                     last = last.max(ev.at);
-                    give(&id, &module, &ctx, ev).await;
+                    give(&id, &module, &ctx, ev, &tracker).await;
                 }
             }
             Err(RecvError::Lagged(n)) => {
-                let since = last - REPLAY_MARGIN;
+                // Never before listening began: those were the previous run's (#310's review).
+                let since = (last - REPLAY_MARGIN).max(listening_since);
                 let store = store.clone();
                 let read = tokio::task::spawn_blocking(move || store.read_events_since(since)).await;
                 let events = match read {
@@ -91,7 +101,7 @@ pub async fn run(
                 for ev in events {
                     if given.first_time(ev.id) {
                         last = last.max(ev.at);
-                        give(&id, &module, &ctx, ev).await;
+                        give(&id, &module, &ctx, ev, &tracker).await;
                         replayed += 1;
                     }
                 }
@@ -103,14 +113,14 @@ pub async fn run(
 }
 
 /// One event to `on_event`, in a task of its own so a panic stays this event's.
-async fn give(id: &ModuleId, module: &Arc<dyn Module>, ctx: &Ctx, ev: Event) {
+async fn give(id: &ModuleId, module: &Arc<dyn Module>, ctx: &Ctx, ev: Event, tracker: &TaskTracker) {
     let (module, ctx, topic) = (module.clone(), ctx.clone(), ev.topic.clone());
-    let handled = tokio::spawn(async move { module.on_event(&ev, &ctx).await }).await;
+    let handled = tracker.spawn(async move { module.on_event(&ev, &ctx).await }).await;
     match handled {
         Ok(Ok(())) => {}
         Ok(Err(e)) => tracing::warn!(module = %id, topic = %topic, error = %e, "on_event failed"),
         Err(e) if e.is_panic() => {
-            tracing::error!(module = %id, topic = %topic, "on_event panicked; the module keeps getting events")
+            tracing::error!(module = %id, topic = %topic, "on_event panicked; the module keeps getting events (if it keeps failing after this, it may need a restart)")
         }
         Err(e) => tracing::error!(module = %id, topic = %topic, error = %e, "on_event task failed"),
     }

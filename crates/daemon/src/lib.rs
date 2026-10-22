@@ -131,6 +131,8 @@ impl Daemon {
         let tracker = TaskTracker::new();
 
         // Subscribe before init so events a module emits while initialising are not missed.
+        // Taken before subscribing: a module's catch-up after a lag never reaches before it (#310).
+        let listening_since = config.clock.now();
         let receivers: Vec<_> = core.registry.entries.iter().map(|_| bus.subscribe()).collect();
         tracker.spawn(indexer::run(index, store.clone(), bus.subscribe(), shutdown.clone()));
 
@@ -148,7 +150,16 @@ impl Daemon {
             }
             // Every event, in order, a lag caught up from the log and a panic kept to its event
             // (#261 findings 1, 2).
-            tracker.spawn(delivery::run(id, entry.module.clone(), ctx, rx, store.clone(), shutdown.clone()));
+            tracker.spawn(delivery::run(
+                id,
+                entry.module.clone(),
+                ctx,
+                rx,
+                store.clone(),
+                shutdown.clone(),
+                listening_since,
+                tracker.clone(),
+            ));
         }
 
         // Modules are initialised, so anything that fires now can run. The first tick catches up
