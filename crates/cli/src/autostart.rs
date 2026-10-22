@@ -69,8 +69,10 @@ pub async fn start_and_connect(exe: &Path, socket: &Path) -> Result<Client> {
 
 /// Why the daemon just failed to start, from its log: its stderr goes nowhere when auto-started,
 /// so `run_daemon` also logs the failure (#266 finding 5). The newest `daemon.log.<date>` file's
-/// last "cannot start daemon: " line, if it was written since `since`; an older one is about an
-/// earlier start, not this one.
+/// last "cannot start daemon: " record, if it was written since `since`; an older one is about an
+/// earlier start, not this one. The whole record: a `config.toml` syntax error is several lines
+/// (where, the line with a caret, the cause), and its first line alone drops the cause (#307's
+/// review). A record ends where the next one starts, at a line beginning with its timestamp.
 fn start_failure(logs: &Path, since: chrono::DateTime<chrono::Utc>) -> Option<String> {
     const MARK: &str = "cannot start daemon: ";
     let newest = std::fs::read_dir(logs)
@@ -79,13 +81,25 @@ fn start_failure(logs: &Path, since: chrono::DateTime<chrono::Utc>) -> Option<St
         .filter(|e| e.file_name().to_string_lossy().starts_with("daemon.log"))
         .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())?;
     let text = std::fs::read_to_string(newest.path()).ok()?;
-    let line = text.lines().rev().find(|l| l.contains(MARK))?;
-    let at = chrono::DateTime::parse_from_rfc3339(line.split_whitespace().next()?).ok()?;
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.iter().rposition(|l| l.contains(MARK) && stamped(l))?;
+    let at = chrono::DateTime::parse_from_rfc3339(lines[start].split_whitespace().next()?).ok()?;
     if at < since {
         return None;
     }
-    let (_, why) = line.split_once(MARK)?;
-    Some(why.trim().to_owned())
+    let (_, first) = lines[start].split_once(MARK)?;
+    let rest = lines[start + 1..].iter().take_while(|l| !stamped(l)).filter(|l| !l.trim().is_empty());
+    let mut why = first.trim().to_owned();
+    for line in rest {
+        why.push_str("\n  ");
+        why.push_str(line.trim_end());
+    }
+    Some(why)
+}
+
+/// Whether a log line starts a record: it begins with an RFC 3339 timestamp.
+fn stamped(line: &str) -> bool {
+    line.split_whitespace().next().is_some_and(|w| chrono::DateTime::parse_from_rfc3339(w).is_ok())
 }
 
 #[cfg(test)]
@@ -111,6 +125,22 @@ mod tests {
              2026-10-19T12:00:02.000002Z  INFO shimmer_daemon: something after it\n",
         );
         assert_eq!(start_failure(dir.path(), since).as_deref(), Some("config.toml: bad lanes"));
+
+        // A multi-line record: the cause on its last line is kept, and the next record isn't.
+        log(
+            dir.path(),
+            "daemon.log.2026-10-19",
+            "2026-10-19T12:00:02.000001Z ERROR shimmer::start: cannot start daemon: invalid_params: config.toml: TOML parse error at line 1, column 7\n\
+             \x20 |\n\
+             1 | [lanes\n\
+             \x20 |       ^\n\
+             unclosed table, expected `]`\n\
+             2026-10-19T12:00:02.000002Z  INFO shimmer_daemon: something after it\n",
+        );
+        let why = start_failure(dir.path(), since).unwrap();
+        assert!(why.starts_with("invalid_params: config.toml: TOML parse error at line 1, column 7\n"), "{why}");
+        assert!(why.contains("1 | [lanes") && why.ends_with("unclosed table, expected `]`"), "{why}");
+        assert!(!why.contains("something after it"), "{why}");
 
         // Only an earlier start's failure: not this one's reason.
         let later = chrono::DateTime::parse_from_rfc3339("2026-10-19T13:00:00Z").unwrap().to_utc();

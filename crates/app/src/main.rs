@@ -85,8 +85,13 @@ fn init_daemon_logging(home: &Path) -> Option<WorkerGuard> {
     match appender {
         Ok(appender) => {
             let (writer, guard) = tracing_appender::non_blocking(appender);
-            let file_layer =
-                tracing_subscriber::fmt::layer().with_ansi(false).with_writer(writer).with_filter(env_filter());
+            // A failed start is always written, whatever RUST_LOG says: auto-start reads the reason
+            // from here (#307's review).
+            let always = format!("{START_FAILED}=error")
+                .parse()
+                .map(|d| env_filter().add_directive(d))
+                .unwrap_or_else(|_| env_filter());
+            let file_layer = tracing_subscriber::fmt::layer().with_ansi(false).with_writer(writer).with_filter(always);
             tracing_subscriber::registry().with(stderr_layer).with(file_layer).init();
             Some(guard)
         }

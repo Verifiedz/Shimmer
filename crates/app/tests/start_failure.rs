@@ -37,3 +37,34 @@ fn a_daemon_started_by_hand_prints_the_reason_once() {
     assert!(!out.status.success(), "{stderr}");
     assert_eq!(stderr.matches("cannot start daemon").count(), 1, "once, not again from the log: {stderr}");
 }
+
+/// #307's review: a config.toml *syntax* error is several lines (where, a caret, the cause). The
+/// whole of it is quoted, cause included, not just its first line.
+#[test]
+fn a_syntax_error_in_config_toml_is_quoted_whole() {
+    let home = Home::new();
+    std::fs::write(home.dir.path().join("home/config.toml"), "[lanes\nfetchers = 2\n").unwrap();
+
+    let out = home.shimmer(&["ping"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("TOML parse error at line 1"), "{stderr}");
+    assert!(stderr.contains("unclosed table"), "the cause, not just where: {stderr}");
+}
+
+/// #307's review: a RUST_LOG that leaves out shimmer::start still gets the reason written.
+#[test]
+fn the_reason_is_logged_whatever_rust_log_says() {
+    let home = Home::new();
+    std::fs::write(home.dir.path().join("home/config.toml"), "[lanes]\nfetchers = \"many\"\n").unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_shimmer"))
+        .arg("ping")
+        .env("SHIMMER_HOME", home.dir.path().join("home"))
+        .env("SHIMMER_SOCKET", home.socket())
+        .env("XDG_CONFIG_HOME", home.dir.path().join("config"))
+        .env("RUST_LOG", "shimmer_daemon=debug")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("lanes.fetchers"), "quoted from the log: {stderr}");
+}
