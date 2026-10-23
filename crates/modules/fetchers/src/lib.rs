@@ -14,9 +14,10 @@
 //! (ADR 0028 §4, §5). [`http`] is the retry wrapper around `ctx.http.get` (ADR 0028 §6);
 //! [`html`] and [`robots`] are the scraping and robots.txt helpers `weworkremotely` uses,
 //! since `Method::Scrape` is responsible for checking robots.txt itself (ADR 0028 §7).
-//! [`module`]'s `Fetchers` wires all of this together: `fetchers.tick` finds due sources
-//! and enqueues `fetchers.run` for each, which runs the matching `Source`, dedupes its
-//! items, and emits `fetchers.item.found` for each new one.
+//! [`module`]'s `Fetchers` wires all of this together: each source schedules its own next
+//! run directly, via `ctx.schedules` (ADR 0028 §6, no fixed heartbeat), which fires
+//! `fetchers.run_task` to run the matching `Source`, dedupe its items, and emit
+//! `fetchers.item.found` for each new one.
 //!
 //! Depends on `core` only.
 

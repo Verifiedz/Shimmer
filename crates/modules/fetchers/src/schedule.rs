@@ -1,28 +1,19 @@
-//! The fetchers heartbeat: a single, fixed-period scheduler trigger (ADR 0028 §5), and the
-//! per-source due-check and last-run bookkeeping it drives.
+//! Per-source scheduling, via `ctx.schedules` (ADR 0028 §6), and last-run bookkeeping.
 //!
-//! `Module::triggers()` has no `Ctx`/config access (`crates/core/src/module.rs:25-27`, called
-//! before `Config::load` and before `Module::init`, `crates/daemon/src/lib.rs:95-96,98-102,120`)
-//! -- so the trigger's own firing period is a fixed constant here, not a config key.
-//! Only which *sources* are due, and how often each one runs, is read from the loaded
-//! [`Sources`] when the trigger actually fires and the handler gets a real `Ctx`.
-//!
-//! (Amends ADR 0028 §5's own example config, which still showed a `tick_interval_s` key --
-//! that was never actually readable by `triggers()`, so it is dropped here rather than built.)
+//! There is no fixed heartbeat trigger: each source schedules its own next run directly
+//! (`Module::triggers()` stays empty) -- see `module.rs`'s `schedule_run`/`cancel_schedule`/
+//! `reconcile_schedule` for when that happens. This file owns only the per-source state that
+//! decision needs: the pending schedule itself (`ScheduleState`) and `last_run.toml`.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use shimmer_core::{CatchUp, Ctx, Error, Result, Schedule, TriggerSpec};
+use shimmer_core::{Ctx, Error, Result};
 
-/// How often the heartbeat fires.
-pub const TICK_INTERVAL: Duration = Duration::from_secs(300);
-pub const TICK_OP: &str = "fetchers.tick";
 /// The real fetch work, queued (ADR 0028 §5) -- internal; `fetchers.run` (inline) checks the
-/// source exists, then enqueues this.
+/// source exists, then enqueues this. Also what a source's own schedule fires (ADR 0028 §6).
 pub const RUN_TASK_OP: &str = "fetchers.run_task";
 
 /// Floors below which a source's own cadence may not be set, per `Method` (ADR 0028 §5/§7).
@@ -31,21 +22,6 @@ pub const RUN_TASK_OP: &str = "fetchers.run_task";
 /// be polled, so it gets a much higher floor.
 pub const MIN_INTERVAL_API_S: u64 = 1800;
 pub const MIN_INTERVAL_SCRAPE_S: u64 = 21_600;
-
-/// The one `TriggerSpec` this module registers (ADR 0028 §5). `lane: None` defers to
-/// `fetchers.tick`'s own `CommandSpec` (`Execution::Queued { lane: "fetchers" }`) rather than
-/// repeating the lane name here.
-pub fn trigger() -> TriggerSpec {
-    TriggerSpec {
-        id: TICK_OP.into(),
-        schedule: Schedule::Every(TICK_INTERVAL),
-        catch_up: CatchUp::Skip,
-        op: TICK_OP.into(),
-        params: Value::Null,
-        lane: None,
-        fallback: None,
-    }
-}
 
 /// Where a source's own file lives (ADR 0028 §4): `data/fetchers/sources/<id>.toml`.
 pub const SOURCES_DIR: &str = "sources";
@@ -72,6 +48,46 @@ pub(crate) fn removed(ctx: &Ctx) -> Result<Vec<String>> {
         .collect())
 }
 
+/// `data/fetchers/sources/<id>.state.toml` (ADR 0028 §6): `{trigger_id, due_at}` for whatever
+/// `ctx.schedules` entry is currently pending for this source. Written by the module, never
+/// hand-edited, same spirit as workspaces' own `state.toml`; [`Sources::load`] skips it rather
+/// than trying to parse it as a source.
+fn schedule_state_path(id: &str) -> String {
+    format!("{SOURCES_DIR}/{id}.state.toml")
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ScheduleState {
+    pub trigger_id: String,
+    pub due_at: DateTime<Utc>,
+}
+
+/// `None` when this source has no pending schedule (never enabled, or disabled/removed since).
+pub(crate) fn load_schedule_state(ctx: &Ctx, id: &str) -> Result<Option<ScheduleState>> {
+    let Some(text) = ctx.store.read_string(&schedule_state_path(id))? else { return Ok(None) };
+    let raw: BTreeMap<String, String> =
+        toml::from_str(&text).map_err(|e| Error::internal(format!("fetchers {id}.state.toml: {e}")))?;
+    let bad = || Error::internal(format!("fetchers {id}.state.toml: missing trigger_id or due_at"));
+    let trigger_id = raw.get("trigger_id").cloned().ok_or_else(bad)?;
+    let due_at = raw
+        .get("due_at")
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&Utc))
+        .ok_or_else(bad)?;
+    Ok(Some(ScheduleState { trigger_id, due_at }))
+}
+
+pub(crate) fn save_schedule_state(ctx: &Ctx, id: &str, trigger_id: &str, due_at: DateTime<Utc>) -> Result<()> {
+    let mut raw = BTreeMap::new();
+    raw.insert("trigger_id", trigger_id.to_owned());
+    raw.insert("due_at", due_at.to_rfc3339());
+    ctx.store.write(&schedule_state_path(id), toml::to_string(&raw).unwrap_or_default())
+}
+
+pub(crate) fn delete_schedule_state(ctx: &Ctx, id: &str) -> Result<()> {
+    ctx.store.delete(&schedule_state_path(id))
+}
+
 /// Every source whose file loaded, plus every one that didn't (ADR 0028 §5). Loaded once at
 /// `Module::init`, re-read on `fetchers.reload` and after any write -- never re-scanned on
 /// every op call, the same shape `automations::State` already uses for its rule files.
@@ -93,6 +109,12 @@ impl Sources {
         let mut problems = BTreeMap::new();
         let prefix = format!("{SOURCES_DIR}/");
         for file in ctx.store.list(SOURCES_DIR)? {
+            // A source's own schedule state (ADR 0028 §6) is a sibling `<id>.state.toml` in
+            // this same folder, not a source -- skipped here, read only through
+            // `load_schedule_state`.
+            if file.ends_with(".state.toml") {
+                continue;
+            }
             let Some(id) = file.strip_prefix(&prefix).and_then(|f| f.strip_suffix(".toml")) else { continue };
             // Read raw bytes, not `read_string` -- that errors on non-UTF-8, and the `?` this
             // used to be written with failed `Module::init` for every source over one bad
@@ -333,45 +355,12 @@ impl IntervalSpec {
     }
 }
 
-/// Every enabled, configured source whose interval has elapsed since its last run (or that
-/// has never run at all). Deterministic order (`BTreeMap`'s own id order).
-pub fn due_sources(
-    sources: &BTreeMap<String, SourceConfig>,
-    last_run: &BTreeMap<String, DateTime<Utc>>,
-    now: DateTime<Utc>,
-) -> Vec<String> {
-    sources
-        .iter()
-        .filter(|(_, c)| c.enabled)
-        .filter_map(|(id, c)| {
-            // Already validated (against the right per-`Method` floor) by
-            // `SourceConfig::parse` -- a floor of 0 here only converts units, it never
-            // re-checks anything.
-            let interval = c.interval.resolve(0).ok()?;
-            let due = match last_run.get(id) {
-                None => true,
-                // A `last_run` in the future (a clock correction, or a `$SHIMMER_HOME` copied
-                // from a machine whose clock was ahead) used to park a source until that time
-                // actually arrived -- up to a silent month-long stall (#126's review, B10).
-                // Ahead of `now` means the record can't be trusted, so the source is due.
-                Some(last) if *last > now => true,
-                Some(last) => now.signed_duration_since(*last).num_seconds() >= interval as i64,
-            };
-            due.then(|| id.clone())
-        })
-        .collect()
-}
-
 /// `data/fetchers/last_run.toml` -- one small file for every source, read-modified-written
-/// together rather than one file per source, since a tick always reads and updates it as a
-/// whole.
+/// together rather than one file per source.
 pub(crate) const LAST_RUN_PATH: &str = "last_run.toml";
 
 /// A corrupt or unparseable `last_run.toml` is logged and treated as empty, never an error
-/// (#126's review, B1): failing here failed every `fetchers.tick`, so a single bad line in a
-/// bookkeeping file stopped all fetching. Empty means every source reads as due, so the worst
-/// case is one extra round of fetches -- which `seen.toml` then dedupes to zero new items --
-/// rather than no fetching at all. The next successful run rewrites the file cleanly.
+/// (#126's review, B1). The next successful run rewrites the file cleanly.
 /// Individual unparseable *entries* are dropped the same way, keeping the good ones.
 pub fn load_last_run(ctx: &Ctx) -> Result<BTreeMap<String, DateTime<Utc>>> {
     let Some(text) = ctx.store.read_string(LAST_RUN_PATH)? else { return Ok(BTreeMap::new()) };
@@ -806,47 +795,9 @@ mod tests {
     }
 
     #[test]
-    fn a_never_run_enabled_source_is_due() {
-        let mut sources = BTreeMap::new();
-        sources.insert("hn-whoishiring".into(), source(true, MIN_INTERVAL_API_S));
-        let due = due_sources(&sources, &BTreeMap::new(), at("2026-01-01T00:00:00Z"));
-        assert_eq!(due, vec!["hn-whoishiring".to_string()]);
-    }
-
-    #[test]
-    fn a_disabled_source_is_never_due() {
-        let mut sources = BTreeMap::new();
-        sources.insert("hn-whoishiring".into(), source(false, MIN_INTERVAL_API_S));
-        let due = due_sources(&sources, &BTreeMap::new(), at("2026-01-01T00:00:00Z"));
-        assert!(due.is_empty());
-    }
-
-    #[test]
-    fn a_source_run_within_its_interval_is_not_due_yet() {
-        let mut sources = BTreeMap::new();
-        sources.insert("hn-whoishiring".into(), source(true, 3600));
-        let mut last = BTreeMap::new();
-        last.insert("hn-whoishiring".to_string(), at("2026-01-01T00:00:00Z"));
-        let due = due_sources(&sources, &last, at("2026-01-01T00:30:00Z"));
-        assert!(due.is_empty(), "only 30 minutes have passed of a 1-hour interval");
-    }
-
-    #[test]
-    fn a_source_run_past_its_interval_is_due_again() {
-        let mut sources = BTreeMap::new();
-        sources.insert("hn-whoishiring".into(), source(true, 3600));
-        let mut last = BTreeMap::new();
-        last.insert("hn-whoishiring".to_string(), at("2026-01-01T00:00:00Z"));
-        let due = due_sources(&sources, &last, at("2026-01-01T01:00:01Z"));
-        assert_eq!(due, vec!["hn-whoishiring".to_string()]);
-    }
-
-    #[test]
     fn one_bad_source_does_not_stop_the_good_ones() {
-        // #126's review, B1: this used to make loading -- and so every `fetchers.tick`,
-        // `list` and `status` -- fail outright, so one typo stopped all fetching and (with
-        // the built-in scheduled-task-failed alert) popped a high-priority notification every
-        // five minutes.
+        // #126's review, B1: this used to make loading -- and so every `fetchers.list`/
+        // `.status` -- fail outright, so one typo stopped all fetching.
         let env = TestEnv::new("fetchers");
         write_source(
             &env,
@@ -865,10 +816,20 @@ mod tests {
         for id in ["bad", "also-bad", "wrong-type"] {
             assert!(loaded.problems.contains_key(id), "{id} should be reported: {:?}", loaded.problems);
         }
+    }
 
-        // And the good one is still schedulable.
-        let due = due_sources(&loaded.sources, &BTreeMap::new(), at("2026-01-01T00:00:00Z"));
-        assert_eq!(due, vec!["good".to_string()]);
+    #[test]
+    fn a_sources_own_state_toml_is_never_mistaken_for_a_source() {
+        let env = TestEnv::new("fetchers");
+        write_source(
+            &env,
+            "good",
+            json!({"enabled": true, "interval": "daily", "kind": "rss", "url": "https://example.test/f.xml"}),
+        );
+        save_schedule_state(&env.ctx, "good", "trig-1", at("2026-01-01T00:00:00Z")).unwrap();
+        let loaded = Sources::load(&env.ctx).unwrap();
+        assert_eq!(loaded.sources.keys().collect::<Vec<_>>(), vec!["good"]);
+        assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
     }
 
     #[test]
@@ -898,23 +859,10 @@ mod tests {
     }
 
     #[test]
-    fn a_last_run_in_the_future_reads_as_due_rather_than_stalling_the_source() {
-        // #126's review, B10: a clock correction, or a $SHIMMER_HOME copied from a machine
-        // running ahead, parked a source until that future time actually arrived.
-        let mut sources = BTreeMap::new();
-        sources.insert("hn-whoishiring".into(), source(true, 3600));
-        let mut last = BTreeMap::new();
-        last.insert("hn-whoishiring".to_string(), at("2026-02-01T00:00:00Z"));
-        let due = due_sources(&sources, &last, at("2026-01-01T00:00:00Z"));
-        assert_eq!(due, vec!["hn-whoishiring".to_string()], "a future last_run must not stall the source");
-    }
-
-    #[test]
     fn a_corrupt_last_run_file_does_not_stop_every_source() {
-        // #126's review, B1's other half: this returned `Err`, failing the whole tick.
         let env = TestEnv::new("fetchers");
         env.ctx.store.write(LAST_RUN_PATH, "this is not: valid toml [[[").unwrap();
-        assert!(load_last_run(&env.ctx).unwrap().is_empty(), "unreadable means every source is due, not an error");
+        assert!(load_last_run(&env.ctx).unwrap().is_empty(), "unreadable reads as empty, not an error");
         assert!(last_run_problem(&env.ctx).is_some(), "but it is reported, not silent");
 
         // A single unreadable entry keeps the good ones.
@@ -922,15 +870,6 @@ mod tests {
         let runs = load_last_run(&env.ctx).unwrap();
         assert_eq!(runs.keys().collect::<Vec<_>>(), vec!["good"]);
         assert!(last_run_problem(&env.ctx).is_some_and(|p| p.contains("bad")));
-    }
-
-    #[test]
-    fn trigger_shape_matches_adr_0028() {
-        let t = trigger();
-        assert_eq!(t.op, TICK_OP);
-        assert_eq!(t.schedule, Schedule::Every(TICK_INTERVAL));
-        assert_eq!(t.catch_up, CatchUp::Skip);
-        assert!(t.lane.is_none(), "defers to fetchers.tick's own CommandSpec lane");
     }
 
     #[test]
