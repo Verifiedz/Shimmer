@@ -88,6 +88,7 @@ label = "Short"
 "fcp"        = "fetchers.copy"
 "ftpl"       = "fetchers.templates"
 "fpeek"      = "fetchers.peek"
+"freload"    = "fetchers.reload"
 # automations (ADR 0035)
 "alist"    = "automations.list"
 "aget"     = "automations.show"
