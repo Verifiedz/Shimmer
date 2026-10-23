@@ -89,9 +89,11 @@ pub fn load(ctx: &Ctx, source: &str) -> Result<SeenSet> {
     }
 }
 
-/// Prevents a scheduled tick and a manual `fetchers.run` for the same source running at
-/// once (ADR 0028 §5). In-process only -- correct because there is exactly one daemon
-/// process per `$SHIMMER_HOME` (CLAUDE.md §1.6, "one writer").
+/// Prevents a source's own schedule firing and a manual `fetchers.run` for the same source
+/// running at once (ADR 0028 §5/§6) -- the one remaining overlap risk once each source has
+/// exactly one pending schedule (ADR 0028 §6: "the one remaining case"). In-process only --
+/// correct because there is exactly one daemon process per `$SHIMMER_HOME` (CLAUDE.md §1.6,
+/// "one writer").
 #[derive(Default)]
 pub struct RunGuard(Mutex<HashSet<String>>);
 
@@ -103,9 +105,9 @@ impl RunGuard {
         running.insert(source.to_owned()).then(|| RunPermit { guard: self, source: source.to_owned() })
     }
 
-    /// A non-mutating peek, for a caller (the tick handler) that only wants to skip enqueuing
-    /// a source it can already see is running -- an optimization, never the actual guarantee,
-    /// which is [`RunGuard::try_acquire`] at the point a run actually starts.
+    /// A non-mutating peek, for `fetchers.list`/`.show` to report whether a source is
+    /// currently mid-fetch -- not the overlap guarantee itself, which is
+    /// [`RunGuard::try_acquire`] at the point a run actually starts.
     pub fn is_running(&self, source: &str) -> bool {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).contains(source)
     }

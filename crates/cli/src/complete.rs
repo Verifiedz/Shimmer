@@ -687,8 +687,10 @@ impl Groups {
                     self.add("fields", "fields", f["name"].as_str().unwrap_or_default(), field_type(&f));
                 }
             }
-            ("records" | "workspaces" | "automations", "TEMPLATE") => self.templates(module, source).await,
-            ("records" | "workspaces" | "automations", "CATEGORY") => self.categories(module, source).await,
+            ("records" | "workspaces" | "automations" | "fetchers", "TEMPLATE") => self.templates(module, source).await,
+            ("records" | "workspaces" | "automations" | "fetchers", "CATEGORY") => {
+                self.categories(module, source).await
+            }
             ("workspaces", "NAME") if command != "new" => self.workspaces(source).await,
             ("packs", "NAME") | ("", "NAME") => self.packs(cx),
             ("packs", "NAME|FOLDER") => {

@@ -140,8 +140,8 @@ Every op declares an `execution` in `core.manifest`:
 
 ```jsonc
 // → a queued op
-{"v":2,"kind":"request","id":"r2","op":"fetchers.run",
- "params":{"source":"hn-whoishiring"}}
+{"v":2,"kind":"request","id":"r2","op":"fetchers.run_task",
+ "params":{"id":"hn-whoishiring"}}
 
 // ← accepted, not completed
 {"v":2,"kind":"response","id":"r2","ok":true,
@@ -157,8 +157,8 @@ Queue behaviour is orthogonal to the op, so it lives on the **frame**, not in `p
 Ops with `execution: inline` ignore it.
 
 ```jsonc
-{"v":2,"kind":"request","id":"r3","op":"fetchers.run",
- "params":{"source":"linkedin"},
+{"v":2,"kind":"request","id":"r3","op":"fetchers.run_task",
+ "params":{"id":"linkedin"},
  "queue":{"priority":"override","confirm":false}}
 ```
 
@@ -215,8 +215,8 @@ no server-side pending state — the daemon holds nothing between the two reques
 
 ```jsonc
 // → 1. ask to jump the lane
-{"v":2,"kind":"request","id":"p1","op":"fetchers.run",
- "params":{"source":"linkedin"},
+{"v":2,"kind":"request","id":"p1","op":"fetchers.run_task",
+ "params":{"id":"linkedin"},
  "queue":{"priority":"override"}}
 
 // ← 2. refused pending confirmation, with what it would cost
@@ -225,13 +225,13 @@ no server-side pending state — the daemon holds nothing between the two reques
   "message":"would displace 3 scheduled tasks in lane 'fetchers'",
   "detail":{"lane":"fetchers","queue_version":41,
     "would_displace":[
-      {"task_id":"01JD2P…","op":"fetchers.run","priority":"scheduled"},
-      {"task_id":"01JD2Q…","op":"fetchers.run","priority":"scheduled"},
-      {"task_id":"01JD2R…","op":"fetchers.run","priority":"scheduled"}]}}}
+      {"task_id":"01JD2P…","op":"fetchers.run_task","priority":"scheduled"},
+      {"task_id":"01JD2Q…","op":"fetchers.run_task","priority":"scheduled"},
+      {"task_id":"01JD2R…","op":"fetchers.run_task","priority":"scheduled"}]}}}
 
 // → 3. user agreed; echo the queue_version you showed them
-{"v":2,"kind":"request","id":"p2","op":"fetchers.run",
- "params":{"source":"linkedin"},
+{"v":2,"kind":"request","id":"p2","op":"fetchers.run_task",
+ "params":{"id":"linkedin"},
  "queue":{"priority":"override","confirm":true,"queue_version":41}}
 
 // ← 4. accepted
@@ -508,13 +508,35 @@ record only (`conflict` on `records.add`, `records.update`, or `records.complete
 
 ## Fetchers ops
 
+A source is a file, `data/fetchers/sources/<id>.toml` (ADR 0028 §4): `[source]` (`label`?,
+`kind`, `enabled`, `interval`, `filter`?) and `[kind]` (that kind's own fields — `rss` needs
+`url`; `json-api` needs `url`/`items_path`/`id_field`/`title_field`/`url_field`;
+`hn-whoishiring` needs none; `wwr` needs `category`). There is no fixed, compiled-in
+registry (ADR 0028 §10): every source names a `kind`, however it got there — written by
+hand, through `fetchers.new`'s structured shape, or from one of the five starter templates
+`fetchers.templates`/`.peek` list. A fresh install's `fetchers.list` is empty.
+
 | Op | Execution | Params | Returns |
 |---|---|---|---|
-| `fetchers.tick` | queued (`fetchers`) | `{}` | `{"enqueued":[…],"already_running":[…]}`, each a source id. The scheduler heartbeat trigger (every 5 minutes, ADR 0028 §5) — not meant to be called by hand, but not refused either. Enqueues `fetchers.run` for every configured, enabled source whose interval has elapsed since its last run, skipping (into `already_running`) a source already mid-fetch. |
-| `fetchers.run` | queued (`fetchers`) | `{"source","title_contains"?,"title_excludes"?}` | `{"source","new_items"}`. Fetches one source now — the fixed, compiled-in registry or a configured `kind` (e.g. `"rss"`), ADR 0028 §2a — through to completion: pages (capped at 10), dedupes against that source's own seen-id set, and emits one `fetchers.item.found` per genuinely new item. `title_contains`/`title_excludes` (ADR 0028 §14), when either is given, replace — never merge with — the source's own `[modules.fetchers.sources.<id>]` filter (§13) for this one call. `not_found` for an unknown source id; `module_error` ("already fetching") if a run for the same source is already in flight. Always records the attempt (even on failure) so a broken source waits a full interval before being retried, rather than being hammered every tick. |
-| `fetchers.list` | inline | `{}` | `{"sources":[{"id","method","kind","enabled","interval_s"}…]}`, one entry per source `fetchers.status`/`fetchers.run` could ever resolve — the fixed registry plus every configured `kind` instance (ADR 0028 §2a). `kind`/`interval_s` are `null` for a fixed source with no `[modules.fetchers.sources.<id>]` entry of its own. Backs `shimmer fetchers list` (ADR 0028 §11). |
-| `fetchers.status` | inline | `{}` | `{"sources":[{"id","last_run_at","running"}…]}` over the same source universe as `fetchers.list`. `last_run_at` is `null` for a source never fetched. Backs `shimmer fetchers status` (ADR 0028 §11). |
-| `fetchers.test` | queued (`fetchers`) | `{"source","title_contains"?,"title_excludes"?}` | `{"source","items":[{source_name,source_id,title,url,raw_data}…]}`. Fetches exactly one page and returns its parsed items — never touches `seen.toml`, `last_run.toml`, or the overlap guard, and emits no `fetchers.item.found`; a dry run only. `title_contains`/`title_excludes` work exactly as in `fetchers.run` above (ADR 0028 §13/§14). Backs `shimmer fetchers test` (ADR 0028 §11). |
+| `fetchers.run` | inline | `{"id","filter"?}` | `{"queued":true,"task_id","lane","position"}`. Checks the source exists before enqueuing `fetchers.run_task` for the real fetch, so an unknown id is refused with `not_found` immediately rather than acking "queued" and failing silently once the task runs (ADR 0028 §9). `filter` (a `core::filter::Filter`, ADR 0028 §8/§14), when given, replaces — never merges with — the source's own file filter for this one call. |
+| `fetchers.run_task` | queued (`fetchers`) | `{"id","filter"?}` | `{"source","new_items"}`. Internal — `fetchers.run` enqueues this after checking the source exists, and this is also what a source's own schedule fires directly (ADR 0028 §6: no fixed heartbeat; each enabled source keeps exactly one pending `ctx.schedules` entry of its own, recomputed whenever the source is created/edited/enabled/disabled/renamed/restored, and after every run finishes). Fetches one source, through its configured `kind` (ADR 0028 §2a/§10), through to completion: pages (capped at 10), dedupes against that source's own seen-id set, and emits one `fetchers.item.found` per genuinely new item. `not_found` for an unknown source id; `module_error` ("already fetching") if a run for the same source is already in flight. Always records the attempt (even on failure) so a broken source waits a full interval before being retried. |
+| `fetchers.list` | inline | `{"removed"?}` | `{"sources":[{"id","label","method","kind","enabled","interval_s","filter","last_run_at","running"}…],"problems":[{"id","problem"}…]}`, one entry per configured source (ADR 0028 §10), read from the module's own in-memory cache (ADR 0028 §5), not re-scanned from disk on every call. `last_run_at` is `null` for a source never fetched. A fresh install's `sources` is empty. With `"removed":true`: `{"removed":[id…]}` instead — every removed source's id, to restore or purge (ADR 0038 §3). Backs `shimmer fetchers list`. |
+| `fetchers.show` | inline | `{"id"}` | A source in full: the same per-source shape `fetchers.list` has, plus `"text"` (its file's raw contents). `not_found` for an unknown id; `invalid_params` if its file exists but doesn't parse. Backs `shimmer fetchers show`. |
+| `fetchers.status` | inline | `{}` | `{"sources","enabled","disabled","problems":[{"id","problem"}…]}` — the whole feature at a glance (how many sources exist, how many are enabled), not per-source (that's `fetchers.list`/`fetchers.show`). Backs `shimmer fetchers status`. |
+| `fetchers.test` | queued (`fetchers`) | `{"id","filter"?}` | `{"source","items":[{source_name,source_id,title,url,raw_data}…]}`. Fetches exactly one page and returns its parsed items — never touches `seen.toml`, `last_run.toml`, or the overlap guard, and emits no `fetchers.item.found`; a dry run only. `filter` works exactly as in `fetchers.run` above. Backs `shimmer fetchers test`. |
+| `fetchers.new` | inline | `{"id","kind","interval","label"?,"enabled"?,"params"?,"filter"?}` **or** `{"id","template","values"?,"preview"?}` (ADR 0028 §10) | A source's view (`fetchers.show`'s own shape, minus `"text"`), under `"source"` for the template shape. `params`/`[kind]` is checked by that kind's own `Kind::parse` before anything is written; a template's answers are checked by its own questions, the same way. `preview: true` (template shape only) returns `{"preview":true,"template","source":{"id","text"}}` without writing anything. `conflict` if `id` already exists; `invalid_params` for anything that fails validation, or for mixing the two shapes (nothing is written either way). Backs `shimmer fetchers new`. |
+| `fetchers.templates` | inline | `{}` | `{"categories":[{"id","label"}…],"templates":[{"id","label","description","category","kind","good_to_know","questions","text"}…]}` — the five starter templates (ADR 0028 §10). Backs `shimmer fetchers templates`. |
+| `fetchers.peek` | inline | `{"id"}` | The same shape as `fetchers.templates`, with exactly one template. `not_found` naming the others when there's no such template. Backs `shimmer fetchers peek`. |
+| `fetchers.edit` | inline | `{"id","text"}` | `fetchers.show`'s own shape. The *whole* replacement file text, same as `automations.edit` (amended by #305's review — a structured shape like `fetchers.new`'s meant re-passing every flag just to change one, with whatever you forgot to retype silently reset). There is no template path for `edit`. `not_found` for an unknown id; `invalid_params` for text that doesn't parse (the old file is kept). Backs `shimmer fetchers edit`. |
+| `fetchers.health` | inline | `{}` | `{"checks":[…]}` in ADR 0033's shape: a `fail` for each source file that won't load (fix: edit or remove its file by hand), a `warn` for each source whose most recent run failed (fix: `fetchers.show` on it) or whose `last_run.toml` entry is unreadable, or one `ok` line. Cleared by the next successful run (ADR 0028 §11) — read fresh every call, never accumulated. Writes nothing. No CLI command of its own; discovered by `shimmer doctor` via `core.manifest`, the same as every other module's `.health`. |
+| `fetchers.items` | inline | `{"source"?,"contains"?,"excludes"?}` | `{"items":[{source_name,source_id,title,url,raw_data}…]}`, most recent first. Answered from the module's own capped log (ADR 0042; `automations.history`'s precedent, not `core.events.list`), not the event log — up to the last 1000 items found across every source. `source` keeps only that source's items; `contains`/`excludes` are a plain case-insensitive title substring narrowing (OR'd within each list, excludes wins), not a `core::filter::Filter`. Backs `shimmer fetchers items`. |
+| `fetchers.remove` | inline | `{"id"}` | `{"removed":true,"source"}`. Moves the source's file to `removed/` (restore brings it back); `not_found` if `id` doesn't exist; `conflict` if it's fetching right now. Backs `shimmer fetchers remove`. |
+| `fetchers.restore` | inline | `{"id"}` | `{"restored":true,"source"?,"problem"?}` — `source` (the usual view) when the restored file still parses, otherwise `null` with `problem` naming why. `not_found` if nothing removed matches `id`; `conflict` if a source `id` already exists again. Backs `shimmer fetchers restore`. |
+| `fetchers.purge` | inline | `{"id"?,"confirm"?}` | `{"purged":N}`. One removed source, or (with no `id`) every one — asks first, same shape as `records.purge`/`automations.purge`: without a matching `confirm`, `confirmation_required` with `{"sources":N}` in `detail`; re-sent with that same object to actually delete. Also deletes that source's dedup state (`<id>/seen.toml`) and its `last_run.toml` entry, so a new source reusing the id starts clean. `{"purged":0}` without asking when there's nothing removed; `not_found` for an `id` that isn't removed. Backs `shimmer fetchers purge`. |
+| `fetchers.enable` / `.disable` | inline | `{"id"}` | The usual source view, `"enabled"` flipped. `not_found` for an unknown id. Backs `shimmer fetchers enable`/`disable`. |
+| `fetchers.rename` | inline | `{"id","to"}` | The usual source view, under `to`. Moves the source's file, its dedup state (`<id>/seen.toml`), its `last_run.toml` entry, and its `items.json` entries (ADR 0042, #315's review) together (ADR 0028 §7), so none of that resets or gets stranded under the old id. `conflict` if `to` already exists, `id` equals `to`, or `id` is fetching right now (renaming mid-fetch would duplicate that run's items, #305's review); `not_found` if `id` doesn't exist. Backs `shimmer fetchers rename`. |
+| `fetchers.copy` | inline | `{"id","to","label"?}` | The usual source view, under `to`, switched off — starting with no dedup or last-run state of its own (a new definition, not a continuation). `conflict` if `to` already exists, `id` equals `to`, or `id` is fetching right now; `not_found` if `id` doesn't exist. Backs `shimmer fetchers copy`. |
+| `fetchers.reload` | inline | `{}` | `{"sources":N,"problems":[{"id","problem"}…]}`. Re-reads every `data/fetchers/sources/*.toml` (ADR 0028 §5) — needed after hand-editing a source file, since the module otherwise only reads them at daemon start. |
 
 A fetch's failure reaches the client as `queue.task.failed` like any other queued op, and
 additionally as `fetchers.fetch.failed` on the bus (see the topic catalogue below) — the
@@ -714,7 +736,7 @@ Connect, discover, subscribe, enqueue, watch it run.
 → {"v":2,"kind":"subscribe","id":"2","topics":["queue.*","fetchers.*"]}
 ← {"v":2,"kind":"response","id":"2","ok":true,"data":{"subscribed":2}}
 
-→ {"v":2,"kind":"request","id":"3","op":"fetchers.run","params":{"source":"hn-whoishiring"}}
+→ {"v":2,"kind":"request","id":"3","op":"fetchers.run","params":{"id":"hn-whoishiring"}}
 ← {"v":2,"kind":"response","id":"3","ok":true,
    "data":{"queued":true,"task_id":"01JD2N…","lane":"fetchers","position":1}}
 

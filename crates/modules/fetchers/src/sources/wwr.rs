@@ -5,48 +5,86 @@
 //! `/categories/remote-full-stack-programming-jobs` page that day (see
 //! `tests/fixtures/wwr/full_stack.html` for a trimmed snapshot).
 //!
-//! Pagination walks a fixed, software-engineering-focused rotation of the site's own
-//! category slugs -- there is no `?page=` on a category page (a category lists everything
-//! in one page), so a page number would be invented, not real. Re-check these slugs
-//! occasionally: WWR has renamed or merged categories before.
+//! One source, one category (the `wwr` kind's own `category` field) -- there is no `?page=`
+//! on a category page (a category lists everything in one page), so tracking several
+//! categories means making several sources, each its own id, rather than one source cycling
+//! through a fixed, compiled-in list the way this did before ADR 0028 §10.
 
 use async_trait::async_trait;
 use serde_json::json;
 use shimmer_core::{Ctx, Error, Result};
 
+use crate::kind::{Kind, KindConfig};
 use crate::source::{Method, Page, RawItem, Source};
 use crate::{html, http, robots};
 
 const BASE: &str = "https://weworkremotely.com";
 
-const CATEGORIES: &[&str] = &[
-    "remote-full-stack-programming-jobs",
-    "remote-front-end-programming-jobs",
-    "remote-back-end-programming-jobs",
-    "remote-devops-sysadmin-jobs",
-];
+pub struct WeWorkRemotely {
+    id: String,
+    /// The category's own url slug, e.g. `remote-full-stack-programming-jobs` -- one source
+    /// per category (ADR 0028 §10): tracking several means making several sources, each with
+    /// its own id and its own dedup/schedule state, rather than one source silently cycling
+    /// through a fixed, compiled-in list of them.
+    category: String,
+}
 
-pub struct WeWorkRemotely;
+impl WeWorkRemotely {
+    pub fn new(id: String, category: String) -> Self {
+        Self { id, category }
+    }
+}
 
-#[async_trait]
-impl Source for WeWorkRemotely {
-    fn id(&self) -> &str {
-        "weworkremotely"
+/// The `wwr` kind (ADR 0028 §10): one required field, `category` (the url slug after
+/// `/categories/`, e.g. `remote-full-stack-programming-jobs`).
+pub struct WwrKind;
+
+const WWR_FIELDS: &[&str] = &["category"];
+
+impl Kind for WwrKind {
+    fn name(&self) -> &'static str {
+        "wwr"
     }
 
     fn method(&self) -> Method {
         Method::Scrape
     }
 
-    async fn fetch_page(&self, ctx: &Ctx, cursor: Option<&str>) -> Result<Page> {
-        let index = match cursor {
-            Some(c) => c.parse::<usize>().map_err(|_| Error::invalid_params(format!("bad cursor '{c}'")))?,
-            None => 0,
-        };
-        let Some(&category) = CATEGORIES.get(index) else {
-            return Ok(Page::default());
-        };
-        let url = format!("{BASE}/categories/{category}");
+    fn parse(
+        &self,
+        params: &serde_json::Map<String, serde_json::Value>,
+    ) -> std::result::Result<Box<dyn KindConfig>, String> {
+        crate::kind::reject_unknown(params, WWR_FIELDS)?;
+        let category = crate::kind::required_str(params, "category")?;
+        Ok(Box::new(WwrConfig { category }))
+    }
+}
+
+#[derive(Debug)]
+struct WwrConfig {
+    category: String,
+}
+
+impl KindConfig for WwrConfig {
+    fn build(&self, id: String) -> std::sync::Arc<dyn Source> {
+        std::sync::Arc::new(WeWorkRemotely::new(id, self.category.clone()))
+    }
+}
+
+#[async_trait]
+impl Source for WeWorkRemotely {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn method(&self) -> Method {
+        Method::Scrape
+    }
+
+    /// One category is one page -- WWR's own category listing has no further pagination
+    /// (confirmed live, ADR 0028 §10), so this never returns a `next_cursor`.
+    async fn fetch_page(&self, ctx: &Ctx, _cursor: Option<&str>) -> Result<Page> {
+        let url = format!("{BASE}/categories/{}", self.category);
 
         // Method::Scrape's own obligation (ADR 0028 §7): the host has no way to know this
         // URL ahead of time to check it centrally, so the source checks it itself.
@@ -72,12 +110,11 @@ impl Source for WeWorkRemotely {
                 source_id: href.to_owned(),
                 title: label,
                 url: format!("{BASE}{href}"),
-                raw_data: json!({"category": category, "company": company, "title": title}),
+                raw_data: json!({"category": self.category, "company": company, "title": title}),
             });
         }
 
-        let next_cursor = (index + 1 < CATEGORIES.len()).then(|| (index + 1).to_string());
-        Ok(Page { items, next_cursor, ..Page::default() })
+        Ok(Page { items, ..Page::default() })
     }
 }
 
@@ -109,10 +146,24 @@ mod tests {
         stub(env, &format!("{BASE}/robots.txt"), ok("User-agent: *\nAllow: /\n"));
     }
 
+    fn wwr(category: &str) -> WeWorkRemotely {
+        WeWorkRemotely::new("my-wwr".into(), category.into())
+    }
+
     #[test]
-    fn id_is_weworkremotely_and_method_is_scrape() {
-        assert_eq!(WeWorkRemotely.id(), "weworkremotely");
-        assert_eq!(WeWorkRemotely.method(), Method::Scrape);
+    fn id_is_whatever_it_was_constructed_with_and_method_is_scrape() {
+        let w = wwr("remote-full-stack-programming-jobs");
+        assert_eq!(w.id(), "my-wwr");
+        assert_eq!(w.method(), Method::Scrape);
+    }
+
+    #[test]
+    fn wwr_kind_requires_a_category_and_rejects_anything_else() {
+        let params = json!({"category": "remote-devops-sysadmin-jobs"}).as_object().unwrap().clone();
+        assert!(WwrKind.parse(&params).is_ok());
+        assert!(WwrKind.parse(&serde_json::Map::new()).is_err());
+        let extra = json!({"category": "x", "nope": true}).as_object().unwrap().clone();
+        assert!(WwrKind.parse(&extra).is_err());
     }
 
     #[tokio::test]
@@ -121,7 +172,7 @@ mod tests {
         allow_robots(&env);
         stub(&env, &format!("{BASE}/categories/remote-full-stack-programming-jobs"), ok(FULL_STACK_PAGE));
 
-        let page = WeWorkRemotely.fetch_page(&env.ctx, None).await.unwrap();
+        let page = wwr("remote-full-stack-programming-jobs").fetch_page(&env.ctx, None).await.unwrap();
         assert_eq!(page.items.len(), 2);
         assert_eq!(page.items[0].source_id, "/remote-jobs/lemon-io-senior-angular-full-stack-developer");
         assert_eq!(
@@ -130,29 +181,7 @@ mod tests {
         );
         assert_eq!(page.items[0].title, "Lemon.io -- Senior Angular Full-stack Developer");
         assert_eq!(page.items[1].title, "Toggl -- Senior Full Stack");
-        assert_eq!(page.next_cursor, Some("1".to_string()));
-    }
-
-    #[tokio::test]
-    async fn the_cursor_walks_every_category_then_stops() {
-        let env = TestEnv::new("fetchers");
-        allow_robots(&env);
-        for category in CATEGORIES {
-            stub(&env, &format!("{BASE}/categories/{category}"), ok(FULL_STACK_PAGE));
-        }
-
-        let mut cursor = None;
-        let mut pages = 0;
-        loop {
-            let page = WeWorkRemotely.fetch_page(&env.ctx, cursor.as_deref()).await.unwrap();
-            pages += 1;
-            match page.next_cursor {
-                Some(next) => cursor = Some(next),
-                None => break,
-            }
-            assert!(pages <= CATEGORIES.len(), "must not cycle past the last category");
-        }
-        assert_eq!(pages, CATEGORIES.len());
+        assert!(page.next_cursor.is_none(), "a category page has no further pagination");
     }
 
     #[tokio::test]
@@ -161,7 +190,7 @@ mod tests {
         stub(&env, &format!("{BASE}/robots.txt"), ok("User-agent: *\nDisallow: /categories/\n"));
         // Deliberately no stub for the category page itself -- if the refusal were
         // downgraded to a warning and fetched anyway, this would fail with "no stub for...".
-        let err = WeWorkRemotely.fetch_page(&env.ctx, None).await.unwrap_err();
+        let err = wwr("remote-full-stack-programming-jobs").fetch_page(&env.ctx, None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::ModuleError);
         assert!(err.message.contains("robots.txt"), "{}", err.message);
     }
@@ -172,7 +201,7 @@ mod tests {
         allow_robots(&env);
         stub(&env, &format!("{BASE}/categories/remote-full-stack-programming-jobs"), ok(EMPTY_SHELL_PAGE));
 
-        let err = WeWorkRemotely.fetch_page(&env.ctx, None).await.unwrap_err();
+        let err = wwr("remote-full-stack-programming-jobs").fetch_page(&env.ctx, None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::ModuleError);
         assert!(err.message.contains("job listings"), "{}", err.message);
     }
