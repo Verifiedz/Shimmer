@@ -4,10 +4,10 @@
 //! [`KindConfig`], plus one line in [`kinds`], never an edit to another kind's file or to
 //! either of those shared dispatchers.
 //!
-//! `hn-whoishiring`/`weworkremotely` are **not** `Kind`s yet -- they stay the fixed,
-//! compiled-in `Source`s `crate::source::registry` already has, unchanged. They have no config
-//! fields of their own (the actual flat-struct problem this fixes), so there is nothing to
-//! migrate until ADR 0028 §10 gives them a real `kind = "..."` config entry of their own.
+//! `hn-whoishiring` and `wwr` are `Kind`s too, as of ADR 0028 §10 -- there is no fixed,
+//! compiled-in registry any more. `HnKind` has no fields of its own; `WwrKind` has one
+//! (`category`), since "which category" used to be a hardcoded list this source cycled
+//! through rather than a per-source setting.
 
 use std::sync::Arc;
 
@@ -23,10 +23,10 @@ pub trait Kind: Send + Sync {
     fn name(&self) -> &'static str;
     fn method(&self) -> Method;
     /// `params` is everything in a source's config entry that isn't `enabled`/`interval`/
-    /// `kind`/`title_contains`/`title_excludes` (`SourceConfig::kind_params`) -- this kind's
-    /// own fields, and nothing else. The message on `Err` is kind-local, no `sources.<id>:`
-    /// prefix -- the caller (`schedule.rs`/`source.rs`) adds that context, so a kind's own
-    /// file never needs to know which source id it's validating.
+    /// `kind`/`filter` (`SourceConfig::kind_params`) -- this kind's own fields, and nothing
+    /// else. The message on `Err` is kind-local, no `sources.<id>:` prefix -- the caller
+    /// (`schedule.rs`/`source.rs`) adds that context, so a kind's own file never needs to
+    /// know which source id it's validating.
     fn parse(&self, params: &Map<String, Value>) -> std::result::Result<Box<dyn KindConfig>, String>;
 }
 
@@ -36,9 +36,14 @@ pub trait KindConfig: Send + Sync + std::fmt::Debug {
     fn build(&self, id: String) -> Arc<dyn Source>;
 }
 
-/// Every generic kind a source's config may name. Adding one is adding a line here.
+/// Every kind a source's config may name. Adding one is adding a line here.
 pub fn kinds() -> Vec<Box<dyn Kind>> {
-    vec![Box::new(crate::sources::rss::RssKind), Box::new(crate::sources::json_api::JsonApiKind)]
+    vec![
+        Box::new(crate::sources::rss::RssKind),
+        Box::new(crate::sources::json_api::JsonApiKind),
+        Box::new(crate::sources::hn::HnKind),
+        Box::new(crate::sources::wwr::WwrKind),
+    ]
 }
 
 pub fn kind(name: &str) -> Option<Box<dyn Kind>> {
@@ -106,15 +111,17 @@ mod tests {
     #[test]
     fn kinds_has_every_generic_kind_and_only_those() {
         let names: Vec<_> = kinds().iter().map(|k| k.name()).collect();
-        assert_eq!(names, vec!["rss", "json-api"]);
+        assert_eq!(names, vec!["rss", "json-api", "hn-whoishiring", "wwr"]);
         assert!(kind("rss").is_some());
         assert!(kind("json-api").is_some());
+        assert!(kind("hn-whoishiring").is_some());
+        assert!(kind("wwr").is_some());
         assert!(kind("carrier-pigeon").is_none());
     }
 
     #[test]
     fn known_names_lists_every_kind() {
-        assert_eq!(known_names(), "rss, json-api");
+        assert_eq!(known_names(), "rss, json-api, hn-whoishiring, wwr");
     }
 
     #[test]

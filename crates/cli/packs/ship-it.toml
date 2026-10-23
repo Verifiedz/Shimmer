@@ -85,6 +85,8 @@ label = "Ship It"
 "source-off"     = "fetchers.disable"
 "relabel-source" = "fetchers.rename"
 "clone-source"   = "fetchers.copy"
+"starters"       = "fetchers.templates"
+"preview-starter" = "fetchers.peek"
 # automations (ADR 0035)
 "hooks"         = "automations.list"
 "inspect-hook"  = "automations.show"

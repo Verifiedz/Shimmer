@@ -86,6 +86,8 @@ label = "Short"
 "foff"       = "fetchers.disable"
 "fmv"        = "fetchers.rename"
 "fcp"        = "fetchers.copy"
+"ftpl"       = "fetchers.templates"
+"fpeek"      = "fetchers.peek"
 # automations (ADR 0035)
 "alist"    = "automations.list"
 "aget"     = "automations.show"

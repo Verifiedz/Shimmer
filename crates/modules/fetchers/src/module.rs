@@ -41,6 +41,8 @@ pub const ENABLE_OP: &str = "fetchers.enable";
 pub const DISABLE_OP: &str = "fetchers.disable";
 pub const RENAME_OP: &str = "fetchers.rename";
 pub const COPY_OP: &str = "fetchers.copy";
+pub const TEMPLATES_OP: &str = "fetchers.templates";
+pub const PEEK_OP: &str = "fetchers.peek";
 
 /// Caps `fetchers.item.found`'s `raw_data` (ADR 0028 §3) -- big enough for a job posting's
 /// text, small enough that one large item can't become the next cache-bloat problem.
@@ -187,8 +189,20 @@ impl Module for Fetchers {
             },
             CommandSpec {
                 op: NEW_OP.into(),
-                summary: "Make a new source".into(),
-                params_schema: source_input_schema(),
+                summary: "Make a new source, from its own kind/interval or from a template's answers".into(),
+                params_schema: new_input_schema(),
+                execution: Execution::Inline,
+            },
+            CommandSpec {
+                op: TEMPLATES_OP.into(),
+                summary: "Ready-made sources to make from a few answers, by category".into(),
+                params_schema: json!({"type": "object", "properties": {}}),
+                execution: Execution::Inline,
+            },
+            CommandSpec {
+                op: PEEK_OP.into(),
+                summary: "Everything about one template: what it does, what to know, its questions".into(),
+                params_schema: json!({"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}}),
                 execution: Execution::Inline,
             },
             CommandSpec {
@@ -286,8 +300,13 @@ impl Module for Fetchers {
                 Ok(json!({"sources": st.sources.len(), "problems": problems_of(&st)}))
             }
             NEW_OP => {
-                let p: SourceInput = decode(params)?;
+                let p: NewParams = decode(params)?;
                 self.create(ctx, p)
+            }
+            TEMPLATES_OP => templates_reply(None),
+            PEEK_OP => {
+                let p: Id = decode(params)?;
+                templates_reply(Some(&p.id))
             }
             EDIT_OP => {
                 let p: EditInput = decode(params)?;
@@ -354,16 +373,14 @@ struct ListParams {
 /// `fetchers.new`/`.edit`'s params (ADR 0028 §9): a source's complete settings, structured
 /// rather than raw file text -- `kind`'s own fields are validated by `Kind::parse` the same
 /// way a hand-edited file's `[kind]` table is, through `schedule::render` then
-/// `SourceConfig::parse` (one validation path for both). `kind` stays optional for now: the
-/// fixed, compiled-in registry (`source::registry`) is only removed in ADR 0028 §10, a later
-/// step, and a bare entry for one of those ids must keep working until then.
+/// `SourceConfig::parse` (one validation path for both). `kind` is required: there is no
+/// fixed, compiled-in registry to fall back to (ADR 0028 §10).
 #[derive(Clone, Deserialize)]
 struct SourceInput {
     id: String,
     #[serde(default)]
     label: Option<String>,
-    #[serde(default)]
-    kind: Option<String>,
+    kind: String,
     #[serde(default)]
     enabled: bool,
     interval: schedule::IntervalSpec,
@@ -375,9 +392,44 @@ struct SourceInput {
     filter: Option<Map<String, Value>>,
 }
 
-fn source_input_schema() -> Value {
+/// `fetchers.edit`'s params (ADR 0028 §9, amended by #305's review): the whole replacement
+/// file text, same shape as `automations.edit`'s -- not a `SourceInput`, so nothing not
+/// explicitly retyped is silently reset.
+#[derive(Deserialize)]
+struct EditInput {
+    id: String,
+    text: String,
+}
+
+/// `fetchers.new`'s own params (ADR 0028 §9/§10): the same shape as [`SourceInput`] above, or
+/// `{"id","template","values","preview"?}` -- the two are mutually exclusive, which
+/// `Fetchers::create` is what actually enforces. `kind`/`interval` are `Option` here, unlike
+/// `SourceInput`, precisely so a template-only payload (naming neither) still decodes.
+#[derive(Deserialize)]
+struct NewParams {
+    id: String,
+    #[serde(default)]
+    label: Option<String>,
+    kind: Option<String>,
+    #[serde(default)]
+    enabled: bool,
+    interval: Option<schedule::IntervalSpec>,
+    #[serde(default)]
+    params: Map<String, Value>,
+    #[serde(default)]
+    filter: Option<Map<String, Value>>,
+    /// The template path (ADR 0028 §10): mutually exclusive with `kind`/`interval`/`params`.
+    template: Option<String>,
+    #[serde(default)]
+    values: Map<String, Value>,
+    /// With a template: the source it would make, without making it.
+    #[serde(default)]
+    preview: bool,
+}
+
+fn new_input_schema() -> Value {
     json!({
-        "type": "object", "required": ["id", "interval"],
+        "type": "object", "required": ["id"],
         "properties": {
             "id": {"type": "string"},
             "label": {"type": "string"},
@@ -386,17 +438,32 @@ fn source_input_schema() -> Value {
             "interval": {},
             "params": {"type": "object"},
             "filter": {"type": "object"},
+            "template": {"type": "string"},
+            "values": {"type": "object"},
+            "preview": {"type": "boolean"},
         },
     })
 }
 
-/// `fetchers.edit`'s params (ADR 0028 §9, amended by #305's review): the whole replacement
-/// file text, same shape as `automations.edit`'s -- not a `SourceInput`, so nothing not
-/// explicitly retyped is silently reset.
-#[derive(Deserialize)]
-struct EditInput {
-    id: String,
-    text: String,
+/// `fetchers.templates`/`.peek` (ADR 0028 §10): every built-in template, or (with `id`) one of
+/// them -- `not_found` naming the others when there's no such template. One function for both
+/// ops, the same way `automations::templates` handles its own optional id.
+fn templates_reply(id: Option<&str>) -> Result<Value> {
+    let all = crate::template::builtin();
+    let templates: Vec<Value> = match id {
+        None => all.iter().map(crate::template::Template::to_wire).collect(),
+        Some(id) => {
+            let names: Vec<&str> = all.iter().map(|t| t.id.as_str()).collect();
+            vec![all
+                .iter()
+                .find(|t| t.id == id)
+                .ok_or_else(|| Error::not_found(format!("no template '{id}' (there are: {})", names.join(", "))))?
+                .to_wire()]
+        }
+    };
+    let categories: Vec<Value> =
+        crate::template::CATEGORIES.iter().map(|(id, label)| json!({"id": id, "label": label})).collect();
+    Ok(json!({"categories": categories, "templates": templates}))
 }
 
 #[derive(Deserialize)]
@@ -603,7 +670,7 @@ impl Fetchers {
                     "id": id,
                     "label": cfg.and_then(|c| c.label.clone()),
                     "method": match s.method() { source::Method::Api => "api", source::Method::Scrape => "scrape" },
-                    "kind": cfg.and_then(|c| c.kind.clone()),
+                    "kind": cfg.map(|c| c.kind.clone()),
                     "enabled": cfg.is_some_and(|c| c.enabled),
                     // 0: already validated at load time (§126 review's per-method floor);
                     // this is read-only display, not re-validation.
@@ -759,16 +826,77 @@ impl Fetchers {
 /// the two modules store one definition per named thing the same way, so the same shape of
 /// code handles it (CLAUDE.md §8).
 impl Fetchers {
-    /// A new source (ADR 0028 §9): validated the same way a hand-edited file is, through
-    /// `schedule::render` then `SourceConfig::parse` -- one validation path for both a
-    /// structured command and `fetchers.reload`. Unlike `automations.new`, there is no
-    /// starter/template path yet (ADR 0028 §10 is a later step).
-    fn create(&self, ctx: &Ctx, p: SourceInput) -> Result<Value> {
-        let _g = self.write.lock();
-        if ctx.store.read(&schedule::path(&p.id))?.is_some() {
-            return Err(Error::conflict(format!("source '{}' already exists", p.id)));
+    /// A new source (ADR 0028 §9/§10): either its own kind/interval, validated the same way a
+    /// hand-edited file is (through `schedule::render` then `SourceConfig::parse` -- one
+    /// validation path for both a structured command and `fetchers.reload`), or a template's
+    /// answers (§10), mirroring `automations.new`'s own dual shape almost verbatim.
+    fn create(&self, ctx: &Ctx, p: NewParams) -> Result<Value> {
+        if let Some(template) = &p.template {
+            if p.kind.is_some()
+                || p.interval.is_some()
+                || p.label.is_some()
+                || !p.params.is_empty()
+                || p.filter.is_some()
+            {
+                return Err(Error::invalid_params("a source comes from a template or from its own kind, not both"));
+            }
+            return self.create_from_template(ctx, &p.id, template, &p.values, p.preview);
         }
-        self.write_source(ctx, p, false, "fetchers.source.created")
+        if p.preview || !p.values.is_empty() {
+            return Err(Error::invalid_params("values and preview go with a template"));
+        }
+        let kind = p.kind.ok_or_else(|| Error::invalid_params("needs a kind (or a template)"))?;
+        let interval = p.interval.ok_or_else(|| Error::invalid_params("needs an interval (or a template)"))?;
+        let input = SourceInput {
+            id: p.id,
+            label: p.label,
+            kind,
+            enabled: p.enabled,
+            interval,
+            params: p.params,
+            filter: p.filter,
+        };
+        let _g = self.write.lock();
+        if ctx.store.read(&schedule::path(&input.id))?.is_some() {
+            return Err(Error::conflict(format!("source '{}' already exists", input.id)));
+        }
+        self.write_source(ctx, input, false, "fetchers.source.created")
+    }
+
+    /// The source `template` makes with these answers (§10), checked like any source; with
+    /// `preview`, only shown, never written.
+    fn create_from_template(
+        &self,
+        ctx: &Ctx,
+        id: &str,
+        template: &str,
+        values: &Map<String, Value>,
+        preview: bool,
+    ) -> Result<Value> {
+        let t = crate::template::builtin()
+            .into_iter()
+            .find(|t| t.id == template)
+            .ok_or_else(|| Error::not_found(format!("no template '{template}' (shimmer fetchers templates)")))?;
+        let answers = t.answers(values).map_err(Error::invalid_params)?;
+        let text = t.fill(&answers);
+        let cfg = schedule::SourceConfig::parse(id, &text).map_err(|m| Error::invalid_params(format!("{id}: {m}")))?;
+        if preview {
+            return Ok(json!({"preview": true, "template": template, "source": {"id": id, "text": text}}));
+        }
+        let _g = self.write.lock();
+        if ctx.store.read(&schedule::path(id))?.is_some() {
+            return Err(Error::conflict(format!("source '{id}' already exists")));
+        }
+        ctx.store.transaction(|tx| {
+            tx.put(&schedule::path(id), text.as_str())?;
+            tx.emit("fetchers.source.created", json!({"source": id, "template": template}))
+        })?;
+        let mut st = self.state();
+        st.problems.remove(id);
+        st.sources.insert(id.to_owned(), cfg.clone());
+        drop(st);
+        self.reconcile_schedule(ctx, id, false, &cfg)?;
+        Ok(json!({"template": template, "source": view(id, &cfg)}))
     }
 
     /// Replace a source's file text wholesale, after checking it (same rule `automations.edit`
@@ -800,15 +928,8 @@ impl Fetchers {
     }
 
     fn write_source(&self, ctx: &Ctx, p: SourceInput, was_enabled: bool, topic: &str) -> Result<Value> {
-        let text = schedule::render(
-            p.label.as_deref(),
-            p.kind.as_deref(),
-            p.enabled,
-            &p.interval,
-            &p.params,
-            p.filter.as_ref(),
-        )
-        .map_err(Error::invalid_params)?;
+        let text = schedule::render(p.label.as_deref(), &p.kind, p.enabled, &p.interval, &p.params, p.filter.as_ref())
+            .map_err(Error::invalid_params)?;
         let cfg = schedule::SourceConfig::parse(&p.id, &text).map_err(Error::invalid_params)?;
         ctx.store.transaction(|tx| {
             tx.put(&schedule::path(&p.id), text.as_str())?;
@@ -1229,7 +1350,7 @@ mod tests {
     #[tokio::test]
     async fn init_loads_every_source_file_so_list_sees_them_with_no_reload_needed() {
         let env = TestEnv::new("fetchers");
-        write_source(&env, "hn-whoishiring", json!({"enabled": true, "interval": "daily"}));
+        write_source(&env, "hn-whoishiring", json!({"enabled": true, "interval": "daily", "kind": "hn-whoishiring"}));
         let fetchers = Fetchers::default();
         fetchers.init(&env.ctx).await.unwrap();
 
@@ -1249,7 +1370,7 @@ mod tests {
             .unwrap()
             .is_empty());
 
-        write_source(&env, "hn-whoishiring", json!({"enabled": true, "interval": "daily"}));
+        write_source(&env, "hn-whoishiring", json!({"enabled": true, "interval": "daily", "kind": "hn-whoishiring"}));
         env.ctx.store.write(&format!("{}/broken.toml", schedule::SOURCES_DIR), "this is not [[[ valid toml").unwrap();
 
         let out = fetchers.handle(RELOAD_OP, Value::Null, &env.ctx).await.unwrap();
@@ -1323,7 +1444,9 @@ mod tests {
     #[tokio::test]
     async fn a_source_already_fetching_is_refused_not_double_run() {
         let env = TestEnv::new("fetchers");
+        write_source(&env, "hn-whoishiring", json!({"enabled": true, "interval": "daily", "kind": "hn-whoishiring"}));
         let fetchers = Fetchers::default();
+        fetchers.load(&env.ctx).unwrap();
         let _permit = fetchers.running.try_acquire("hn-whoishiring").unwrap();
 
         let err = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None).await.unwrap_err();
@@ -1383,9 +1506,11 @@ mod tests {
     #[tokio::test]
     async fn a_successful_fetch_emits_item_found_and_dedupes_on_the_next_run() {
         let env = TestEnv::new("fetchers");
+        write_source(&env, "hn-whoishiring", json!({"enabled": true, "interval": "daily", "kind": "hn-whoishiring"}));
         stub_one_hn_comment(&env, 10, "<p>Acme | Remote<p>Hiring Rust engineers.");
 
         let fetchers = Fetchers::default();
+        fetchers.load(&env.ctx).unwrap();
         let out = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None).await.unwrap();
         assert_eq!((out["source"].as_str(), out["new_items"].as_u64()), (Some("hn-whoishiring"), Some(1)));
 
@@ -1413,7 +1538,10 @@ mod tests {
         write_source(
             &env,
             "hn-whoishiring",
-            json!({"enabled": true, "interval": "daily", "filter": {"title": {"not_contains": "senior"}}}),
+            json!({
+                "enabled": true, "interval": "daily", "kind": "hn-whoishiring",
+                "filter": {"title": {"not_contains": "senior"}},
+            }),
         );
         const BASE: &str = "https://hacker-news.firebaseio.com/v0";
         {
@@ -1459,7 +1587,10 @@ mod tests {
         write_source(
             &env,
             "hn-whoishiring",
-            json!({"enabled": true, "interval": "daily", "filter": {"title": {"contains": "junior"}}}),
+            json!({
+                "enabled": true, "interval": "daily", "kind": "hn-whoishiring",
+                "filter": {"title": {"contains": "junior"}},
+            }),
         );
         const BASE: &str = "https://hacker-news.firebaseio.com/v0";
         {
@@ -1495,7 +1626,10 @@ mod tests {
         write_source(
             &env,
             "hn-whoishiring",
-            json!({"enabled": true, "interval": "daily", "filter": {"title": {"contains": "junior"}}}),
+            json!({
+                "enabled": true, "interval": "daily", "kind": "hn-whoishiring",
+                "filter": {"title": {"contains": "junior"}},
+            }),
         );
         const BASE: &str = "https://hacker-news.firebaseio.com/v0";
         {
@@ -1526,7 +1660,9 @@ mod tests {
 
     #[tokio::test]
     async fn an_override_filter_on_a_real_run_leaves_the_items_it_drops_findable_later() {
-        let env = TestEnv::new("fetchers"); // no configured filter at all -- the override is the only one
+        let env = TestEnv::new("fetchers");
+        // No configured filter at all -- the override is the only one.
+        write_source(&env, "hn-whoishiring", json!({"enabled": true, "interval": "daily", "kind": "hn-whoishiring"}));
         const BASE: &str = "https://hacker-news.firebaseio.com/v0";
         {
             let mut responses = env.http.responses.lock().unwrap();
@@ -1547,6 +1683,7 @@ mod tests {
 
         let override_filter = json!({"title": {"not_contains": "senior"}}).as_object().unwrap().clone();
         let fetchers = Fetchers::default();
+        fetchers.load(&env.ctx).unwrap();
         let out = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), Some(override_filter)).await.unwrap();
         assert_eq!(out["new_items"], 1);
 
@@ -1614,9 +1751,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_shows_only_an_opted_into_fixed_source_and_a_configured_kind() {
+    async fn list_shows_only_a_configured_source() {
         let env = TestEnv::new("fetchers");
-        write_source(&env, "hn-whoishiring", json!({"enabled": true, "interval": "daily"}));
+        write_source(&env, "my-hn", json!({"enabled": true, "interval": "daily", "kind": "hn-whoishiring"}));
         write_source(
             &env,
             "my-team-blog",
@@ -1627,15 +1764,14 @@ mod tests {
         fetchers.load(&env.ctx).unwrap();
         let out = fetchers.list(&env.ctx, ListParams::default()).await.unwrap();
         let sources = out["sources"].as_array().unwrap();
-        // weworkremotely is compiled in but never configured here, so a user with no
-        // interest in job hunting never sees it (ADR 0028 §19).
+        // ADR 0028 §10 -- there is no fixed, compiled-in registry any more; only ids with
+        // their own config entry show up at all.
         assert_eq!(sources.len(), 2, "{sources:?}");
-        assert!(sources.iter().all(|s| s["id"] != "weworkremotely"), "{sources:?}");
 
-        let hn = sources.iter().find(|s| s["id"] == "hn-whoishiring").unwrap();
+        let hn = sources.iter().find(|s| s["id"] == "my-hn").unwrap();
         assert_eq!(
             (hn["method"].as_str(), hn["enabled"].as_bool(), hn["kind"].as_str()),
-            (Some("api"), Some(true), None)
+            (Some("api"), Some(true), Some("hn-whoishiring"))
         );
         assert_eq!(hn["interval_s"], 86_400);
 
@@ -1650,11 +1786,14 @@ mod tests {
     async fn list_reports_last_run_and_whether_a_source_is_mid_fetch() {
         // ADR 0028 §9 merges the prior design's separate per-source `list`/`status` into one.
         let env = TestEnv::new("fetchers");
-        // Both must have their own entry to show up in list at all (ADR 0028 §19) --
-        // fetching hn-whoishiring works regardless (resolve() needs none), but seeing it
-        // and weworkremotely listed afterward does not.
-        write_source(&env, "hn-whoishiring", json!({"enabled": true, "interval": "daily"}));
-        write_source(&env, "weworkremotely", json!({"enabled": false, "interval": schedule::MIN_INTERVAL_SCRAPE_S}));
+        // Both must have their own entry to show up in list at all (ADR 0028 §10/§19) -- there
+        // is no fixed, compiled-in registry to resolve against without one.
+        write_source(&env, "hn-whoishiring", json!({"enabled": true, "interval": "daily", "kind": "hn-whoishiring"}));
+        write_source(
+            &env,
+            "weworkremotely",
+            json!({"enabled": false, "interval": schedule::MIN_INTERVAL_SCRAPE_S, "kind": "wwr", "category": "remote-full-stack-programming-jobs"}),
+        );
         let fetchers = Fetchers::default();
         fetchers.load(&env.ctx).unwrap();
         stub_one_hn_comment(&env, 10, "<p>Acme | Remote<p>Hiring.");
@@ -1673,8 +1812,12 @@ mod tests {
     #[test]
     fn status_is_a_feature_wide_summary_not_per_source() {
         let env = TestEnv::new("fetchers");
-        write_source(&env, "hn-whoishiring", json!({"enabled": true, "interval": "daily"}));
-        write_source(&env, "weworkremotely", json!({"enabled": false, "interval": schedule::MIN_INTERVAL_SCRAPE_S}));
+        write_source(&env, "hn-whoishiring", json!({"enabled": true, "interval": "daily", "kind": "hn-whoishiring"}));
+        write_source(
+            &env,
+            "weworkremotely",
+            json!({"enabled": false, "interval": schedule::MIN_INTERVAL_SCRAPE_S, "kind": "wwr", "category": "remote-full-stack-programming-jobs"}),
+        );
         let fetchers = Fetchers::default();
         fetchers.load(&env.ctx).unwrap();
 
@@ -1685,9 +1828,12 @@ mod tests {
     #[tokio::test]
     async fn test_shows_parsed_items_without_touching_dedup_last_run_or_events() {
         let env = TestEnv::new("fetchers");
+        write_source(&env, "hn-whoishiring", json!({"enabled": true, "interval": "daily", "kind": "hn-whoishiring"}));
         stub_one_hn_comment(&env, 10, "<p>Acme | Remote<p>Hiring Rust engineers.");
 
-        let out = Fetchers::default().test(&env.ctx, "hn-whoishiring".into(), None).await.unwrap();
+        let fetchers = Fetchers::default();
+        fetchers.load(&env.ctx).unwrap();
+        let out = fetchers.test(&env.ctx, "hn-whoishiring".into(), None).await.unwrap();
         assert_eq!(out["source"], "hn-whoishiring");
         let items = out["items"].as_array().unwrap();
         assert_eq!(items.len(), 1);
@@ -1702,8 +1848,10 @@ mod tests {
     #[tokio::test]
     async fn test_does_not_conflict_with_a_concurrent_real_fetch_of_the_same_source() {
         let env = TestEnv::new("fetchers");
+        write_source(&env, "hn-whoishiring", json!({"enabled": true, "interval": "daily", "kind": "hn-whoishiring"}));
         stub_one_hn_comment(&env, 10, "<p>Acme | Remote<p>Hiring.");
         let fetchers = Fetchers::default();
+        fetchers.load(&env.ctx).unwrap();
         let _permit = fetchers.running.try_acquire("hn-whoishiring").unwrap();
 
         // A real fetch would be refused right now (see
@@ -1717,7 +1865,9 @@ mod tests {
     async fn a_transport_failure_still_records_the_run_and_emits_fetch_failed() {
         // No responses stubbed at all -- every ctx.http.get call fails with `unavailable`.
         let env = TestEnv::new("fetchers");
+        write_source(&env, "hn-whoishiring", json!({"enabled": true, "interval": "daily", "kind": "hn-whoishiring"}));
         let fetchers = Fetchers::default();
+        fetchers.load(&env.ctx).unwrap();
 
         let err = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::Unavailable);
@@ -1736,8 +1886,10 @@ mod tests {
     #[tokio::test]
     async fn handle_routes_both_ops_by_name() {
         let env = TestEnv::new("fetchers");
+        write_source(&env, "hn-whoishiring", json!({"enabled": true, "interval": "daily", "kind": "hn-whoishiring"}));
         stub_one_hn_comment(&env, 20, "<p>Widgets Inc<p>Hiring.");
         let fetchers = Fetchers::default();
+        fetchers.load(&env.ctx).unwrap();
 
         let run = fetchers.handle(RUN_OP, json!({"id": "hn-whoishiring"}), &env.ctx).await.unwrap();
         assert_eq!(run["queued"], true);
@@ -1762,7 +1914,9 @@ mod tests {
     #[tokio::test]
     async fn run_enqueues_run_task_with_the_same_params_it_was_given() {
         let env = TestEnv::new("fetchers");
+        write_source(&env, "hn-whoishiring", json!({"enabled": true, "interval": "daily", "kind": "hn-whoishiring"}));
         let fetchers = Fetchers::default();
+        fetchers.load(&env.ctx).unwrap();
         let out = fetchers
             .handle(RUN_OP, json!({"id": "hn-whoishiring", "filter": {"title": {"contains": "junior"}}}), &env.ctx)
             .await
@@ -1784,8 +1938,8 @@ mod tests {
         env.ctx.cancel.cancel();
         let fetchers = Fetchers::default();
 
-        let source = source::find("hn-whoishiring").unwrap();
-        let err = fetchers.run_source(&env.ctx, source.as_ref(), None, None).await.unwrap_err();
+        let source = crate::sources::hn::HnWhoIsHiring::new("hn-whoishiring".into());
+        let err = fetchers.run_source(&env.ctx, &source, None, None).await.unwrap_err();
         assert!(env.ctx.cancel.is_cancelled());
         assert_eq!(classify_failure(&env.ctx, &err), "cancelled");
     }
@@ -1793,8 +1947,10 @@ mod tests {
     #[tokio::test]
     async fn a_cancelled_fetch_is_classified_and_emitted_as_cancelled_not_whatever_error_surfaced() {
         let env = TestEnv::new("fetchers");
-        env.ctx.cancel.cancel();
+        write_source(&env, "hn-whoishiring", json!({"enabled": true, "interval": "daily", "kind": "hn-whoishiring"}));
         let fetchers = Fetchers::default();
+        fetchers.load(&env.ctx).unwrap();
+        env.ctx.cancel.cancel();
 
         let err = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None).await.unwrap_err();
         assert_eq!(classify_failure(&env.ctx, &err), "cancelled");
@@ -1814,7 +1970,7 @@ mod tests {
         let fetchers = Fetchers::default();
         let mut input = rss_input("blog", "https://example.test/f.xml");
         input.interval = schedule::IntervalSpec::Seconds(3600);
-        fetchers.create(&env.ctx, input).unwrap();
+        fetchers.create(&env.ctx, as_new_params(input)).unwrap();
         let first = pending_schedule(&env, "blog").expect("create schedules the first run");
 
         // Time passes before the (eventually cancelled) run fires. `blog` never actually
@@ -1865,8 +2021,8 @@ mod tests {
         );
         let fetchers = Fetchers::default();
 
-        let source = source::find("hn-whoishiring").unwrap();
-        fetchers.run_source(&ctx, source.as_ref(), None, None).await.unwrap();
+        let source = crate::sources::hn::HnWhoIsHiring::new("hn-whoishiring".into());
+        fetchers.run_source(&ctx, &source, None, None).await.unwrap();
 
         let reported = progress.lock().unwrap();
         assert!(!reported.is_empty(), "at least the first page must report progress");
@@ -1904,7 +2060,7 @@ mod tests {
         SourceInput {
             id: id.into(),
             label: None,
-            kind: Some("rss".into()),
+            kind: "rss".into(),
             enabled: true,
             interval: schedule::IntervalSpec::Preset("hourly".into()),
             params: json!({"url": url}).as_object().unwrap().clone(),
@@ -1912,11 +2068,29 @@ mod tests {
         }
     }
 
+    /// `fetchers.new`'s structured shape, as [`SourceInput`] -- `Fetchers::create` itself
+    /// takes [`NewParams`] (ADR 0028 §10's dual shape), so every test below that built a
+    /// `SourceInput` before that split now converts through this.
+    fn as_new_params(i: SourceInput) -> NewParams {
+        NewParams {
+            id: i.id,
+            label: i.label,
+            kind: Some(i.kind),
+            enabled: i.enabled,
+            interval: Some(i.interval),
+            params: i.params,
+            filter: i.filter,
+            template: None,
+            values: Map::new(),
+            preview: false,
+        }
+    }
+
     #[test]
     fn create_makes_a_new_source_and_refuses_a_duplicate_id() {
         let env = TestEnv::new("fetchers");
         let fetchers = Fetchers::default();
-        let v = fetchers.create(&env.ctx, rss_input("blog", "https://example.test/f.xml")).unwrap();
+        let v = fetchers.create(&env.ctx, as_new_params(rss_input("blog", "https://example.test/f.xml"))).unwrap();
         assert_eq!(v["id"], "blog");
         assert_eq!(v["kind"], "rss");
         assert!(fetchers.state().sources.contains_key("blog"));
@@ -1924,7 +2098,8 @@ mod tests {
         let cfg = schedule::SourceConfig::parse("blog", &saved).unwrap();
         assert_eq!(cfg.kind_params.get("url").and_then(Value::as_str), Some("https://example.test/f.xml"));
 
-        let err = fetchers.create(&env.ctx, rss_input("blog", "https://example.test/f.xml")).unwrap_err();
+        let err =
+            fetchers.create(&env.ctx, as_new_params(rss_input("blog", "https://example.test/f.xml"))).unwrap_err();
         assert_eq!(err.code, shimmer_core::ErrorCode::Conflict);
     }
 
@@ -1934,9 +2109,91 @@ mod tests {
         let fetchers = Fetchers::default();
         let mut bad = rss_input("blog", "https://example.test/f.xml");
         bad.params = Map::new(); // rss needs a url
-        let err = fetchers.create(&env.ctx, bad).unwrap_err();
+        let err = fetchers.create(&env.ctx, as_new_params(bad)).unwrap_err();
         assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams);
         assert!(env.ctx.store.read(&schedule::path("blog")).unwrap().is_none());
+    }
+
+    #[test]
+    fn templates_lists_every_built_in_and_peek_finds_one_by_id_or_reports_the_others() {
+        let all = templates_reply(None).unwrap();
+        let ids: Vec<&str> = all["templates"].as_array().unwrap().iter().map(|t| t["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["hn-whoishiring", "wwr", "greenhouse", "lever", "rss"]);
+        assert!(!all["categories"].as_array().unwrap().is_empty());
+
+        let one = templates_reply(Some("rss")).unwrap();
+        assert_eq!(one["templates"].as_array().unwrap().len(), 1);
+        assert_eq!(one["templates"][0]["id"], "rss");
+
+        let err = templates_reply(Some("nope")).unwrap_err();
+        assert_eq!(err.code, shimmer_core::ErrorCode::NotFound);
+        assert!(err.message.contains("rss"), "{}", err.message);
+    }
+
+    #[test]
+    fn create_from_a_template_previews_without_writing_then_makes_the_real_source() {
+        let env = TestEnv::new("fetchers");
+        let fetchers = Fetchers::default();
+        let values = json!({"URL": "https://example.test/feed.xml"}).as_object().unwrap().clone();
+        let params = NewParams {
+            id: "my-feed".into(),
+            label: None,
+            kind: None,
+            enabled: false,
+            interval: None,
+            params: Map::new(),
+            filter: None,
+            template: Some("rss".into()),
+            values: values.clone(),
+            preview: true,
+        };
+        let preview = fetchers.create(&env.ctx, params).unwrap();
+        assert_eq!(preview["preview"], true);
+        assert!(env.ctx.store.read(&schedule::path("my-feed")).unwrap().is_none(), "a preview writes nothing");
+
+        let made = fetchers
+            .create(
+                &env.ctx,
+                NewParams {
+                    id: "my-feed".into(),
+                    label: None,
+                    kind: None,
+                    enabled: false,
+                    interval: None,
+                    params: Map::new(),
+                    filter: None,
+                    template: Some("rss".into()),
+                    values,
+                    preview: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(made["source"]["id"], "my-feed");
+        assert_eq!(made["source"]["kind"], "rss");
+        assert!(env.ctx.store.read(&schedule::path("my-feed")).unwrap().is_some());
+
+        // Mixing a template with the structured shape, or sending a template's own
+        // values/preview without one, are both refused (ADR 0028 §10's dual shape, same
+        // posture `automations.new` already takes).
+        let mixed = NewParams {
+            id: "x".into(),
+            label: None,
+            kind: Some("rss".into()),
+            enabled: false,
+            interval: None,
+            params: Map::new(),
+            filter: None,
+            template: Some("rss".into()),
+            values: Map::new(),
+            preview: false,
+        };
+        assert!(fetchers.create(&env.ctx, mixed).unwrap_err().message.contains("not both"));
+        let stray_values = NewParams {
+            template: None,
+            values: json!({"URL": "x"}).as_object().unwrap().clone(),
+            ..as_new_params(rss_input("y", "https://e.test/f"))
+        };
+        assert!(fetchers.create(&env.ctx, stray_values).unwrap_err().message.contains("go with a template"));
     }
 
     #[test]
@@ -2256,13 +2513,13 @@ mod tests {
         let fetchers = Fetchers::default();
         let mut enabled = rss_input("blog", "https://example.test/f.xml");
         enabled.interval = schedule::IntervalSpec::Seconds(3600);
-        fetchers.create(&env.ctx, enabled).unwrap();
+        fetchers.create(&env.ctx, as_new_params(enabled)).unwrap();
         let state = pending_schedule(&env, "blog").expect("an enabled source schedules its first run");
         assert_eq!(state.due_at, env.ctx.clock.now() + chrono::Duration::seconds(3600));
 
         let mut disabled = rss_input("quiet-blog", "https://example.test/g.xml");
         disabled.enabled = false;
-        fetchers.create(&env.ctx, disabled).unwrap();
+        fetchers.create(&env.ctx, as_new_params(disabled)).unwrap();
         assert!(pending_schedule(&env, "quiet-blog").is_none());
     }
 
@@ -2291,7 +2548,7 @@ mod tests {
         let fetchers = Fetchers::default();
         let mut input = rss_input("blog", "https://example.test/f.xml");
         input.interval = schedule::IntervalSpec::Seconds(3600);
-        fetchers.create(&env.ctx, input).unwrap();
+        fetchers.create(&env.ctx, as_new_params(input)).unwrap();
         let first = pending_schedule(&env, "blog").unwrap();
         let first_trigger_count = env.schedules.added.lock().unwrap().len();
 
@@ -2321,7 +2578,7 @@ mod tests {
         let fetchers = Fetchers::default();
         let mut input = rss_input("blog", "https://example.test/f.xml");
         input.interval = schedule::IntervalSpec::Seconds(3600);
-        fetchers.create(&env.ctx, input).unwrap();
+        fetchers.create(&env.ctx, as_new_params(input)).unwrap();
         assert!(pending_schedule(&env, "blog").is_some());
 
         fetchers.remove(&env.ctx, "blog").unwrap();
@@ -2337,7 +2594,7 @@ mod tests {
         let fetchers = Fetchers::default();
         let mut input = rss_input("blog", "https://example.test/f.xml");
         input.interval = schedule::IntervalSpec::Seconds(3600);
-        fetchers.create(&env.ctx, input).unwrap();
+        fetchers.create(&env.ctx, as_new_params(input)).unwrap();
         let before = pending_schedule(&env, "blog").unwrap();
 
         fetchers.rename(&env.ctx, MoveParams { id: "blog".into(), to: "team-blog".into() }).unwrap();
@@ -2364,7 +2621,11 @@ mod tests {
     #[tokio::test]
     async fn a_finished_run_schedules_the_next_one_from_its_own_last_run_time() {
         let env = TestEnv::new("fetchers");
-        write_source(&env, "hn-whoishiring", json!({"enabled": true, "interval": schedule::MIN_INTERVAL_API_S}));
+        write_source(
+            &env,
+            "hn-whoishiring",
+            json!({"enabled": true, "interval": schedule::MIN_INTERVAL_API_S, "kind": "hn-whoishiring"}),
+        );
         let fetchers = Fetchers::default();
         fetchers.load(&env.ctx).unwrap();
         stub_one_hn_comment(&env, 10, "<p>Acme | Remote<p>Hiring.");

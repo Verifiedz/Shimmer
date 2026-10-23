@@ -101,6 +101,8 @@ belongs to this machine, so copying your Shimmer folder elsewhere doesn't bring 
 | fetchers items | `shuukaku` | `feed` | `haul` | `fitems` |
 | fetchers show | `shoukai` | `inspect-source` | `sensor-report` | `fshow` |
 | fetchers new | `souzou` | `add-source` | `chart-source` | `fnew` |
+| fetchers templates | `mihon` | `starters` | `scan-blueprints` | `ftpl` |
+| fetchers peek | `nozoku` | `preview-starter` | `read-blueprint` | `fpeek` |
 | fetchers edit | `shuusei` | `edit-source` | `retune-sensor` | `fedit` |
 | fetchers remove | `haijo` | `drop-source` | `unchart` | `frm` |
 | fetchers restore | `sosei` | `restore-source` | `rechart` | `fundo` |

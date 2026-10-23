@@ -124,62 +124,28 @@ pub trait Source: Send + Sync {
     async fn fetch_page(&self, ctx: &Ctx, cursor: Option<&str>) -> Result<Page>;
 }
 
-/// The fixed, compiled-in sources (ADR 0028 §10). Not a plugin registry -- adding one of
-/// these is adding a line here. A `kind`-less config entry for one of these ids adjusts it
-/// (ADR 0028 §2a) -- it never replaces or disables its presence here, and [`resolve`] and
-/// [`find`] can always build one by id with zero config at all, same as before. Whether one
-/// shows up *unprompted* in `fetchers.list`/`fetchers.status` is a separate question
-/// [`known`] answers differently (ADR 0028 §19).
-pub fn registry() -> Vec<std::sync::Arc<dyn Source>> {
-    vec![
-        std::sync::Arc::new(crate::sources::hn::HnWhoIsHiring),
-        std::sync::Arc::new(crate::sources::wwr::WeWorkRemotely),
-    ]
-}
-
-pub fn find(id: &str) -> Option<std::sync::Arc<dyn Source>> {
-    registry().into_iter().find(|s| s.id() == id)
-}
-
-/// The two-layered lookup ADR 0028 §2a describes: a configured `kind` builds a brand-new
-/// instance from that source's own file; no `kind` (or no source file at all) falls back to
-/// the fixed [`registry`]. Pure -- `sources` is whatever `Sources::load` already read and
-/// validated (CLAUDE.md §12 rule 10), so a config-shape error here would mean that
-/// validation has a gap, not that this call should report one -- hence `Error::internal`,
-/// not `invalid_params`, on the "known kind but missing its own field" branches.
+/// Builds `id`'s `Source` from its own file's `kind` (ADR 0028 §10: no fixed, compiled-in
+/// registry any more -- every source, `hn-whoishiring`/`wwr` included, is a configured `kind`
+/// instance). Pure -- `sources` is whatever `Sources::load` already read and validated
+/// (CLAUDE.md §12 rule 10), so a config-shape error here would mean that validation has a
+/// gap, not that this call should report one -- hence `Error::internal`, not
+/// `invalid_params`, on the "known kind but missing its own field" branches.
 pub fn resolve(sources: &Sources, id: &str) -> Result<Option<std::sync::Arc<dyn Source>>> {
-    resolve_from(sources, id)
-}
-
-fn resolve_from(sources: &Sources, id: &str) -> Result<Option<std::sync::Arc<dyn Source>>> {
-    let Some(cfg) = sources.sources.get(id) else { return Ok(find(id)) };
-    let Some(kind_name) = cfg.kind.as_deref() else { return Ok(find(id)) };
-    let kind = crate::kind::kind(kind_name).ok_or_else(|| {
-        Error::internal(format!("sources.{id}: unknown kind \"{kind_name}\" despite passing load-time validation"))
+    let Some(cfg) = sources.sources.get(id) else { return Ok(None) };
+    let kind = crate::kind::kind(&cfg.kind).ok_or_else(|| {
+        Error::internal(format!("sources.{id}: unknown kind \"{}\" despite passing load-time validation", cfg.kind))
     })?;
     let parsed = kind.parse(&cfg.kind_params).map_err(|m| {
-        Error::internal(format!("sources.{id}: kind \"{kind_name}\" {m} despite passing load-time validation"))
+        Error::internal(format!("sources.{id}: kind \"{}\" {m} despite passing load-time validation", cfg.kind))
     })?;
     Ok(Some(parsed.build(id.to_string())))
 }
 
-/// Every source `fetchers.list`/`fetchers.status` surface *unprompted*: a fixed [`registry`]
-/// source only once the user has given it its own source file (even a bare, disabled one),
-/// plus one instance per configured `kind` entry (ADR 0028 §2a) -- never the whole fixed
-/// registry regardless of interest (ADR 0028 §19). This is *not* the universe [`resolve`] can
-/// build something for -- that still falls back to the fixed registry by id with zero config
-/// at all, so `fetchers test hn-whoishiring` keeps working for anyone who already knows the
-/// id; this only governs what shows up for someone who never asked.
+/// Every source `fetchers.list`/`fetchers.show` could ever resolve -- one instance per
+/// configured source (ADR 0028 §10), skipping an id whose own file has a problem (it's
+/// reported in `problems` instead, not surfaced as a `Source`).
 pub fn known(sources: &Sources) -> Vec<std::sync::Arc<dyn Source>> {
-    let mut out: Vec<_> = registry().into_iter().filter(|s| sources.sources.contains_key(s.id())).collect();
-    for (id, cfg) in &sources.sources {
-        if cfg.kind.is_some() {
-            if let Ok(Some(s)) = resolve_from(sources, id) {
-                out.push(s);
-            }
-        }
-    }
-    out
+    sources.sources.keys().filter_map(|id| resolve(sources, id).ok().flatten()).collect()
 }
 
 #[cfg(test)]
@@ -247,32 +213,19 @@ mod tests {
     }
 
     #[test]
-    fn the_registry_has_every_reference_source_and_only_known_ids_resolve() {
-        let all = registry();
-        let ids: Vec<_> = all.iter().map(|s| s.id()).collect();
-        assert_eq!(ids, vec!["hn-whoishiring", "weworkremotely"]);
-        assert!(find("hn-whoishiring").is_some());
-        assert!(find("weworkremotely").is_some());
-        assert!(find("not-a-real-source").is_none());
-    }
-
-    #[test]
-    fn known_includes_nothing_from_the_fixed_registry_with_no_config_at_all() {
-        // CLAUDE.md §1's "general before specific" -- a user with no interest in job hunting
-        // must not see hn-whoishiring/weworkremotely show up unprompted just because they're
-        // compiled in (ADR 0028 §19).
+    fn resolve_returns_none_for_an_unconfigured_id() {
+        // ADR 0028 §10 -- there is no fixed, compiled-in registry any more; an id resolves
+        // only once it has its own config entry naming a kind.
         let env = TestEnv::new("fetchers");
         let sources = Sources::load(&env.ctx).unwrap();
-        let ids: Vec<_> = known(&sources).iter().map(|s| s.id().to_string()).collect();
-        assert_eq!(ids, Vec::<String>::new());
-        // Explicit invocation by id is a separate, unaffected path.
-        assert!(resolve(&sources, "hn-whoishiring").unwrap().is_some());
+        assert!(resolve(&sources, "hn-whoishiring").unwrap().is_none());
+        assert!(known(&sources).is_empty());
     }
 
     #[test]
-    fn known_includes_a_fixed_source_only_once_it_has_its_own_entry() {
+    fn known_and_resolve_both_need_a_configured_kind() {
         let env = TestEnv::new("fetchers");
-        write_source(&env, "hn-whoishiring", json!({"enabled": false, "interval": "daily"}));
+        write_source(&env, "my-hn", json!({"enabled": true, "interval": "daily", "kind": "hn-whoishiring"}));
         write_source(
             &env,
             "my-team-blog",
@@ -280,7 +233,9 @@ mod tests {
         );
         let sources = Sources::load(&env.ctx).unwrap();
         let ids: Vec<_> = known(&sources).iter().map(|s| s.id().to_string()).collect();
-        assert_eq!(ids, vec!["hn-whoishiring", "my-team-blog"], "weworkremotely was never configured");
+        assert_eq!(ids, vec!["my-hn", "my-team-blog"]);
+        assert!(resolve(&sources, "my-hn").unwrap().is_some());
+        assert!(resolve(&sources, "not-configured").unwrap().is_none());
     }
 
     #[test]

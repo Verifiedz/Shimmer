@@ -1,0 +1,32 @@
+[template]
+label = "We Work Remotely"
+description = "Job postings from one We Work Remotely category page"
+category = "job-boards"
+kind = "wwr"
+good_to_know = [
+    "One source per category -- track more than one by making another source from this template",
+    "It's a scraped page, not an API, so it only checks a few times a day at most",
+]
+
+[[question]]
+name = "CATEGORY"
+prompt = "Which category (the part of its url after /categories/, e.g. remote-full-stack-programming-jobs)"
+kind = "name"
+required = true
+
+[[question]]
+name = "TITLE_FILTER"
+prompt = "Only show titles containing (comma-separated, optional)"
+kind = "filter"
+
+[source]
+text = '''
+[source]
+enabled = false
+interval = "daily"
+kind = "wwr"
+filter = ${TITLE_FILTER} # if TITLE_FILTER
+
+[kind]
+category = "${CATEGORY}"
+'''
