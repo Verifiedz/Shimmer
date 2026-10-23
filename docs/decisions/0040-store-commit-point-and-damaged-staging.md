@@ -40,11 +40,17 @@ wrong:
      oldest first, stopping at the first that still fails. Recovery applies folders in the
      order they were made: a folder is named `<nanoseconds, never repeating>-<txid>`, since a
      ULID alone is ordered only to the millisecond.
-2. **Recovery takes each staging folder on its own.** A marked one that can't be applied is moved
-   to `.staging/broken/<txid>/`, whole: never deleted, since it may hold committed data. It's
-   logged with the reason, returned in `Recovery::broken`, and reported by `shimmer doctor` (which
-   counts `.staging/broken/`: the CLI never links the store, CLAUDE.md §3). The daemon starts. An
-   unmarked folder that can't be deleted is logged and left; it never happened, so it blocks
+2. **Recovery takes each staging folder on its own.** A marked one that is **damaged** (its
+   manifest missing or unreadable as JSON, or a file it stages gone) is moved to
+   `.staging/broken/<txid>/`, whole: never deleted, since it may hold committed data. It's logged
+   with the reason, returned in `Recovery::broken`, and reported by `shimmer doctor` (which counts
+   `.staging/broken/`: the CLI never links the store, CLAUDE.md §3). The daemon starts. A marked
+   one that's **intact** but can't be applied just then (the disk or a permission failing at the
+   moment of a start) isn't damage: it's kept and joins the waiting list, retried before the next
+   save like one that fails while running (#309's second review), and every later folder waits
+   behind it, in order. A damaged one that can't even be moved aside is left in place and never
+   retried, so it can't hold up every later save; it's logged as such (`Recovery::left_in_place`).
+   An unmarked folder that can't be deleted is logged and left; it never happened, so it blocks
    nothing. `.staging/` is gitignored, so `broken/` stays on the machine where it happened.
 3. **Only recovery checks the log for an event before appending it**, and it reads each day's file
    once. A fresh commit has just staged its events, so they can't be in the log yet.

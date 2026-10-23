@@ -29,10 +29,13 @@ impl StoreBackend for Backend {
     /// review). Recovery at start lands them before anything subscribes; the indexer reads them
     /// from the log.
     fn commit(&self, namespace: &str, plan: TxPlan) -> Result<()> {
-        for e in self.store.commit_logged(namespace, plan)? {
+        // Whatever landed is published, even if this transaction then failed (#309's second
+        // review): those events are in the log, and nothing else would ever publish them.
+        let (logged, result) = self.store.commit_logged(namespace, plan);
+        for e in logged {
             self.bus.publish(e);
         }
-        Ok(())
+        result
     }
 }
 

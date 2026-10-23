@@ -67,8 +67,8 @@ impl Store {
 
     /// Finish or discard every in-flight transaction left by a crash. Idempotent.
     pub fn recover(&self) -> Result<Recovery> {
-        let _g = self.lock();
-        tx::recover(&self.home)
+        let mut pending = self.lock();
+        tx::recover(&self.home, &mut pending)
     }
 
     /// Append to the event log. Used for events that are not part of a store transaction.
@@ -82,12 +82,22 @@ impl Store {
     /// transaction whose last step failed is committed (it happens), but its events aren't
     /// logged yet, so they aren't returned until a later call or recovery lands them (#309's
     /// review). The daemon publishes exactly these, so nothing reaches the bus before the log.
-    pub fn commit_logged(&self, namespace: &str, plan: TxPlan) -> Result<Vec<Event>> {
-        let dir = self.namespace_dir(namespace)?;
-        for w in &plan.writes {
-            let (shimmer_core::Write::Put { path, .. } | shimmer_core::Write::Delete { path }) = w;
-            validate_path(path)?;
-        }
+    ///
+    /// The events come back even when this transaction fails: an earlier one that landed in the
+    /// same call is durable, and has to be published whatever happens to this one (#309's second
+    /// review). So it's both, not a `Result` of either.
+    pub fn commit_logged(&self, namespace: &str, plan: TxPlan) -> (Vec<Event>, Result<()>) {
+        let checked = self.namespace_dir(namespace).and_then(|dir| {
+            for w in &plan.writes {
+                let (shimmer_core::Write::Put { path, .. } | shimmer_core::Write::Delete { path }) = w;
+                validate_path(path)?;
+            }
+            Ok(dir)
+        });
+        let dir = match checked {
+            Ok(dir) => dir,
+            Err(e) => return (Vec::new(), Err(e)),
+        };
         let mut pending = self.lock();
         tx::commit(&self.home, &dir, namespace, plan, &mut pending)
     }
@@ -136,6 +146,6 @@ impl StoreBackend for Store {
     }
 
     fn commit(&self, namespace: &str, plan: TxPlan) -> Result<()> {
-        self.commit_logged(namespace, plan).map(|_| ())
+        self.commit_logged(namespace, plan).1
     }
 }
