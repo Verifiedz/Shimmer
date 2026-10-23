@@ -50,8 +50,8 @@ On test/run, it replaces -- never merges with -- whatever the source's own file 
 for that one call only. On new, it's the source's own setting, same as --label/--interval/etc.
 (edit replaces the whole file, the filter included.)
 
-items' own --contains/--excludes are a separate, client-side narrowing of what's already
-been found and saved -- a plain case-insensitive substring match, not a filter.
+items' own --contains/--excludes are a separate narrowing of what's already been found and
+saved -- a plain case-insensitive substring match, not a filter.
 
 A source is a file in your data folder, data/fetchers/sources/SOURCE.toml:
 
@@ -70,11 +70,6 @@ no sources at all -- start from a template (see 'shimmer fetchers templates') or
 --interval/--set yourself.
 
 Add --json to any command for raw output.";
-
-/// `core.events.list`'s own query limit for `items` -- generous enough to cover several runs
-/// across every source before filtering down to one, well under the daemon's own cap
-/// (`MAX_EVENTS_LIMIT`, `crates/daemon/src/core.rs`).
-const ITEMS_QUERY_LIMIT: usize = 200;
 
 /// `fetchers new`'s own flags, turned into `fetchers.new`'s params (ADR 0028 §9) by
 /// [`source_params`]. `interval` stays raw text here (not yet known to be a preset or a
@@ -171,8 +166,9 @@ pub enum FetchersCmd {
 /// `--contains a, b ,c` (or `--excludes`) as a term list -- comma-separated, each term
 /// trimmed. `None` means the flag was not given at all, not "given but empty" (`Flags`
 /// itself already rejects an empty value, e.g. `--contains=`). Only `items`' own
-/// `--contains`/`--excludes` use this now -- a plain client-side substring narrowing, not a
-/// `core::filter::Filter` (ADR 0028 §8).
+/// `--contains`/`--excludes` use this now -- sent to `fetchers.items` (ADR 0042) as a plain
+/// substring narrowing, not a `core::filter::Filter` (ADR 0028 §8); this is just the CLI's own
+/// flag parsing, the matching itself happens server-side.
 ///
 /// An empty term is dropped rather than passed on: `--excludes senior,` used to send
 /// `["senior", ""]`, and `""` is a substring of every title, so a single stray comma excluded
@@ -193,17 +189,6 @@ fn parse_filter(raw: Option<&str>) -> std::result::Result<Option<Map<String, Val
         Ok(_) => Err("--filter takes a JSON object, e.g. '{\"title\": {\"contains\": \"senior\"}}'".into()),
         Err(e) => Err(format!("--filter: invalid JSON: {e}")),
     }
-}
-
-/// `items`' own `--contains`/`--excludes`, narrowing what's already been found rather than
-/// what a `Source` fetches. Same matching rule as `fetchers`' own `SourceConfig::matches_title`
-/// (case-insensitive substring, OR'd within each list) -- duplicated, not imported, since a
-/// client crate must not depend on a module crate (CLAUDE.md §3).
-fn title_matches(title: &str, contains: &[String], excludes: &[String]) -> bool {
-    let lower = title.to_lowercase();
-    let included = contains.is_empty() || contains.iter().any(|w| lower.contains(&w.to_lowercase()));
-    let excluded = excludes.iter().any(|w| lower.contains(&w.to_lowercase()));
-    included && !excluded
 }
 
 /// `words` are what follows `shimmer fetchers`.
@@ -566,24 +551,27 @@ pub async fn run(client: &mut Client, cmd: &FetchersCmd, json_out: bool, prompt:
             Ok(if json_out { render::json(&result) } else { fetched(source, &result) })
         }
         FetchersCmd::Items { source, title_contains, title_excludes } => {
-            // fetchers.item.found is a plain string literal, not an import from shimmer-fetchers
-            // -- a client crate must not depend on a module crate (CLAUDE.md §3's dependency
-            // rules), same reason every other op name in this file is also a literal.
-            let data = client
-                .call("core.events.list", json!({"topic": "fetchers.item.found", "limit": ITEMS_QUERY_LIMIT}))
-                .await?;
-            let events = data["events"].as_array().cloned().unwrap_or_default();
-            let contains = title_contains.clone().unwrap_or_default();
-            let excludes = title_excludes.clone().unwrap_or_default();
-            let matching: Vec<Value> = events
-                .into_iter()
-                .filter(|e| match source {
-                    None => true,
-                    Some(s) => e["payload"]["source_name"].as_str() == Some(s.as_str()),
-                })
-                .filter(|e| title_matches(e["payload"]["title"].as_str().unwrap_or_default(), &contains, &excludes))
-                .collect();
-            Ok(if json_out { render::json(&json!({"items": matching})) } else { items(source.as_deref(), &matching) })
+            // fetchers.items (ADR 0042): answered server-side now, from fetchers' own capped
+            // log, not by this client pulling fetchers.item.found events and matching them
+            // itself. Params match the op's own schema -- contains/excludes omitted entirely
+            // when the flag wasn't given, same reasoning as every other optional field in
+            // this file (CLAUDE.md §2: a client that computes something is a bug).
+            let mut params = json!({});
+            if let Some(s) = source {
+                params["source"] = json!(s);
+            }
+            if let Some(c) = title_contains {
+                params["contains"] = json!(c);
+            }
+            if let Some(e) = title_excludes {
+                params["excludes"] = json!(e);
+            }
+            let data = client.call("fetchers.items", params).await?;
+            Ok(if json_out {
+                render::json(&data)
+            } else {
+                items(source.as_deref(), &data["items"].as_array().cloned().unwrap_or_default())
+            })
         }
     }
 }
@@ -840,6 +828,14 @@ fn show(s: &Value) -> String {
     line("kind", s["kind"].as_str().unwrap_or("built in").to_owned());
     line("label", full(&s["label"]));
     line("interval", s["interval_s"].as_u64().map(when::format_duration).unwrap_or_else(|| "-".into()));
+    // Same wording `fetchers.health` uses for `shimmer doctor`'s warn line (module.rs), so a
+    // person who reaches for `show` instead of `doctor` still sees why a source stopped
+    // working, not just a healthy-looking file.
+    if let Some(err) = s["last_error"].as_object() {
+        let error = err.get("error").and_then(Value::as_str).unwrap_or_default();
+        let reason = err.get("reason").and_then(Value::as_str).unwrap_or_default();
+        line("last error", format!("{error} ({reason})"));
+    }
     out.push('\n');
     out.push_str(s["text"].as_str().unwrap_or_default().trim_end());
     out
@@ -1010,17 +1006,17 @@ fn test_items(source: &str, result: &Value) -> String {
     )
 }
 
-/// Every `fetchers.item.found` event matched, most recent first -- `core.events.list` itself
-/// returns oldest-first (the event-log's own convention), reversed here only for display,
-/// same reasoning as a feed or a log tail: what just happened belongs on top.
-fn items(source: Option<&str>, events: &[Value]) -> String {
-    if events.is_empty() {
+/// Every item `fetchers.items` matched -- already most recent first, flat (no event
+/// envelope), straight from the daemon (ADR 0042: this used to re-sort and reach into
+/// `["payload"]` itself, back when it called `core.events.list` directly).
+fn items(source: Option<&str>, items: &[Value]) -> String {
+    if items.is_empty() {
         return match source {
             Some(s) => format!("{s}: no items found yet"),
             None => "no items found yet".into(),
         };
     }
-    let n = events.len();
+    let n = items.len();
     let summary = match source {
         Some(s) => format!("{s}: {n} item{}", if n == 1 { "" } else { "s" }),
         None => format!("{n} item{}", if n == 1 { "" } else { "s" }),
@@ -1030,16 +1026,14 @@ fn items(source: Option<&str>, events: &[Value]) -> String {
     let (header, rows): (Vec<String>, Vec<Vec<String>>) = match source {
         Some(_) => (
             ["TITLE", "URL"].map(String::from).to_vec(),
-            events.iter().rev().map(|ev| vec![render::cell(&ev["payload"]["title"]), url(&ev["payload"])]).collect(),
+            items.iter().map(|it| vec![render::cell(&it["title"]), url(it)]).collect(),
         ),
         None => (
             ["SOURCE", "TITLE", "URL"].map(String::from).to_vec(),
-            events
+            items
                 .iter()
-                .rev()
-                .map(|ev| {
-                    let p = &ev["payload"];
-                    vec![p["source_name"].as_str().unwrap_or("?").to_owned(), render::cell(&p["title"]), url(p)]
+                .map(|it| {
+                    vec![it["source_name"].as_str().unwrap_or("?").to_owned(), render::cell(&it["title"]), url(it)]
                 })
                 .collect(),
         ),
@@ -1241,6 +1235,19 @@ mod tests {
     }
 
     #[test]
+    fn show_surfaces_last_error_so_a_broken_source_does_not_look_healthy() {
+        let healthy = json!({"id": "my-feed", "enabled": true, "kind": "rss", "label": null,
+            "interval_s": 3600, "last_error": null, "text": "[source]\nkind = \"rss\"\n"});
+        assert!(!show(&healthy).contains("last error"), "{}", show(&healthy));
+
+        let broken = json!({"id": "my-feed", "enabled": true, "kind": "rss", "label": null,
+            "interval_s": 3600, "last_error": {"error": "connection refused", "reason": "network"},
+            "text": "[source]\nkind = \"rss\"\n"});
+        let out = show(&broken);
+        assert!(out.contains("last error  connection refused (network)"), "{out}");
+    }
+
+    #[test]
     fn status_renders_the_feature_wide_summary_and_any_problems() {
         let data = json!({"sources": 5, "enabled": 2, "disabled": 3, "problems": []});
         assert_eq!(status(&data), "5 sources: 2 enabled, 3 disabled");
@@ -1286,20 +1293,20 @@ mod tests {
     }
 
     fn found(source: &str, title: &str, url: &str) -> Value {
-        json!({"topic": "fetchers.item.found", "payload": {"source_name": source, "title": title, "url": url}})
+        json!({"source_name": source, "title": title, "url": url})
     }
 
     #[test]
-    fn items_groups_by_source_when_none_is_given_and_shows_newest_first() {
-        let events = vec![
-            found("hn-whoishiring", "Acme hiring", "https://x/1"),
+    fn items_groups_by_source_and_shows_newest_first_as_given() {
+        // fetchers.items (ADR 0042) already answers newest-first; `items` no longer reorders.
+        let items_in = vec![
             found("weworkremotely", "Rust role", "https://x/2"),
+            found("hn-whoishiring", "Acme hiring", "https://x/1"),
         ];
-        let out = items(None, &events);
+        let out = items(None, &items_in);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "2 items");
         assert_eq!(lines[1], "SOURCE          TITLE        URL");
-        // events arrive oldest-first; display must flip to newest-first.
         assert!(lines[2].contains("weworkremotely") && lines[2].contains("Rust role"), "{out}");
         assert!(lines[3].contains("hn-whoishiring") && lines[3].contains("Acme hiring"), "{out}");
     }
@@ -1329,17 +1336,6 @@ mod tests {
         let expected: Vec<String> = ["junior", "entry level", "new grad"].iter().map(|s| s.to_string()).collect();
         assert_eq!(terms(Some("junior, entry level ,new grad")), Some(expected));
         assert_eq!(terms(Some("junior")), Some(vec!["junior".to_string()]));
-    }
-
-    #[test]
-    fn title_matches_is_case_insensitive_and_excludes_win_over_contains() {
-        assert!(title_matches("Junior Rust Engineer", &[], &[]), "no filter at all keeps everything");
-        assert!(title_matches("Junior Rust Engineer", &["junior".into()], &[]));
-        assert!(!title_matches("Senior Rust Engineer", &["junior".into()], &[]), "contains must actually match");
-        assert!(
-            !title_matches("Junior Rust Engineer", &["junior".into()], &["engineer".into()]),
-            "an excludes match drops it even though contains would have kept it"
-        );
     }
 
     #[test]

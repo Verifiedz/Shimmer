@@ -43,10 +43,25 @@ pub const RENAME_OP: &str = "fetchers.rename";
 pub const COPY_OP: &str = "fetchers.copy";
 pub const TEMPLATES_OP: &str = "fetchers.templates";
 pub const PEEK_OP: &str = "fetchers.peek";
+pub const HEALTH_OP: &str = "fetchers.health";
+/// Inline, answered from [`ITEMS`] alone -- never the event log (ADR 0042: a module has no way
+/// to read that back; `core.events.list` reaches a client, not code running inside the daemon).
+pub const ITEMS_OP: &str = "fetchers.items";
 
 /// Caps `fetchers.item.found`'s `raw_data` (ADR 0028 §3) -- big enough for a job posting's
 /// text, small enough that one large item can't become the next cache-bloat problem.
 const MAX_RAW_DATA_CHARS: usize = 8 * 1024;
+/// Every source's found items, oldest first, capped: `automations.history`'s precedent (ADR
+/// 0042), not a second copy of `core.events.list`'s own query path. `fetchers.item.found` stays
+/// the source of truth -- this is a convenience that answers "what did I just find" fast and
+/// for free, same posture `automations`' own `history.json` already takes ("the event log has
+/// everything").
+const ITEMS: &str = "items.json";
+/// Oldest dropped past this many. Twenty sources each finding a full `dedup::MAX_NEW_PER_RUN`
+/// in one run would alone fill this -- the cap exists so one noisy run across many sources
+/// can't make `fetchers.items` an ever-growing file, not to comfortably hold every source's
+/// entire backlog at once.
+const ITEMS_KEPT: usize = 1000;
 /// However many fields an item has, each still keeps enough characters to be recognisable
 /// rather than being cut to nothing.
 const MIN_FIELD_CHARS: usize = 64;
@@ -273,6 +288,25 @@ impl Module for Fetchers {
                 }),
                 execution: Execution::Inline,
             },
+            CommandSpec {
+                op: HEALTH_OP.into(),
+                summary: "Check every source for problems; changes nothing (ADR 0033)".into(),
+                params_schema: json!({"type": "object"}),
+                execution: Execution::Inline,
+            },
+            CommandSpec {
+                op: ITEMS_OP.into(),
+                summary: "Items a real run has actually found and kept, most recent first".into(),
+                params_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "source": {"type": "string"},
+                        "contains": {"type": "array", "items": {"type": "string"}},
+                        "excludes": {"type": "array", "items": {"type": "string"}},
+                    },
+                }),
+                execution: Execution::Inline,
+            },
         ]
     }
 
@@ -343,6 +377,11 @@ impl Module for Fetchers {
             COPY_OP => {
                 let p: CopyParams = decode(params)?;
                 self.copy(ctx, p)
+            }
+            HEALTH_OP => self.health(ctx),
+            ITEMS_OP => {
+                let p: ItemsParams = decode(params)?;
+                Ok(items_reply(ctx, p))
             }
             _ => Err(Error::unknown_op(format!("fetchers has no op '{op}'"))),
         }
@@ -487,6 +526,20 @@ struct Purge {
     confirm: Option<Value>,
 }
 
+/// `fetchers.items` (ADR 0042): `contains`/`excludes` are a plain case-insensitive substring
+/// narrowing of what's already in [`ITEMS`] -- deliberately not a `core::filter::Filter`
+/// (ADR 0028 §8), the same "that's a different, simpler thing" distinction the CLI's own
+/// doc comment drew before this moved server-side.
+#[derive(Default, Deserialize)]
+struct ItemsParams {
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    contains: Vec<String>,
+    #[serde(default)]
+    excludes: Vec<String>,
+}
+
 /// `FetchParams.filter`/`SourceInput.filter`, checked the same way `SourceConfig::parse`
 /// checks a source's own configured one (ADR 0028 §8) -- `fetchers.run`/`.test` reach this
 /// past the CLI's own `--filter` parsing, so a broken filter sent directly as an op's params
@@ -606,7 +659,14 @@ impl Fetchers {
         // full interval (a day, for `daily`) having fetched nothing.
         let _g = self.write.lock();
         if !ctx.cancel.is_cancelled() {
-            schedule::record_run(ctx, &source_id, ctx.clock.now())?;
+            match &outcome {
+                Ok(_) => schedule::record_run(ctx, &source_id, ctx.clock.now())?,
+                // `fetchers.health`'s own reading of this file (ADR 0028 §11) -- the same
+                // classification `fetchers.fetch.failed` emits below, never a second one.
+                Err(e) => {
+                    schedule::record_failure(ctx, &source_id, ctx.clock.now(), &e.message, classify_failure(ctx, e))?
+                }
+            }
         }
         // Rescheduled regardless of cancellation (#306's review, blocking; the same root
         // issue as #299's review point 1): the one-time schedule that fired to start this
@@ -660,6 +720,7 @@ impl Fetchers {
             return Ok(json!({"removed": schedule::removed(ctx)?}));
         }
         let last_run = schedule::load_last_run(ctx)?;
+        let last_failures = schedule::load_last_failures(ctx);
         let st = self.state();
         let sources: Vec<Value> = source::known(&st)
             .iter()
@@ -677,6 +738,9 @@ impl Fetchers {
                     "interval_s": cfg.and_then(|c| c.interval.resolve(0).ok()),
                     "filter": cfg.and_then(|c| c.filter.clone()),
                     "last_run_at": last_run.get(id),
+                    // `None` once the next run succeeds (ADR 0028 §11) -- the most recent
+                    // outcome only, never a history.
+                    "last_error": last_failures.get(id).map(|(_, error, reason)| json!({"error": error, "reason": reason})),
                     "running": self.running.is_running(id),
                 })
             })
@@ -701,6 +765,40 @@ impl Fetchers {
         drop(st);
         problems.extend(schedule::last_run_problem(ctx).map(|why| json!({"id": "last_run", "problem": why})));
         Ok(json!({"sources": total, "enabled": enabled, "disabled": total - enabled, "problems": problems}))
+    }
+
+    /// `shimmer doctor`'s own check (ADR 0033, ADR 0028 §11): two kinds of problem, both
+    /// read fresh from current state every call, never accumulated -- a fixed source simply
+    /// stops appearing next time. A source file that doesn't parse (§5's `problems`) is
+    /// `fail`: nothing about it can be used until it's fixed. A source whose most recent run
+    /// failed is `warn`: it still has a valid, working file, and the next scheduled run may
+    /// well succeed on its own.
+    fn health(&self, ctx: &Ctx) -> Result<Value> {
+        let st = self.state();
+        let mut checks: Vec<Value> = st
+            .problems
+            .iter()
+            .map(|(id, why)| {
+                json!({"status": "fail", "subject": id,
+                    "message": format!("{id} can't be used: {why}"),
+                    "fix": {"summary": format!("fix or remove its file: data/fetchers/sources/{id}.toml")}})
+            })
+            .collect();
+        let total = st.sources.len();
+        drop(st);
+        for (id, (at, error, reason)) in schedule::load_last_failures(ctx) {
+            checks.push(json!({"status": "warn", "subject": id,
+                "message": format!("{id}'s last run ({at}) failed: {error} ({reason})"),
+                "fix": {"summary": "see what happened", "op": SHOW_OP, "params": {"id": id}}}));
+        }
+        if let Some(why) = schedule::last_run_problem(ctx) {
+            checks.push(json!({"status": "warn", "message": why}));
+        }
+        if checks.is_empty() {
+            checks.push(json!({"status": "ok",
+                "message": format!("{total} {}, all fine", if total == 1 { "source" } else { "sources" })}));
+        }
+        Ok(json!({"checks": checks}))
     }
 
     /// Fetches exactly one page from a source and returns its parsed items -- never the
@@ -817,6 +915,26 @@ impl Fetchers {
             }
             Ok(())
         })?;
+        // A separate write, after the transaction above has committed: [`ITEMS`] is a
+        // convenience cache (ADR 0042), not the source of truth the previous transaction's
+        // events already are, so a crash between the two loses at most this cache's copy of
+        // what just happened, never the record of it happening. Held only across this call --
+        // up to 8 fetches finish around the same time on this lane, and this file's own
+        // read-modify-write must not interleave with another source's, the same reasoning
+        // `fetch`'s own `last_run.toml` update already uses this lock for.
+        if !found.is_empty() {
+            let _g = self.write.lock();
+            let mut items = item_log(ctx);
+            for item in &found {
+                let mut entry = item_payload(source_id, item);
+                entry["at"] = json!(now);
+                items.push(entry);
+            }
+            let drop = items.len().saturating_sub(ITEMS_KEPT);
+            items.drain(..drop);
+            let text = serde_json::to_string_pretty(&items).map_err(|e| Error::internal(e.to_string()))?;
+            ctx.store.write(ITEMS, text)?;
+        }
         Ok(new_count)
     }
 }
@@ -954,6 +1072,9 @@ impl Fetchers {
         let last_run = schedule::load_last_run(ctx)?;
         let mut v = view(id, &cfg);
         v["last_run_at"] = json!(last_run.get(id));
+        v["last_error"] = json!(schedule::load_last_failures(ctx)
+            .get(id)
+            .map(|(_, error, reason)| json!({"error": error, "reason": reason})));
         v["running"] = json!(self.running.is_running(id));
         v["text"] = json!(text);
         Ok(v)
@@ -1093,7 +1214,9 @@ impl Fetchers {
 
     /// Give a source a new id (ADR 0038 §6): its dedup state (`<id>/seen.toml`) and
     /// `last_run.toml` entry move with it (ADR 0028 §7), so a renamed source is never
-    /// mistaken for brand new on its next run.
+    /// mistaken for brand new on its next run. Its `items.json` entries (ADR 0042) are
+    /// relabelled too (#315's review), so `fetchers.items` under the new id still finds what
+    /// it found under the old one.
     fn rename(&self, ctx: &Ctx, p: MoveParams) -> Result<Value> {
         let _g = self.write.lock();
         if p.id == p.to {
@@ -1116,6 +1239,7 @@ impl Fetchers {
         let renamed = schedule::SourceConfig::parse(&p.to, &text).map_err(Error::invalid_params)?;
         let seen = ctx.store.read(&dedup::path(&p.id))?;
         let last_run = schedule::rename_last_run(ctx, &p.id, &p.to)?;
+        let renamed_items = rename_items(ctx, &p.id, &p.to);
         let old_schedule = schedule::load_schedule_state(ctx, &p.id)?;
         ctx.store.transaction(|tx| {
             tx.put(&schedule::path(&p.to), text.as_str())?;
@@ -1126,6 +1250,9 @@ impl Fetchers {
             }
             if let Some(last_run) = &last_run {
                 tx.put(schedule::LAST_RUN_PATH, last_run.as_str())?;
+            }
+            if let Some(items) = &renamed_items {
+                tx.put(ITEMS, items.as_str())?;
             }
             tx.emit("fetchers.source.renamed", json!({"from": p.id, "to": p.to}))
         })?;
@@ -1259,6 +1386,60 @@ fn item_payload(source_id: &str, item: &RawItem) -> Value {
         "url": item.url,
         "raw_data": cap_raw_data(&item.raw_data),
     })
+}
+
+/// [`ITEMS`], oldest first. A broken file reads as empty, the same convenience-not-truth
+/// posture `automations::history` already takes -- `fetchers.item.found` events are what
+/// actually happened; this is only a fast, capped way to show it.
+fn item_log(ctx: &Ctx) -> Vec<Value> {
+    ctx.store
+        .read_string(ITEMS)
+        .ok()
+        .flatten()
+        .and_then(|t| serde_json::from_str::<Vec<Value>>(&t).ok())
+        .unwrap_or_default()
+}
+
+/// [`ITEMS`]'s entries for `from` relabelled `to` (ADR 0038 §6's own review on #315): a rename
+/// moves a source's dedup state and `last_run.toml` entry already (ADR 0028 §7), but left
+/// `items.json` filing everything under the old id, so `fetchers.items NEW_ID` reported
+/// nothing found even right after a rename. `None` when there is nothing to rewrite -- no
+/// item was ever found under `from`, or it aged out of the capped log already -- so the
+/// caller can skip the write entirely, same contract `schedule::rename_last_run` already uses.
+fn rename_items(ctx: &Ctx, from: &str, to: &str) -> Option<String> {
+    let mut items = item_log(ctx);
+    let mut changed = false;
+    for item in &mut items {
+        if item["source_name"] == from {
+            item["source_name"] = json!(to);
+            changed = true;
+        }
+    }
+    changed.then(|| serde_json::to_string_pretty(&items).unwrap_or_default())
+}
+
+/// `fetchers.items` (ADR 0042): matched, most recent first. Reads [`ITEMS`] fresh on every
+/// call rather than through `self.state()` -- it is small and capped, and a plain read keeps
+/// this op from needing any lock a concurrent `run_source` write might contend with.
+fn items_reply(ctx: &Ctx, p: ItemsParams) -> Value {
+    let matching: Vec<Value> = item_log(ctx)
+        .into_iter()
+        .rev()
+        .filter(|e| p.source.as_deref().is_none_or(|s| e["source_name"] == s))
+        .filter(|e| title_matches(e["title"].as_str().unwrap_or_default(), &p.contains, &p.excludes))
+        .collect();
+    json!({"items": matching})
+}
+
+/// Same matching rule the CLI's own `items` used to apply client-side, before this moved
+/// server-side (ADR 0042): a plain case-insensitive substring match, OR'd within each list --
+/// deliberately simpler than `core::filter::Filter` (ADR 0028 §8), which is for a source's own
+/// standing configuration, not a one-off "show me the ones about X" narrowing of history.
+fn title_matches(title: &str, contains: &[String], excludes: &[String]) -> bool {
+    let lower = title.to_lowercase();
+    let included = contains.is_empty() || contains.iter().any(|w| lower.contains(&w.to_lowercase()));
+    let excluded = excludes.iter().any(|w| lower.contains(&w.to_lowercase()));
+    included && !excluded
 }
 
 /// Caps an item's `raw_data` (ADR 0028 §3) **without changing its shape** (#126's review,
@@ -1530,6 +1711,82 @@ mod tests {
         assert_eq!(second["new_items"].as_u64(), Some(0));
         let found_after_second = env.backend.events().iter().filter(|e| e.topic == "fetchers.item.found").count();
         assert_eq!(found_after_second, 1, "an already-seen item must never be emitted twice");
+
+        // The same run also appended to fetchers.items' own log (ADR 0042) -- fetchers.items
+        // answers from this, not from re-querying the events above.
+        let log = item_log(&env.ctx);
+        assert_eq!(log.len(), 1, "the already-seen second run must not append a duplicate");
+        assert_eq!(
+            (log[0]["source_name"].as_str(), log[0]["source_id"].as_str()),
+            (Some("hn-whoishiring"), Some("10"))
+        );
+        assert!(log[0]["at"].is_string(), "each entry carries when it was found");
+    }
+
+    #[tokio::test]
+    async fn the_items_log_drops_the_oldest_past_its_cap() {
+        let env = TestEnv::new("fetchers");
+        write_source(&env, "hn-whoishiring", json!({"enabled": true, "interval": "daily", "kind": "hn-whoishiring"}));
+        stub_one_hn_comment(&env, 10, "<p>Acme | Remote<p>Hiring Rust engineers.");
+
+        let padding: Vec<Value> = (0..ITEMS_KEPT)
+            .map(|i| json!({"source_name": "old", "title": format!("old {i}"), "url": "https://x", "at": "2020-01-01T00:00:00Z"}))
+            .collect();
+        env.ctx.store.write(ITEMS, serde_json::to_string(&padding).unwrap()).unwrap();
+
+        let fetchers = Fetchers::default();
+        fetchers.load(&env.ctx).unwrap();
+        fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None).await.unwrap();
+
+        let log = item_log(&env.ctx);
+        assert_eq!(log.len(), ITEMS_KEPT, "stays capped, the oldest dropped to make room for the new one");
+        assert_eq!(log.last().unwrap()["source_name"], "hn-whoishiring", "the newest item lands at the end");
+        assert_eq!(log.first().unwrap()["title"], "old 1", "\"old 0\", the very oldest, was the one dropped");
+    }
+
+    #[test]
+    fn title_matches_is_case_insensitive_and_excludes_win_over_contains() {
+        assert!(title_matches("Junior Rust Engineer", &[], &[]), "no filter at all keeps everything");
+        assert!(title_matches("Junior Rust Engineer", &["junior".into()], &[]));
+        assert!(!title_matches("Senior Rust Engineer", &["junior".into()], &[]), "contains must actually match");
+        assert!(
+            !title_matches("Junior Rust Engineer", &["junior".into()], &["engineer".into()]),
+            "an excludes match drops it even though contains would have kept it"
+        );
+    }
+
+    #[test]
+    fn items_reply_filters_by_source_and_title_most_recent_first() {
+        let env = TestEnv::new("fetchers");
+        let log = vec![
+            json!({"source_name": "a", "title": "Junior Rust Engineer", "url": "https://x/1"}),
+            json!({"source_name": "b", "title": "Senior Rust Engineer", "url": "https://x/2"}),
+            json!({"source_name": "a", "title": "Staff Python Engineer", "url": "https://x/3"}),
+        ];
+        env.ctx.store.write(ITEMS, serde_json::to_string(&log).unwrap()).unwrap();
+
+        let all = items_reply(&env.ctx, ItemsParams::default());
+        let titles: Vec<&str> = all["items"].as_array().unwrap().iter().map(|i| i["title"].as_str().unwrap()).collect();
+        assert_eq!(
+            titles,
+            vec!["Staff Python Engineer", "Senior Rust Engineer", "Junior Rust Engineer"],
+            "oldest-first on disk, most recent first in the reply"
+        );
+
+        let a_only = items_reply(&env.ctx, ItemsParams { source: Some("a".into()), ..Default::default() });
+        assert_eq!(a_only["items"].as_array().unwrap().len(), 2);
+
+        let rust_only = items_reply(&env.ctx, ItemsParams { contains: vec!["rust".into()], ..Default::default() });
+        assert_eq!(rust_only["items"].as_array().unwrap().len(), 2);
+
+        let no_senior = items_reply(&env.ctx, ItemsParams { excludes: vec!["senior".into()], ..Default::default() });
+        assert_eq!(no_senior["items"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn items_reply_with_no_log_yet_is_empty_not_an_error() {
+        let env = TestEnv::new("fetchers");
+        assert_eq!(items_reply(&env.ctx, ItemsParams::default()), json!({"items": []}));
     }
 
     #[tokio::test]
@@ -1803,6 +2060,7 @@ mod tests {
         let sources = out["sources"].as_array().unwrap();
         let hn = sources.iter().find(|s| s["id"] == "hn-whoishiring").unwrap();
         assert_eq!(hn["last_run_at"], json!(env.ctx.clock.now()));
+        assert!(hn["last_error"].is_null(), "a successful run has no last error");
         assert_eq!(hn["running"], false);
 
         let wwr = sources.iter().find(|s| s["id"] == "weworkremotely").unwrap();
@@ -1823,6 +2081,49 @@ mod tests {
 
         let out = fetchers.status(&env.ctx).unwrap();
         assert_eq!(out, json!({"sources": 2, "enabled": 1, "disabled": 1, "problems": []}));
+    }
+
+    #[test]
+    fn health_is_one_ok_check_when_nothing_is_wrong() {
+        let env = TestEnv::new("fetchers");
+        write_source(&env, "my-hn", json!({"enabled": true, "interval": "daily", "kind": "hn-whoishiring"}));
+        let fetchers = Fetchers::default();
+        fetchers.load(&env.ctx).unwrap();
+
+        let out = fetchers.health(&env.ctx).unwrap();
+        let checks = out["checks"].as_array().unwrap();
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0]["status"], "ok");
+        assert!(checks[0]["message"].as_str().unwrap().contains("1 source"), "{}", checks[0]["message"]);
+    }
+
+    #[test]
+    fn health_reports_a_broken_file_and_a_failed_run_and_a_fix_clears_each() {
+        let env = TestEnv::new("fetchers");
+        write_source(&env, "my-hn", json!({"enabled": true, "interval": "daily", "kind": "hn-whoishiring"}));
+        env.ctx.store.write(&schedule::path("broken"), "not valid toml [[[").unwrap();
+        schedule::record_failure(&env.ctx, "my-hn", env.ctx.clock.now(), "boom", "network").unwrap();
+        let fetchers = Fetchers::default();
+        fetchers.load(&env.ctx).unwrap();
+
+        let out = fetchers.health(&env.ctx).unwrap();
+        let checks = out["checks"].as_array().unwrap();
+        assert_eq!(checks.len(), 2);
+        let broken = checks.iter().find(|c| c["subject"] == "broken").expect("the broken file is reported");
+        assert_eq!(broken["status"], "fail");
+        let failed = checks.iter().find(|c| c["subject"] == "my-hn").expect("the failed run is reported");
+        assert_eq!(failed["status"], "warn");
+        assert!(failed["message"].as_str().unwrap().contains("boom"), "{}", failed["message"]);
+        assert_eq!(failed["fix"]["op"], SHOW_OP);
+        assert_eq!(failed["fix"]["params"], json!({"id": "my-hn"}));
+
+        // Fixing each -- removing the broken file, a fresh successful run -- clears it from
+        // the next call; health is read fresh every time, never accumulated.
+        env.ctx.store.delete(&schedule::path("broken")).unwrap();
+        fetchers.load(&env.ctx).unwrap();
+        schedule::record_run(&env.ctx, "my-hn", env.ctx.clock.now()).unwrap();
+        let out = fetchers.health(&env.ctx).unwrap();
+        assert_eq!(out["checks"][0]["status"], "ok");
     }
 
     #[tokio::test]
@@ -1881,6 +2182,13 @@ mod tests {
         let failed: Vec<_> = env.backend.events().into_iter().filter(|e| e.topic == "fetchers.fetch.failed").collect();
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].payload["reason"], "network");
+
+        // The same classification lands in `last_run.toml` (ADR 0028 §11), for
+        // `fetchers.health` to read back without a second one.
+        let failures = schedule::load_last_failures(&env.ctx);
+        let (_, error, reason) = failures.get("hn-whoishiring").expect("the failure is recorded");
+        assert_eq!(reason, "network");
+        assert_eq!(error, &failed[0].payload["error"].as_str().unwrap().to_owned());
     }
 
     #[tokio::test]
@@ -2254,6 +2562,11 @@ mod tests {
         let v = fetchers.show(&env.ctx, "blog").unwrap();
         assert_eq!(v["id"], "blog");
         assert_eq!(v["text"].as_str().unwrap(), text);
+        assert!(v["last_error"].is_null(), "never run yet");
+
+        schedule::record_failure(&env.ctx, "blog", env.ctx.clock.now(), "boom", "network").unwrap();
+        let v = fetchers.show(&env.ctx, "blog").unwrap();
+        assert_eq!(v["last_error"], json!({"error": "boom", "reason": "network"}));
 
         let err = fetchers.show(&env.ctx, "nope").unwrap_err();
         assert_eq!(err.code, shimmer_core::ErrorCode::NotFound);
@@ -2398,6 +2711,40 @@ mod tests {
 
         let err = fetchers.rename(&env.ctx, MoveParams { id: "team-blog".into(), to: "team-blog".into() }).unwrap_err();
         assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn rename_relabels_its_items_json_entries_too() {
+        // #315's review: `items.json` (ADR 0042) still filed everything under the old id
+        // after a rename, so `fetchers.items NEW_ID` reported nothing found even though the
+        // items were right there, under the name nothing pointed at any more.
+        let env = TestEnv::new("fetchers");
+        let fetchers = Fetchers::default();
+        write_source(
+            &env,
+            "jobs",
+            json!({"enabled": true, "interval": "hourly", "kind": "rss", "url": "https://example.test/f.xml"}),
+        );
+        fetchers.load(&env.ctx).unwrap();
+        let log = vec![
+            json!({"source_name": "jobs", "title": "Rust Engineer", "url": "https://x/1", "at": "2026-01-01T00:00:00Z"}),
+            json!({"source_name": "other", "title": "Unrelated", "url": "https://x/2", "at": "2026-01-01T00:00:00Z"}),
+        ];
+        env.ctx.store.write(ITEMS, serde_json::to_string(&log).unwrap()).unwrap();
+
+        fetchers.rename(&env.ctx, MoveParams { id: "jobs".into(), to: "rust-jobs".into() }).unwrap();
+
+        let items =
+            items_reply(&env.ctx, ItemsParams { source: Some("rust-jobs".into()), contains: vec![], excludes: vec![] });
+        assert_eq!(items["items"].as_array().unwrap().len(), 1, "{items:?}");
+        assert_eq!(items["items"][0]["title"], "Rust Engineer");
+        let under_old_id =
+            items_reply(&env.ctx, ItemsParams { source: Some("jobs".into()), contains: vec![], excludes: vec![] });
+        assert!(under_old_id["items"].as_array().unwrap().is_empty(), "{under_old_id:?}");
+        // The other source's own items are untouched.
+        let other =
+            items_reply(&env.ctx, ItemsParams { source: Some("other".into()), contains: vec![], excludes: vec![] });
+        assert_eq!(other["items"].as_array().unwrap().len(), 1);
     }
 
     #[test]
