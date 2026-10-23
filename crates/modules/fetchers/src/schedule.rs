@@ -7,9 +7,11 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
+use shimmer_core::filter::Filter;
 use shimmer_core::{Ctx, Error, Result};
 
 /// The real fetch work, queued (ADR 0028 §5) -- internal; `fetchers.run` (inline) checks the
@@ -149,14 +151,12 @@ pub struct SourceConfig {
     /// (`crate::source::registry`). Present: built from this source's own `[kind]` table
     /// instead (ADR 0028 §2a/§3), via `crate::kind::kind`.
     pub kind: Option<String>,
-    /// A title must contain at least one of these (case-insensitive substring, OR-matched)
-    /// to be kept. Empty means no inclusion filter at all -- everything passes this stage.
-    pub title_contains: Vec<String>,
-    /// A title containing any of these (same matching as `title_contains`) is dropped, even
-    /// if `title_contains` would have kept it. Checked against every source's own title
-    /// only (ADR 0028 §13) -- a source whose `raw_data` carries a longer description is not
-    /// searched.
-    pub title_excludes: Vec<String>,
+    /// A `core::filter::Filter` (ADR 0028 §8), checked against `{"title": …}` only -- a source
+    /// whose `raw_data` carries a longer description is not searched. `None` keeps everything.
+    /// Kept as raw JSON, not a parsed `Filter` (which has no way back to JSON), so
+    /// `view()`/`fetchers.show`'s `text` can show it unchanged; already validated once, at
+    /// parse time, via [`matches_title`].
+    pub filter: Option<Map<String, Value>>,
     /// This source's `kind`'s own fields, from the file's `[kind]` table, untouched and
     /// opaque to this struct -- `crate::kind::Kind::parse` is the only thing that knows what
     /// any of these keys mean (ADR 0028 §3).
@@ -185,10 +185,8 @@ struct SourceMeta {
     interval: IntervalSpec,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kind: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    title_contains: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    title_excludes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    filter: Option<toml::Table>,
 }
 
 /// Builds a source file's TOML text from `fetchers.new`/`.edit`'s structured params (ADR 0028
@@ -203,22 +201,22 @@ pub(crate) fn render(
     enabled: bool,
     interval: &IntervalSpec,
     params: &Map<String, Value>,
-    title_contains: &[String],
-    title_excludes: &[String],
+    filter: Option<&Map<String, Value>>,
 ) -> std::result::Result<String, String> {
-    let kind_table = match toml::Value::try_from(params) {
-        Ok(toml::Value::Table(t)) => t,
+    let as_table = |m: &Map<String, Value>, what: &str| match toml::Value::try_from(m) {
+        Ok(toml::Value::Table(t)) => Ok(t),
         Ok(_) => unreachable!("a JSON object always serializes to a toml table"),
-        Err(e) => return Err(format!("params: {e}")),
+        Err(e) => Err(format!("{what}: {e}")),
     };
+    let kind_table = as_table(params, "params")?;
+    let filter_table = filter.map(|f| as_table(f, "filter")).transpose()?;
     let file = SourceFile {
         source: SourceMeta {
             label: label.map(str::to_owned),
             enabled,
             interval: interval.clone(),
             kind: kind.map(str::to_owned),
-            title_contains: title_contains.to_vec(),
-            title_excludes: title_excludes.to_vec(),
+            filter: filter_table,
         },
         kind: kind_table,
     };
@@ -226,9 +224,9 @@ pub(crate) fn render(
 }
 
 impl SourceConfig {
-    /// `id`'s file text, checked: its id's own charset, every `title_contains`/
-    /// `title_excludes` term, and -- the bulk of it -- its `kind`'s own fields, dispatched
-    /// through `crate::kind::kind` (ADR 0028 §3). One sentence naming what's wrong, the same
+    /// `id`'s file text, checked: its id's own charset, its `filter` (a `core::filter::Filter`,
+    /// ADR 0028 §8), and -- the bulk of it -- its `kind`'s own fields, dispatched through
+    /// `crate::kind::kind` (ADR 0028 §3). One sentence naming what's wrong, the same
     /// convention `Rule::parse` already uses in `automations`, so a broken file looks the
     /// same regardless of which module it's from.
     pub fn parse(id: &str, text: &str) -> std::result::Result<Self, String> {
@@ -240,15 +238,15 @@ impl SourceConfig {
             return Err("not a usable source id -- lowercase letters, digits, '-' and '_' only".into());
         }
         let file: SourceFile = toml::from_str(text).map_err(|e| format!("not a source file: {}", e.message()))?;
-        for (what, terms) in
-            [("title_contains", &file.source.title_contains), ("title_excludes", &file.source.title_excludes)]
-        {
-            // An empty or whitespace term is a substring of every title, so one stray comma
-            // in `title_excludes = ["senior", ""]` excludes everything, and in
-            // `title_contains` matches everything (#126's review, B3).
-            if terms.iter().any(|t| t.trim().is_empty()) {
-                return Err(format!("{what}: an empty term matches every title -- remove it (a trailing comma?)"));
-            }
+        let filter = file
+            .source
+            .filter
+            .as_ref()
+            .map(|t| serde_json::to_value(t).ok().and_then(|v| v.as_object().cloned()).unwrap_or_default());
+        if let Some(f) = &filter {
+            only_title_keys(f)?;
+            // `Filter::parse`'s own errors already name the key ("filter on 'title': …").
+            Filter::parse(f)?;
         }
         let kind_params =
             serde_json::to_value(&file.kind).ok().and_then(|v| v.as_object().cloned()).unwrap_or_default();
@@ -297,29 +295,61 @@ impl SourceConfig {
             enabled: file.source.enabled,
             interval: file.source.interval,
             kind: file.source.kind,
-            title_contains: file.source.title_contains,
-            title_excludes: file.source.title_excludes,
+            filter,
             kind_params,
         })
     }
 
-    /// Whether an item's title should be kept, given this source's own filter lists. See
+    /// Whether an item's title should be kept, given this source's own filter. See
     /// [`matches_title`] for the matching rule itself.
-    pub fn matches_title(&self, title: &str) -> bool {
-        matches_title(title, &self.title_contains, &self.title_excludes)
+    pub fn matches_title(&self, title: &str, today: NaiveDate, tz: Tz) -> bool {
+        matches_title(self.filter.as_ref(), title, today, tz)
     }
 }
 
-/// A title matching nothing in `contains` is dropped only when that list is non-empty; a
-/// title matching anything in `excludes` is always dropped, regardless of `contains`. Both
-/// are case-insensitive substrings, OR'd within each list. A free function, not only
-/// [`SourceConfig::matches_title`], so an ad-hoc CLI override (ADR 0028 §14) can run the
-/// identical rule against lists that never came from a source's own file at all.
-pub fn matches_title(title: &str, contains: &[String], excludes: &[String]) -> bool {
-    let lower = title.to_lowercase();
-    let included = contains.is_empty() || contains.iter().any(|w| lower.contains(&w.to_lowercase()));
-    let excluded = excludes.iter().any(|w| lower.contains(&w.to_lowercase()));
-    included && !excluded
+/// `filter` must check only `title`, plain or inside an `"or"` alternative -- `Filter` has no
+/// schema behind it (its own doc comment), so a key like `company = {"contains": "x"}` parses
+/// as a perfectly good filter and then silently matches nothing, every time, once it's
+/// checked against `{"title": …}` only below (#311's review, blocking; #299's review point
+/// 5). Shared by [`SourceConfig::parse`] (a source's own file) and `module::validate_filter`
+/// (an ad-hoc `fetchers.run`/`.test`/`.new` override), so neither path can drift from the
+/// other's idea of what a filter here is allowed to name.
+pub(crate) fn only_title_keys(filter: &Map<String, Value>) -> std::result::Result<(), String> {
+    for (key, value) in filter {
+        if key == "or" {
+            // A malformed "or" (not a list, an empty alternative) is left to `Filter::parse`'s
+            // own, better-worded error -- this only needs to recurse into whatever alternatives
+            // *are* shaped like filters.
+            if let Some(list) = value.as_array() {
+                for alt in list {
+                    if let Some(obj) = alt.as_object() {
+                        only_title_keys(obj)?;
+                    }
+                }
+            }
+            continue;
+        }
+        if key != "title" {
+            return Err(format!("filter on '{key}': only 'title' is checked against an item; nothing else matches"));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `title` passes `filter` (ADR 0028 §8) -- `None` keeps everything. A free function,
+/// not only [`SourceConfig::matches_title`], so an ad-hoc CLI override can run the identical
+/// rule against a filter that never came from a source's own file at all. `filter` is already
+/// validated (by `SourceConfig::parse`, or by the ad-hoc override's own check before this is
+/// ever called) -- a parse failure here would mean that validation has a gap, so it reads as
+/// "keep everything," the same safe direction an unset value already takes.
+pub fn matches_title(filter: Option<&Map<String, Value>>, title: &str, today: NaiveDate, tz: Tz) -> bool {
+    match filter {
+        None => true,
+        Some(f) => match Filter::parse(f) {
+            Ok(parsed) => parsed.matches(&json!({"title": title}), today, tz),
+            Err(_) => true,
+        },
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -435,7 +465,7 @@ pub(crate) mod test_support {
 
     use super::*;
 
-    const ENVELOPE_KEYS: &[&str] = &["label", "enabled", "interval", "kind", "title_contains", "title_excludes"];
+    const ENVELOPE_KEYS: &[&str] = &["label", "enabled", "interval", "kind", "filter"];
 
     pub(crate) fn source_file(fields: &Value) -> String {
         let mut source = toml::Table::new();
@@ -535,6 +565,10 @@ mod tests {
         assert!(loaded.problems.get("broken").is_some_and(|p| p.contains("not a source file")));
     }
 
+    fn today() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()
+    }
+
     #[test]
     fn a_non_utf8_source_file_is_a_problem_not_a_load_failure() {
         // #303's review, blocking: `Sources::load` used `read_string`, which errors on
@@ -548,18 +582,36 @@ mod tests {
     }
 
     #[test]
-    fn a_title_filter_round_trips_through_a_file() {
+    fn a_filter_round_trips_through_a_file() {
         let cfg = SourceConfig::parse(
             "hn-whoishiring",
             &source_file(&json!({
                 "enabled": true, "interval": "daily",
-                "title_contains": ["junior", "entry level"],
-                "title_excludes": ["senior", "staff"],
+                "filter": {"or": [{"title": {"contains": "junior"}}, {"title": {"contains": "entry level"}}],
+                           "title": {"not_contains": "senior"}},
             })),
         )
         .unwrap();
-        assert_eq!(cfg.title_contains, vec!["junior".to_string(), "entry level".to_string()]);
-        assert_eq!(cfg.title_excludes, vec!["senior".to_string(), "staff".to_string()]);
+        assert!(cfg.matches_title("Junior Engineer", today(), chrono_tz::UTC));
+        assert!(!cfg.matches_title("Senior Engineer", today(), chrono_tz::UTC));
+    }
+
+    #[test]
+    fn a_filter_on_any_field_but_title_is_rejected_at_load_not_silently_matching_nothing() {
+        // #311's review, blocking: `Filter` has no schema, so `company = {"contains": "Acme"}`
+        // used to load fine and then match nothing, forever -- the filter is checked against
+        // `{"title": …}` only. Same for a key inside an "or" alternative.
+        let why = problem_for(
+            json!({"enabled": true, "interval": "daily", "filter": {"company": {"contains": "Acme"}}}),
+            "hn-whoishiring",
+        );
+        assert!(why.contains("company"), "{why}");
+
+        let why = problem_for(
+            json!({"enabled": true, "interval": "daily", "filter": {"or": [{"company": {"contains": "Acme"}}]}}),
+            "hn-whoishiring",
+        );
+        assert!(why.contains("company"), "{why}");
     }
 
     #[test]
@@ -576,27 +628,35 @@ mod tests {
     #[test]
     fn matches_title_with_no_filter_configured_keeps_everything() {
         let s = source(true, MIN_INTERVAL_API_S);
-        assert!(s.matches_title("Senior Staff Engineer"));
-        assert!(s.matches_title(""));
+        assert!(s.matches_title("Senior Staff Engineer", today(), chrono_tz::UTC));
+        assert!(s.matches_title("", today(), chrono_tz::UTC));
     }
 
     #[test]
     fn matches_title_requires_one_of_contains_case_insensitively() {
         let mut s = source(true, MIN_INTERVAL_API_S);
-        s.title_contains = vec!["junior".into(), "entry level".into()];
-        assert!(s.matches_title("Junior Software Engineer"));
-        assert!(s.matches_title("JUNIOR SOFTWARE ENGINEER"), "must be case-insensitive");
-        assert!(s.matches_title("Entry Level Developer"));
-        assert!(!s.matches_title("Senior Software Engineer"), "matches neither term");
+        s.filter = Some(
+            json!({"or": [{"title": {"contains": "junior"}}, {"title": {"contains": "entry level"}}]})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        assert!(s.matches_title("Junior Software Engineer", today(), chrono_tz::UTC));
+        assert!(s.matches_title("JUNIOR SOFTWARE ENGINEER", today(), chrono_tz::UTC), "must be case-insensitive");
+        assert!(s.matches_title("Entry Level Developer", today(), chrono_tz::UTC));
+        assert!(!s.matches_title("Senior Software Engineer", today(), chrono_tz::UTC), "matches neither term");
     }
 
     #[test]
     fn matches_title_excludes_always_wins_over_contains() {
         let mut s = source(true, MIN_INTERVAL_API_S);
-        s.title_contains = vec!["engineer".into()];
-        s.title_excludes = vec!["senior".into()];
-        assert!(s.matches_title("Junior Engineer"));
-        assert!(!s.matches_title("Senior Engineer"), "excludes must win even though 'engineer' is in title_contains");
+        s.filter =
+            Some(json!({"title": {"contains": "engineer", "not_contains": "senior"}}).as_object().unwrap().clone());
+        assert!(s.matches_title("Junior Engineer", today(), chrono_tz::UTC));
+        assert!(
+            !s.matches_title("Senior Engineer", today(), chrono_tz::UTC),
+            "excludes must win even though 'engineer' matches contains"
+        );
     }
 
     #[test]
@@ -788,8 +848,7 @@ mod tests {
             enabled,
             interval: IntervalSpec::Seconds(interval_s),
             kind: None,
-            title_contains: Vec::new(),
-            title_excludes: Vec::new(),
+            filter: None,
             kind_params: Map::new(),
         }
     }
@@ -833,16 +892,20 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_filter_term_is_rejected_rather_than_matching_every_title() {
-        // #126's review, B3: `--excludes senior,` becomes ["senior", ""], and "" is a substring
-        // of every title, so everything got excluded. Same the other way for `title_contains`.
-        for field in ["title_excludes", "title_contains"] {
-            let why =
-                problem_for(json!({"enabled": true, "interval": "daily", field: ["senior", ""]}), "hn-whoishiring");
-            assert!(why.contains(field), "{field}: {why}");
+    fn an_empty_filter_operator_value_is_rejected_at_load_time() {
+        // #126's review, B3's original concern ("" is a substring of every title, so an empty
+        // term matched/excluded everything) is now `core::filter::Op::parse`'s own job --
+        // `contains`/`not_contains` already refuse an empty value.
+        for op in ["contains", "not_contains"] {
+            let mut title = Map::new();
+            title.insert(op.to_owned(), json!(""));
+            let mut filter = Map::new();
+            filter.insert("title".to_owned(), Value::Object(title));
+            let mut fields = json!({"enabled": true, "interval": "daily"});
+            fields.as_object_mut().unwrap().insert("filter".to_owned(), Value::Object(filter));
+            let why = problem_for(fields, "hn-whoishiring");
+            assert!(why.contains(op), "{op}: {why}");
         }
-        // Whitespace-only counts as empty.
-        problem_for(json!({"enabled": true, "interval": "daily", "title_contains": ["  "]}), "hn-whoishiring");
     }
 
     #[test]
@@ -897,14 +960,14 @@ mod tests {
 
     #[test]
     fn render_builds_a_file_that_parses_back_to_the_same_fields() {
+        let filter = json!({"title": {"contains": "junior", "not_contains": "staff"}}).as_object().unwrap().clone();
         let text = render(
             Some("My Team's Blog"),
             Some("rss"),
             true,
             &IntervalSpec::Preset("hourly".into()),
             &json!({"url": "https://example.test/feed.xml"}).as_object().unwrap().clone(),
-            &["junior".to_string()],
-            &["staff".to_string()],
+            Some(&filter),
         )
         .unwrap();
         let cfg = SourceConfig::parse("my-team-blog", &text).unwrap();
@@ -913,16 +976,15 @@ mod tests {
         assert!(cfg.enabled);
         assert_eq!(cfg.interval, IntervalSpec::Preset("hourly".into()));
         assert_eq!(cfg.kind_params.get("url").and_then(Value::as_str), Some("https://example.test/feed.xml"));
-        assert_eq!(cfg.title_contains, vec!["junior".to_string()]);
-        assert_eq!(cfg.title_excludes, vec!["staff".to_string()]);
+        assert_eq!(cfg.filter, Some(filter));
     }
 
     #[test]
     fn render_omits_label_and_kind_entirely_when_absent_so_a_built_in_source_still_parses() {
-        let text =
-            render(None, None, false, &IntervalSpec::Seconds(MIN_INTERVAL_API_S), &Map::new(), &[], &[]).unwrap();
+        let text = render(None, None, false, &IntervalSpec::Seconds(MIN_INTERVAL_API_S), &Map::new(), None).unwrap();
         let cfg = SourceConfig::parse("hn-whoishiring", &text).unwrap();
         assert_eq!(cfg.label, None);
         assert_eq!(cfg.kind, None);
+        assert_eq!(cfg.filter, None);
     }
 }

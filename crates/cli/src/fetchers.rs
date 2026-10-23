@@ -19,7 +19,7 @@ commands:
                         removed, to restore or purge
   show SOURCE           one source in full, with its file text
   new SOURCE --interval SPEC [--kind KIND] [--label TEXT] [--enabled] [--set KEY=VALUE]…
-                        [FILTER]    make a new source
+                        [--filter JSON]    make a new source
   edit SOURCE [--file FILE]   replace a source's whole file text; interactively, opens $EDITOR
                         on a copy of the current file; a broken edit is refused and the old
                         one kept
@@ -32,21 +32,20 @@ commands:
   copy SOURCE NEW [--label TEXT]
                         a new source like SOURCE, switched off until you enable it
   status               the whole feature at a glance: how many sources, how many enabled, any problems
-  test SOURCE [FILTER]   fetch one page and show its parsed items; never saves or marks anything seen
-  run SOURCE [--wait] [FILTER]  fetch one source now
+  test SOURCE [--filter JSON]   fetch one page and show its parsed items; never saves or marks
+                        anything seen
+  run SOURCE [--wait] [--filter JSON]  fetch one source now
   items [SOURCE] [--contains W,W] [--excludes W,W]  items a real run has actually found and kept,
                         most recent first
 
-FILTER (new, test and run):
-  --contains W,W,...    keep only a title containing at least one of these (case-insensitive)
-  --excludes W,W,...    drop a title containing any of these, even one --contains would keep
-
-On test/run, FILTER replaces -- never merges with -- whatever the source's own file
-configures, for that one call only. On new, it's the source's own setting, same as
---label/--interval/etc. (edit replaces the whole file, title_contains/_excludes included.)
+--filter JSON (new, test and run) is a core::filter::Filter (ADR 0028 §8), e.g.
+  --filter '{\"title\": {\"contains\": \"senior\"}}'
+On test/run, it replaces -- never merges with -- whatever the source's own file configures,
+for that one call only. On new, it's the source's own setting, same as --label/--interval/etc.
+(edit replaces the whole file, the filter included.)
 
 items' own --contains/--excludes are a separate, client-side narrowing of what's already
-been found and saved.
+been found and saved -- a plain case-insensitive substring match, not a filter.
 
 A source is a file in your data folder, data/fetchers/sources/SOURCE.toml:
 
@@ -54,10 +53,11 @@ A source is a file in your data folder, data/fetchers/sources/SOURCE.toml:
   enabled = true
   interval = \"daily\"             # a preset (hourly, daily, weekly) or a number of seconds
   kind = \"rss\"                   # absent: SOURCE must be one of the built-in ones
+  filter = { title = { contains = \"senior\" } }
   [kind]
   url = \"https://example.test/feed.xml\"
 
-new/edit's --set KEY=VALUE fills in [kind]'s own fields (e.g. --set url=https://example.test/feed.xml);
+new's --set KEY=VALUE fills in [kind]'s own fields (e.g. --set url=https://example.test/feed.xml);
 --kind omitted means SOURCE must already be one of the built-in ones. --interval takes a preset
 (hourly, daily, weekly) or a number of seconds; --set's value is read as JSON when it parses as
 a number or true/false, otherwise as plain text.
@@ -69,8 +69,8 @@ Add --json to any command for raw output.";
 /// (`MAX_EVENTS_LIMIT`, `crates/daemon/src/core.rs`).
 const ITEMS_QUERY_LIMIT: usize = 200;
 
-/// `fetchers new`/`edit`'s own flags, turned into `fetchers.new`/`.edit`'s params (ADR 0028
-/// §9) by [`source_params`]. `interval` stays raw text here (not yet known to be a preset or a
+/// `fetchers new`'s own flags, turned into `fetchers.new`'s params (ADR 0028 §9) by
+/// [`source_params`]. `interval` stays raw text here (not yet known to be a preset or a
 /// number of seconds) -- that's for the daemon's own `IntervalSpec` to decide.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SourceInput {
@@ -80,8 +80,7 @@ pub struct SourceInput {
     pub interval: String,
     pub enabled: bool,
     pub params: Map<String, Value>,
-    pub title_contains: Option<Vec<String>>,
-    pub title_excludes: Option<Vec<String>>,
+    pub filter: Option<Map<String, Value>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -135,14 +134,12 @@ pub enum FetchersCmd {
     Status,
     Test {
         source: String,
-        title_contains: Option<Vec<String>>,
-        title_excludes: Option<Vec<String>>,
+        filter: Option<Map<String, Value>>,
     },
     Run {
         source: String,
         wait: bool,
-        title_contains: Option<Vec<String>>,
-        title_excludes: Option<Vec<String>>,
+        filter: Option<Map<String, Value>>,
     },
     Items {
         source: Option<String>,
@@ -153,14 +150,29 @@ pub enum FetchersCmd {
 
 /// `--contains a, b ,c` (or `--excludes`) as a term list -- comma-separated, each term
 /// trimmed. `None` means the flag was not given at all, not "given but empty" (`Flags`
-/// itself already rejects an empty value, e.g. `--contains=`).
+/// itself already rejects an empty value, e.g. `--contains=`). Only `items`' own
+/// `--contains`/`--excludes` use this now -- a plain client-side substring narrowing, not a
+/// `core::filter::Filter` (ADR 0028 §8).
 ///
-/// An empty term is dropped rather than passed on (#126's review, B3): `--excludes senior,`
-/// used to send `["senior", ""]`, and `""` is a substring of every title, so a single stray
-/// comma excluded everything the source had. The daemon rejects empty terms too -- this just
-/// means the common typo quietly does the obvious thing instead of erroring.
+/// An empty term is dropped rather than passed on: `--excludes senior,` used to send
+/// `["senior", ""]`, and `""` is a substring of every title, so a single stray comma excluded
+/// everything.
 fn terms(value: Option<&str>) -> Option<Vec<String>> {
     value.map(|s| s.split(',').map(|t| t.trim().to_owned()).filter(|t| !t.is_empty()).collect())
+}
+
+/// `--filter JSON` (ADR 0028 §8, on `new`/`edit`/`test`/`run`): a `core::filter::Filter` as
+/// JSON text, e.g. `--filter '{"title": {"contains": "senior"}}'`. `None` when the flag was
+/// not given at all -- sent as nothing, not an empty object, so the daemon falls back to the
+/// source's own configured filter (on `test`/`run`) rather than overriding it with "nothing
+/// allowed."
+fn parse_filter(raw: Option<&str>) -> std::result::Result<Option<Map<String, Value>>, String> {
+    let Some(raw) = raw else { return Ok(None) };
+    match serde_json::from_str::<Value>(raw) {
+        Ok(Value::Object(m)) => Ok(Some(m)),
+        Ok(_) => Err("--filter takes a JSON object, e.g. '{\"title\": {\"contains\": \"senior\"}}'".into()),
+        Err(e) => Err(format!("--filter: invalid JSON: {e}")),
+    }
 }
 
 /// `items`' own `--contains`/`--excludes`, narrowing what's already been found rather than
@@ -196,31 +208,20 @@ pub fn parse(words: Vec<String>) -> std::result::Result<FetchersCmd, String> {
         "status" if rest.is_empty() => Ok(FetchersCmd::Status),
         "status" => Err("'fetchers status' takes no arguments".into()),
         "test" => {
-            let flags =
-                Flags::split(rest, &["--contains", "--excludes"], &[]).map_err(|e| format!("fetchers test: {e}"))?;
+            let flags = Flags::split(rest, &["--filter"], &[]).map_err(|e| format!("fetchers test: {e}"))?;
             let source = match flags.positional.as_slice() {
                 [s] => s.clone(),
-                _ => return Err("usage: shimmer fetchers test SOURCE [--contains W,W] [--excludes W,W]".into()),
+                _ => return Err("usage: shimmer fetchers test SOURCE [--filter JSON]".into()),
             };
-            Ok(FetchersCmd::Test {
-                source,
-                title_contains: terms(flags.value("--contains")),
-                title_excludes: terms(flags.value("--excludes")),
-            })
+            Ok(FetchersCmd::Test { source, filter: parse_filter(flags.value("--filter"))? })
         }
         "run" => {
-            let flags = Flags::split(rest, &["--contains", "--excludes"], &["--wait"])
-                .map_err(|e| format!("fetchers run: {e}"))?;
+            let flags = Flags::split(rest, &["--filter"], &["--wait"]).map_err(|e| format!("fetchers run: {e}"))?;
             let source = match flags.positional.as_slice() {
                 [s] => s.clone(),
-                _ => return Err("usage: shimmer fetchers run SOURCE [--wait] [--contains W,W] [--excludes W,W]".into()),
+                _ => return Err("usage: shimmer fetchers run SOURCE [--wait] [--filter JSON]".into()),
             };
-            Ok(FetchersCmd::Run {
-                source,
-                wait: flags.has("--wait"),
-                title_contains: terms(flags.value("--contains")),
-                title_excludes: terms(flags.value("--excludes")),
-            })
+            Ok(FetchersCmd::Run { source, wait: flags.has("--wait"), filter: parse_filter(flags.value("--filter"))? })
         }
         "items" => {
             let flags =
@@ -299,18 +300,17 @@ fn set_value(raw: &str) -> Value {
 }
 
 /// `new SOURCE --interval SPEC [--kind KIND] [--label TEXT] [--enabled] [--set KEY=VALUE]…
-/// [--contains W,W] [--excludes W,W]`.
+/// [--filter JSON]`.
 fn parse_source_input(words: Vec<String>) -> std::result::Result<FetchersCmd, String> {
     let usage = "usage: shimmer fetchers new SOURCE --interval SPEC [--kind KIND] [--label TEXT] [--enabled] \
-         [--set KEY=VALUE]… [--contains W,W] [--excludes W,W]"
+         [--set KEY=VALUE]… [--filter JSON]"
         .to_owned();
     let mut words = words.into_iter();
     let id = words.next().ok_or_else(|| usage.clone())?;
     if id.starts_with('-') {
         return Err(usage);
     }
-    let (mut kind, mut label, mut interval) = (None, None, None);
-    let (mut contains, mut excludes) = (None, None);
+    let (mut kind, mut label, mut interval, mut filter) = (None, None, None, None);
     let mut enabled = false;
     let mut params = Map::new();
     while let Some(word) = words.next() {
@@ -320,8 +320,7 @@ fn parse_source_input(words: Vec<String>) -> std::result::Result<FetchersCmd, St
             "--label" => label = Some(value("--label")?),
             "--interval" => interval = Some(value("--interval")?),
             "--enabled" => enabled = true,
-            "--contains" => contains = Some(value("--contains")?),
-            "--excludes" => excludes = Some(value("--excludes")?),
+            "--filter" => filter = Some(value("--filter")?),
             "--set" => {
                 let kv = value("--set")?;
                 let (k, v) = kv.split_once('=').ok_or_else(|| "--set needs KEY=VALUE".to_owned())?;
@@ -338,8 +337,7 @@ fn parse_source_input(words: Vec<String>) -> std::result::Result<FetchersCmd, St
         interval,
         enabled,
         params,
-        title_contains: terms(contains.as_deref()),
-        title_excludes: terms(excludes.as_deref()),
+        filter: parse_filter(filter.as_deref())?,
     }))
 }
 
@@ -465,22 +463,22 @@ pub async fn run(client: &mut Client, cmd: &FetchersCmd, json_out: bool, prompt:
             let data = client.call("fetchers.status", json!({})).await?;
             Ok(if json_out { render::json(&data) } else { status(&data) })
         }
-        FetchersCmd::Test { source, title_contains, title_excludes } => {
+        FetchersCmd::Test { source, filter } => {
             // Always follows: a dry run that returned immediately with just a task id would
             // defeat its own point, unlike `run`, which has something useful to say either way.
             client.subscribe(&["queue.task.*"]).await?;
-            let params = filter_params(source, title_contains, title_excludes);
+            let params = filter_params(source, filter);
             let handle = client.call("fetchers.test", params).await?;
             let task = task_id(&handle)?;
             let result = follow(client, task).await?;
             Ok(if json_out { render::json(&result) } else { test_items(source, &result) })
         }
-        FetchersCmd::Run { source, wait, title_contains, title_excludes } => {
+        FetchersCmd::Run { source, wait, filter } => {
             if *wait {
                 // Before the request, so not even the first event can be missed.
                 client.subscribe(&["queue.task.*"]).await?;
             }
-            let params = filter_params(source, title_contains, title_excludes);
+            let params = filter_params(source, filter);
             let handle = client.call("fetchers.run", params).await?;
             let task = task_id(&handle)?;
             if !*wait {
@@ -602,11 +600,8 @@ fn source_params(input: &SourceInput) -> Value {
     if let Some(l) = &input.label {
         p["label"] = json!(l);
     }
-    if let Some(c) = &input.title_contains {
-        p["title_contains"] = json!(c);
-    }
-    if let Some(e) = &input.title_excludes {
-        p["title_excludes"] = json!(e);
+    if let Some(f) = &input.filter {
+        p["filter"] = json!(f);
     }
     p
 }
@@ -662,17 +657,14 @@ fn removed_list(data: &Value) -> String {
     out
 }
 
-/// `fetchers.run`/`fetchers.test`'s params: `id`, plus `title_contains`/
-/// `title_excludes` only when a `--contains`/`--excludes` flag was actually given --
-/// omitted entirely, not sent as an empty list, so the module falls back to the source's
-/// own configured filter (ADR 0028 §14) rather than overriding it with "nothing allowed."
-fn filter_params(source: &str, title_contains: &Option<Vec<String>>, title_excludes: &Option<Vec<String>>) -> Value {
+/// `fetchers.run`/`fetchers.test`'s params: `id`, plus `filter` only when `--filter` was
+/// actually given -- omitted entirely, not sent as an empty object, so the module falls back
+/// to the source's own configured filter (ADR 0028 §8/§14) rather than overriding it with
+/// "nothing allowed."
+fn filter_params(source: &str, filter: &Option<Map<String, Value>>) -> Value {
     let mut params = json!({"id": source});
-    if let Some(c) = title_contains {
-        params["title_contains"] = json!(c);
-    }
-    if let Some(e) = title_excludes {
-        params["title_excludes"] = json!(e);
+    if let Some(f) = filter {
+        params["filter"] = json!(f);
     }
     params
 }
@@ -877,8 +869,7 @@ mod tests {
                 interval: "daily".into(),
                 enabled: false,
                 params: Map::new(),
-                title_contains: None,
-                title_excludes: None,
+                filter: None,
             }))
         );
         assert_eq!(
@@ -894,10 +885,8 @@ mod tests {
                 "--enabled",
                 "--set",
                 "url=https://example.test/f.xml",
-                "--contains",
-                "junior",
-                "--excludes",
-                "senior"
+                "--filter",
+                "{\"title\": {\"contains\": \"junior\"}}",
             ]),
             Ok(FetchersCmd::New(SourceInput {
                 id: "blog".into(),
@@ -906,8 +895,7 @@ mod tests {
                 interval: "3600".into(),
                 enabled: true,
                 params: json!({"url": "https://example.test/f.xml"}).as_object().unwrap().clone(),
-                title_contains: Some(vec!["junior".into()]),
-                title_excludes: Some(vec!["senior".into()]),
+                filter: Some(json!({"title": {"contains": "junior"}}).as_object().unwrap().clone()),
             }))
         );
         assert_eq!(p(&["edit", "blog"]), Ok(FetchersCmd::Edit { id: "blog".into(), file: None }));
@@ -931,41 +919,29 @@ mod tests {
         );
         assert_eq!(
             p(&["test", "hn-whoishiring"]),
-            Ok(FetchersCmd::Test { source: "hn-whoishiring".into(), title_contains: None, title_excludes: None })
+            Ok(FetchersCmd::Test { source: "hn-whoishiring".into(), filter: None })
         );
         assert_eq!(
             p(&["run", "hn-whoishiring"]),
-            Ok(FetchersCmd::Run {
-                source: "hn-whoishiring".into(),
-                wait: false,
-                title_contains: None,
-                title_excludes: None,
-            })
+            Ok(FetchersCmd::Run { source: "hn-whoishiring".into(), wait: false, filter: None })
         );
         assert_eq!(
             p(&["run", "hn-whoishiring", "--wait"]),
-            Ok(FetchersCmd::Run {
-                source: "hn-whoishiring".into(),
-                wait: true,
-                title_contains: None,
-                title_excludes: None,
-            })
+            Ok(FetchersCmd::Run { source: "hn-whoishiring".into(), wait: true, filter: None })
         );
         assert_eq!(
-            p(&["run", "hn-whoishiring", "--contains", "junior, entry level", "--excludes", "senior,staff"]),
+            p(&["run", "hn-whoishiring", "--filter", "{\"title\": {\"not_contains\": \"senior\"}}"]),
             Ok(FetchersCmd::Run {
                 source: "hn-whoishiring".into(),
                 wait: false,
-                title_contains: Some(vec!["junior".into(), "entry level".into()]),
-                title_excludes: Some(vec!["senior".into(), "staff".into()]),
+                filter: Some(json!({"title": {"not_contains": "senior"}}).as_object().unwrap().clone()),
             })
         );
         assert_eq!(
-            p(&["test", "hn-whoishiring", "--contains", "junior"]),
+            p(&["test", "hn-whoishiring", "--filter", "{\"title\": {\"contains\": \"junior\"}}"]),
             Ok(FetchersCmd::Test {
                 source: "hn-whoishiring".into(),
-                title_contains: Some(vec!["junior".into()]),
-                title_excludes: None,
+                filter: Some(json!({"title": {"contains": "junior"}}).as_object().unwrap().clone()),
             })
         );
         assert_eq!(p(&["items"]), Ok(FetchersCmd::Items { source: None, title_contains: None, title_excludes: None }));
@@ -1150,14 +1126,11 @@ mod tests {
 
     #[test]
     fn filter_params_omits_a_field_entirely_when_its_flag_was_not_given() {
-        assert_eq!(filter_params("hn-whoishiring", &None, &None), json!({"id": "hn-whoishiring"}));
+        assert_eq!(filter_params("hn-whoishiring", &None), json!({"id": "hn-whoishiring"}));
+        let filter = json!({"title": {"contains": "junior"}}).as_object().unwrap().clone();
         assert_eq!(
-            filter_params("hn-whoishiring", &Some(vec!["junior".into()]), &None),
-            json!({"id": "hn-whoishiring", "title_contains": ["junior"]})
-        );
-        assert_eq!(
-            filter_params("hn-whoishiring", &None, &Some(vec!["senior".into()])),
-            json!({"id": "hn-whoishiring", "title_excludes": ["senior"]})
+            filter_params("hn-whoishiring", &Some(filter)),
+            json!({"id": "hn-whoishiring", "filter": {"title": {"contains": "junior"}}})
         );
     }
 
@@ -1178,8 +1151,7 @@ mod tests {
             interval: "daily".into(),
             enabled: false,
             params: Map::new(),
-            title_contains: None,
-            title_excludes: None,
+            filter: None,
         };
         assert_eq!(source_params(&minimal), json!({"id": "blog", "enabled": false, "interval": "daily", "params": {}}));
 
@@ -1190,15 +1162,14 @@ mod tests {
             interval: "3600".into(),
             enabled: true,
             params: json!({"url": "https://example.test/f.xml"}).as_object().unwrap().clone(),
-            title_contains: Some(vec!["junior".into()]),
-            title_excludes: Some(vec!["senior".into()]),
+            filter: Some(json!({"title": {"contains": "junior"}}).as_object().unwrap().clone()),
         };
         assert_eq!(
             source_params(&full),
             json!({
                 "id": "blog", "kind": "rss", "label": "My Blog", "enabled": true, "interval": 3600,
                 "params": {"url": "https://example.test/f.xml"},
-                "title_contains": ["junior"], "title_excludes": ["senior"],
+                "filter": {"title": {"contains": "junior"}},
             })
         );
     }

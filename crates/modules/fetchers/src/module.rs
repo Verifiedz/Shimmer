@@ -1,11 +1,15 @@
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use chrono::NaiveDate;
+use chrono_tz::Tz;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use shimmer_core::filter::Filter;
 use shimmer_core::params::decode;
 use shimmer_core::{
-    CommandSpec, Ctx, Error, ErrorCode, Execution, LaneConfig, Manifest, Module, Result, TriggerId, WriteLock,
+    local_date, CommandSpec, Ctx, Error, ErrorCode, Execution, LaneConfig, Manifest, Module, Result, TriggerId,
+    WriteLock,
 };
 
 use crate::dedup::{self, RunGuard};
@@ -126,8 +130,7 @@ impl Module for Fetchers {
                     "type": "object", "required": ["id"],
                     "properties": {
                         "id": {"type": "string"},
-                        "title_contains": {"type": "array", "items": {"type": "string"}},
-                        "title_excludes": {"type": "array", "items": {"type": "string"}},
+                        "filter": {"type": "object"},
                     },
                 }),
                 // Inline, not Queued (see RUN_OP's own doc comment): it checks the source
@@ -143,8 +146,7 @@ impl Module for Fetchers {
                     "type": "object", "required": ["id"],
                     "properties": {
                         "id": {"type": "string"},
-                        "title_contains": {"type": "array", "items": {"type": "string"}},
-                        "title_excludes": {"type": "array", "items": {"type": "string"}},
+                        "filter": {"type": "object"},
                     },
                 }),
                 execution: Execution::Queued { lane: LANE.into() },
@@ -172,8 +174,7 @@ impl Module for Fetchers {
                     "type": "object", "required": ["id"],
                     "properties": {
                         "id": {"type": "string"},
-                        "title_contains": {"type": "array", "items": {"type": "string"}},
-                        "title_excludes": {"type": "array", "items": {"type": "string"}},
+                        "filter": {"type": "object"},
                     },
                 }),
                 execution: Execution::Queued { lane: LANE.into() },
@@ -266,7 +267,7 @@ impl Module for Fetchers {
             RUN_OP => self.run(ctx, params).await,
             RUN_TASK_OP => {
                 let p: FetchParams = decode(params)?;
-                let filter = TitleFilterOverride::from_params(p.title_contains, p.title_excludes)?;
+                let filter = validate_filter(p.filter)?;
                 self.fetch(ctx, p.id, filter).await
             }
             LIST_OP => {
@@ -276,7 +277,7 @@ impl Module for Fetchers {
             STATUS_OP => self.status(ctx),
             TEST_OP => {
                 let p: FetchParams = decode(params)?;
-                let filter = TitleFilterOverride::from_params(p.title_contains, p.title_excludes)?;
+                let filter = validate_filter(p.filter)?;
                 self.test(ctx, p.id, filter).await
             }
             RELOAD_OP => {
@@ -332,10 +333,11 @@ impl Module for Fetchers {
 #[derive(Deserialize)]
 struct FetchParams {
     id: String,
+    /// An ad-hoc `core::filter::Filter` (ADR 0028 §8/§14), replacing -- never merging with --
+    /// the source's own configured filter for this one call. Absent means the configured
+    /// filter (if any) applies exactly as before this existed.
     #[serde(default)]
-    title_contains: Option<Vec<String>>,
-    #[serde(default)]
-    title_excludes: Option<Vec<String>>,
+    filter: Option<Map<String, Value>>,
 }
 
 #[derive(Deserialize)]
@@ -367,10 +369,10 @@ struct SourceInput {
     interval: schedule::IntervalSpec,
     #[serde(default)]
     params: Map<String, Value>,
+    /// A `core::filter::Filter` (ADR 0028 §8), checked against `{"title": …}` only. `None`
+    /// keeps everything.
     #[serde(default)]
-    title_contains: Vec<String>,
-    #[serde(default)]
-    title_excludes: Vec<String>,
+    filter: Option<Map<String, Value>>,
 }
 
 fn source_input_schema() -> Value {
@@ -383,8 +385,7 @@ fn source_input_schema() -> Value {
             "enabled": {"type": "boolean"},
             "interval": {},
             "params": {"type": "object"},
-            "title_contains": {"type": "array", "items": {"type": "string"}},
-            "title_excludes": {"type": "array", "items": {"type": "string"}},
+            "filter": {"type": "object"},
         },
     })
 }
@@ -419,37 +420,16 @@ struct Purge {
     confirm: Option<Value>,
 }
 
-/// An ad-hoc title filter from a `fetchers.run`/`fetchers.test` caller (the CLI's
-/// `--contains`/`--excludes` flags), scoped to one call -- it replaces, never merges with,
-/// whatever this source's own file configures (ADR 0028 §14).
-/// `None` means neither flag was given at all, so the configured filter (if any) applies
-/// exactly as before this existed.
-struct TitleFilterOverride {
-    contains: Vec<String>,
-    excludes: Vec<String>,
-}
-
-impl TitleFilterOverride {
-    fn from_params(contains: Option<Vec<String>>, excludes: Option<Vec<String>>) -> Result<Option<Self>> {
-        if contains.is_none() && excludes.is_none() {
-            return Ok(None);
-        }
-        let contains = contains.unwrap_or_default();
-        let excludes = excludes.unwrap_or_default();
-        // An empty or whitespace term is a substring of every title, so it would exclude or
-        // include everything -- the same reason config load already rejects one (#126's
-        // review, B3). `fetchers.run`/`fetchers.test` reach this past the CLI's own
-        // comma-split filtering, so an automation or `shimmer call` sending `[""]` must be
-        // rejected here too, not just stop marking items seen (#279's re-review).
-        for (what, terms) in [("title_contains", &contains), ("title_excludes", &excludes)] {
-            if terms.iter().any(|t| t.trim().is_empty()) {
-                return Err(Error::invalid_params(format!(
-                    "{what}: an empty term matches every title -- remove it (a trailing comma?)"
-                )));
-            }
-        }
-        Ok(Some(Self { contains, excludes }))
+/// `FetchParams.filter`/`SourceInput.filter`, checked the same way `SourceConfig::parse`
+/// checks a source's own configured one (ADR 0028 §8) -- `fetchers.run`/`.test` reach this
+/// past the CLI's own `--filter` parsing, so a broken filter sent directly as an op's params
+/// (an automation, `shimmer call`) is rejected here too, not just at file-load time.
+fn validate_filter(filter: Option<Map<String, Value>>) -> Result<Option<Map<String, Value>>> {
+    if let Some(f) = &filter {
+        schedule::only_title_keys(f).map_err(Error::invalid_params)?;
+        Filter::parse(f).map_err(Error::invalid_params)?;
     }
+    Ok(filter)
 }
 
 impl Fetchers {
@@ -534,7 +514,7 @@ impl Fetchers {
         }))
     }
 
-    async fn fetch(&self, ctx: &Ctx, source_id: String, filter_override: Option<TitleFilterOverride>) -> Result<Value> {
+    async fn fetch(&self, ctx: &Ctx, source_id: String, filter_override: Option<Map<String, Value>>) -> Result<Value> {
         if source_id.trim().is_empty() {
             return Err(Error::invalid_params("id must not be empty"));
         }
@@ -626,10 +606,9 @@ impl Fetchers {
                     "kind": cfg.and_then(|c| c.kind.clone()),
                     "enabled": cfg.is_some_and(|c| c.enabled),
                     // 0: already validated at load time (§126 review's per-method floor);
-                    // this is read-only display, not re-validation, same as `due_sources`.
+                    // this is read-only display, not re-validation.
                     "interval_s": cfg.and_then(|c| c.interval.resolve(0).ok()),
-                    "title_contains": cfg.map(|c| c.title_contains.clone()).unwrap_or_default(),
-                    "title_excludes": cfg.map(|c| c.title_excludes.clone()).unwrap_or_default(),
+                    "filter": cfg.and_then(|c| c.filter.clone()),
                     "last_run_at": last_run.get(id),
                     "running": self.running.is_running(id),
                 })
@@ -662,7 +641,7 @@ impl Fetchers {
     /// anything seen"). Deliberately simpler than [`Fetchers::run_source`]: a dry run has no
     /// state of its own to protect, so it skips the overlap guard too -- a `test` can run
     /// alongside a real `fetch` of the same source without conflict.
-    async fn test(&self, ctx: &Ctx, source_id: String, filter_override: Option<TitleFilterOverride>) -> Result<Value> {
+    async fn test(&self, ctx: &Ctx, source_id: String, filter_override: Option<Map<String, Value>>) -> Result<Value> {
         if source_id.trim().is_empty() {
             return Err(Error::invalid_params("id must not be empty"));
         }
@@ -673,11 +652,13 @@ impl Fetchers {
         // Applied here too (§13/§14), not just in `run_source` -- a preview that shows items
         // a real run would never keep is a misleading preview.
         let configured = sources.sources.get(&source_id);
+        let today = local_date(ctx.clock.now(), &ctx.local_tz);
+        let tz = ctx.local_tz.tz();
         let items: Vec<Value> = page
             .items
             .into_iter()
             .filter_map(RawItem::sanitized)
-            .filter(|item| passes_title_filter(&item.title, filter_override.as_ref(), configured))
+            .filter(|item| passes_title_filter(&item.title, filter_override.as_ref(), configured, today, tz))
             .map(|item| item_payload(&source_id, &item))
             .collect();
         Ok(json!({"source": source_id, "items": items}))
@@ -693,12 +674,14 @@ impl Fetchers {
         &self,
         ctx: &Ctx,
         source: &dyn Source,
-        filter_override: Option<&TitleFilterOverride>,
+        filter_override: Option<&Map<String, Value>>,
         configured: Option<&schedule::SourceConfig>,
     ) -> Result<usize> {
         let source_id = source.id();
         let mut seen = dedup::load(ctx, source_id)?;
         let now = ctx.clock.now();
+        let today = local_date(now, &ctx.local_tz);
+        let tz = ctx.local_tz.tz();
         let mut found: Vec<RawItem> = Vec::new();
         let mut cursor: Option<String> = None;
         // A title this source's own config excludes, or that `filter_override` excludes for
@@ -728,12 +711,12 @@ impl Fetchers {
             let next = page.next_cursor;
             for item in page.items.into_iter().filter_map(RawItem::sanitized) {
                 if seen.is_new(&item.source_id) {
-                    if !passes_title_filter(&item.title, filter_override, configured) {
+                    if !passes_title_filter(&item.title, filter_override, configured, today, tz) {
                         // A *configured* filter is a standing decision, so a title it drops is
-                        // marked seen and never re-examined. A one-off `--contains`/`--excludes`
+                        // marked seen and never re-examined. A one-off `--filter`
                         // on `run` is not: marking those seen meant a single experiment hid the
-                        // rest of a source's backlog for the full 90-day retention, and a stray
-                        // comma hid all of it (#126's review, B2 with B3). An override leaves
+                        // rest of a source's backlog for the full 90-day retention (#126's
+                        // review, B2). An override leaves
                         // the items it drops untouched, so the next plain run still finds them.
                         if filter_override.is_none() {
                             seen.touch(item.source_id.clone(), now);
@@ -823,8 +806,7 @@ impl Fetchers {
             p.enabled,
             &p.interval,
             &p.params,
-            &p.title_contains,
-            &p.title_excludes,
+            p.filter.as_ref(),
         )
         .map_err(Error::invalid_params)?;
         let cfg = schedule::SourceConfig::parse(&p.id, &text).map_err(Error::invalid_params)?;
@@ -1095,8 +1077,7 @@ fn view(id: &str, cfg: &schedule::SourceConfig) -> Value {
         "interval_s": cfg.interval.resolve(0).ok(),
         "kind": cfg.kind,
         "kind_params": cfg.kind_params,
-        "title_contains": cfg.title_contains,
-        "title_excludes": cfg.title_excludes,
+        "filter": cfg.filter,
     })
 }
 
@@ -1126,18 +1107,19 @@ fn classify_failure(ctx: &Ctx, err: &Error) -> &'static str {
     }
 }
 
-/// Whether an item's title should be kept: `filter_override` (ADR 0028 §14), when given,
-/// completely replaces `configured`'s own `title_contains`/`title_excludes` for this one
-/// call -- the two are never merged. With neither present, everything passes, exactly as
-/// before either of them existed.
+/// Whether an item's title should be kept: `filter_override` (ADR 0028 §8/§14), when given,
+/// completely replaces `configured`'s own filter for this one call -- the two are never
+/// merged. With neither present, everything passes.
 fn passes_title_filter(
     title: &str,
-    filter_override: Option<&TitleFilterOverride>,
+    filter_override: Option<&Map<String, Value>>,
     configured: Option<&schedule::SourceConfig>,
+    today: NaiveDate,
+    tz: Tz,
 ) -> bool {
     match filter_override {
-        Some(f) => schedule::matches_title(title, &f.contains, &f.excludes),
-        None => configured.is_none_or(|c| c.matches_title(title)),
+        Some(f) => schedule::matches_title(Some(f), title, today, tz),
+        None => configured.is_none_or(|c| c.matches_title(title, today, tz)),
     }
 }
 
@@ -1309,32 +1291,33 @@ mod tests {
     }
 
     #[test]
-    fn title_filter_override_is_none_only_when_neither_flag_was_given() {
-        assert!(TitleFilterOverride::from_params(None, None).unwrap().is_none());
-        let f = TitleFilterOverride::from_params(Some(vec!["junior".into()]), None).unwrap().unwrap();
-        assert_eq!((f.contains, f.excludes), (vec!["junior".to_string()], Vec::new()));
-        let f = TitleFilterOverride::from_params(None, Some(vec!["senior".into()])).unwrap().unwrap();
-        assert_eq!((f.contains, f.excludes), (Vec::new(), vec!["senior".to_string()]));
+    fn validate_filter_is_none_only_when_nothing_was_given() {
+        assert!(validate_filter(None).unwrap().is_none());
+        let f = json!({"title": {"contains": "junior"}}).as_object().unwrap().clone();
+        assert_eq!(validate_filter(Some(f.clone())).unwrap(), Some(f));
     }
 
     #[test]
-    fn an_empty_title_filter_term_from_a_caller_is_rejected_not_just_defanged() {
-        // B2 already stops an override from marking a dropped item seen, so this was only ever
-        // wrong, not destructive -- but `fetchers.run`/`fetchers.test` reach `from_params`
-        // straight from an op's params, past the CLI's own comma-split filtering (#59)
-        // and config load's own rejection (B3), so an automation or `shimmer call` sending
-        // `{"title_excludes": ["senior", ""]}` must hit the same rejection here (#279's re-review).
-        match TitleFilterOverride::from_params(None, Some(vec!["senior".into(), String::new()])) {
-            Ok(_) => panic!("an empty title_excludes term must be rejected"),
-            Err(e) => {
-                assert_eq!(e.code, shimmer_core::ErrorCode::InvalidParams);
-                assert!(e.message.contains("title_excludes"), "{}", e.message);
-            }
-        }
-        match TitleFilterOverride::from_params(Some(vec!["  ".into()]), None) {
-            Ok(_) => panic!("a whitespace-only title_contains term must be rejected"),
-            Err(e) => assert!(e.message.contains("title_contains"), "{}", e.message),
-        }
+    fn an_invalid_filter_from_a_caller_is_rejected_not_just_defanged() {
+        // `fetchers.run`/`fetchers.test` reach `validate_filter` straight from an op's params,
+        // past the CLI's own `--filter` parsing, so a broken filter sent directly by an
+        // automation or `shimmer call` must hit the same rejection a broken configured filter
+        // would at file-load time.
+        let bad = json!({"title": {"contains": ""}}).as_object().unwrap().clone();
+        let err = validate_filter(Some(bad)).unwrap_err();
+        assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams);
+        assert!(err.message.contains("contains"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_caller_supplied_filter_on_any_field_but_title_is_also_rejected() {
+        // #311's review, blocking, through the same ad-hoc override path as above -- a
+        // `fetchers.run`/`.test`/`.new` filter that only names a field no one checks must be
+        // caught here too, not just at file-load time (`schedule::only_title_keys`).
+        let bad = json!({"company": {"contains": "Acme"}}).as_object().unwrap().clone();
+        let err = validate_filter(Some(bad)).unwrap_err();
+        assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams);
+        assert!(err.message.contains("company"), "{}", err.message);
     }
 
     #[tokio::test]
@@ -1430,7 +1413,7 @@ mod tests {
         write_source(
             &env,
             "hn-whoishiring",
-            json!({"enabled": true, "interval": "daily", "title_excludes": ["senior"]}),
+            json!({"enabled": true, "interval": "daily", "filter": {"title": {"not_contains": "senior"}}}),
         );
         const BASE: &str = "https://hacker-news.firebaseio.com/v0";
         {
@@ -1476,7 +1459,7 @@ mod tests {
         write_source(
             &env,
             "hn-whoishiring",
-            json!({"enabled": true, "interval": "daily", "title_contains": ["junior"]}),
+            json!({"enabled": true, "interval": "daily", "filter": {"title": {"contains": "junior"}}}),
         );
         const BASE: &str = "https://hacker-news.firebaseio.com/v0";
         {
@@ -1512,7 +1495,7 @@ mod tests {
         write_source(
             &env,
             "hn-whoishiring",
-            json!({"enabled": true, "interval": "daily", "title_contains": ["junior"]}),
+            json!({"enabled": true, "interval": "daily", "filter": {"title": {"contains": "junior"}}}),
         );
         const BASE: &str = "https://hacker-news.firebaseio.com/v0";
         {
@@ -1534,7 +1517,7 @@ mod tests {
 
         let fetchers = Fetchers::default();
         fetchers.load(&env.ctx).unwrap();
-        let override_filter = TitleFilterOverride { contains: vec!["senior".into()], excludes: Vec::new() };
+        let override_filter = json!({"title": {"contains": "senior"}}).as_object().unwrap().clone();
         let out = fetchers.test(&env.ctx, "hn-whoishiring".into(), Some(override_filter)).await.unwrap();
         let items = out["items"].as_array().unwrap();
         assert_eq!(items.len(), 1, "{items:?}");
@@ -1562,7 +1545,7 @@ mod tests {
             );
         }
 
-        let override_filter = TitleFilterOverride { contains: Vec::new(), excludes: vec!["senior".into()] };
+        let override_filter = json!({"title": {"not_contains": "senior"}}).as_object().unwrap().clone();
         let fetchers = Fetchers::default();
         let out = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), Some(override_filter)).await.unwrap();
         assert_eq!(out["new_items"], 1);
@@ -1781,7 +1764,7 @@ mod tests {
         let env = TestEnv::new("fetchers");
         let fetchers = Fetchers::default();
         let out = fetchers
-            .handle(RUN_OP, json!({"id": "hn-whoishiring", "title_contains": ["junior"]}), &env.ctx)
+            .handle(RUN_OP, json!({"id": "hn-whoishiring", "filter": {"title": {"contains": "junior"}}}), &env.ctx)
             .await
             .unwrap();
         assert_eq!(out["queued"], true);
@@ -1789,7 +1772,7 @@ mod tests {
         let submitted = env.queue.requests.lock().unwrap();
         assert_eq!(submitted.len(), 1);
         assert_eq!(submitted[0].op, RUN_TASK_OP);
-        assert_eq!(submitted[0].params, json!({"id": "hn-whoishiring", "title_contains": ["junior"]}));
+        assert_eq!(submitted[0].params, json!({"id": "hn-whoishiring", "filter": {"title": {"contains": "junior"}}}));
     }
 
     #[tokio::test]
@@ -1925,8 +1908,7 @@ mod tests {
             enabled: true,
             interval: schedule::IntervalSpec::Preset("hourly".into()),
             params: json!({"url": url}).as_object().unwrap().clone(),
-            title_contains: Vec::new(),
-            title_excludes: Vec::new(),
+            filter: None,
         }
     }
 
