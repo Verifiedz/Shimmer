@@ -94,7 +94,21 @@ impl Daemon {
         // One writer: a second daemon on the same home would corrupt the ordering guarantees.
         let lock = lock_home(store.home()).await?;
         let recovered = store.recover()?;
-        if recovered != Default::default() {
+        // Each says only what's true of it (#309's second review): kept aside, left in place, or
+        // waiting to be retried.
+        if !recovered.broken.is_empty() {
+            tracing::warn!(broken = ?recovered.broken, "some committed saves are damaged; kept in .staging/broken/");
+        }
+        if !recovered.left_in_place.is_empty() {
+            tracing::error!(left = ?recovered.left_in_place, "some committed saves are damaged and couldn't be moved aside; left in .staging/");
+        }
+        if recovered.waiting > 0 {
+            tracing::warn!(
+                waiting = recovered.waiting,
+                "some committed saves couldn't be applied yet; retried before the next save"
+            );
+        }
+        if recovered.broken.is_empty() && recovered.left_in_place.is_empty() && recovered != Default::default() {
             tracing::info!(?recovered, "recovered interrupted transactions");
         }
 

@@ -37,8 +37,9 @@ daemon.sock
 
 pub struct Store {
     home: PathBuf,
-    /// Serialises commits and log appends. Cheap: one writer process anyway.
-    write_lock: Mutex<()>,
+    /// Serialises commits and log appends. Cheap: one writer process anyway. Holds the
+    /// committed transactions whose last step failed, retried before the next commit (#260).
+    write_lock: Mutex<Vec<PathBuf>>,
 }
 
 impl Store {
@@ -53,7 +54,7 @@ impl Store {
         if !ignore.exists() {
             atomic::write_atomic(&ignore, GITIGNORE.as_bytes())?;
         }
-        Ok(Self { home, write_lock: Mutex::new(()) })
+        Ok(Self { home, write_lock: Mutex::new(Vec::new()) })
     }
 
     pub fn home(&self) -> &Path {
@@ -66,8 +67,8 @@ impl Store {
 
     /// Finish or discard every in-flight transaction left by a crash. Idempotent.
     pub fn recover(&self) -> Result<Recovery> {
-        let _g = self.lock();
-        tx::recover(&self.home)
+        let mut pending = self.lock();
+        tx::recover(&self.home, &mut pending)
     }
 
     /// Append to the event log. Used for events that are not part of a store transaction.
@@ -76,12 +77,37 @@ impl Store {
         log::append(&self.home, event)
     }
 
+    /// [`StoreBackend::commit`], returning the events that reached the log in this call, in log
+    /// order: earlier transactions that were waiting and have now landed, then this one's. A
+    /// transaction whose last step failed is committed (it happens), but its events aren't
+    /// logged yet, so they aren't returned until a later call or recovery lands them (#309's
+    /// review). The daemon publishes exactly these, so nothing reaches the bus before the log.
+    ///
+    /// The events come back even when this transaction fails: an earlier one that landed in the
+    /// same call is durable, and has to be published whatever happens to this one (#309's second
+    /// review). So it's both, not a `Result` of either.
+    pub fn commit_logged(&self, namespace: &str, plan: TxPlan) -> (Vec<Event>, Result<()>) {
+        let checked = self.namespace_dir(namespace).and_then(|dir| {
+            for w in &plan.writes {
+                let (shimmer_core::Write::Put { path, .. } | shimmer_core::Write::Delete { path }) = w;
+                validate_path(path)?;
+            }
+            Ok(dir)
+        });
+        let dir = match checked {
+            Ok(dir) => dir,
+            Err(e) => return (Vec::new(), Err(e)),
+        };
+        let mut pending = self.lock();
+        tx::commit(&self.home, &dir, namespace, plan, &mut pending)
+    }
+
     /// Every logged event, oldest first, tolerating torn or corrupt lines.
     pub fn read_events(&self) -> Result<EventScan> {
         log::read_all(&self.home)
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<PathBuf>> {
         // A panic mid-commit leaves staging state that recovery handles; the lock itself
         // guards no data, so poisoning carries no information.
         self.write_lock.lock().unwrap_or_else(|e| e.into_inner())
@@ -120,12 +146,6 @@ impl StoreBackend for Store {
     }
 
     fn commit(&self, namespace: &str, plan: TxPlan) -> Result<()> {
-        let dir = self.namespace_dir(namespace)?;
-        for w in &plan.writes {
-            let (shimmer_core::Write::Put { path, .. } | shimmer_core::Write::Delete { path }) = w;
-            validate_path(path)?;
-        }
-        let _g = self.lock();
-        tx::commit(&self.home, &dir, namespace, plan)
+        self.commit_logged(namespace, plan).1
     }
 }

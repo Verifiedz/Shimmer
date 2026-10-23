@@ -7,6 +7,14 @@
 //!
 //! Step 3 is idempotent and is exactly what recovery runs, so a crash anywhere after step 2
 //! rolls forward and a crash before it rolls back (staging deleted).
+//!
+//! Step 2 is the commit point in every sense: once `COMMITTED` is written the transaction has
+//! happened, so a failure in step 3 is not reported as a failed write (a retry would make it
+//! twice, #260). Step 3 is retried before the next commit and on the next start.
+//!
+//! Recovery takes each staging folder on its own. One that can't be applied (a damaged
+//! manifest, a staged file gone) is moved to `.staging/broken/`, kept, never deleted, since it
+//! may hold committed data, and the daemon starts anyway (#260 finding 2).
 
 use std::fs::{self, File};
 use std::io::Write as _;
@@ -41,13 +49,59 @@ enum StagedOp {
     },
 }
 
+/// Damaged staging folders, moved aside by recovery, kept for a person to look at.
+pub const BROKEN: &str = "broken";
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Recovery {
     pub rolled_forward: usize,
     pub discarded: usize,
+    /// Committed transactions that are damaged (a manifest that can't be read, a staged file
+    /// gone), moved to `.staging/broken/<txid>/`: the id and why.
+    pub broken: Vec<(String, String)>,
+    /// Damaged ones that couldn't even be moved aside: left in place, never retried (they'd
+    /// fail every time and hold up every later save). The id and why.
+    pub left_in_place: Vec<(String, String)>,
+    /// Committed transactions intact but not applied yet (the disk or a permission failed just
+    /// then, or an earlier one is still waiting): kept and retried before the next save, in
+    /// order, as one that fails while running is (#309's second review).
+    pub waiting: usize,
 }
 
-pub fn commit(home: &Path, ns_dir: &Path, namespace: &str, plan: TxPlan) -> Result<()> {
+/// `pending`: committed transactions whose step 3 failed earlier in this run, oldest first,
+/// retried before anything else. Returns the events that reached the log in this call, in log
+/// order (the retried transactions' first, then this one's), **and** whether this transaction
+/// itself was committed. Both, always: if a retried one lands and this one then fails, its events
+/// are still durable and must still be published, or nothing ever would (#309's second review).
+/// Only these may be published (durable first, published second); one still waiting publishes
+/// nothing yet.
+pub fn commit(
+    home: &Path,
+    ns_dir: &Path,
+    namespace: &str,
+    plan: TxPlan,
+    pending: &mut Vec<PathBuf>,
+) -> (Vec<Event>, Result<()>) {
+    let mut logged = retry(home, pending);
+    let result = commit_one(home, ns_dir, namespace, plan, pending, &mut logged);
+    (logged, result)
+}
+
+/// This transaction, once `retry` has run: staged and queued behind a waiting one, or applied.
+fn commit_one(
+    home: &Path,
+    ns_dir: &Path,
+    namespace: &str,
+    plan: TxPlan,
+    pending: &mut Vec<PathBuf>,
+    logged: &mut Vec<Event>,
+) -> Result<()> {
+    // While an older transaction still waits, this one waits behind it, staged, even a lone file
+    // write: applied now, an older one landing later would overwrite it (#309's review).
+    if !pending.is_empty() {
+        pending.push(stage(home, namespace, &plan)?);
+        return Ok(());
+    }
     // Fast path: a lone file write needs no staging (§7.1, first bullet).
     if plan.events.is_empty() {
         if let [Write::Put { path, bytes }] = plan.writes.as_slice() {
@@ -55,7 +109,55 @@ pub fn commit(home: &Path, ns_dir: &Path, namespace: &str, plan: TxPlan) -> Resu
         }
     }
     let dir = stage(home, namespace, &plan)?;
-    apply(home, &dir)
+    // Committed: it has happened. A failure from here is finished later, never reported as a
+    // failed write, which a caller would retry into a second copy.
+    match apply(home, &dir, None) {
+        Ok(events) => logged.extend(events),
+        Err(e) => {
+            tracing::error!(tx = %dir.display(), error = %e, "a committed write couldn't be finished; retried before the next one");
+            pending.push(dir);
+        }
+    }
+    Ok(())
+}
+
+/// Finish what earlier commits couldn't, oldest first, stopping at the first that still fails:
+/// a later one landing before it would break commit order. What's left is tried again next time
+/// (and by recovery on the next start). Returns the events that reached the log.
+fn retry(home: &Path, pending: &mut Vec<PathBuf>) -> Vec<Event> {
+    let mut events = Vec::new();
+    let mut logged = log::Logged::default();
+    while let Some(dir) = pending.first() {
+        match apply(home, dir, Some(&mut logged)) {
+            Ok(applied) => {
+                events.extend(applied);
+                pending.remove(0);
+            }
+            Err(e) => {
+                tracing::warn!(tx = %dir.display(), error = %e, "a committed write still can't be finished");
+                break;
+            }
+        }
+    }
+    events
+}
+
+/// Names a staging folder so they sort in the order they were made, which recovery relies on
+/// (#309's review): nanoseconds since 1970, never repeating or going back within a run. A
+/// transaction's ULID alone is ordered only to the millisecond.
+fn order_key() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+    // A compare-and-swap loop rather than `fetch_update`, which newer Rust renames.
+    let mut last = LAST.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(last + 1);
+        match LAST.compare_exchange_weak(last, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(seen) => last = seen,
+        }
+    }
 }
 
 fn staging_root(home: &Path) -> PathBuf {
@@ -64,7 +166,7 @@ fn staging_root(home: &Path) -> PathBuf {
 
 /// Steps 1 and 2. Returns the staging directory, committed.
 fn stage(home: &Path, namespace: &str, plan: &TxPlan) -> Result<PathBuf> {
-    let dir = staging_root(home).join(plan.id.to_string());
+    let dir = staging_root(home).join(format!("{:020}-{}", order_key(), plan.id));
     fs::create_dir(&dir).map_err(|e| Error::conflict(format!("cannot create staging dir: {e}")))?;
     fs::create_dir(dir.join("files"))?;
 
@@ -93,8 +195,10 @@ fn stage(home: &Path, namespace: &str, plan: &TxPlan) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Step 3. Safe to run any number of times on a committed staging directory.
-fn apply(home: &Path, dir: &Path) -> Result<()> {
+/// Step 3. Safe to run any number of times on a committed staging directory. `logged`: check
+/// each event against the log before appending it, for a transaction a crash or a failure may
+/// have half applied; `None` for a fresh commit, whose events can't be logged yet.
+fn apply(home: &Path, dir: &Path, logged: Option<&mut log::Logged>) -> Result<Vec<Event>> {
     let staged: Staged = serde_json::from_slice(&fs::read(dir.join(MANIFEST))?)
         .map_err(|e| Error::internal(format!("corrupt staged transaction {}: {e}", dir.display())))?;
     let ns_dir = home.join("data").join(&staged.namespace);
@@ -120,32 +224,100 @@ fn apply(home: &Path, dir: &Path) -> Result<()> {
             }
         }
     }
-    for event in &staged.events {
-        if !log::contains(home, event)? {
-            log::append(home, event)?;
+    match logged {
+        Some(logged) => {
+            for event in &staged.events {
+                logged.append_once(home, event)?;
+            }
+        }
+        None => {
+            for event in &staged.events {
+                log::append(home, event)?;
+            }
         }
     }
     fs::remove_dir_all(dir)?;
     fsync_dir(&staging_root(home))?;
-    Ok(())
+    Ok(staged.events)
 }
 
-pub fn recover(home: &Path) -> Result<Recovery> {
+/// `pending`: where a committed transaction that can't be applied *yet* goes, to be retried
+/// before the next save. Only a damaged one is moved aside: a transient failure (the disk, a
+/// permission) at the moment of a start would heal by itself, so it isn't treated as damage
+/// (#309's second review).
+pub fn recover(home: &Path, pending: &mut Vec<PathBuf>) -> Result<Recovery> {
     let mut r = Recovery::default();
-    for entry in fs::read_dir(staging_root(home))? {
-        let dir = entry?.path();
-        if !dir.is_dir() {
+    let mut logged = log::Logged::default();
+    // Oldest first: folders are named to sort in the order they were made (`order_key`), and two
+    // waiting transactions to one file must land in that order (#309's review).
+    let mut dirs: Vec<PathBuf> =
+        fs::read_dir(staging_root(home))?.map(|e| e.map(|e| e.path())).collect::<std::io::Result<_>>()?;
+    dirs.sort();
+    for dir in dirs {
+        if !dir.is_dir() || dir.file_name().is_some_and(|n| n == BROKEN) {
             continue;
         }
-        if dir.join(COMMITTED).exists() {
-            apply(home, &dir)?;
-            r.rolled_forward += 1;
-        } else {
-            fs::remove_dir_all(&dir)?;
-            r.discarded += 1;
+        let id = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if !dir.join(COMMITTED).exists() {
+            match fs::remove_dir_all(&dir) {
+                Ok(()) => r.discarded += 1,
+                // Never committed, so nothing in it happened; a leftover can't stop the daemon.
+                Err(e) => tracing::warn!(tx = %id, error = %e, "couldn't delete an uncommitted staging folder"),
+            }
+            continue;
+        }
+        if let Some(why) = damaged(&dir) {
+            let to = staging_root(home).join(BROKEN).join(&id);
+            match fs::create_dir_all(staging_root(home).join(BROKEN)).and_then(|()| fs::rename(&dir, &to)) {
+                Ok(()) => {
+                    tracing::error!(tx = %id, error = %why, kept = %to.display(), "a committed transaction is damaged; kept aside");
+                    r.broken.push((id, why));
+                }
+                Err(m) => {
+                    tracing::error!(tx = %id, error = %why, move_error = %m, "a committed transaction is damaged and couldn't be moved aside; left in place");
+                    r.left_in_place.push((id, why));
+                }
+            }
+            continue;
+        }
+        // Intact. Behind one already waiting, it waits too: commit order.
+        if !pending.is_empty() {
+            pending.push(dir);
+            r.waiting += 1;
+            continue;
+        }
+        match apply(home, &dir, Some(&mut logged)) {
+            Ok(_) => r.rolled_forward += 1,
+            Err(e) => {
+                tracing::warn!(tx = %id, error = %e, "a committed transaction couldn't be applied yet; retried before the next save");
+                pending.push(dir);
+                r.waiting += 1;
+            }
         }
     }
     Ok(r)
+}
+
+/// Why a committed staging folder can never be applied, if it can't: its manifest is gone or
+/// doesn't parse, or a file it stages is missing. `None` for an intact one, whose failure to apply
+/// is the disk's or a permission's, not the folder's.
+fn damaged(dir: &Path) -> Option<String> {
+    let bytes = match fs::read(dir.join(MANIFEST)) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some("its manifest.json is missing".into()),
+        // Can't read it right now: not evidence of damage.
+        Err(_) => return None,
+    };
+    let staged: Staged = match serde_json::from_slice(&bytes) {
+        Ok(s) => s,
+        Err(e) => return Some(format!("corrupt staged transaction {}: {e}", dir.display())),
+    };
+    staged.ops.iter().find_map(|op| match op {
+        StagedOp::Put { path, file } if !dir.join(file).exists() => {
+            Some(format!("the staged copy of {path} ({file}) is missing"))
+        }
+        _ => None,
+    })
 }
 
 #[cfg(test)]
@@ -199,7 +371,7 @@ mod tests {
         fs::remove_file(dir.join(COMMITTED)).unwrap(); // crash landed just before the marker
 
         let r = store.recover().unwrap();
-        assert_eq!(r, Recovery { rolled_forward: 0, discarded: 1 });
+        assert_eq!(r, Recovery { discarded: 1, ..Recovery::default() });
         assert!(store.read("records", "a.toml").unwrap().is_none());
         assert!(logged(&store).is_empty());
     }
@@ -281,5 +453,230 @@ mod tests {
         let scan = store.read_events().unwrap();
         assert_eq!(scan.events, [e1, e2], "event after a torn line is not lost");
         assert_eq!(scan.skipped, 1);
+    }
+
+    /// #260 finding 2: a committed staging folder that can't be applied no longer stops every
+    /// start. It's moved to `.staging/broken/`, kept whole, and every other one still recovers.
+    #[test]
+    fn a_damaged_staging_folder_is_kept_aside_and_the_rest_recovers() {
+        let home = TempDir::new().unwrap();
+        let store = Store::open(home.path()).unwrap();
+        let bad_manifest = stage(home.path(), "records", &plan(vec![])).unwrap();
+        fs::write(bad_manifest.join(MANIFEST), b"{ not json").unwrap();
+        let missing_file = stage(home.path(), "records", &plan(vec![])).unwrap();
+        fs::remove_file(missing_file.join("files/1")).unwrap();
+        let ev = event("records.item.created");
+        let good = stage(home.path(), "records", &plan(vec![ev.clone()])).unwrap();
+
+        let r = store.recover().expect("recovery never fails on one bad folder");
+        assert_eq!(r.rolled_forward, 1);
+        let mut broken: Vec<String> = r.broken.iter().map(|(id, _)| id.clone()).collect();
+        broken.sort();
+        let mut want: Vec<String> = [&bad_manifest, &missing_file]
+            .iter()
+            .map(|d| d.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        want.sort();
+        assert_eq!(broken, want);
+        for id in &want {
+            let kept = home.path().join(".staging/broken").join(id);
+            assert!(kept.join(COMMITTED).exists() && kept.join(MANIFEST).exists(), "kept whole: {}", kept.display());
+        }
+        assert!(!good.exists());
+        assert_eq!(logged(&store), [ev], "the good one still applied");
+        // Kept aside, so the next start doesn't trip on them again.
+        assert_eq!(store.recover().unwrap(), Recovery::default());
+    }
+
+    /// #260's second pass, finding 10: once `COMMITTED` is written the write has happened. A
+    /// failure finishing it is not reported as a failed write (a retry would make a second copy);
+    /// it's finished before the next commit, its event logged exactly once.
+    #[cfg(unix)]
+    #[test]
+    fn a_committed_write_that_cant_be_finished_is_a_success_finished_later() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TempDir::new().unwrap();
+        let store = Store::open(home.path()).unwrap();
+        let events = home.path().join("events");
+        fs::set_permissions(&events, fs::Permissions::from_mode(0o500)).unwrap();
+        if File::create(events.join("probe")).is_ok() {
+            return; // root ignores permissions: nothing to test here
+        }
+        let ev = event("records.item.created");
+        store.commit("records", plan(vec![ev.clone()])).expect("committed, so it succeeded");
+        assert_eq!(store.read("records", "a.toml").unwrap().unwrap(), b"a", "the files are in place");
+        assert_eq!(fs::read_dir(home.path().join(".staging")).unwrap().count(), 1, "its last step waits");
+
+        fs::set_permissions(&events, fs::Permissions::from_mode(0o700)).unwrap();
+        let next = event("records.item.updated");
+        store.commit("records", plan(vec![next.clone()])).unwrap();
+        assert_eq!(logged(&store), [ev, next], "the first event once, before the second");
+        assert_eq!(fs::read_dir(home.path().join(".staging")).unwrap().count(), 0);
+    }
+
+    /// #260 finding 3: two writers of one file at once each use their own temp file, so neither
+    /// fails and the file is always one writer's whole content.
+    #[test]
+    fn many_writers_of_one_file_at_once_never_fail_or_mix() {
+        let home = TempDir::new().unwrap();
+        let file = home.path().join("cache/one.bin");
+        let writers: Vec<_> = (0..20u8)
+            .map(|i| {
+                let file = file.clone();
+                std::thread::spawn(move || write_atomic(&file, &vec![i; 64 * 1024]))
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap().expect("no writer fails");
+        }
+        let got = fs::read(&file).unwrap();
+        assert_eq!(got.len(), 64 * 1024);
+        assert!(got.iter().all(|b| *b == got[0]), "one writer's content, whole");
+        let left: Vec<_> = fs::read_dir(file.parent().unwrap()).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(left, [std::ffi::OsString::from("one.bin")], "no temp files left");
+    }
+
+    /// The events a commit handed back, after checking the commit itself succeeded.
+    fn logged_ok((logged, result): (Vec<Event>, Result<()>)) -> Vec<Event> {
+        result.expect("the commit itself succeeded");
+        logged
+    }
+
+    fn one(path: &str, bytes: &[u8], events: Vec<Event>) -> TxPlan {
+        TxPlan { id: Ulid::new(), writes: vec![Write::Put { path: path.into(), bytes: bytes.to_vec() }], events }
+    }
+
+    /// Makes `home`'s event log unwritable. False when that can't be done (running as root).
+    #[cfg(unix)]
+    fn block_log(home: &Path, blocked: bool) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let events = home.join("events");
+        fs::set_permissions(&events, fs::Permissions::from_mode(if blocked { 0o500 } else { 0o700 })).unwrap();
+        !blocked || File::create(events.join("probe")).is_err()
+    }
+
+    /// #309's review: a save whose last step failed hands back no events (nothing to publish),
+    /// and they come back, in order, from the commit that finally lands them.
+    #[cfg(unix)]
+    #[test]
+    fn only_events_that_reached_the_log_are_handed_back() {
+        let home = TempDir::new().unwrap();
+        let store = Store::open(home.path()).unwrap();
+        if !block_log(home.path(), true) {
+            return;
+        }
+        let first = event("records.item.created");
+        assert_eq!(
+            logged_ok(store.commit_logged("records", one("a.toml", b"1", vec![first.clone()]))),
+            [],
+            "not logged yet"
+        );
+        block_log(home.path(), false);
+        let second = event("records.item.updated");
+        let got = logged_ok(store.commit_logged("records", one("b.toml", b"2", vec![second.clone()])));
+        assert_eq!(got, [first, second], "the waiting one first, then this one");
+    }
+
+    /// #309's review: while an older save waits, a newer one to the same file (even a lone write,
+    /// the fast path) waits behind it, so the file ends up with the newer content.
+    #[cfg(unix)]
+    #[test]
+    fn a_newer_save_never_lands_before_an_older_one_still_waiting() {
+        let home = TempDir::new().unwrap();
+        let store = Store::open(home.path()).unwrap();
+        if !block_log(home.path(), true) {
+            return;
+        }
+        let older = event("records.item.created");
+        logged_ok(store.commit_logged("records", one("a.toml", b"old", vec![older.clone()])));
+        logged_ok(store.commit_logged("records", one("a.toml", b"new", vec![])));
+        assert_ne!(
+            store.read("records", "a.toml").unwrap().as_deref(),
+            Some(&b"new"[..]),
+            "waits behind the older one"
+        );
+        block_log(home.path(), false);
+        let later = event("records.item.updated");
+        logged_ok(store.commit_logged("records", one("b.toml", b"x", vec![later.clone()])));
+        assert_eq!(store.read("records", "a.toml").unwrap().unwrap(), b"new", "the newer content, not the older");
+        assert_eq!(logged(&store), [older, later]);
+        assert_eq!(fs::read_dir(home.path().join(".staging")).unwrap().count(), 0);
+    }
+
+    /// #309's review: recovery applies waiting saves in the order they were made, whatever order
+    /// the folder listing comes in, so the newer content of a file wins and events stay in order.
+    #[test]
+    fn recovery_applies_waiting_saves_oldest_first() {
+        let home = TempDir::new().unwrap();
+        let store = Store::open(home.path()).unwrap();
+        let (e1, e2, e3) =
+            (event("records.item.created"), event("records.item.updated"), event("records.item.completed"));
+        // Staged in this order, within the same millisecond as far as their ULIDs know.
+        for (bytes, ev) in [(&b"1"[..], &e1), (b"2", &e2), (b"3", &e3)] {
+            stage(home.path(), "records", &one("a.toml", bytes, vec![ev.clone()])).unwrap();
+        }
+        let mut names: Vec<String> = fs::read_dir(home.path().join(".staging"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 3);
+        store.recover().unwrap();
+        assert_eq!(store.read("records", "a.toml").unwrap().unwrap(), b"3");
+        assert_eq!(logged(&store), [e1, e2, e3]);
+    }
+
+    /// #309's second review: a waiting save lands during the retry, then the new save fails.
+    /// The landed one's events still come back to be published: its staging folder is gone, so
+    /// nothing else ever would. And the new save's failure is still reported.
+    #[cfg(unix)]
+    #[test]
+    fn events_that_landed_come_back_even_when_the_new_save_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TempDir::new().unwrap();
+        let store = Store::open(home.path()).unwrap();
+        if !block_log(home.path(), true) {
+            return;
+        }
+        let waiting = event("records.item.created");
+        assert_eq!(logged_ok(store.commit_logged("records", one("a.toml", b"1", vec![waiting.clone()]))), []);
+        block_log(home.path(), false);
+        // The new save's own namespace can't be written: its lone write (the fast path) fails.
+        let locked = home.path().join("data/locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+        let (handed_back, result) = store.commit_logged("locked", one("x.toml", b"x", vec![]));
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err(), "the new save's failure is reported");
+        assert_eq!(handed_back, std::slice::from_ref(&waiting), "the one that landed comes back anyway");
+        assert_eq!(logged(&store), [waiting], "and it really is in the log");
+    }
+
+    /// #309's second review: an intact save that can't be applied at a start because the disk or
+    /// a permission fails just then isn't damage. It's kept (not moved to broken/), retried
+    /// before the next save, and lands then, in order, with its event published.
+    #[cfg(unix)]
+    #[test]
+    fn a_save_that_fails_for_a_moment_at_start_is_retried_not_kept_aside() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TempDir::new().unwrap();
+        let store = Store::open(home.path()).unwrap();
+        let ns = home.path().join("data/records");
+        fs::create_dir_all(&ns).unwrap();
+        let first = event("records.item.created");
+        let dir = stage(home.path(), "records", &one("a.toml", b"1", vec![first.clone()])).unwrap();
+        fs::set_permissions(&ns, fs::Permissions::from_mode(0o500)).unwrap();
+        if File::create(ns.join("probe")).is_ok() {
+            return; // root ignores permissions
+        }
+        let r = store.recover().expect("a start is never blocked");
+        fs::set_permissions(&ns, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!((r.waiting, r.broken.len(), r.rolled_forward), (1, 0, 0), "{r:?}");
+        assert!(dir.exists(), "kept where it was, not moved to broken/");
+        let second = event("records.item.updated");
+        let published = logged_ok(store.commit_logged("records", one("a.toml", b"2", vec![second.clone()])));
+        assert_eq!(published, [first.clone(), second.clone()], "the kept one first, then this one");
+        assert_eq!(store.read("records", "a.toml").unwrap().unwrap(), b"2");
+        assert_eq!(logged(&store), [first, second]);
     }
 }

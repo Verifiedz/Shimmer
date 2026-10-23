@@ -60,6 +60,17 @@ pub async fn run(args: &Args, pack_warnings: &[String]) -> ExitCode {
     if let Some(mut client) = connect(args, &mut checks).await {
         checks.extend(packs(pack_warnings));
         checks.extend(modules(&mut client).await);
+        // Read from this folder's own `.staging/`: with --socket, the daemon asked may serve
+        // another folder, so the check would describe the wrong one (#309's review). Until the
+        // daemon answers it itself, it's skipped there and says so.
+        match &args.socket {
+            None => checks.extend(saves(&shimmer_proto::paths::shimmer_home())),
+            Some(_) => checks.push(Check::new(
+                "store",
+                Status::Warn,
+                "saves not checked: with --socket, doctor may be asking another folder's daemon",
+            )),
+        }
     }
     let failed = checks.iter().any(|c| c.status == Status::Fail);
     println!("{}", if args.json { render::json(&to_json(&checks)) } else { report(&checks) });
@@ -172,6 +183,54 @@ pub fn module_checks(area: &str, data: &Value) -> Vec<Check> {
             }
         })
         .collect()
+}
+
+/// Saves the daemon couldn't finish (#260): a committed one still waiting in `.staging/` after a
+/// minute (it's retried before the next save and at the next start), and damaged ones recovery
+/// moved to `.staging/broken/`, kept because they may hold data. Read from the folder: the store
+/// has no op for this, and the CLI never links it (CLAUDE.md §3).
+pub fn saves(home: &std::path::Path) -> Vec<Check> {
+    let staging = home.join(".staging");
+    let minute_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    let dirs = |dir: std::path::PathBuf| -> Vec<std::fs::DirEntry> {
+        std::fs::read_dir(dir).map(|d| d.flatten().filter(|e| e.path().is_dir()).collect()).unwrap_or_default()
+    };
+    let waiting = dirs(staging.clone())
+        .into_iter()
+        .filter(|e| e.file_name() != "broken" && e.path().join("COMMITTED").exists())
+        .filter(|e| e.metadata().and_then(|m| m.modified()).is_ok_and(|t| t < minute_ago))
+        .count();
+    let broken = dirs(staging.join("broken")).len();
+    let mut out = Vec::new();
+    if waiting > 0 {
+        out.push(
+            Check::new(
+                "store",
+                Status::Warn,
+                format!("{waiting} save(s) made but not finished: their event isn't logged yet"),
+            )
+            .fix("it's retried before the next save and at the next start; the daemon log says why it failed"),
+        );
+    }
+    if broken > 0 {
+        out.push(
+            Check::new(
+                "store",
+                Status::Warn,
+                format!(
+                    "{broken} damaged save(s) couldn't be applied and were kept in {}",
+                    staging.join("broken").display()
+                ),
+            )
+            .fix(
+                "each folder's manifest.json says where its files/ go; the daemon log says why; delete it once handled",
+            ),
+        );
+    }
+    if out.is_empty() {
+        out.push(Check::new("store", Status::Ok, "every save finished"));
+    }
+    out
 }
 
 /// `{"summary", "op"?, "params"?}` as one line. The command is the one a person would type when
