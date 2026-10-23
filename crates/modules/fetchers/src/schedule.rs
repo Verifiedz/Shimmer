@@ -14,14 +14,16 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use shimmer_core::{CatchUp, Ctx, Error, Result, Schedule, TriggerSpec};
 
 /// How often the heartbeat fires.
 pub const TICK_INTERVAL: Duration = Duration::from_secs(300);
 pub const TICK_OP: &str = "fetchers.tick";
-pub const FETCH_OP: &str = "fetchers.run";
+/// The real fetch work, queued (ADR 0028 §5) -- internal; `fetchers.run` (inline) checks the
+/// source exists, then enqueues this.
+pub const RUN_TASK_OP: &str = "fetchers.run_task";
 
 /// Floors below which a source's own cadence may not be set, per `Method` (ADR 0028 §5/§7).
 /// An API source hits a known, source-maintained endpoint built for this kind of polling; a
@@ -45,10 +47,30 @@ pub fn trigger() -> TriggerSpec {
     }
 }
 
-/// Where a source's own file lives (ADR 0028 §4): `data/fetchers/sources/<id>.toml`. The
-/// write side (`fetchers.new`/`.edit`/`.remove`, which construct this path too) lands with
-/// the rest of the command set.
+/// Where a source's own file lives (ADR 0028 §4): `data/fetchers/sources/<id>.toml`.
 pub const SOURCES_DIR: &str = "sources";
+/// Where `fetchers.remove` moves a source's file, until `restore` or `purge` (ADR 0038 §1).
+pub const REMOVED_DIR: &str = "removed";
+
+pub(crate) fn path(id: &str) -> String {
+    format!("{SOURCES_DIR}/{id}.toml")
+}
+
+pub(crate) fn removed_path(id: &str) -> String {
+    format!("{REMOVED_DIR}/{id}.toml")
+}
+
+/// The ids of removed sources, to restore or purge.
+pub(crate) fn removed(ctx: &Ctx) -> Result<Vec<String>> {
+    let prefix = format!("{REMOVED_DIR}/");
+    Ok(ctx
+        .store
+        .list(REMOVED_DIR)?
+        .iter()
+        .filter_map(|f| f.strip_prefix(&prefix).and_then(|f| f.strip_suffix(".toml")))
+        .map(str::to_owned)
+        .collect())
+}
 
 /// Every source whose file loaded, plus every one that didn't (ADR 0028 §5). Loaded once at
 /// `Module::init`, re-read on `fetchers.reload` and after any write -- never re-scanned on
@@ -120,8 +142,10 @@ pub struct SourceConfig {
 }
 
 /// The file as written, `data/fetchers/sources/<id>.toml` (ADR 0028 §4): `[source]`, the
-/// envelope every kind shares, and `[kind]`, that kind's own fields.
-#[derive(Deserialize)]
+/// envelope every kind shares, and `[kind]`, that kind's own fields. Also `Serialize` --
+/// [`render`] builds this same shape from `fetchers.new`/`.edit`'s structured params, so a
+/// structured command and a hand-edited file go through the exact same [`SourceConfig::parse`].
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SourceFile {
     source: SourceMeta,
@@ -129,20 +153,54 @@ struct SourceFile {
     kind: toml::Table,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SourceMeta {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     label: Option<String>,
     #[serde(default)]
     enabled: bool,
     interval: IntervalSpec,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     kind: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     title_contains: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     title_excludes: Vec<String>,
+}
+
+/// Builds a source file's TOML text from `fetchers.new`/`.edit`'s structured params (ADR 0028
+/// §9) -- the mechanical inverse of [`SourceConfig::parse`], so a structured command, a
+/// template (later), and a hand-edited-then-`fetchers.reload`ed file all produce and accept
+/// the identical on-disk shape. Validation stays centralized in `SourceConfig::parse`, called
+/// on this function's own output by the caller -- this function only renders text, it never
+/// decides whether that text is valid.
+pub(crate) fn render(
+    label: Option<&str>,
+    kind: Option<&str>,
+    enabled: bool,
+    interval: &IntervalSpec,
+    params: &Map<String, Value>,
+    title_contains: &[String],
+    title_excludes: &[String],
+) -> std::result::Result<String, String> {
+    let kind_table = match toml::Value::try_from(params) {
+        Ok(toml::Value::Table(t)) => t,
+        Ok(_) => unreachable!("a JSON object always serializes to a toml table"),
+        Err(e) => return Err(format!("params: {e}")),
+    };
+    let file = SourceFile {
+        source: SourceMeta {
+            label: label.map(str::to_owned),
+            enabled,
+            interval: interval.clone(),
+            kind: kind.map(str::to_owned),
+            title_contains: title_contains.to_vec(),
+            title_excludes: title_excludes.to_vec(),
+        },
+        kind: kind_table,
+    };
+    toml::to_string(&file).map_err(|e| format!("internal: {e}"))
 }
 
 impl SourceConfig {
@@ -242,7 +300,7 @@ pub fn matches_title(title: &str, contains: &[String], excludes: &[String]) -> b
     included && !excluded
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum IntervalSpec {
     Preset(String),
@@ -307,7 +365,7 @@ pub fn due_sources(
 /// `data/fetchers/last_run.toml` -- one small file for every source, read-modified-written
 /// together rather than one file per source, since a tick always reads and updates it as a
 /// whole.
-const LAST_RUN_PATH: &str = "last_run.toml";
+pub(crate) const LAST_RUN_PATH: &str = "last_run.toml";
 
 /// A corrupt or unparseable `last_run.toml` is logged and treated as empty, never an error
 /// (#126's review, B1): failing here failed every `fetchers.tick`, so a single bad line in a
@@ -347,6 +405,36 @@ pub fn record_run(ctx: &Ctx, source: &str, now: DateTime<Utc>) -> Result<()> {
     all.insert(source.to_owned(), now);
     let raw: BTreeMap<&str, String> = all.iter().map(|(id, at)| (id.as_str(), at.to_rfc3339())).collect();
     ctx.store.write(LAST_RUN_PATH, toml::to_string(&raw).unwrap_or_default())
+}
+
+/// `last_run.toml`'s text with `from`'s entry moved to `to`, if `from` had one; `None` if
+/// `from` never ran -- a never-run source being renamed needs no `last_run.toml` write at all
+/// (ADR 0028 §7). The caller puts the result in the same `ctx.store.transaction` as the
+/// source file's own move, so the rename is one atomic unit (CLAUDE.md §7.1).
+pub(crate) fn rename_last_run(ctx: &Ctx, from: &str, to: &str) -> Result<Option<String>> {
+    let mut all = load_last_run(ctx)?;
+    let Some(at) = all.remove(from) else { return Ok(None) };
+    all.insert(to.to_owned(), at);
+    let raw: BTreeMap<&str, String> = all.iter().map(|(id, at)| (id.as_str(), at.to_rfc3339())).collect();
+    Ok(Some(toml::to_string(&raw).unwrap_or_default()))
+}
+
+/// `last_run.toml`'s text with every id in `ids` dropped, if any of them had an entry;
+/// `None` if none did -- a purge of sources that never ran needs no `last_run.toml` write at
+/// all. Same "the caller puts this in its own transaction" contract as [`rename_last_run`]
+/// (#305's review, should-fix: `purge` left this behind, so a new source reusing a purged
+/// id inherited its old last-run time and had its first run delayed).
+pub(crate) fn remove_last_run(ctx: &Ctx, ids: &[String]) -> Result<Option<String>> {
+    let mut all = load_last_run(ctx)?;
+    let mut changed = false;
+    for id in ids {
+        changed |= all.remove(id).is_some();
+    }
+    if !changed {
+        return Ok(None);
+    }
+    let raw: BTreeMap<&str, String> = all.iter().map(|(id, at)| (id.as_str(), at.to_rfc3339())).collect();
+    Ok(Some(toml::to_string(&raw).unwrap_or_default()))
 }
 
 /// Shared across this crate's own tests (`schedule`, `source`, `module`): a source file's text
@@ -866,5 +954,36 @@ mod tests {
     fn load_last_run_with_nothing_recorded_yet_is_empty_not_an_error() {
         let env = TestEnv::new("fetchers");
         assert!(load_last_run(&env.ctx).unwrap().is_empty());
+    }
+
+    #[test]
+    fn render_builds_a_file_that_parses_back_to_the_same_fields() {
+        let text = render(
+            Some("My Team's Blog"),
+            Some("rss"),
+            true,
+            &IntervalSpec::Preset("hourly".into()),
+            &json!({"url": "https://example.test/feed.xml"}).as_object().unwrap().clone(),
+            &["junior".to_string()],
+            &["staff".to_string()],
+        )
+        .unwrap();
+        let cfg = SourceConfig::parse("my-team-blog", &text).unwrap();
+        assert_eq!(cfg.label.as_deref(), Some("My Team's Blog"));
+        assert_eq!(cfg.kind.as_deref(), Some("rss"));
+        assert!(cfg.enabled);
+        assert_eq!(cfg.interval, IntervalSpec::Preset("hourly".into()));
+        assert_eq!(cfg.kind_params.get("url").and_then(Value::as_str), Some("https://example.test/feed.xml"));
+        assert_eq!(cfg.title_contains, vec!["junior".to_string()]);
+        assert_eq!(cfg.title_excludes, vec!["staff".to_string()]);
+    }
+
+    #[test]
+    fn render_omits_label_and_kind_entirely_when_absent_so_a_built_in_source_still_parses() {
+        let text =
+            render(None, None, false, &IntervalSpec::Seconds(MIN_INTERVAL_API_S), &Map::new(), &[], &[]).unwrap();
+        let cfg = SourceConfig::parse("hn-whoishiring", &text).unwrap();
+        assert_eq!(cfg.label, None);
+        assert_eq!(cfg.kind, None);
     }
 }

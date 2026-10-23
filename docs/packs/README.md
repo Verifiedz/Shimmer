@@ -99,6 +99,17 @@ belongs to this machine, so copying your Shimmer folder elsewhere doesn't bring 
 | fetchers test | `teisatsu` | `smoke-test` | `trial-run` | `ftest` |
 | fetchers run | `shutsugeki` | `poll` | `deep-scan` | `frun` |
 | fetchers items | `shuukaku` | `feed` | `haul` | `fitems` |
+| fetchers show | `shoukai` | `inspect-source` | `sensor-report` | `fshow` |
+| fetchers new | `souzou` | `add-source` | `chart-source` | `fnew` |
+| fetchers edit | `shuusei` | `edit-source` | `retune-sensor` | `fedit` |
+| fetchers remove | `haijo` | `drop-source` | `unchart` | `frm` |
+| fetchers restore | `sosei` | `restore-source` | `rechart` | `fundo` |
+| fetchers purge | `shoukyo` | `gc-sources` | `vent-sector` | `fpurge` |
+| fetchers enable | `kidou` | `source-on` | `power-on` | `fon` |
+| fetchers disable | `teishi` | `source-off` | `power-down` | `foff` |
+| fetchers rename | `tsukekae` | `relabel-source` | `retag-source` | `fmv` |
+| fetchers copy | `utsushi` | `clone-source` | `duplicate-source` | `fcp` |
+| fetchers reload | `yomikomi` | `rescan-sources` | `recalibrate-sensors` | `freload` |
 | automations list | `keikaku` | `hooks` | `protocols` | `alist` |
 | automations show | `dore` | `inspect-hook` | `briefing` | `aget` |
 | automations new | `tsukuru` | `add-hook` | `standing-order` | `anew` |
@@ -166,7 +177,7 @@ On the right of each alias goes the command it runs, by its op name:
 | `workspaces.force_relaunch` | `shimmer workspaces force-relaunch` |
 | `queue.list`, `.show`, `.cancel`, `.move` | `shimmer queue <verb>` |
 | `scheduler.list`, `.show`, `.add`, `.edit`, `.disable`, `.enable`, `.remove`, `.restore`, `.purge` | `shimmer scheduler <verb>` |
-| `fetchers.list`, `.status`, `.test`, `.run`, `.items` | `shimmer fetchers <verb>` |
+| `fetchers.list`, `.show`, `.new`, `.edit`, `.remove`, `.restore`, `.purge`, `.enable`, `.disable`, `.rename`, `.copy`, `.status`, `.reload`, `.test`, `.run`, `.items` | `shimmer fetchers <verb>` |
 | `notify.list`, `.show`, `.count`, `.remove`, `.send`, `.test`, `.resend`, `.pause`, `.resume`, `.quiet`, `.status`, `.cap` | `shimmer notify <verb>` |
 | `notify.mark_read`, `.mark_unread` | `shimmer notify mark-read`, `mark-unread` |
 | `automations.list`, `.show`, `.new`, `.edit`, `.remove`, `.restore`, `.purge`, `.rename`, `.copy`, `.enable`, `.disable`, `.test`, `.events`, `.history`, `.status`, `.depth`, `.reload`, `.templates`, `.peek` | `shimmer automations <verb>` |
