@@ -72,7 +72,7 @@ pub fn parse(words: Vec<String>) -> std::result::Result<QueueCmd, String> {
                 _ => Err("'queue move' needs exactly one of --before OTHER or --last".into()),
             }
         }
-        other => Err(format!("unknown queue command '{other}'; see 'shimmer queue --help'")),
+        other => Err(crate::suggest::unknown_command(Some("queue"), other, USAGE)),
     }
 }
 

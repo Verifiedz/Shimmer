@@ -26,6 +26,7 @@ mod scheduler;
 mod schedules;
 mod startup;
 mod style;
+mod suggest;
 mod when;
 mod workspaces;
 
@@ -233,6 +234,7 @@ fn prints_data(cmd: &Command) -> bool {
                     | RecordsCmd::Export { .. }
                     | RecordsCmd::ListRemoved { .. }
                     | RecordsCmd::Collections
+                    | RecordsCmd::ListWhich
                     | RecordsCmd::Check { .. }
                     | RecordsCmd::Peek { file: true, .. }
             )

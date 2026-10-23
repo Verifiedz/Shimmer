@@ -103,16 +103,37 @@ async fn run_daemon() -> ExitCode {
         Arc::new(shimmer_automations::Automations::default()),
         Arc::new(shimmer_notify::Notify::default()),
     ];
-    let config = DaemonConfig::from_env();
-    let socket = config.socket.clone();
+    let mut config = DaemonConfig::from_env();
+    // Run in `/`, never in the folder whatever started it was in (#266 finding 3): a drive the
+    // daemon sits in can't be unmounted. Its folder and socket are made absolute first, so a
+    // relative `SHIMMER_HOME` still means the folder it named.
+    let absolute = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    config.home = absolute(&config.home);
+    config.socket = absolute(&config.socket);
+    if let Err(e) = std::env::set_current_dir("/") {
+        tracing::warn!(error = %e, "couldn't change the daemon's working folder to /");
+    }
+    let (socket, home) = (config.socket.clone(), config.home.clone());
     let daemon = match Daemon::start(config, modules).await {
         Ok(d) => d,
         // Refused because one already runs. A lock held by a daemon that doesn't answer is still a
         // real failure (below), so a login service retries it.
-        Err(e) if e.code == ErrorCode::Conflict && answers_soon(&socket).await => {
-            eprintln!("shimmer: already running: a daemon answers on {} ({e})", socket.display());
-            return already_running();
-        }
+        Err(e) if e.code == ErrorCode::Conflict => match answers_soon(&socket, &home).await {
+            // Only this folder's daemon counts as "already running" (ADR 0039 §4).
+            Answer::ThisFolder => {
+                eprintln!("shimmer: already running: a daemon answers on {} ({e})", socket.display());
+                return already_running();
+            }
+            // Another folder's daemon on this socket is a real conflict: fail, so it's retried and seen.
+            Answer::Other(why) => {
+                eprintln!("shimmer: cannot start daemon: {why}");
+                return ExitCode::FAILURE;
+            }
+            Answer::Nobody => {
+                eprintln!("shimmer: cannot start daemon: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
         Err(e) => {
             eprintln!("shimmer: cannot start daemon: {e}");
             return ExitCode::FAILURE;
@@ -134,15 +155,30 @@ async fn run_daemon() -> ExitCode {
 /// review), or the login service restarts it in a loop.
 const STARTING_UP: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Whether a daemon answers on `socket` within [`STARTING_UP`].
-async fn answers_soon(socket: &Path) -> bool {
+/// Who answers on a socket a starting daemon couldn't take.
+enum Answer {
+    /// The daemon for this Shimmer folder.
+    ThisFolder,
+    /// Something else: another folder's daemon (ADR 0039 §4), or one we can't talk to. Why.
+    Other(String),
+    /// Nothing within [`STARTING_UP`].
+    Nobody,
+}
+
+/// Who answers on `socket` within [`STARTING_UP`]: a full handshake, so another folder's daemon
+/// (which names its folder in `welcome`) is never taken for this one's.
+async fn answers_soon(socket: &Path, home: &Path) -> Answer {
+    use shimmer_cli::{Client, ConnectError};
     let deadline = tokio::time::Instant::now() + STARTING_UP;
     loop {
-        if tokio::net::UnixStream::connect(socket).await.is_ok() {
-            return true;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return false;
+        match Client::connect_for(socket, home).await {
+            Ok(_) => return Answer::ThisFolder,
+            Err(e @ ConnectError::OtherHome { .. }) => return Answer::Other(e.into_error(socket).message),
+            Err(e) if !e.nobody_listening() && tokio::time::Instant::now() >= deadline => {
+                return Answer::Other(e.into_error(socket).message)
+            }
+            Err(_) if tokio::time::Instant::now() >= deadline => return Answer::Nobody,
+            Err(_) => {}
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }

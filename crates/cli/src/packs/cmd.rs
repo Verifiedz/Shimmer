@@ -91,7 +91,7 @@ pub fn parse(rest: Vec<String>) -> std::result::Result<PacksCmd, String> {
         "show" => one("a pack name").map(|name| PacksCmd::Show { name }),
         "check" => one("a pack name or folder").map(|target| PacksCmd::Check { target }),
         "use" => one("a pack name, or 'none'").map(|name| PacksCmd::Use { name, link: !no_link }),
-        other => Err(format!("unknown packs command '{other}'")),
+        other => Err(crate::suggest::unknown_command(Some("packs"), other, USAGE)),
     }
 }
 
