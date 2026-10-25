@@ -1,8 +1,9 @@
 # 0041. Vaults: named Shimmer folders you can switch between
 
-Status: proposed · Raised by Dev B · Needs sign-off: Dev A (`crates/app/src/main.rs` applies the vault
-before the runtime starts; the CLAUDE.md §7 and §15 wording below) · No `core`, `proto` or daemon
-change · Depends on #293 (ADR 0039: one socket per Shimmer folder)
+Status: proposed · Raised by Dev B · Needs sign-off: Dev A (`crates/app/src/main.rs` re-runs itself
+in the chosen vault, §3; a quiet start for the daemon, §5a; the CLAUDE.md §2, §7 and §15 wording
+below) · No `core` or `proto` change · Depends on #293 (ADR 0039: one socket per Shimmer folder),
+merged · Revised after Wasay's review on #312
 
 ## Context
 
@@ -77,14 +78,22 @@ workspace's scripts get their own vault's path as `SHIMMER_HOME`.
 `--vault` is a front flag, like `--pack`: it counts before the command word, so a records field called
 `vault` still works after it. `--socket` still wins for the socket itself.
 
-**Applied once, first thing.** `crates/app/src/main.rs` resolves the vault before the tokio runtime and
-any thread exist, then sets `SHIMMER_HOME` and `SHIMMER_SOCKET` (ADR 0039's `default_socket` for that
-folder) for this process. Everything that already reads `proto::paths::shimmer_home()` and
-`socket_path()` then just works: auto-start, user packs in `$SHIMMER_HOME/packs` and their linked
-commands, `shimmer startup`, `doctor`, Tab completion, workspaces' step logs. `main` becomes a plain
-function that builds the runtime itself, instead of `#[tokio::main]`. Setting the environment before
-any thread exists is the one moment it's safe; nothing changes it afterwards. `shimmer daemon` is
-unaffected: auto-start already pins its environment.
+**Applied once, first thing, by re-running in the vault.** When a command needs a vault other than
+the one its environment already names (`--vault` given, or a vault chosen with `use` and no
+`SHIMMER_HOME` set), `crates/app/src/main.rs` resolves it and **re-runs the same binary** with
+`SHIMMER_HOME` and `SHIMMER_SOCKET` (ADR 0039's `default_socket` for that folder) set through
+`Command::env`, and `--vault` taken off the line: on Unix with `CommandExt::exec`, which replaces the
+process and keeps its pid; on Windows by spawning it, waiting, and passing on its exit code. A
+`SHIMMER_VAULT_APPLIED=1` marker on the re-run stops it re-running again. Everything that already reads
+`proto::paths::shimmer_home()` and `socket_path()` then just works, unchanged: auto-start, user packs
+and their linked commands, `shimmer startup`, `doctor`, Tab completion, workspaces' step logs.
+
+Why not set the environment in-process: `std::env::set_var` is `unsafe` from Rust edition 2024, the
+workspace forbids `unsafe_code`, and `crates/daemon/src/secrets.rs` already declines to call it for
+that reason (CLAUDE.md §12 rule 8, Wasay on #312). Passing a resolved `Paths { home, socket }` down
+explicitly instead would work too, but touches every call site above for the same result. The cost of
+re-running is one extra exec, only when a vault other than the environment's is in use. `shimmer
+daemon` never re-runs: auto-start already pins its environment.
 
 ### 4. Where vaults are kept
 
@@ -114,7 +123,9 @@ newer Shimmer can share the file.
   (`made = true`), or already be a Shimmer folder, one with the store's `.gitignore` and `data/`
   (**adopted**, `made = false`). Anything else is refused. The folder is filled in by its daemon the
   first time a command runs there.
-- **`use`**: refuses a vault whose folder is gone, saying where it was expected.
+- **`use`**: refuses a vault whose folder is gone, saying where it was expected. When `SHIMMER_HOME` is
+  set in its own environment (a shell rc, say), it warns that plain commands still go there, since
+  `SHIMMER_HOME` comes before `use` (§3).
 - **`rename`**: the name only. If it's the vault in use, `use` follows it.
 - **`remove`**: refuses `main`, the vault in use (`use` another first), and the vault `shimmer startup`
   starts at login (`startup off` first). It stops that vault's daemon (`core.shutdown` on its socket),
@@ -124,26 +135,54 @@ newer Shimmer can share the file.
   folder only when it was made by Shimmer (`made = true`), it still looks like a Shimmer folder, and it
   isn't a symlink. Its daemon is stopped first, and the folder goes once the socket has. An adopted vault
   is only forgotten: Shimmer never deletes a folder it didn't make.
-- **`copy`** needs no daemon change:
+- **`copy`**:
   1. It stops VAULT's daemon, as `shimmer shutdown` does, and **holds VAULT's `.daemon.lock` itself**,
      so no daemon can start there mid-copy. There is still exactly one writer (CLAUDE.md §2): for those
      moments, none.
-  2. It copies everything except what's derived or tied to the machine: `index.sqlite*`, `cache/`,
-     `logs/`, the socket and the lock. `.staging/` *is* copied, so the copy's own recovery finishes any
-     save that was committed (ADR 0040).
-  3. It releases the lock and registers NEW (`made = true`).
-  4. **The copy starts with everything off**, so it never sends a duplicate reminder or email. The CLI
-     starts the copy's daemon and switches things off **through their own ops**, never by editing the
-     copy's files: `scheduler.disable` for every enabled schedule, `automations.disable` for every
-     enabled rule, `fetchers.disable` for every enabled source once #277 adds it (skipped while the op
-     isn't in the manifest), and `notify.pause {"all": true}`, held until `notify resume`. The `✓` line
-     says what was switched off and how to turn it back on. `--live` skips this step.
+  2. It copies into a temporary folder beside the target (`<target>.copying`), everything except what's
+     derived or tied to the machine: `index.sqlite*`, `cache/`, `logs/`, the socket and the lock.
+     `.staging/` *is* copied, so the copy's own recovery finishes any save that was committed (ADR 0040).
+     Then it renames the temporary folder to the target and only then registers NEW (`made = true`), so
+     an interrupted copy never leaves a half vault registered; a leftover `.copying` folder is removed
+     by the next `copy` to that name. With `--path DIR`, the temporary folder sits beside DIR.
+  3. It releases the lock.
+  4. **The copy starts with everything off** (§5a), so it never sends a duplicate reminder or email:
+     its first start is a quiet start, during which the CLI switches things off **through their own
+     ops**: `scheduler.disable` for every enabled schedule, `automations.disable` for every enabled
+     rule, `fetchers.disable` for every enabled source, `notify.pause {"all": true}` (held until
+     `notify resume`), and `workspaces.reset` for any workspace whose copied state isn't `ready` (it
+     can't have launched anything in the copy). Then it stops the copy's daemon; the next command
+     there starts it normally, with nothing switched on. The `✓` line says what was switched off and
+     how to turn it back on. `--live` skips step 4.
 
   The next command in VAULT starts its daemon again, as auto-start always does.
+- **Packs** stay global (the active pack is in `cli.toml`), and a user pack is read from the vault in
+  use and then from `main`'s `packs/`, so switching to a vault without that pack folder doesn't turn
+  every command into a broken-pack warning.
 - **`shimmer startup on`** pins the vault in effect (`--vault`, or the one in use): one login service,
   as today. `startup status` names the vault.
 - **Seeing where you are**: `vaults status`, and `shimmer doctor`'s daemon line names the vault.
   Ordinary commands print nothing extra, so scripts see no noise.
+
+### 5a. A quiet start
+
+Starting the copy's daemon, then switching things off, isn't enough on its own (Wasay on #312): a
+daemon does work while it starts, before any client can reach it. The scheduler's recovery (ADR 0004
+amendment, #308) queues again every firing copied in as `unfinished`, its first tick catches up what
+came due while the source was stopped, and automations and notify react from `init`. So the daemon
+gets a quiet start: `shimmer daemon --quiet`, which `vaults copy` asks auto-start for once, for the
+copy's first start. During a quiet start:
+
+- **The scheduler** forgets every `unfinished` firing instead of settling it (they were the source
+  vault's run, not this one's), counts every schedule from now instead of catching up (as `enable`
+  does), and doesn't tick.
+- **The queue** doesn't run tasks a module queued (`Origin::Module`: an automation's action, a
+  fallback); they wait in memory and go with the daemon when it stops. Tasks a person asks for run
+  as usual, which is how the CLI switches things off.
+
+Nothing about a quiet start is written down, so it lasts for that one run: once the CLI has switched
+everything off and stopped it, every later start is ordinary. It's a small daemon change, in the
+scheduler and the queue, and needs Dev A's sign-off.
 
 ### 6. The same as every other feature
 
@@ -159,6 +198,10 @@ newer Shimmer can share the file.
   commands is a separate change to ADR 0029.
 
 ## Proposed changes to CLAUDE.md
+
+- §2, after "The daemon is the only process that opens the data directory for writing": "One
+  exception: `shimmer vaults copy` and `purge` copy and delete a whole vault's folder while holding its
+  `.daemon.lock`, so there is still at most one writer (ADR 0041)."
 
 - §7, the paragraph on client settings: "…the CLI keeps its own (the active command pack, §15.1, **and
   named vaults, ADR 0041**) in `~/.config/shimmer/cli.toml`…".
@@ -176,11 +219,21 @@ newer Shimmer can share the file.
 ## Consequences
 
 - Testing a template, a purge or a rule needs no environment variables and can't touch the real data.
-- The vault is chosen once, before anything else runs, so no other code needs to know vaults exist.
+- The vault is chosen once, by re-running in it before anything else runs, so no other code needs to
+  know vaults exist, and nothing sets the environment in-process.
 - `purge` can delete a whole folder; it's limited to folders Shimmer made, and always asks.
-- Depends on #293: without one socket per folder, two vaults would share a daemon.
+- The daemon gains a quiet start, used only for a copy's first run; nothing else changes in it.
+- Depends on #293 (merged): without one socket per folder, two vaults would share a daemon.
 
 ## Tests (the implementation PR)
+
+- A copy of a vault with a due `run_once` schedule, an `unfinished` firing and a rule that sends a
+  message: nothing runs in the copy, during its quiet start or at its next ordinary start (Wasay on
+  #312). `--live` leaves them on.
+- `--vault` re-runs once (the marker stops a loop), keeps the exit code, and takes `--vault` off the
+  line; with no vault to switch to, nothing re-runs.
+- `vaults use` warns when `SHIMMER_HOME` is set; an interrupted copy leaves no registered vault; a
+  copied `active` workspace is `ready` in the copy; the active pack found from `main` in another vault.
 
 - Which vault wins: `--vault` > `SHIMMER_HOME` > `use` > `main`, as a plain function with no
   environment changed.
