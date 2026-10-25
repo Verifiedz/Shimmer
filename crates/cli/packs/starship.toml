@@ -87,6 +87,7 @@ label = "Starship"
 "duplicate-source"  = "fetchers.copy"
 "scan-blueprints"   = "fetchers.templates"
 "read-blueprint"    = "fetchers.peek"
+"recalibrate-sensors" = "fetchers.reload"
 # automations (ADR 0035)
 "protocols"         = "automations.list"
 "briefing"          = "automations.show"
