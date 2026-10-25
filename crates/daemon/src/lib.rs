@@ -10,6 +10,7 @@ mod backend;
 mod bus;
 mod config;
 mod core;
+mod delivery;
 mod desktop;
 mod http_backend;
 mod indexer;
@@ -32,7 +33,6 @@ use std::time::Duration;
 use shimmer_core::{Clock, Emitter, Error, Module, ModuleId, NamespacedStore, Result};
 use shimmer_store::Store;
 use tokio::net::UnixListener;
-use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -131,10 +131,12 @@ impl Daemon {
         let tracker = TaskTracker::new();
 
         // Subscribe before init so events a module emits while initialising are not missed.
+        // Taken before subscribing: a module's catch-up after a lag never reaches before it (#310).
+        let listening_since = config.clock.now();
         let receivers: Vec<_> = core.registry.entries.iter().map(|_| bus.subscribe()).collect();
         tracker.spawn(indexer::run(index, store.clone(), bus.subscribe(), shutdown.clone()));
 
-        for (entry, mut rx) in core.registry.entries.iter().zip(receivers) {
+        for (entry, rx) in core.registry.entries.iter().zip(receivers) {
             let id = entry.manifest.id.clone();
             let ctx = core.ctxs[&id].clone();
             match entry.module.init(&ctx).await {
@@ -146,24 +148,18 @@ impl Daemon {
                     continue;
                 }
             }
-            let (module, shutdown) = (entry.module.clone(), shutdown.clone());
-            tracker.spawn(async move {
-                loop {
-                    let ev = tokio::select! {
-                        _ = shutdown.cancelled() => return,
-                        ev = rx.recv() => ev,
-                    };
-                    match ev {
-                        Ok(ev) => {
-                            if let Err(e) = module.on_event(&ev, &ctx).await {
-                                tracing::warn!(module = %id, topic = %ev.topic, error = %e, "on_event failed");
-                            }
-                        }
-                        Err(RecvError::Lagged(n)) => tracing::warn!(module = %id, dropped = n, "module lagged the bus"),
-                        Err(RecvError::Closed) => return,
-                    }
-                }
-            });
+            // Every event, in order, a lag caught up from the log and a panic kept to its event
+            // (#261 findings 1, 2).
+            tracker.spawn(delivery::run(
+                id,
+                entry.module.clone(),
+                ctx,
+                rx,
+                store.clone(),
+                shutdown.clone(),
+                listening_since,
+                tracker.clone(),
+            ));
         }
 
         // Modules are initialised, so anything that fires now can run. The first tick catches up

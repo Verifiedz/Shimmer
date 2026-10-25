@@ -64,9 +64,24 @@ pub fn contains(home: &Path, event: &Event) -> Result<bool> {
 }
 
 pub fn read_all(home: &Path) -> Result<EventScan> {
+    read_from(home, None)
+}
+
+/// Events logged at or after `since`, oldest first: only the day files from `since`'s day on
+/// are read (a day file holds the events whose `at` falls on it). For a module that fell
+/// behind the bus, catching up from where it was (#261 finding 1).
+pub fn read_since(home: &Path, since: chrono::DateTime<chrono::Utc>) -> Result<EventScan> {
+    let mut scan = read_from(home, Some(&format!("{}.jsonl", since.format("%Y-%m-%d"))))?;
+    scan.events.retain(|e| e.at >= since);
+    Ok(scan)
+}
+
+/// `first`: the earliest day file to read, by name (they sort by date).
+fn read_from(home: &Path, first: Option<&str>) -> Result<EventScan> {
     let mut files: Vec<PathBuf> = fs::read_dir(home.join("events"))?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .filter(|p| first.is_none_or(|first| p.file_name().is_some_and(|n| n.to_string_lossy().as_ref() >= first)))
         .collect();
     files.sort();
     let mut scan = EventScan { events: Vec::new(), skipped: 0 };
@@ -82,4 +97,29 @@ pub fn read_all(home: &Path) -> Result<EventScan> {
         }
     }
     Ok(scan)
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::TimeZone;
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn read_since_reads_from_that_day_on_and_only_what_came_since() {
+        let home = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(home.path().join("events")).unwrap();
+        let at = |d, h| chrono::Utc.with_ymd_and_hms(2026, 10, d, h, 0, 0).unwrap();
+        let ev = |d, h| Event::new("records".into(), "records.item.created", json!({"d": d, "h": h}), at(d, h));
+        let (old, before, after, next_day) = (ev(18, 9), ev(19, 8), ev(19, 10), ev(20, 7));
+        for e in [&old, &before, &after, &next_day] {
+            append(home.path(), e).unwrap();
+        }
+        // A line no older file could hold is never even read: break the 18th's file.
+        fs::write(home.path().join("events/2026-10-18.jsonl"), [0xff, 0xfe]).unwrap();
+        let scan = read_since(home.path(), at(19, 9)).unwrap();
+        assert_eq!(scan.events, [after, next_day]);
+        assert_eq!(scan.skipped, 0, "the 18th's file wasn't read");
+    }
 }
