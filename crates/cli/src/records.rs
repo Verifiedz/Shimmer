@@ -94,6 +94,8 @@ pub type Flags = Vec<(String, String)>;
 pub enum RecordsCmd {
     Help,
     Collections,
+    /// `records list` with no collection: the collections, and how to list one.
+    ListWhich,
     /// `id` is `None` when the daemon should make one from the title (ADR 0018).
     Add {
         collection: String,
@@ -348,6 +350,7 @@ pub fn parse(words: Vec<String>) -> std::result::Result<RecordsCmd, String> {
             let [collection, file]: [String; 2] = positional.try_into().map_err(|_| usage)?;
             Ok(RecordsCmd::Import { collection, file, dry_run, skip_invalid, yes })
         }
+        "list" if positional.is_empty() && flags.is_empty() && !removed => Ok(RecordsCmd::ListWhich),
         "list" | "export" => {
             let [collection]: [String; 1] = positional
                 .try_into()
@@ -492,7 +495,7 @@ pub fn parse(words: Vec<String>) -> std::result::Result<RecordsCmd, String> {
                 _ => RecordsCmd::Remove { collection, id, force },
             })
         }
-        other => Err(format!("unknown records command '{other}'; see 'shimmer records --help'")),
+        other => Err(crate::suggest::unknown_command(Some("records"), other, USAGE)),
     }
 }
 
@@ -554,7 +557,12 @@ fn number(flag: &str, value: &str) -> std::result::Result<usize, String> {
 impl RecordsCmd {
     pub(crate) fn collection(&self) -> Option<&str> {
         match self {
-            Self::Help | Self::Collections | Self::Templates { .. } | Self::Peek { .. } | Self::New { .. } => None,
+            Self::Help
+            | Self::Collections
+            | Self::ListWhich
+            | Self::Templates { .. }
+            | Self::Peek { .. }
+            | Self::New { .. } => None,
             Self::Add { collection, .. }
             | Self::Rename { collection, .. }
             | Self::List { collection, .. }
@@ -627,7 +635,7 @@ pub fn request(cmd: &RecordsCmd, schema: &Value) -> Result<(&'static str, Value)
             };
             return request(&list, schema);
         }
-        RecordsCmd::Collections => ("records.collections", json!({})),
+        RecordsCmd::Collections | RecordsCmd::ListWhich => ("records.collections", json!({})),
         RecordsCmd::RemovedCollections => ("records.collections", json!({"removed": true})),
         RecordsCmd::PurgeCollection { id, .. } => ("records.purge_collection", json!({"id": id})),
         RecordsCmd::Add { collection, id, set } => {
@@ -1295,6 +1303,10 @@ pub fn show(cmd: &RecordsCmd, data: &Value, schema: &Value) -> String {
     match cmd {
         RecordsCmd::Help => USAGE.into(),
         RecordsCmd::Collections => collections(data),
+        RecordsCmd::ListWhich => match data["collections"].as_array().is_some_and(|c| !c.is_empty()) {
+            true => format!("which collection? shimmer records list COLLECTION\n\n{}", collections(data)),
+            false => collections(data),
+        },
         // The id comes from the reply: the daemon may have made it (ADR 0018).
         // In full, never cut like a table cell: it's what the person types next.
         RecordsCmd::Add { collection, .. } => {
@@ -1837,7 +1849,7 @@ mod tests {
                 refine: Refine::default()
             }
         );
-        assert!(parse_words(&["list"]).is_err());
+        assert_eq!(parse_words(&["list"]).unwrap(), RecordsCmd::ListWhich, "which collection? (the collections)");
         assert!(parse_words(&["list", "leetcode", "--limit", "lots"]).unwrap_err().contains("whole number"));
     }
 

@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -36,6 +36,23 @@ impl Client {
     /// Connect and complete the handshake. The raw `io::Error` from connecting is kept apart
     /// so the caller can tell "nobody is listening" (start a daemon) from everything else.
     pub async fn connect(socket: &Path) -> std::result::Result<Self, ConnectError> {
+        Self::connect_for(socket, &shimmer_proto::paths::shimmer_home()).await
+    }
+
+    /// [`connect`](Self::connect), refusing a daemon that serves a folder other than `home`
+    /// (ADR 0039 §3). A daemon that names no folder (older, or `shimmer mockd`) is accepted.
+    pub async fn connect_for(socket: &Path, home: &Path) -> std::result::Result<Self, ConnectError> {
+        if let Some(why) = shimmer_proto::paths::too_long(socket) {
+            return Err(ConnectError::Protocol(Error::invalid_params(why)));
+        }
+        // A socket in the shared `/tmp` folder is only trusted if that folder is ours (ADR 0039 §5).
+        let uid = shimmer_proto::paths::owner_uid();
+        if let Some(dir) = socket.parent().filter(|_| shimmer_proto::paths::in_short_socket_dir(socket, uid)) {
+            if dir.exists() {
+                shimmer_proto::paths::check_private_dir(dir, uid)
+                    .map_err(|why| ConnectError::Protocol(Error::unavailable(why)))?;
+            }
+        }
         let stream = UnixStream::connect(socket).await.map_err(ConnectError::Io)?;
         let (rd, wr) = stream.into_split();
         let mut client = Self {
@@ -46,11 +63,18 @@ impl Client {
             events: VecDeque::new(),
             daemon_version: String::new(),
         };
-        client.handshake().await.map_err(ConnectError::Protocol)?;
+        let served = client.handshake().await.map_err(ConnectError::Protocol)?;
+        if let Some(served) = served {
+            let mine = shimmer_proto::paths::resolve(home);
+            if Path::new(&served) != mine {
+                return Err(ConnectError::OtherHome { served, mine });
+            }
+        }
         Ok(client)
     }
 
-    async fn handshake(&mut self) -> Result<()> {
+    /// The folder the daemon said it serves, if it said.
+    async fn handshake(&mut self) -> Result<Option<String>> {
         let hello = ClientFrame::Hello {
             v: PROTOCOL_VERSION,
             client: "cli".into(),
@@ -61,9 +85,9 @@ impl Client {
             .await
             .map_err(|_| Error::unavailable("daemon did not answer the handshake"))??;
         match frame {
-            ServerFrame::Welcome { daemon_version, .. } => {
+            ServerFrame::Welcome { daemon_version, home, .. } => {
                 self.daemon_version = daemon_version;
-                Ok(())
+                Ok(home)
             }
             ServerFrame::Error { error, .. } => Err(error),
             other => Err(Error::bad_request(format!("expected welcome, got {}", kind(&other)))),
@@ -168,6 +192,8 @@ pub enum ConnectError {
     Io(io::Error),
     /// Something answered but the handshake failed (wrong version, not a daemon, timeout).
     Protocol(Error),
+    /// A daemon answered, but for another Shimmer folder (ADR 0039 §3).
+    OtherHome { served: String, mine: PathBuf },
 }
 
 impl ConnectError {
@@ -180,6 +206,11 @@ impl ConnectError {
         match self {
             Self::Io(e) => Error::unavailable(format!("cannot connect to {}: {e}", socket.display())),
             Self::Protocol(e) => e,
+            Self::OtherHome { served, mine } => Error::unavailable(format!(
+                "the daemon on {} serves {served}, not {}; set SHIMMER_SOCKET to that folder's daemon, or unset it",
+                socket.display(),
+                mine.display()
+            )),
         }
     }
 }

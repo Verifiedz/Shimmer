@@ -127,6 +127,11 @@ fn commands(usage: &str) -> Vec<Cmd> {
     out
 }
 
+/// The command words a help page lists (`list`, `show`, …), for "did you mean…?" (`suggest`).
+pub(crate) fn command_words(usage: &str) -> Vec<String> {
+    commands(usage).into_iter().map(|c| c.word).collect()
+}
+
 /// `commands:`, `moving data:`, `changing a collection:`; not `WHEN is exactly one of:`.
 fn is_section_title(line: &str) -> bool {
     line.strip_suffix(':').is_some_and(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_lowercase() || c == ' '))
@@ -682,8 +687,10 @@ impl Groups {
                     self.add("fields", "fields", f["name"].as_str().unwrap_or_default(), field_type(&f));
                 }
             }
-            ("records" | "workspaces" | "automations", "TEMPLATE") => self.templates(module, source).await,
-            ("records" | "workspaces" | "automations", "CATEGORY") => self.categories(module, source).await,
+            ("records" | "workspaces" | "automations" | "fetchers", "TEMPLATE") => self.templates(module, source).await,
+            ("records" | "workspaces" | "automations" | "fetchers", "CATEGORY") => {
+                self.categories(module, source).await
+            }
             ("workspaces", "NAME") if command != "new" => self.workspaces(source).await,
             ("packs", "NAME") | ("", "NAME") => self.packs(cx),
             ("packs", "NAME|FOLDER") => {

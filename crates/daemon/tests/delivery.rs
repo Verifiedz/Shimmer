@@ -58,7 +58,7 @@ impl Module for Counter {
     }
 
     async fn on_event(&self, ev: &Event, _ctx: &Ctx) -> Result<()> {
-        if ev.topic != "counter.tick.happened" {
+        if !matches!(ev.topic.as_str(), "counter.tick.happened" | "burst.tick.happened") {
             return Ok(());
         }
         if ev.payload["panic"] == true {
@@ -134,5 +134,46 @@ async fn a_lag_right_after_a_restart_never_replays_the_previous_runs_events() {
     let seen_after: Vec<u64> = serde_json::from_value(c.call("counter.seen", json!({})).await.unwrap()).unwrap();
     assert!(seen.iter().all(|i| *i < 90000), "the previous run's events came again");
     assert_eq!(seen_after, (0..2000).collect::<Vec<_>>(), "this run's, once each, in order");
+    stop(d).await;
+}
+
+/// Emits `n` ticks in one transaction while it starts, before any module listens.
+struct BurstAtStart(u64);
+
+#[async_trait]
+impl Module for BurstAtStart {
+    fn manifest(&self) -> Manifest {
+        Manifest {
+            id: "burst".into(),
+            version: "0.0.1".into(),
+            namespace: "burst".into(),
+            topics: vec!["burst.tick.happened".into()],
+            topic_descriptions: Default::default(),
+            capabilities: vec![],
+        }
+    }
+    async fn init(&self, ctx: &Ctx) -> Result<()> {
+        ctx.store.transaction(|tx| {
+            for i in 0..self.0 {
+                tx.emit("burst.tick.happened", json!({"i": i, "panic": false}))?;
+            }
+            Ok(())
+        })
+    }
+    async fn handle(&self, op: &str, _: Value, _: &Ctx) -> Result<Value> {
+        Err(shimmer_core::Error::unknown_op(op))
+    }
+}
+
+/// #322's review (#310 with #323): every module starts before any listens, so a receiver holds
+/// everything emitted during the others' starts and can lag right then. The catch-up from the log
+/// covers it: every event once, in order.
+#[tokio::test]
+async fn a_receiver_that_overflows_while_another_module_starts_still_gets_every_event_once() {
+    let env = Env::new();
+    let d = env.try_start(vec![Arc::new(BurstAtStart(2000)), Arc::new(Counter::default())]).await.unwrap();
+    let mut c = Client::connect(&env.sock).await;
+    let seen = seen_until(&mut c, 2000).await;
+    assert_eq!(seen, (0..2000).collect::<Vec<_>>(), "every one, once, in order");
     stop(d).await;
 }

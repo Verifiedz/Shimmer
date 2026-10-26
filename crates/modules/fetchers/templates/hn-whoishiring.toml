@@ -1,0 +1,23 @@
+[template]
+label = "Hacker News: Who is hiring?"
+description = "Job postings from HN's monthly \"Who is hiring?\" thread"
+category = "job-boards"
+kind = "hn-whoishiring"
+good_to_know = [
+    "New postings appear roughly once a month, when a fresh thread is submitted",
+    "It reads HN's own public API directly -- nothing to configure beyond an optional title filter",
+]
+
+[[question]]
+name = "TITLE_FILTER"
+prompt = "Only show titles containing (comma-separated, optional)"
+kind = "filter"
+
+[source]
+text = '''
+[source]
+enabled = false
+interval = "hourly"
+kind = "hn-whoishiring"
+filter = ${TITLE_FILTER} # if TITLE_FILTER
+'''

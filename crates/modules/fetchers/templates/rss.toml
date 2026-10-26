@@ -1,0 +1,25 @@
+[template]
+label = "An RSS or Atom feed"
+description = "New entries from any RSS or Atom feed"
+category = "feeds"
+kind = "rss"
+good_to_know = [
+    "Works for RSS 0.x/1.0/2.0 and Atom alike",
+]
+
+[[question]]
+name = "URL"
+prompt = "The feed's url"
+kind = "url"
+required = true
+
+[source]
+text = '''
+[source]
+enabled = false
+interval = "hourly"
+kind = "rss"
+
+[kind]
+url = "${URL}"
+'''

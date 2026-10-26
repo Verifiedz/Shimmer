@@ -42,6 +42,10 @@ pub enum ServerFrame {
         v: u32,
         daemon_version: String,
         session: String,
+        /// The Shimmer folder this daemon serves, resolved (ADR 0039 §2). Absent from an older
+        /// daemon and from `shimmer mockd`, which serves fixtures, not a folder.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        home: Option<String>,
     },
     Response {
         v: u32,
@@ -53,20 +57,30 @@ pub enum ServerFrame {
         error: Option<Error>,
     },
     /// Pushed at any time after `subscribe`. Carries no id.
-    Event {
-        v: u32,
-        event: Event,
-    },
+    Event { v: u32, event: Event },
     /// A failure with no request to attach to: a rejected handshake or an unparseable frame.
-    Error {
-        v: u32,
-        error: Error,
-    },
+    Error { v: u32, error: Error },
 }
 
 impl ServerFrame {
+    /// A `welcome` from something that serves no folder (`shimmer mockd`, test servers).
     pub fn welcome(daemon_version: impl Into<String>, session: impl Into<String>) -> Self {
-        Self::Welcome { v: crate::PROTOCOL_VERSION, daemon_version: daemon_version.into(), session: session.into() }
+        Self::Welcome {
+            v: crate::PROTOCOL_VERSION,
+            daemon_version: daemon_version.into(),
+            session: session.into(),
+            home: None,
+        }
+    }
+
+    /// The real daemon's `welcome`, naming the folder it serves (ADR 0039 §2).
+    pub fn welcome_for(daemon_version: impl Into<String>, session: impl Into<String>, home: &std::path::Path) -> Self {
+        Self::Welcome {
+            v: crate::PROTOCOL_VERSION,
+            daemon_version: daemon_version.into(),
+            session: session.into(),
+            home: Some(crate::paths::resolve(home).display().to_string()),
+        }
     }
 
     pub fn ok(id: impl Into<String>, data: Value) -> Self {
@@ -172,6 +186,19 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// ADR 0039 §2: the real daemon names its folder; a welcome without one still decodes.
+    #[test]
+    fn welcome_names_its_folder_and_a_welcome_without_one_still_decodes() {
+        let with =
+            serde_json::to_value(ServerFrame::welcome_for("0.1.0", "s1", std::path::Path::new("/x/y/../shimmer")))
+                .unwrap();
+        assert_eq!(with["home"], "/x/shimmer");
+        let without = serde_json::to_value(ServerFrame::welcome("0.1.0", "s1")).unwrap();
+        assert!(without.get("home").is_none(), "absent, not null: {without}");
+        let old = r#"{"v":2,"kind":"welcome","daemon_version":"0.1.0","session":"s1"}"#;
+        assert!(matches!(decode_server(old).unwrap(), ServerFrame::Welcome { home: None, .. }));
+    }
 
     #[test]
     fn protocol_md_examples_parse() {

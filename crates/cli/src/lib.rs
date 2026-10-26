@@ -26,6 +26,7 @@ mod scheduler;
 mod schedules;
 mod startup;
 mod style;
+mod suggest;
 mod when;
 mod workspaces;
 
@@ -233,6 +234,7 @@ fn prints_data(cmd: &Command) -> bool {
                     | RecordsCmd::Export { .. }
                     | RecordsCmd::ListRemoved { .. }
                     | RecordsCmd::Collections
+                    | RecordsCmd::ListWhich
                     | RecordsCmd::Check { .. }
                     | RecordsCmd::Peek { file: true, .. }
             )
@@ -320,7 +322,7 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
         return workspaces::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
     }
     if let Command::Fetchers(cmd) = &args.command {
-        return fetchers::run(&mut client, cmd, args.json).await.map(Some);
+        return fetchers::run(&mut client, cmd, args.json, &mut workspaces::Terminal).await.map(Some);
     }
     if let Command::Call { op, params, first: Some(yes) } = &args.command {
         return call_first(&mut client, op, params.clone(), *yes).await.map(|data| Some(output(args, &data)));
