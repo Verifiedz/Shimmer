@@ -87,6 +87,7 @@ label = "Ship It"
 "clone-source"   = "fetchers.copy"
 "starters"       = "fetchers.templates"
 "preview-starter" = "fetchers.peek"
+"rescan-sources" = "fetchers.reload"
 # automations (ADR 0035)
 "hooks"         = "automations.list"
 "inspect-hook"  = "automations.show"

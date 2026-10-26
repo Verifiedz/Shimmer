@@ -38,6 +38,7 @@ commands:
   copy SOURCE NEW [--label TEXT]
                         a new source like SOURCE, switched off until you enable it
   status               the whole feature at a glance: how many sources, how many enabled, any problems
+  reload                re-read the source files after editing them by hand
   test SOURCE [--filter JSON]   fetch one page and show its parsed items; never saves or marks
                         anything seen
   run SOURCE [--wait] [--filter JSON]  fetch one source now
@@ -147,6 +148,7 @@ pub enum FetchersCmd {
         label: Option<String>,
     },
     Status,
+    Reload,
     Test {
         source: String,
         filter: Option<Map<String, Value>>,
@@ -224,6 +226,8 @@ pub fn parse(words: Vec<String>) -> std::result::Result<FetchersCmd, String> {
         }
         "status" if rest.is_empty() => Ok(FetchersCmd::Status),
         "status" => Err("'fetchers status' takes no arguments".into()),
+        "reload" if rest.is_empty() => Ok(FetchersCmd::Reload),
+        "reload" => Err("'fetchers reload' takes no arguments".into()),
         "test" => {
             let flags = Flags::split(rest, &["--filter"], &[]).map_err(|e| format!("fetchers test: {e}"))?;
             let source = match flags.positional.as_slice() {
@@ -521,6 +525,15 @@ pub async fn run(client: &mut Client, cmd: &FetchersCmd, json_out: bool, prompt:
         FetchersCmd::Status => {
             let data = client.call("fetchers.status", json!({})).await?;
             Ok(if json_out { render::json(&data) } else { status(&data) })
+        }
+        FetchersCmd::Reload => {
+            let data = client.call("fetchers.reload", json!({})).await?;
+            if json_out {
+                return Ok(render::json(&data));
+            }
+            let mut out = format!("✓ read {} sources", full(&data["sources"]));
+            out.push_str(&problems(&data["problems"]));
+            Ok(out)
         }
         FetchersCmd::Test { source, filter } => {
             // Always follows: a dry run that returned immediately with just a task id would
@@ -930,28 +943,52 @@ fn task_error(payload: &Value) -> Error {
 /// the prior design's separate per-source `list`/`status` into one).
 fn list(data: &Value, now: DateTime<Utc>) -> String {
     let sources = data["sources"].as_array().cloned().unwrap_or_default();
-    if sources.is_empty() {
-        return "no sources known".into();
-    }
-    let rows: Vec<Vec<String>> = sources
-        .iter()
-        .map(|s| {
-            let last_run = when::timestamp(&s["last_run_at"]);
-            vec![
-                render::cell(&s["id"]),
-                render::cell(&s["method"]),
-                s["kind"].as_str().unwrap_or("-").to_string(),
-                // on/off under STATE, coloured like every other feature's (ADR 0038 §6).
-                if s["enabled"].as_bool().unwrap_or(false) { "on".into() } else { "off".into() },
-                s["interval_s"].as_u64().map(when::format_duration).unwrap_or_else(|| "-".into()),
-                last_run.map_or("never".into(), |t| when::relative(t, now)),
-                if s["running"].as_bool().unwrap_or(false) { "running".into() } else { "idle".into() },
-            ]
-        })
+    let mut out = if sources.is_empty() {
+        "no sources yet: see 'shimmer fetchers templates', then \
+         'shimmer fetchers new SOURCE --from TEMPLATE'"
+            .to_owned()
+    } else {
+        let rows: Vec<Vec<String>> = sources
+            .iter()
+            .map(|s| {
+                let last_run = when::timestamp(&s["last_run_at"]);
+                vec![
+                    render::cell(&s["id"]),
+                    render::cell(&s["method"]),
+                    s["kind"].as_str().unwrap_or("-").to_string(),
+                    // on/off under STATE, coloured like every other feature's (ADR 0038 §6).
+                    if s["enabled"].as_bool().unwrap_or(false) { "on".into() } else { "off".into() },
+                    s["interval_s"].as_u64().map(when::format_duration).unwrap_or_else(|| "-".into()),
+                    last_run.map_or("never".into(), |t| when::relative(t, now)),
+                    if s["running"].as_bool().unwrap_or(false) { "running".into() } else { "idle".into() },
+                ]
+            })
+            .collect();
+        let header = ["ID", "METHOD", "KIND", "STATE", "INTERVAL", "LAST RUN", ""].map(String::from);
+        let n = sources.len();
+        format!("{}\n{n} source{}", table(&header, &rows), if n == 1 { "" } else { "s" })
+    };
+    out.push_str(&problems(&data["problems"]));
+    out
+}
+
+/// Source files that can't be used, under `list`'s table -- same shape as `automations list`'s
+/// own `problems` (CLAUDE.md §8: one host module's pattern, duplicated per module, not shared).
+fn problems(v: &Value) -> String {
+    let lines: Vec<String> = v
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| format!("  ✗ {}: {}", full(&p["id"]), full(&p["problem"])))
         .collect();
-    let header = ["ID", "METHOD", "KIND", "STATE", "INTERVAL", "LAST RUN", ""].map(String::from);
-    let n = sources.len();
-    format!("{}\n{n} source{}", table(&header, &rows), if n == 1 { "" } else { "s" })
+    match lines.is_empty() {
+        true => String::new(),
+        false => format!(
+            "\n\n{}\n{}\n  fix with 'shimmer fetchers edit SOURCE', or the file and 'shimmer fetchers reload'",
+            paint(Role::Warning, "not running (can't be used):"),
+            lines.join("\n")
+        ),
+    }
 }
 
 /// The whole feature at a glance (ADR 0028 §9): not per-source -- that's `fetchers.list`/
@@ -1053,6 +1090,8 @@ mod tests {
         assert_eq!(p(&["list"]), Ok(FetchersCmd::List { removed: false }));
         assert_eq!(p(&["list", "--removed"]), Ok(FetchersCmd::List { removed: true }));
         assert_eq!(p(&["status"]), Ok(FetchersCmd::Status));
+        assert_eq!(p(&["reload"]), Ok(FetchersCmd::Reload));
+        assert!(p(&["reload", "x"]).unwrap_err().contains("takes no arguments"));
         assert_eq!(p(&["show", "blog"]), Ok(FetchersCmd::Show { id: "blog".into() }));
         assert_eq!(
             p(&["new", "blog", "--interval", "daily"]),
@@ -1224,8 +1263,24 @@ mod tests {
     }
 
     #[test]
-    fn list_with_nothing_known_says_so() {
-        assert_eq!(list(&json!({"sources": []}), Utc::now()), "no sources known");
+    fn list_with_nothing_known_points_at_templates() {
+        let out = list(&json!({"sources": []}), Utc::now());
+        assert!(
+            out.contains("shimmer fetchers templates") && out.contains("shimmer fetchers new SOURCE --from TEMPLATE"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn list_shows_broken_source_files_under_the_table() {
+        let data = json!({
+            "sources": [],
+            "problems": [{"id": "latin1", "problem": "not UTF-8"}],
+        });
+        let out = list(&data, Utc::now());
+        assert!(out.contains("not running (can't be used):"), "{out}");
+        assert!(out.contains("latin1: not UTF-8"), "{out}");
+        assert!(out.contains("shimmer fetchers edit SOURCE") && out.contains("shimmer fetchers reload"), "{out}");
     }
 
     #[test]

@@ -641,6 +641,25 @@ mod tests {
     }
 
     #[test]
+    fn a_typo_d_field_on_hn_or_wwr_is_rejected_not_silently_ignored() {
+        // #302's review: `hn-whoishiring` and `wwr` are ordinary `Kind`s now (ADR 0028 §10),
+        // each still validated through `Kind::parse` -> `reject_unknown` -- a stray key in
+        // `[kind]` must fail to load, not sit there doing nothing. The rebase onto #313
+        // dropped this test without changing the behaviour it covers; put back.
+        let why = problem_for(
+            json!({"enabled": true, "interval": "daily", "kind": "hn-whoishiring", "title_exclude": ["intern"]}),
+            "hn-whoishiring",
+        );
+        assert!(why.contains("title_exclude"), "{why}");
+
+        let why = problem_for(
+            json!({"enabled": true, "interval": 3600, "kind": "wwr", "categroy": "remote-full-stack-programming-jobs"}),
+            "my-wwr",
+        );
+        assert!(why.contains("categroy"), "{why}");
+    }
+
+    #[test]
     fn matches_title_with_no_filter_configured_keeps_everything() {
         let s = source(true, MIN_INTERVAL_API_S);
         assert!(s.matches_title("Senior Staff Engineer", today(), chrono_tz::UTC));
