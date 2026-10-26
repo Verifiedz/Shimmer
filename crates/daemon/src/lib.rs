@@ -134,18 +134,28 @@ impl Daemon {
         let receivers: Vec<_> = core.registry.entries.iter().map(|_| bus.subscribe()).collect();
         tracker.spawn(indexer::run(index, store.clone(), bus.subscribe(), shutdown.clone()));
 
-        for (entry, mut rx) in core.registry.entries.iter().zip(receivers) {
+        // Every module is initialised before any of them reacts to an event. A module reacting
+        // while a later one is still starting could queue that one's op (automations sending
+        // notify.send about a workspace found half-launched at start) and have it refused as
+        // "not initialised", losing the message. Events emitted meanwhile wait in each module's
+        // receiver, subscribed above.
+        let mut started = Vec::new();
+        for (entry, rx) in core.registry.entries.iter().zip(receivers) {
             let id = entry.manifest.id.clone();
             let ctx = core.ctxs[&id].clone();
             match entry.module.init(&ctx).await {
-                Ok(()) => entry.ready.store(true, Ordering::Release),
+                Ok(()) => {
+                    entry.ready.store(true, Ordering::Release);
+                    started.push((entry, rx, id, ctx));
+                }
                 Err(e) => {
                     // One broken module must not take the daemon down: its ops answer
                     // `unavailable` and everything else keeps working.
                     tracing::error!(module = %id, error = %e, "module init failed; ops will answer unavailable");
-                    continue;
                 }
             }
+        }
+        for (entry, mut rx, id, ctx) in started {
             let (module, shutdown) = (entry.module.clone(), shutdown.clone());
             tracker.spawn(async move {
                 loop {
