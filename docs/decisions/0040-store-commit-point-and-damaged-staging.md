@@ -71,9 +71,15 @@ the caller as a failed write."
 - A write can return success while its last step is still pending, in practice only when the disk
   is failing or a permission was changed under the daemon. Until it's finished, its event isn't in
   the log yet and some of its files may not be in place, the same state a crash leaves, finished
-  the same way. Doctor makes it visible. While one waits, later writes wait behind it: they
-  succeed, but nothing they change is visible until the problem is fixed and the next write (or
-  the next start) lands them all, in order.
+  the same way. Doctor makes it visible. While one waits, later writes wait behind it, in order.
+  **Reads see them anyway** (#309's third review): `read` and `list` look through the waiting
+  saves first, newest first (a staged write returns its bytes, a staged delete reads as gone), so a
+  read-modify-write made meanwhile builds on what was committed instead of silently undoing it.
+  Unlike after a crash, the daemon keeps answering while saves wait, which is why this matters.
+  When nothing waits (almost always) a read is the file, with no lock taken.
+- Folders sort by `<number>-<txid>`, the number never going back within a run, and recovery starts
+  the next run's numbers after the largest it found, so a clock that went back between runs can't
+  reorder them; a folder from before numbering (a bare ULID) counts as the oldest.
 - A damaged staging folder needs a person to look at it once; nothing reads `broken/` again.
 - Tests: a corrupt manifest and a missing staged file each leave a running daemon, a kept
   `broken/` folder and a doctor warning; an unwritable log gives a successful add, one record and

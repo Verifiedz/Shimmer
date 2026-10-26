@@ -68,6 +68,58 @@ pub struct Recovery {
     pub waiting: usize,
 }
 
+/// What the waiting transactions (`pending`, oldest first) say about `path` in `namespace`, newest
+/// first: `Some(Some(bytes))` for a staged write, `Some(None)` for a staged delete, `None` when no
+/// waiting transaction touches it (read the file). A committed transaction has happened, so a read
+/// must see it even before it's applied, or a read-modify-write made meanwhile undoes it (#309's
+/// third review). A folder gone or unreadable has just landed: skipped, the file has it.
+pub fn read_waiting(pending: &[PathBuf], namespace: &str, path: &str) -> Option<Option<Vec<u8>>> {
+    for dir in pending.iter().rev() {
+        let Some(staged) = staged_in(dir) else { continue };
+        if staged.namespace != namespace {
+            continue;
+        }
+        // Within one transaction the last op on a path is the one that stands.
+        let last = staged.ops.iter().rev().find(|op| match op {
+            StagedOp::Put { path: p, .. } | StagedOp::Delete { path: p } => p == path,
+        });
+        match last {
+            Some(StagedOp::Put { file, .. }) => match fs::read(dir.join(file)) {
+                Ok(bytes) => return Some(Some(bytes)),
+                Err(_) => continue,
+            },
+            Some(StagedOp::Delete { .. }) => return Some(None),
+            None => {}
+        }
+    }
+    None
+}
+
+/// `listed` (the files on disk under `prefix`) as the waiting transactions leave it, applied
+/// oldest first: a staged write adds its path, a staged delete removes it (#309's third review).
+pub fn list_waiting(pending: &[PathBuf], namespace: &str, prefix: &str, listed: &mut Vec<String>) {
+    let under =
+        |p: &str| prefix.is_empty() || p == prefix || p.starts_with(&format!("{}/", prefix.trim_end_matches('/')));
+    for dir in pending {
+        let Some(staged) = staged_in(dir) else { continue };
+        if staged.namespace != namespace {
+            continue;
+        }
+        for op in &staged.ops {
+            match op {
+                StagedOp::Put { path, .. } if under(path) && !listed.contains(path) => listed.push(path.clone()),
+                StagedOp::Delete { path } => listed.retain(|p| p != path),
+                _ => {}
+            }
+        }
+    }
+    listed.sort();
+}
+
+fn staged_in(dir: &Path) -> Option<Staged> {
+    serde_json::from_slice(&fs::read(dir.join(MANIFEST)).ok()?).ok()
+}
+
 /// `pending`: committed transactions whose step 3 failed earlier in this run, oldest first,
 /// retried before anything else. Returns the events that reached the log in this call, in log
 /// order (the retried transactions' first, then this one's), **and** whether this transaction
@@ -145,9 +197,10 @@ fn retry(home: &Path, pending: &mut Vec<PathBuf>) -> Vec<Event> {
 /// Names a staging folder so they sort in the order they were made, which recovery relies on
 /// (#309's review): nanoseconds since 1970, never repeating or going back within a run. A
 /// transaction's ULID alone is ordered only to the millisecond.
+static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn order_key() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static LAST: AtomicU64 = AtomicU64::new(0);
+    use std::sync::atomic::Ordering;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
     // A compare-and-swap loop rather than `fetch_update`, which newer Rust renames.
     let mut last = LAST.load(Ordering::Relaxed);
@@ -252,7 +305,12 @@ pub fn recover(home: &Path, pending: &mut Vec<PathBuf>) -> Result<Recovery> {
     // waiting transactions to one file must land in that order (#309's review).
     let mut dirs: Vec<PathBuf> =
         fs::read_dir(staging_root(home))?.map(|e| e.map(|e| e.path())).collect::<std::io::Result<_>>()?;
-    dirs.sort();
+    dirs.sort_by_key(|d| (folder_key(d), d.clone()));
+    // New folders sort after every one already here, even if the clock went back between runs
+    // (#309's third review).
+    if let Some(newest) = dirs.iter().map(|d| folder_key(d)).max() {
+        LAST.fetch_max(newest, std::sync::atomic::Ordering::Relaxed);
+    }
     for dir in dirs {
         if !dir.is_dir() || dir.file_name().is_some_and(|n| n == BROKEN) {
             continue;
@@ -296,6 +354,16 @@ pub fn recover(home: &Path, pending: &mut Vec<PathBuf>) -> Result<Recovery> {
         }
     }
     Ok(r)
+}
+
+/// A staging folder's place in commit order: the number before its `-`. One named by a bare ULID,
+/// left from before folders were numbered, counts as the oldest.
+fn folder_key(dir: &Path) -> u64 {
+    dir.file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.split_once('-'))
+        .and_then(|(key, _)| key.parse().ok())
+        .unwrap_or(0)
 }
 
 /// Why a committed staging folder can never be applied, if it can't: its manifest is gone or
@@ -590,11 +658,13 @@ mod tests {
         let older = event("records.item.created");
         logged_ok(store.commit_logged("records", one("a.toml", b"old", vec![older.clone()])));
         logged_ok(store.commit_logged("records", one("a.toml", b"new", vec![])));
+        // On disk it waits behind the older one; a read sees it already (#309's third review).
         assert_ne!(
-            store.read("records", "a.toml").unwrap().as_deref(),
+            fs::read(home.path().join("data/records/a.toml")).ok().as_deref(),
             Some(&b"new"[..]),
-            "waits behind the older one"
+            "on disk: waits"
         );
+        assert_eq!(store.read("records", "a.toml").unwrap().unwrap(), b"new", "a read sees the latest save");
         block_log(home.path(), false);
         let later = event("records.item.updated");
         logged_ok(store.commit_logged("records", one("b.toml", b"x", vec![later.clone()])));
@@ -678,5 +748,88 @@ mod tests {
         assert_eq!(published, [first.clone(), second.clone()], "the kept one first, then this one");
         assert_eq!(store.read("records", "a.toml").unwrap().unwrap(), b"2");
         assert_eq!(logged(&store), [first, second]);
+    }
+
+    /// #309's third review (Wasay's probe): a save waits because its files can't be written; a
+    /// read-modify-write made meanwhile must build on it, not on the old file, or when both land
+    /// the second silently undoes the first.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_modify_write_while_a_save_waits_keeps_both_changes() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TempDir::new().unwrap();
+        let store = Store::open(home.path()).unwrap();
+        logged_ok(
+            store.commit_logged("records", one("items/a.toml", b"x = 0\ny = 0\n", vec![event("records.item.created")])),
+        );
+        let items = home.path().join("data/records/items");
+        fs::set_permissions(&items, fs::Permissions::from_mode(0o555)).unwrap();
+        if File::create(items.join("probe")).is_ok() {
+            return; // root ignores permissions
+        }
+        // The first change waits: its file can't be written.
+        logged_ok(
+            store.commit_logged("records", one("items/a.toml", b"x = 1\ny = 0\n", vec![event("records.item.updated")])),
+        );
+        // A read-modify-write meanwhile sees it.
+        let seen = String::from_utf8(store.read("records", "items/a.toml").unwrap().unwrap()).unwrap();
+        assert_eq!(seen, "x = 1\ny = 0\n", "the waiting save is read through");
+        let next = seen.replace("y = 0", "y = 1");
+        logged_ok(
+            store.commit_logged("records", one("items/a.toml", next.as_bytes(), vec![event("records.item.updated")])),
+        );
+        fs::set_permissions(&items, fs::Permissions::from_mode(0o755)).unwrap();
+        logged_ok(store.commit_logged("records", one("other.toml", b"z", vec![])));
+        assert_eq!(store.read("records", "items/a.toml").unwrap().unwrap(), b"x = 1\ny = 1\n", "both changes kept");
+        assert_eq!(fs::read(items.join("a.toml")).unwrap(), b"x = 1\ny = 1\n");
+    }
+
+    /// `list` sees what waiting saves add and remove, and a waiting delete reads as gone.
+    #[cfg(unix)]
+    #[test]
+    fn list_and_read_see_what_waiting_saves_add_and_remove() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TempDir::new().unwrap();
+        let store = Store::open(home.path()).unwrap();
+        logged_ok(store.commit_logged("records", one("items/old.toml", b"o", vec![])));
+        let items = home.path().join("data/records/items");
+        fs::set_permissions(&items, fs::Permissions::from_mode(0o555)).unwrap();
+        if File::create(items.join("probe")).is_ok() {
+            return;
+        }
+        let plan = TxPlan {
+            id: Ulid::new(),
+            writes: vec![
+                Write::Put { path: "items/new.toml".into(), bytes: b"n".to_vec() },
+                Write::Delete { path: "items/old.toml".into() },
+            ],
+            events: vec![event("records.item.created")],
+        };
+        logged_ok(store.commit_logged("records", plan));
+        assert_eq!(store.list("records", "items").unwrap(), ["items/new.toml"], "added and removed");
+        assert_eq!(store.read("records", "items/old.toml").unwrap(), None, "a waiting delete reads as gone");
+        assert_eq!(store.read("records", "items/new.toml").unwrap().unwrap(), b"n");
+        // Another namespace is untouched by it.
+        assert_eq!(store.list("other", "").unwrap(), Vec::<String>::new());
+        fs::set_permissions(&items, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// #309's third review: a folder from before folders were numbered (a bare ULID) is the
+    /// oldest, and a new folder always sorts after the ones recovery found, whatever the clock.
+    #[test]
+    fn recovery_order_survives_old_folder_names_and_a_clock_that_went_back() {
+        let home = TempDir::new().unwrap();
+        let store = Store::open(home.path()).unwrap();
+        let (e1, e2) = (event("records.item.created"), event("records.item.updated"));
+        // A pre-numbering folder, and one numbered far in the future (a clock that went back).
+        let old = stage(home.path(), "records", &one("a.toml", b"1", vec![e1.clone()])).unwrap();
+        fs::rename(&old, home.path().join(".staging").join(Ulid::new().to_string())).unwrap();
+        let ahead = stage(home.path(), "records", &one("a.toml", b"2", vec![e2.clone()])).unwrap();
+        let future = home.path().join(".staging").join(format!("{:020}-{}", u64::MAX / 2, Ulid::new()));
+        fs::rename(&ahead, &future).unwrap();
+        store.recover().unwrap();
+        assert_eq!(store.read("records", "a.toml").unwrap().unwrap(), b"2", "the bare-ULID one first");
+        assert_eq!(logged(&store), [e1, e2]);
+        assert!(order_key() > u64::MAX / 2, "new folders sort after what recovery found");
     }
 }

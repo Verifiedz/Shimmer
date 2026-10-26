@@ -40,6 +40,9 @@ pub struct Store {
     /// Serialises commits and log appends. Cheap: one writer process anyway. Holds the
     /// committed transactions whose last step failed, retried before the next commit (#260).
     write_lock: Mutex<Vec<PathBuf>>,
+    /// Whether any committed transaction is waiting, so a read checks without taking
+    /// `write_lock` (which a commit holds while it writes) in the usual case, when none is.
+    any_waiting: std::sync::atomic::AtomicBool,
 }
 
 impl Store {
@@ -54,7 +57,7 @@ impl Store {
         if !ignore.exists() {
             atomic::write_atomic(&ignore, GITIGNORE.as_bytes())?;
         }
-        Ok(Self { home, write_lock: Mutex::new(Vec::new()) })
+        Ok(Self { home, write_lock: Mutex::new(Vec::new()), any_waiting: std::sync::atomic::AtomicBool::new(false) })
     }
 
     pub fn home(&self) -> &Path {
@@ -68,7 +71,9 @@ impl Store {
     /// Finish or discard every in-flight transaction left by a crash. Idempotent.
     pub fn recover(&self) -> Result<Recovery> {
         let mut pending = self.lock();
-        tx::recover(&self.home, &mut pending)
+        let r = tx::recover(&self.home, &mut pending);
+        self.note_waiting(&pending);
+        r
     }
 
     /// Append to the event log. Used for events that are not part of a store transaction.
@@ -99,12 +104,28 @@ impl Store {
             Err(e) => return (Vec::new(), Err(e)),
         };
         let mut pending = self.lock();
-        tx::commit(&self.home, &dir, namespace, plan, &mut pending)
+        let committed = tx::commit(&self.home, &dir, namespace, plan, &mut pending);
+        self.note_waiting(&pending);
+        committed
     }
 
     /// Every logged event, oldest first, tolerating torn or corrupt lines.
     pub fn read_events(&self) -> Result<EventScan> {
         log::read_all(&self.home)
+    }
+
+    /// The committed transactions still waiting to be applied, oldest first: a copy, so the lock
+    /// isn't held while they're read.
+    fn waiting(&self) -> Vec<PathBuf> {
+        if !self.any_waiting.load(std::sync::atomic::Ordering::Acquire) {
+            return Vec::new();
+        }
+        self.lock().clone()
+    }
+
+    /// Records whether anything is waiting, after a commit or recovery changed the list.
+    fn note_waiting(&self, pending: &[PathBuf]) {
+        self.any_waiting.store(!pending.is_empty(), std::sync::atomic::Ordering::Release);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<PathBuf>> {
@@ -124,6 +145,12 @@ impl Store {
 impl StoreBackend for Store {
     fn read(&self, namespace: &str, path: &str) -> Result<Option<Vec<u8>>> {
         validate_path(path)?;
+        // A committed save still waiting to be applied is read through, so a read-modify-write
+        // never builds on what it's about to replace (#309's third review). Nothing waits,
+        // almost always: then it's the file.
+        if let Some(waiting) = tx::read_waiting(&self.waiting(), namespace, path) {
+            return Ok(waiting);
+        }
         match fs::read(self.namespace_dir(namespace)?.join(path)) {
             Ok(b) => Ok(Some(b)),
             Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => Ok(None),
@@ -142,6 +169,10 @@ impl StoreBackend for Store {
         let mut out = Vec::new();
         atomic::walk_files(&root, &start, &mut out)?;
         out.sort();
+        let waiting = self.waiting();
+        if !waiting.is_empty() {
+            tx::list_waiting(&waiting, namespace, prefix, &mut out);
+        }
         Ok(out)
     }
 
