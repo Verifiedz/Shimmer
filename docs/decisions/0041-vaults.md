@@ -1,9 +1,9 @@
 # 0041. Vaults: named Shimmer folders you can switch between
 
 Status: proposed · Raised by Dev B · Needs sign-off: Dev A (`crates/app/src/main.rs` re-runs itself
-in the chosen vault, §3; a quiet start for the daemon, §5a; the CLAUDE.md §2, §7 and §15 wording
-below) · No `core` or `proto` change · Depends on #293 (ADR 0039: one socket per Shimmer folder),
-merged · Revised after Wasay's review on #312
+in the chosen vault, §3; a quiet start for the daemon, §5a; the CLAUDE.md §2, §7, §10.3 and §15
+wording below) · No `core` or `proto` change · Depends on #293 (ADR 0039: one socket per Shimmer folder),
+merged · Revised after Wasay's two reviews on #312
 
 ## Context
 
@@ -83,8 +83,12 @@ the one its environment already names (`--vault` given, or a vault chosen with `
 `SHIMMER_HOME` set), `crates/app/src/main.rs` resolves it and **re-runs the same binary** with
 `SHIMMER_HOME` and `SHIMMER_SOCKET` (ADR 0039's `default_socket` for that folder) set through
 `Command::env`, and `--vault` taken off the line: on Unix with `CommandExt::exec`, which replaces the
-process and keeps its pid; on Windows by spawning it, waiting, and passing on its exit code. A
-`SHIMMER_VAULT_APPLIED=1` marker on the re-run stops it re-running again. Everything that already reads
+process and keeps its pid; on Windows by spawning it, waiting, and passing on its exit code. It
+re-runs only when the vault's resolved folder (`proto::paths::resolve`) differs from the environment's
+`SHIMMER_HOME`, so the re-run itself, which has `SHIMMER_HOME` set to that folder and no `--vault`,
+never re-runs again: no marker variable, so nothing new reaches the daemon or workspace scripts (a
+`SHIMMER_*` variable reaching scripts is a §10.1 ABI addition, and a stale marker in a terminal a
+script opened would make `--vault` act on the wrong vault; Wasay on #312). Everything that already reads
 `proto::paths::shimmer_home()` and `socket_path()` then just works, unchanged: auto-start, user packs
 and their linked commands, `shimmer startup`, `doctor`, Tab completion, workspaces' step logs.
 
@@ -142,18 +146,25 @@ newer Shimmer can share the file.
   2. It copies into a temporary folder beside the target (`<target>.copying`), everything except what's
      derived or tied to the machine: `index.sqlite*`, `cache/`, `logs/`, the socket and the lock.
      `.staging/` *is* copied, so the copy's own recovery finishes any save that was committed (ADR 0040).
-     Then it renames the temporary folder to the target and only then registers NEW (`made = true`), so
-     an interrupted copy never leaves a half vault registered; a leftover `.copying` folder is removed
-     by the next `copy` to that name. With `--path DIR`, the temporary folder sits beside DIR.
-  3. It releases the lock.
-  4. **The copy starts with everything off** (§5a), so it never sends a duplicate reminder or email:
-     its first start is a quiet start, during which the CLI switches things off **through their own
-     ops**: `scheduler.disable` for every enabled schedule, `automations.disable` for every enabled
-     rule, `fetchers.disable` for every enabled source, `notify.pause {"all": true}` (held until
-     `notify resume`), and `workspaces.reset` for any workspace whose copied state isn't `ready` (it
-     can't have launched anything in the copy). Then it stops the copy's daemon; the next command
-     there starts it normally, with nothing switched on. The `✓` line says what was switched off and
-     how to turn it back on. `--live` skips step 4.
+     With `--path DIR`, the temporary folder sits beside DIR. Then it releases VAULT's lock.
+  3. **The copy is switched off while it's still the temporary folder** (§5a), so it never sends a
+     duplicate reminder or email, and a vault that's registered is always a quiet one (Wasay on #312:
+     a copy interrupted after registering but before switching off would otherwise start live).
+     `<target>.copying` gets its own daemon (ADR 0039: its own socket, by its own path), started quiet,
+     and the CLI switches things off **through their own ops**: `scheduler.disable` for every enabled
+     schedule, `automations.disable` for every enabled rule, `fetchers.disable` for every enabled
+     source, `notify.pause {"all": true}` (held until `notify resume`), and `workspaces.reset` for any
+     workspace whose copied state isn't `ready` (it can't have launched anything in the copy; see
+     below). Then it stops that daemon. `--live` skips this step.
+  4. Only then it renames `<target>.copying` to the target and registers NEW (`made = true`). An
+     interrupted copy, at any step, leaves no registered vault, only a `.copying` folder, removed by the
+     next `copy` to that name. The `✓` line says what was switched off and how to turn it back on.
+
+  **Resetting a copied workspace.** `workspaces.reset` is `dirty → ready` today; `stop` runs
+  `cleanup.sh`, which in the copy would close the *source* vault's real windows and processes. So
+  `reset` grows to `active` and `launching` too: it forgets what the workspace thinks is running and
+  runs nothing, asking first as it already does. That's a §10.3 state-machine amendment (below),
+  owned by workspaces, so the daemon never edits a module's files.
 
   The next command in VAULT starts its daemon again, as auto-start always does.
 - **Packs** stay global (the active pack is in `cli.toml`), and a user pack is read from the vault in
@@ -174,15 +185,24 @@ gets a quiet start: `shimmer daemon --quiet`, which `vaults copy` asks auto-star
 copy's first start. During a quiet start:
 
 - **The scheduler** forgets every `unfinished` firing instead of settling it (they were the source
-  vault's run, not this one's), counts every schedule from now instead of catching up (as `enable`
-  does), and doesn't tick.
-- **The queue** doesn't run tasks a module queued (`Origin::Module`: an automation's action, a
-  fallback); they wait in memory and go with the daemon when it stops. Tasks a person asks for run
-  as usual, which is how the CLI switches things off.
+  vault's run, not this one's), through `forget()`, so it's **written to the trigger files**:
+  otherwise the next ordinary start's recovery would queue them again, since recovery doesn't check
+  whether a trigger is enabled (Wasay on #312). It counts every schedule from now instead of catching
+  up (as `enable` does), also written, and doesn't tick.
+- **The queue refuses** a task a module asks for (`Origin::Module`: an automation's action, a
+  fallback) with `unavailable` ("the daemon started quiet"), so it's never enqueued: no
+  `queue.task.enqueued` is logged, `queue list` never shows it, and nothing is left for a later
+  recovery to mistake for an unfinished firing. Tasks a person asks for run as usual, which is how the
+  CLI switches things off.
 
-Nothing about a quiet start is written down, so it lasts for that one run: once the CLI has switched
-everything off and stopped it, every later start is ordinary. It's a small daemon change, in the
-scheduler and the queue, and needs Dev A's sign-off.
+The **mode** isn't written down, so it lasts for that one run; **what it settles is** (the forgotten
+firings, the recounted schedules, and whatever the CLI switches off). Once the CLI has switched
+everything off and stopped it, every later start is ordinary, with nothing to run.
+
+**How it's asked for.** `shimmer daemon --quiet` for a daemon started by hand, and an argument to
+auto-start's spawn (`start_and_connect(…, quiet: true)`) that only `vaults copy` passes, so `doctor`,
+`startup` and ordinary auto-start can't start a quiet daemon by accident. It's a small daemon change,
+in the scheduler and the queue, and needs Dev A's sign-off.
 
 ### 6. The same as every other feature
 
@@ -198,6 +218,9 @@ scheduler and the queue, and needs Dev A's sign-off.
   commands is a separate change to ADR 0029.
 
 ## Proposed changes to CLAUDE.md
+
+- §10.3, the `reset` bullet: "`workspaces.reset` also takes an `active` or `launching` workspace: it
+  forgets what the workspace thinks is running and runs nothing (ADR 0041, for a vault copy)."
 
 - §2, after "The daemon is the only process that opens the data directory for writing": "One
   exception: `shimmer vaults copy` and `purge` copy and delete a whole vault's folder while holding its
@@ -230,8 +253,12 @@ scheduler and the queue, and needs Dev A's sign-off.
 - A copy of a vault with a due `run_once` schedule, an `unfinished` firing and a rule that sends a
   message: nothing runs in the copy, during its quiet start or at its next ordinary start (Wasay on
   #312). `--live` leaves them on.
-- `--vault` re-runs once (the marker stops a loop), keeps the exit code, and takes `--vault` off the
-  line; with no vault to switch to, nothing re-runs.
+- A copy interrupted before it's switched off (between steps 2 and 4) leaves no registered vault,
+  and the next `copy` to that name removes the leftover `.copying` folder.
+- A copied `active` workspace is `ready` in the copy and its `cleanup.sh` never ran.
+- `--vault` re-runs once (the resolved-folder check stops a loop), keeps the exit code, and takes
+  `--vault` off the line; with no vault to switch to, nothing re-runs; no `SHIMMER_*` variable is
+  added to the daemon's or a script's environment.
 - `vaults use` warns when `SHIMMER_HOME` is set; an interrupted copy leaves no registered vault; a
   copied `active` workspace is `ready` in the copy; the active pack found from `main` in another vault.
 
