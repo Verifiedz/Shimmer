@@ -9,6 +9,10 @@ term=${TERMINAL_APP:-auto}
 if [ -n "$EDITOR_PLACE" ] && [ "$term" = "kitty" ]; then
     shimmer_hyprland_launch "$EDITOR_PLACE" "kitty --directory $(shimmer_quote "$PROJECT_DIR") nvim" "the Neovim window"
 else
-    [ -n "$EDITOR_PLACE" ] && echo "note: EDITOR_PLACE is set, but TERMINAL_APP resolves to '$term', not kitty: opening Neovim without placement"
+    if [ -n "$EDITOR_PLACE" ]; then
+        msg="EDITOR_PLACE is set, but TERMINAL_APP resolves to '$term', not kitty: opening Neovim without placement"
+        echo "note: $msg"
+        shimmer_daily_dev_log "$msg"
+    fi
     shimmer_open_editor neovim "$PROJECT_DIR"
 fi

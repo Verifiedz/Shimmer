@@ -56,6 +56,17 @@ shimmer_warn_if_place() {
     return 0
 }
 
+# Append MESSAGE to a real log file. Detached steps (editor, the monitors, notes, chat,
+# browser, focus) have their stdout thrown away by the daemon -- only a supervised step (check)
+# gets one (ADR 0010 S2a) -- so a plain `echo` from any of them is never seen anywhere. This is
+# the only way to leave a trail of what placement actually did: tail -f
+# "$SHIMMER_HOME/logs/$SHIMMER_WORKSPACE_ID-daily-dev.log" during activate to watch it live.
+shimmer_daily_dev_log() {
+    dir="$SHIMMER_HOME/logs"
+    mkdir -p "$dir" 2>/dev/null || return 0
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >>"$dir/$SHIMMER_WORKSPACE_ID-daily-dev.log" 2>/dev/null
+}
+
 # A snapshot of every client Hyprland currently has, taken once at the start of this activation
 # (the check step calls this). Steps check against the snapshot, not live state: MONITORS_PLACE
 # puts both the system and GPU monitor on the same workspace in the same activation, and if the
@@ -100,12 +111,15 @@ shimmer_hyprland_launch() {
     command=$2
     label=$3
     if [ -z "$place" ]; then
+        shimmer_daily_dev_log "$label: no placement set, opening plainly ($command)"
         sh -c "$command" >/dev/null 2>&1 &
         shimmer_record_left_open "$label"
         return 0
     fi
     if ! shimmer_hyprland_ready; then
-        echo "note: $label has a placement set ($place), but Hyprland, hyprctl or jq isn't available here: opening it without placement"
+        msg="$label has a placement set ($place), but Hyprland, hyprctl or jq isn't available here: opening it without placement"
+        echo "note: $msg"
+        shimmer_daily_dev_log "$msg"
         sh -c "$command" >/dev/null 2>&1 &
         shimmer_record_left_open "$label"
         return 0
@@ -114,7 +128,9 @@ shimmer_hyprland_launch() {
     key=${place#*:}
     mon=$(shimmer_hyprland_monitor_name "$key")
     if [ -z "$mon" ]; then
-        echo "note: $label's $key monitor isn't connected right now: opening it without placement"
+        msg="$label's $key monitor isn't connected right now: opening it without placement"
+        echo "note: $msg"
+        shimmer_daily_dev_log "$msg"
         sh -c "$command" >/dev/null 2>&1 &
         shimmer_record_left_open "$label"
         return 0
@@ -122,10 +138,13 @@ shimmer_hyprland_launch() {
     class=${command%% *}
     class=${class##*/}
     if shimmer_hyprland_workspace_occupied "$ws" "$class"; then
-        echo "already open from the last activate: $label (workspace $ws)"
+        msg="already open from the last activate: $label (workspace $ws, class $class)"
+        echo "$msg"
+        shimmer_daily_dev_log "$msg"
         shimmer_record_left_open "$label (placed: workspace $ws, $key monitor)"
         return 0
     fi
+    shimmer_daily_dev_log "$label: placing on workspace $ws ($key monitor = $mon), class guess '$class': $command"
     hyprctl dispatch exec "[workspace $ws; monitor $mon] $command" >/dev/null 2>&1
     shimmer_record_left_open "$label (placed: workspace $ws, $key monitor)"
 }
