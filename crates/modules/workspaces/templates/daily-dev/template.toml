@@ -19,7 +19,7 @@ good_to_know = [
     "Placement needs HYPRLAND_MAIN_MONITOR / HYPRLAND_SECOND_MONITOR filled in too (a substring of hyprctl monitors -j's description for each), and only works for Neovim and the monitors when TERMINAL_APP is kitty; everything else falls back to opening unplaced, with a note saying why",
     "A window Shimmer places with Hyprland is always left running: Shimmer can't tell it apart from any other window that app already has open, so workspaces stop leaves it and says so. That's also true of Obsidian and your chat app even without placement",
     "Your browser tabs open as arguments to BROWSER_COMMAND only if you fill in BROWSER_URLS; leave it empty if your browser already restores its tabs on its own",
-    "Run it again while it's still active and it reuses the terminals it already opened instead of piling up more",
+    "Run it again while it's still active and it reuses what it already opened instead of piling up more: unplaced terminals by their own process, and a placed app by checking whether its workspace already has a window on it before the activation's own steps opened anything",
 ]
 on_stop = "Closes the terminals it opened for Neovim and the monitors, where CLOSE_ON_STOP allows it and they weren't placed with Hyprland. Everything else (Obsidian, your chat app, your browser, and anything placed with Hyprland) is always left open, and it says so."
 

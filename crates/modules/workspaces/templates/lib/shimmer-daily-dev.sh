@@ -39,6 +39,30 @@ shimmer_hyprland_place_ok() {
     return 0
 }
 
+# A snapshot of occupied workspace ids, taken once at the start of this activation (the check
+# step calls this). Steps check against the snapshot, not live state: MONITORS_PLACE puts both
+# the system and GPU monitor on the same workspace in the same activation, and if the GPU
+# monitor's step asked live after the system monitor's step had already opened its window, it
+# would see that workspace "already occupied" and skip itself too. A snapshot taken before
+# either ran doesn't have that problem, while still correctly catching a genuine repeat
+# `workspaces activate` (where the previous activation's windows are already there before this
+# one starts).
+shimmer_hyprland_snapshot() {
+    shimmer_hyprland_ready || return 0
+    mkdir -p "$SHIMMER_STATE_DIR"
+    hyprctl clients -j 2>/dev/null | jq -r '[.[].workspace.id] | unique | .[]' >"$SHIMMER_STATE_DIR/hyprland-occupied" 2>/dev/null
+}
+
+# Was WORKSPACE occupied in that snapshot? A placed launch has no process group Shimmer can
+# check (unlike shimmer_window_open, which the plain, unplaced path uses) -- Hyprland itself
+# spawned it -- so this is the placed path's own "don't reopen what's already there": running
+# `workspaces activate` again on an already-active workspace would otherwise pile up a new
+# window on every call, instead of leaving the existing one alone like every other step here
+# does.
+shimmer_hyprland_workspace_occupied() {
+    [ -f "$SHIMMER_STATE_DIR/hyprland-occupied" ] && grep -qx "$1" "$SHIMMER_STATE_DIR/hyprland-occupied" 2>/dev/null
+}
+
 # Run COMMAND (already a full command line, e.g. "kitty btop" or "obsidian '/my/vault'"),
 # placed on PLACE's workspace and monitor if PLACE parses and both Hyprland and that monitor
 # are available right now; otherwise COMMAND runs as an ordinary background launch, with one
@@ -67,6 +91,11 @@ shimmer_hyprland_launch() {
         echo "note: $label's $key monitor isn't connected right now: opening it without placement"
         sh -c "$command" >/dev/null 2>&1 &
         shimmer_record_left_open "$label"
+        return 0
+    fi
+    if shimmer_hyprland_workspace_occupied "$ws"; then
+        echo "already open from the last activate: $label (workspace $ws)"
+        shimmer_record_left_open "$label (placed: workspace $ws, $key monitor)"
         return 0
     fi
     hyprctl dispatch exec "[workspace $ws; monitor $mon] $command" >/dev/null 2>&1
