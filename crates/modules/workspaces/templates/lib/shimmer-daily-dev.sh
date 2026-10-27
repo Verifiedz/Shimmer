@@ -56,28 +56,37 @@ shimmer_warn_if_place() {
     return 0
 }
 
-# A snapshot of occupied workspace ids, taken once at the start of this activation (the check
-# step calls this). Steps check against the snapshot, not live state: MONITORS_PLACE puts both
-# the system and GPU monitor on the same workspace in the same activation, and if the GPU
-# monitor's step asked live after the system monitor's step had already opened its window, it
-# would see that workspace "already occupied" and skip itself too. A snapshot taken before
+# A snapshot of every client Hyprland currently has, taken once at the start of this activation
+# (the check step calls this). Steps check against the snapshot, not live state: MONITORS_PLACE
+# puts both the system and GPU monitor on the same workspace in the same activation, and if the
+# GPU monitor's step asked live after the system monitor's step had already opened its window,
+# it would see that workspace "already occupied" and skip itself too. A snapshot taken before
 # either ran doesn't have that problem, while still correctly catching a genuine repeat
 # `workspaces activate` (where the previous activation's windows are already there before this
 # one starts).
 shimmer_hyprland_snapshot() {
     shimmer_hyprland_ready || return 0
     mkdir -p "$SHIMMER_STATE_DIR"
-    hyprctl clients -j 2>/dev/null | jq -r '[.[].workspace.id] | unique | .[]' >"$SHIMMER_STATE_DIR/hyprland-occupied" 2>/dev/null
+    hyprctl clients -j 2>/dev/null >"$SHIMMER_STATE_DIR/hyprland-clients.json" || :
 }
 
-# Was WORKSPACE occupied in that snapshot? A placed launch has no process group Shimmer can
-# check (unlike shimmer_window_open, which the plain, unplaced path uses) -- Hyprland itself
-# spawned it -- so this is the placed path's own "don't reopen what's already there": running
-# `workspaces activate` again on an already-active workspace would otherwise pile up a new
-# window on every call, instead of leaving the existing one alone like every other step here
-# does.
+# Does the snapshot already have a window of CLASS on WORKSPACE? A placed launch has no
+# process group Shimmer can check (unlike shimmer_window_open, which the plain, unplaced path
+# uses) -- Hyprland itself spawned it -- so this is the placed path's own "don't reopen what's
+# already there". Matched by class, not just "is the workspace non-empty": that workspace may
+# already hold something this app had nothing to do with (another terminal, a VM manager
+# window), which looked exactly like "already placed" and silently skipped the real launch.
+# CLASS is a best-effort guess (the launching command's own first word); a real class that
+# doesn't match it just means a genuine repeat activation opens another window instead of
+# reusing the old one -- the same piling-up this exists to prevent, not a worse failure than
+# before this existed.
 shimmer_hyprland_workspace_occupied() {
-    [ -f "$SHIMMER_STATE_DIR/hyprland-occupied" ] && grep -qx "$1" "$SHIMMER_STATE_DIR/hyprland-occupied" 2>/dev/null
+    ws=$1
+    class=$2
+    [ -f "$SHIMMER_STATE_DIR/hyprland-clients.json" ] || return 1
+    jq -e --argjson ws "$ws" --arg class "$class" \
+        'any(.[]; .workspace.id == $ws and (.class // "" | ascii_downcase) == ($class | ascii_downcase))' \
+        "$SHIMMER_STATE_DIR/hyprland-clients.json" >/dev/null 2>&1
 }
 
 # Run COMMAND (already a full command line, e.g. "kitty btop" or "obsidian '/my/vault'"),
@@ -110,7 +119,9 @@ shimmer_hyprland_launch() {
         shimmer_record_left_open "$label"
         return 0
     fi
-    if shimmer_hyprland_workspace_occupied "$ws"; then
+    class=${command%% *}
+    class=${class##*/}
+    if shimmer_hyprland_workspace_occupied "$ws" "$class"; then
         echo "already open from the last activate: $label (workspace $ws)"
         shimmer_record_left_open "$label (placed: workspace $ws, $key monitor)"
         return 0
