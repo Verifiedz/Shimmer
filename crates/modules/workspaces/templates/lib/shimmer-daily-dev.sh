@@ -39,6 +39,23 @@ shimmer_hyprland_place_ok() {
     return 0
 }
 
+# For the check step: does VALUE (a *_COMMAND question's answer) look like a *_PLACE value
+# ("4:second") that landed in the wrong question? Both kinds of question mention "monitor" --
+# the app (SYSTEM_MONITOR_COMMAND) and the physical display (MONITORS_PLACE) -- and they're
+# only a couple of questions apart in the wizard, so this is a plausible mix-up worth a
+# specific message rather than the much less helpful "isn't installed" the command-existence
+# check below would otherwise give.
+shimmer_warn_if_place() {
+    name=$1
+    value=$2
+    place_name=$3
+    [ -n "$value" ] || return 0
+    if shimmer_hyprland_place_ok "$value"; then
+        shimmer_fail "$name is '$value', which looks like a workspace:monitor placement value, not a command: did you mean $place_name instead?"
+    fi
+    return 0
+}
+
 # A snapshot of occupied workspace ids, taken once at the start of this activation (the check
 # step calls this). Steps check against the snapshot, not live state: MONITORS_PLACE puts both
 # the system and GPU monitor on the same workspace in the same activation, and if the GPU

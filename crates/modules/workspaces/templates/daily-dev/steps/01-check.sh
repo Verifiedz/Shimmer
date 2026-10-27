@@ -21,6 +21,11 @@ if [ -n "$OBSIDIAN_VAULT" ]; then
     shimmer_has obsidian || shimmer_fail "obsidian isn't installed (or isn't on PATH)"
 fi
 
+shimmer_warn_if_place SYSTEM_MONITOR_COMMAND "$SYSTEM_MONITOR_COMMAND" MONITORS_PLACE
+shimmer_warn_if_place GPU_MONITOR_COMMAND "$GPU_MONITOR_COMMAND" MONITORS_PLACE
+shimmer_warn_if_place DISCORD_COMMAND "$DISCORD_COMMAND" CHAT_PLACE
+shimmer_warn_if_place BROWSER_COMMAND "$BROWSER_COMMAND" BROWSER_PLACE
+
 if [ -n "$SYSTEM_MONITOR_COMMAND" ]; then
     shimmer_has "${SYSTEM_MONITOR_COMMAND%% *}" ||
         shimmer_fail "SYSTEM_MONITOR_COMMAND's ${SYSTEM_MONITOR_COMMAND%% *} isn't installed"
