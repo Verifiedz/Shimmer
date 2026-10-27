@@ -1,0 +1,65 @@
+# Daily dev: your coding project, notes, system monitors, chat and browser, opened together.
+# Created from Shimmer's daily-dev template. It's your folder now: edit it freely.
+#
+#   shimmer workspaces activate <id> --wait     open it all
+#   shimmer workspaces stop <id> --wait         close what it can, and list what it left open
+#   shimmer workspaces reconfigure <id>         change your answers (the [env] table at the bottom)
+#
+# Every question is optional: leave one empty and that step does nothing. Obsidian, your chat
+# app and your browser are left running, since Shimmer can't tell one of their windows from any
+# other they already have open.
+#
+# A *_PLACE question (e.g. EDITOR_PLACE = "1:main") puts that app on a workspace and monitor
+# with `hyprctl dispatch exec`, the same technique a hand-written Hyprland script would use:
+# nothing is ever read from or written to your Hyprland config. Anything placed this way is
+# always left running too, same reason as Obsidian above: it's spawned by Hyprland itself, not
+# by this workspace, so `workspaces stop` can never find it to close.
+
+[workspace]
+label = "Daily dev"
+description = "Your coding project, notes, monitors, chat and browser"
+
+[[step]]
+name = "check"
+description = "The terminal and the apps you've asked for exist, and every *_PLACE answer is valid"
+mode = "supervised"
+timeout_s = 15
+
+[[step]]
+name = "editor"
+description = "Open the project folder in Neovim, placed by EDITOR_PLACE if set"
+mode = "detached"
+
+[[step]]
+name = "system-monitor"
+description = "Open the system monitor, in its own terminal, placed by MONITORS_PLACE if set"
+mode = "detached"
+
+[[step]]
+name = "gpu-monitor"
+description = "Open the GPU monitor, in its own terminal, placed by MONITORS_PLACE if set"
+mode = "detached"
+
+[[step]]
+name = "notes"
+description = "Open the Obsidian vault, placed by NOTES_PLACE if set"
+mode = "detached"
+
+[[step]]
+name = "chat"
+description = "Open your chat app, placed by CHAT_PLACE if set"
+mode = "detached"
+
+[[step]]
+name = "browser"
+description = "Open your browser, placed by BROWSER_PLACE if set"
+mode = "detached"
+
+[[step]]
+name = "focus"
+description = "Switch focus back to Neovim's workspace, if EDITOR_PLACE is set"
+mode = "supervised"
+timeout_s = 5
+
+[cleanup]
+timeout_s = 20

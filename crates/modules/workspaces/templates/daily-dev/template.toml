@@ -1,0 +1,136 @@
+[template]
+label = "Daily dev"
+description = "Your coding project, notes, system monitors, chat and browser, opened together"
+category = "daily"
+needs = [
+    "A terminal (TERMINAL_APP), for Neovim and the monitors",
+    "Neovim, if you give a project folder",
+    "A system monitor (SYSTEM_MONITOR_COMMAND), if you keep it, e.g. btop or htop",
+    "A GPU monitor (GPU_MONITOR_COMMAND), if you keep it, e.g. nvtop",
+    "Obsidian, if you give a vault",
+    "Whatever DISCORD_COMMAND opens, if you keep it",
+    "Whatever BROWSER_COMMAND opens, if you keep it",
+    "hyprctl and jq, only if you fill in a *_PLACE question (Hyprland placement)",
+]
+good_to_know = [
+    "Every app is optional: leave a question empty and that step does nothing",
+    "Neovim and the monitors each open in their own terminal (TERMINAL_APP)",
+    "A *_PLACE question (e.g. EDITOR_PLACE = \"1:main\") puts that app on a workspace and monitor with hyprctl dispatch exec, the same way a hand-written Hyprland script would: nothing is ever read from or written to your Hyprland config",
+    "Placement needs HYPRLAND_MAIN_MONITOR / HYPRLAND_SECOND_MONITOR filled in too (a substring of hyprctl monitors -j's description for each), and only works for Neovim and the monitors when TERMINAL_APP is kitty; everything else falls back to opening unplaced, with a note saying why",
+    "A window Shimmer places with Hyprland is always left running: Shimmer can't tell it apart from any other window that app already has open, so workspaces stop leaves it and says so. That's also true of Obsidian and your chat app even without placement",
+    "Your browser tabs open as arguments to BROWSER_COMMAND only if you fill in BROWSER_URLS; leave it empty if your browser already restores its tabs on its own",
+    "Run it again while it's still active and it reuses the terminals it already opened instead of piling up more",
+]
+on_stop = "Closes the terminals it opened for Neovim and the monitors, where CLOSE_ON_STOP allows it and they weren't placed with Hyprland. Everything else (Obsidian, your chat app, your browser, and anything placed with Hyprland) is always left open, and it says so."
+
+[[question]]
+name = "PROJECT_DIR"
+prompt = "Project folder to open in Neovim"
+kind = "folder"
+help = "Opens in a terminal running nvim. Leave empty to skip."
+
+[[question]]
+name = "EDITOR_PLACE"
+prompt = "Neovim's workspace:monitor"
+kind = "text"
+help = "e.g. 1:main. main/second match HYPRLAND_MAIN_MONITOR/HYPRLAND_SECOND_MONITOR below. Only takes effect when TERMINAL_APP is kitty. Leave empty for no placement."
+
+[[question]]
+name = "OBSIDIAN_VAULT"
+prompt = "Obsidian vault to open"
+kind = "folder"
+help = "Leave empty to skip Obsidian."
+
+[[question]]
+name = "NOTES_PLACE"
+prompt = "Obsidian's workspace:monitor"
+kind = "text"
+help = "e.g. 3:second. Leave empty for no placement."
+
+[[question]]
+name = "SYSTEM_MONITOR_COMMAND"
+prompt = "System monitor command"
+kind = "command"
+default = "btop"
+help = "Runs in its own terminal, e.g. btop, htop, glances. Leave empty to skip."
+
+[[question]]
+name = "GPU_MONITOR_COMMAND"
+prompt = "GPU monitor command"
+kind = "command"
+default = "nvtop"
+help = "Runs in its own terminal, e.g. nvtop, nvidia-smi -l 1, radeontop. Leave empty to skip."
+
+[[question]]
+name = "MONITORS_PLACE"
+prompt = "The system and GPU monitors' workspace:monitor"
+kind = "text"
+help = "e.g. 4:second. Both land together, same as a hand-written Hyprland script would put them. Only takes effect when TERMINAL_APP is kitty. Leave empty for no placement."
+
+[[question]]
+name = "DISCORD_COMMAND"
+prompt = "Command to open your chat app"
+kind = "command"
+default = "discord"
+help = "Whatever you installed it as, e.g. discord, vesktop, flatpak run com.discordapp.Discord. Leave empty to skip."
+
+[[question]]
+name = "CHAT_PLACE"
+prompt = "Your chat app's workspace:monitor"
+kind = "text"
+help = "e.g. 5:main. Leave empty for no placement."
+
+[[question]]
+name = "BROWSER_COMMAND"
+prompt = "Command to open your browser"
+kind = "command"
+default = "zen-browser"
+help = "Whatever you installed it as, e.g. zen-browser, firefox, brave. Leave empty to skip the browser step entirely."
+
+[[question]]
+name = "BROWSER_URLS"
+prompt = "Startup tabs for your browser (optional)"
+kind = "urls"
+help = "Passed as arguments to BROWSER_COMMAND. Separated by spaces. Leave empty if your browser already restores its own tabs."
+
+[[question]]
+name = "BROWSER_PLACE"
+prompt = "Your browser's workspace:monitor"
+kind = "text"
+help = "e.g. 2:second. Leave empty for no placement."
+
+[[question]]
+name = "HYPRLAND_MAIN_MONITOR"
+prompt = "Main monitor (for *_PLACE = N:main)"
+kind = "text"
+help = "A substring of that monitor's description, as `hyprctl monitors -j` reports it, e.g. Odyssey G60SD. Leave empty if you're not using any *_PLACE question."
+
+[[question]]
+name = "HYPRLAND_SECOND_MONITOR"
+prompt = "Second monitor (for *_PLACE = N:second)"
+kind = "text"
+help = "A substring of that monitor's description, e.g. M27Q. Leave empty if you're not using any *_PLACE question."
+
+[[question]]
+name = "TERMINAL_APP"
+prompt = "Terminal for Neovim and the monitors"
+kind = "choice"
+choices = ["auto", "kitty", "foot", "alacritty", "wezterm", "ghostty", "gnome-terminal", "konsole", "terminal", "iterm", "none"]
+default = "auto"
+help = "auto: Terminal on macOS, the first one found on Linux. terminal and iterm are macOS only. Hyprland placement (EDITOR_PLACE, MONITORS_PLACE) only works when this is kitty."
+
+[[question]]
+name = "OPEN_ON"
+prompt = "Where windows open"
+kind = "choice"
+choices = ["auto", "this-machine", "connected-computer"]
+default = "auto"
+help = "this-machine: this computer's own screen, even if Shimmer was started from a Cursor/VS Code terminal connected from elsewhere. connected-computer: the computer you're connected from. auto: wherever Shimmer was started."
+
+[[question]]
+name = "CLOSE_ON_STOP"
+prompt = "Close the terminals it opened when you run workspaces stop"
+kind = "choice"
+choices = ["yes", "no"]
+default = "yes"
+help = "Closed: the kitty/foot/alacritty/wezterm/ghostty/konsole/xterm terminals it opened for Neovim and the monitors, when they weren't placed with Hyprland. Never closed: GNOME Terminal and macOS Terminal/iTerm windows, Obsidian, your chat app, your browser, and anything placed with Hyprland."

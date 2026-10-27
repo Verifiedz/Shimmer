@@ -21,9 +21,28 @@ const MONOREPO_HELPER: (&str, &str) = file!("lib/shimmer-monorepo.sh", "lib/shim
 const OFFLINE_HELPER: (&str, &str) = file!("lib/shimmer-offline.sh", "lib/shimmer-offline.sh");
 const SCRATCH_HELPER: (&str, &str) = file!("lib/shimmer-scratch.sh", "lib/shimmer-scratch.sh");
 const UPDATE_HELPER: (&str, &str) = file!("lib/shimmer-update.sh", "lib/shimmer-update.sh");
+const DAILY_DEV_HELPER: (&str, &str) = file!("lib/shimmer-daily-dev.sh", "lib/shimmer-daily-dev.sh");
 
 /// `(id, files)`, sorted by id.
 const BUILTINS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "daily-dev",
+        &[
+            file!("template.toml", "daily-dev/template.toml"),
+            file!("workspace.toml", "daily-dev/workspace.toml"),
+            file!("steps/01-check.sh", "daily-dev/steps/01-check.sh"),
+            file!("steps/02-editor.sh", "daily-dev/steps/02-editor.sh"),
+            file!("steps/03-system-monitor.sh", "daily-dev/steps/03-system-monitor.sh"),
+            file!("steps/04-gpu-monitor.sh", "daily-dev/steps/04-gpu-monitor.sh"),
+            file!("steps/05-notes.sh", "daily-dev/steps/05-notes.sh"),
+            file!("steps/06-chat.sh", "daily-dev/steps/06-chat.sh"),
+            file!("steps/07-browser.sh", "daily-dev/steps/07-browser.sh"),
+            file!("steps/08-focus.sh", "daily-dev/steps/08-focus.sh"),
+            file!("cleanup.sh", "daily-dev/cleanup.sh"),
+            HELPER,
+            DAILY_DEV_HELPER,
+        ],
+    ),
     (
         "free-disk",
         &[
