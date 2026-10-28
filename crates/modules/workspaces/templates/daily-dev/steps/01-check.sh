@@ -1,6 +1,6 @@
 # Supervised: stop with one clear sentence before anything opens.
 . "$SHIMMER_WORKSPACE_DIR/lib/shimmer-open.sh"
-. "$SHIMMER_WORKSPACE_DIR/lib/shimmer-daily-dev.sh"
+. "$SHIMMER_WORKSPACE_DIR/lib/shimmer-hyprland.sh"
 
 problem=$(shimmer_display_problem)
 [ -z "$problem" ] || shimmer_fail "$problem"

@@ -1,6 +1,6 @@
 # Detached: the Obsidian vault (OBSIDIAN_VAULT).
 . "$SHIMMER_WORKSPACE_DIR/lib/shimmer-open.sh"
-. "$SHIMMER_WORKSPACE_DIR/lib/shimmer-daily-dev.sh"
+. "$SHIMMER_WORKSPACE_DIR/lib/shimmer-hyprland.sh"
 
 [ -n "$OBSIDIAN_VAULT" ] || exit 0
 shimmer_hyprland_launch "$NOTES_PLACE" "obsidian $(shimmer_quote "$OBSIDIAN_VAULT")" \

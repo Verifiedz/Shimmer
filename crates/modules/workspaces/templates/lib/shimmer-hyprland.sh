@@ -1,11 +1,13 @@
-# Shared helpers for the daily-dev template's optional Hyprland placement: putting an app on a
-# specific workspace and monitor at launch time with `hyprctl dispatch exec`, the same technique
-# a hand-written Hyprland script already uses. Never reads or writes the Hyprland config: it's
-# all one-shot dispatch rules at exec time.
+# Shared helpers for a workspace template's optional Hyprland placement: putting an app on a
+# specific workspace and monitor at launch time with `hyprctl dispatch exec`, the same
+# technique a hand-written Hyprland script already uses. Never reads or writes the Hyprland
+# config: it's all one-shot dispatch rules at exec time. Used by daily-dev and gaming; any
+# template wanting the same can source this file alongside the universal shimmer-open.sh.
 #
 # A *_PLACE value is "WORKSPACE:KEY", e.g. "1:main" or "4:second". KEY is "main" or "second",
 # resolved against HYPRLAND_MAIN_MONITOR / HYPRLAND_SECOND_MONITOR (a substring of that
-# monitor's hardware description, as `hyprctl monitors -j` reports it).
+# monitor's hardware description, as `hyprctl monitors -j` reports it) -- questions every
+# template using this file is expected to ask, the same names each time.
 
 # Is Hyprland running here, with hyprctl and jq available?
 shimmer_hyprland_ready() {
@@ -56,15 +58,15 @@ shimmer_warn_if_place() {
     return 0
 }
 
-# Append MESSAGE to a real log file. Detached steps (editor, the monitors, notes, chat,
-# browser, focus) have their stdout thrown away by the daemon -- only a supervised step (check)
-# gets one (ADR 0010 S2a) -- so a plain `echo` from any of them is never seen anywhere. This is
-# the only way to leave a trail of what placement actually did: tail -f
-# "$SHIMMER_HOME/logs/$SHIMMER_WORKSPACE_ID-daily-dev.log" during activate to watch it live.
-shimmer_daily_dev_log() {
+# Append MESSAGE to a real log file. A detached placement step has its stdout thrown away by
+# the daemon -- only a supervised step (check) gets one (ADR 0010 S2a) -- so a plain `echo`
+# from one is never seen anywhere. This is the only way to leave a trail of what placement
+# actually did: tail -f "$SHIMMER_HOME/logs/$SHIMMER_WORKSPACE_ID-hyprland.log" during activate
+# to watch it live.
+shimmer_hyprland_log() {
     dir="$SHIMMER_HOME/logs"
     mkdir -p "$dir" 2>/dev/null || return 0
-    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >>"$dir/$SHIMMER_WORKSPACE_ID-daily-dev.log" 2>/dev/null
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >>"$dir/$SHIMMER_WORKSPACE_ID-hyprland.log" 2>/dev/null
 }
 
 # Some apps (notably Electron apps like Discord, which fork or re-exec into a different
@@ -102,7 +104,7 @@ shimmer_hyprland_ensure_workspace() {
             addr=$2
             if [ "$actual_ws" != "$ws" ]; then
                 hyprctl dispatch movetoworkspacesilent "$ws,address:$addr" >/dev/null 2>&1
-                shimmer_daily_dev_log "$label: Hyprland's exec rule missed (landed on workspace $actual_ws), moved to $ws instead"
+                shimmer_hyprland_log "$label: Hyprland's exec rule missed (landed on workspace $actual_ws), moved to $ws instead"
             fi
             printf '%s' "$addr"
             return 0
@@ -110,7 +112,7 @@ shimmer_hyprland_ensure_workspace() {
         sleep 0.5
         i=$((i + 1))
     done
-    shimmer_daily_dev_log "$label: no new window matching class '$class' appeared within 8s, gave up correcting its workspace"
+    shimmer_hyprland_log "$label: no new window matching class '$class' appeared within 8s, gave up correcting its workspace"
     return 1
 }
 
@@ -125,7 +127,7 @@ shimmer_hyprland_ensure_monitor() {
     current=$(hyprctl monitors -j 2>/dev/null | jq -r --argjson ws "$ws" '[.[] | select(.activeWorkspace.id == $ws)][0].name // ""')
     [ -n "$current" ] && [ "$current" != "$mon" ] || return 0
     hyprctl dispatch moveworkspacetomonitor "$ws" "$mon" >/dev/null 2>&1
-    shimmer_daily_dev_log "$label: workspace $ws was showing on $current instead of $mon, moved"
+    shimmer_hyprland_log "$label: workspace $ws was showing on $current instead of $mon, moved"
 }
 
 # Is the window at ADDRESS still open? Checking Hyprland's live state, not this script's own
@@ -206,7 +208,7 @@ shimmer_hyprland_launch() {
     slot=$4
     marker="$SHIMMER_STATE_DIR/hyprland-placed-$slot"
     if [ -z "$place" ]; then
-        shimmer_daily_dev_log "$label: no placement set, opening plainly ($command)"
+        shimmer_hyprland_log "$label: no placement set, opening plainly ($command)"
         sh -c "$command" >/dev/null 2>&1 &
         shimmer_record_left_open "$label"
         return 0
@@ -214,7 +216,7 @@ shimmer_hyprland_launch() {
     if ! shimmer_hyprland_ready; then
         msg="$label has a placement set ($place), but Hyprland, hyprctl or jq isn't available here: opening it without placement"
         echo "note: $msg"
-        shimmer_daily_dev_log "$msg"
+        shimmer_hyprland_log "$msg"
         sh -c "$command" >/dev/null 2>&1 &
         shimmer_record_left_open "$label"
         return 0
@@ -225,7 +227,7 @@ shimmer_hyprland_launch() {
     if [ -z "$mon" ]; then
         msg="$label's $key monitor isn't connected right now: opening it without placement"
         echo "note: $msg"
-        shimmer_daily_dev_log "$msg"
+        shimmer_hyprland_log "$msg"
         sh -c "$command" >/dev/null 2>&1 &
         shimmer_record_left_open "$label"
         return 0
@@ -233,7 +235,7 @@ shimmer_hyprland_launch() {
     if [ -f "$marker" ] && shimmer_hyprland_window_alive "$(cat "$marker" 2>/dev/null)"; then
         msg="already open from the last activate: $label"
         echo "$msg"
-        shimmer_daily_dev_log "$msg"
+        shimmer_hyprland_log "$msg"
         shimmer_record_left_open "$label (placed: workspace $ws, $key monitor)"
         return 0
     fi
@@ -242,7 +244,7 @@ shimmer_hyprland_launch() {
     class=${class##*/}
     shimmer_hyprland_lock "$class"
     before=$(hyprctl clients -j 2>/dev/null | jq -r '.[].address' 2>/dev/null)
-    shimmer_daily_dev_log "$label: placing on workspace $ws ($key monitor = $mon), class guess '$class': $command"
+    shimmer_hyprland_log "$label: placing on workspace $ws ($key monitor = $mon), class guess '$class': $command"
     hyprctl dispatch exec "[workspace $ws; monitor $mon] $command" >/dev/null 2>&1
     shimmer_record_left_open "$label (placed: workspace $ws, $key monitor)"
     addr=$(shimmer_hyprland_ensure_workspace "$ws" "$class" "$label" "$before")

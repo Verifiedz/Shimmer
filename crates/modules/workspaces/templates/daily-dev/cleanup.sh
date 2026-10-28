@@ -5,7 +5,7 @@
 # class or title alone could just as easily hit a window that has nothing to do with this
 # workspace.
 . "$SHIMMER_WORKSPACE_DIR/lib/shimmer-open.sh"
-. "$SHIMMER_WORKSPACE_DIR/lib/shimmer-daily-dev.sh"
+. "$SHIMMER_WORKSPACE_DIR/lib/shimmer-hyprland.sh"
 
 shimmer_close_windows
 shimmer_hyprland_close_all

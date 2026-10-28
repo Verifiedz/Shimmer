@@ -1,6 +1,6 @@
 # Detached: Neovim on the project folder, in a terminal (TERMINAL_APP).
 . "$SHIMMER_WORKSPACE_DIR/lib/shimmer-open.sh"
-. "$SHIMMER_WORKSPACE_DIR/lib/shimmer-daily-dev.sh"
+. "$SHIMMER_WORKSPACE_DIR/lib/shimmer-hyprland.sh"
 
 [ -n "$PROJECT_DIR" ] || exit 0
 

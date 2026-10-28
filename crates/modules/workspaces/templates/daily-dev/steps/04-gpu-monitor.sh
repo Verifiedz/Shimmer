@@ -1,6 +1,6 @@
 # Detached: a GPU monitor (GPU_MONITOR_COMMAND), in its own terminal.
 . "$SHIMMER_WORKSPACE_DIR/lib/shimmer-open.sh"
-. "$SHIMMER_WORKSPACE_DIR/lib/shimmer-daily-dev.sh"
+. "$SHIMMER_WORKSPACE_DIR/lib/shimmer-hyprland.sh"
 
 [ -n "$GPU_MONITOR_COMMAND" ] || exit 0
 

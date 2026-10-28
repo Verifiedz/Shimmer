@@ -1,0 +1,64 @@
+[template]
+label = "Gaming"
+description = "Steam and a game of your choice, opened together"
+category = "daily"
+needs = [
+    "Steam, if you keep STEAM_COMMAND",
+    "Whatever GAME_COMMAND launches, if you keep it",
+    "hyprctl and jq, only if you fill in a *_PLACE question (Hyprland placement)",
+]
+good_to_know = [
+    "Every app is optional: leave a question empty and that step does nothing",
+    "GAME_COMMAND is the whole launch line for one specific game, e.g. steam -applaunch 105600 for a Steam game (its app id, from its store page's url), or a direct path for anything else",
+    "A *_PLACE question (e.g. STEAM_PLACE = \"1:main\") puts that app on a workspace and monitor with hyprctl dispatch exec, the same technique the daily-dev template uses: nothing is ever read from or written to your Hyprland config",
+    "Placement needs HYPRLAND_MAIN_MONITOR / HYPRLAND_SECOND_MONITOR filled in too (a substring of hyprctl monitors -j's description for each)",
+    "workspaces stop closes a placed app by the exact window it remembers putting there (CLOSE_ON_STOP permitting), never by guessing from class or title. An app you left unplaced (no *_PLACE answer) is always left open instead",
+    "Run it again while it's still active and it reuses what it already placed instead of piling up more",
+    "Every placement decision is logged to logs/<id>-hyprland.log in your Shimmer folder: a detached step has no other log, so tail -f that file during activate to watch it live",
+]
+on_stop = "Closes every window it placed with Hyprland (CLOSE_ON_STOP permitting), by the exact window it remembers. An app you left unplaced (no *_PLACE answer) is always left open."
+
+[[question]]
+name = "STEAM_COMMAND"
+prompt = "Command to open Steam"
+kind = "command"
+default = "steam"
+help = "Leave empty to skip Steam entirely."
+
+[[question]]
+name = "STEAM_PLACE"
+prompt = "Steam's workspace:monitor"
+kind = "text"
+help = "e.g. 1:main. main/second match HYPRLAND_MAIN_MONITOR/HYPRLAND_SECOND_MONITOR below. Leave empty for no placement."
+
+[[question]]
+name = "GAME_COMMAND"
+prompt = "Command to launch your game"
+kind = "command"
+help = "e.g. steam -applaunch 105600 for Terraria on Steam, or a direct path for anything else. Leave empty to skip."
+
+[[question]]
+name = "GAME_PLACE"
+prompt = "Your game's workspace:monitor"
+kind = "text"
+help = "e.g. 2:second. Leave empty for no placement."
+
+[[question]]
+name = "HYPRLAND_MAIN_MONITOR"
+prompt = "Main monitor (for *_PLACE = N:main)"
+kind = "text"
+help = "A substring of that monitor's description, as `hyprctl monitors -j` reports it, e.g. Odyssey G60SD. Leave empty if you're not using any *_PLACE question."
+
+[[question]]
+name = "HYPRLAND_SECOND_MONITOR"
+prompt = "Second monitor (for *_PLACE = N:second)"
+kind = "text"
+help = "A substring of that monitor's description, e.g. M27Q. Leave empty if you're not using any *_PLACE question."
+
+[[question]]
+name = "CLOSE_ON_STOP"
+prompt = "Close what it placed when you run workspaces stop"
+kind = "choice"
+choices = ["yes", "no"]
+default = "yes"
+help = "Closed: anything placed with Hyprland, by the exact window it remembers. Never closed: anything you left unplaced (no *_PLACE answer)."

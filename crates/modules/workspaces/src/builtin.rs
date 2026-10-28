@@ -21,7 +21,7 @@ const MONOREPO_HELPER: (&str, &str) = file!("lib/shimmer-monorepo.sh", "lib/shim
 const OFFLINE_HELPER: (&str, &str) = file!("lib/shimmer-offline.sh", "lib/shimmer-offline.sh");
 const SCRATCH_HELPER: (&str, &str) = file!("lib/shimmer-scratch.sh", "lib/shimmer-scratch.sh");
 const UPDATE_HELPER: (&str, &str) = file!("lib/shimmer-update.sh", "lib/shimmer-update.sh");
-const DAILY_DEV_HELPER: (&str, &str) = file!("lib/shimmer-daily-dev.sh", "lib/shimmer-daily-dev.sh");
+const HYPRLAND_HELPER: (&str, &str) = file!("lib/shimmer-hyprland.sh", "lib/shimmer-hyprland.sh");
 
 /// `(id, files)`, sorted by id.
 const BUILTINS: &[(&str, &[(&str, &str)])] = &[
@@ -40,7 +40,7 @@ const BUILTINS: &[(&str, &[(&str, &str)])] = &[
             file!("steps/08-focus.sh", "daily-dev/steps/08-focus.sh"),
             file!("cleanup.sh", "daily-dev/cleanup.sh"),
             HELPER,
-            DAILY_DEV_HELPER,
+            HYPRLAND_HELPER,
         ],
     ),
     (
@@ -56,6 +56,19 @@ const BUILTINS: &[(&str, &[(&str, &str)])] = &[
             file!("cleanup.sh", "free-disk/cleanup.sh"),
             HELPER,
             FREE_HELPER,
+        ],
+    ),
+    (
+        "gaming",
+        &[
+            file!("template.toml", "gaming/template.toml"),
+            file!("workspace.toml", "gaming/workspace.toml"),
+            file!("steps/01-check.sh", "gaming/steps/01-check.sh"),
+            file!("steps/02-steam.sh", "gaming/steps/02-steam.sh"),
+            file!("steps/03-game.sh", "gaming/steps/03-game.sh"),
+            file!("cleanup.sh", "gaming/cleanup.sh"),
+            HELPER,
+            HYPRLAND_HELPER,
         ],
     ),
     (

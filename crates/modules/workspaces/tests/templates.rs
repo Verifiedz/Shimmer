@@ -43,6 +43,7 @@ async fn templates_lists_the_built_ins_with_their_questions() {
             "vm",
             "web-project",
             "daily-dev",
+            "gaming",
             "github-inbox",
             "free-disk",
             "health",
@@ -146,7 +147,7 @@ async fn create_never_overwrites_and_checks_everything_first() {
     assert_eq!(e.code, ErrorCode::NotFound);
     assert!(
         e.message.contains(
-            "there are: daily-dev, free-disk, github-inbox, health, monorepo, offline-prep, scratch, smoke-test, update-everything, vm, web-project"
+            "there are: daily-dev, free-disk, gaming, github-inbox, health, monorepo, offline-prep, scratch, smoke-test, update-everything, vm, web-project"
         ),
         "{}",
         e.message

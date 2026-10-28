@@ -1,0 +1,37 @@
+# Gaming: Steam and a game of your choice, opened together. Created from Shimmer's gaming
+# template. It's your folder now: edit it freely.
+#
+#   shimmer workspaces activate <id> --wait     open it all
+#   shimmer workspaces stop <id> --wait         close what it placed, and list what it left open
+#   shimmer workspaces reconfigure <id>         change your answers (the [env] table at the bottom)
+#
+# Every question is optional: leave one empty and that step does nothing.
+#
+# A *_PLACE question (e.g. STEAM_PLACE = "1:main") puts that app on a workspace and monitor
+# with `hyprctl dispatch exec`, the same technique the daily-dev template uses: nothing is
+# ever read from or written to your Hyprland config. `workspaces stop` closes a placed app by
+# the exact window it remembers putting there -- never by guessing from class or title, which
+# could just as easily match a window that has nothing to do with this workspace.
+
+[workspace]
+label = "Gaming"
+description = "Steam and a game, opened together"
+
+[[step]]
+name = "check"
+description = "The commands you've asked for exist, and every *_PLACE answer is valid"
+mode = "supervised"
+timeout_s = 15
+
+[[step]]
+name = "steam"
+description = "Open Steam, placed by STEAM_PLACE if set"
+mode = "detached"
+
+[[step]]
+name = "game"
+description = "Launch your game, placed by GAME_PLACE if set"
+mode = "detached"
+
+[cleanup]
+timeout_s = 20

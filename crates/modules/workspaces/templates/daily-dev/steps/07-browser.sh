@@ -1,6 +1,6 @@
 # Detached: your browser (BROWSER_COMMAND), optionally with startup tabs (BROWSER_URLS).
 . "$SHIMMER_WORKSPACE_DIR/lib/shimmer-open.sh"
-. "$SHIMMER_WORKSPACE_DIR/lib/shimmer-daily-dev.sh"
+. "$SHIMMER_WORKSPACE_DIR/lib/shimmer-hyprland.sh"
 
 [ -n "$BROWSER_COMMAND" ] || exit 0
 
