@@ -4,4 +4,4 @@
 
 [ -n "$DISCORD_COMMAND" ] || exit 0
 shimmer_hyprland_launch "$CHAT_PLACE" "$DISCORD_COMMAND" \
-    "the $DISCORD_COMMAND window (it keeps one program running; opening it again just focuses it)"
+    "the $DISCORD_COMMAND window (it keeps one program running; opening it again just focuses it)" chat

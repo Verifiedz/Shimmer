@@ -4,4 +4,4 @@
 
 [ -n "$OBSIDIAN_VAULT" ] || exit 0
 shimmer_hyprland_launch "$NOTES_PLACE" "obsidian $(shimmer_quote "$OBSIDIAN_VAULT")" \
-    "the Obsidian window (Obsidian keeps every vault in one program, and may hold unsaved edits)"
+    "the Obsidian window (Obsidian keeps every vault in one program, and may hold unsaved edits)" notes

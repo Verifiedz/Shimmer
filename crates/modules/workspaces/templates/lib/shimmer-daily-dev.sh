@@ -67,37 +67,51 @@ shimmer_daily_dev_log() {
     printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >>"$dir/$SHIMMER_WORKSPACE_ID-daily-dev.log" 2>/dev/null
 }
 
-# A snapshot of every client Hyprland currently has, taken once at the start of this activation
-# (the check step calls this). Steps check against the snapshot, not live state: MONITORS_PLACE
-# puts both the system and GPU monitor on the same workspace in the same activation, and if the
-# GPU monitor's step asked live after the system monitor's step had already opened its window,
-# it would see that workspace "already occupied" and skip itself too. A snapshot taken before
-# either ran doesn't have that problem, while still correctly catching a genuine repeat
-# `workspaces activate` (where the previous activation's windows are already there before this
-# one starts).
-shimmer_hyprland_snapshot() {
-    shimmer_hyprland_ready || return 0
-    mkdir -p "$SHIMMER_STATE_DIR"
-    hyprctl clients -j 2>/dev/null >"$SHIMMER_STATE_DIR/hyprland-clients.json" || :
-}
-
-# Does the snapshot already have a window of CLASS on WORKSPACE? A placed launch has no
-# process group Shimmer can check (unlike shimmer_window_open, which the plain, unplaced path
-# uses) -- Hyprland itself spawned it -- so this is the placed path's own "don't reopen what's
-# already there". Matched by class, not just "is the workspace non-empty": that workspace may
-# already hold something this app had nothing to do with (another terminal, a VM manager
-# window), which looked exactly like "already placed" and silently skipped the real launch.
-# CLASS is a best-effort guess (the launching command's own first word); a real class that
-# doesn't match it just means a genuine repeat activation opens another window instead of
-# reusing the old one -- the same piling-up this exists to prevent, not a worse failure than
-# before this existed.
-shimmer_hyprland_workspace_occupied() {
+# Some apps (notably Electron apps like Discord, which fork or re-exec into a different
+# process on startup) lose Hyprland's one-shot `[workspace N]` exec rule, since Hyprland tracks
+# it by the PID the dispatch call itself spawned -- a fork/re-exec can break that link, and the
+# window then opens wherever is currently focused instead. Poll (up to ~8s, since Electron apps
+# are often slow to actually map a window) for a window of CLASS whose address wasn't in BEFORE
+# -- genuinely new since this call's own dispatch, not just any window of that class, since
+# several launches can share one class (every kitty-wrapped step reports "kitty"). Moves it to
+# WORKSPACE if it landed elsewhere -- still a one-shot dispatch, never a persistent window rule.
+# Prints the new window's address on success (so the caller can remember exactly which window
+# is "this launch", not just its class) and nothing if none appeared in time.
+shimmer_hyprland_ensure_workspace() {
     ws=$1
     class=$2
-    [ -f "$SHIMMER_STATE_DIR/hyprland-clients.json" ] || return 1
-    jq -e --argjson ws "$ws" --arg class "$class" \
-        'any(.[]; .workspace.id == $ws and (.class // "" | ascii_downcase) == ($class | ascii_downcase))' \
-        "$SHIMMER_STATE_DIR/hyprland-clients.json" >/dev/null 2>&1
+    label=$3
+    before=$4
+    i=0
+    while [ "$i" -lt 16 ]; do
+        found=$(hyprctl clients -j 2>/dev/null | jq -r --arg class "$class" --arg before "$before" '
+            ($before | split("\n")) as $old |
+            ([.[] | select((.class // "" | ascii_downcase) == ($class | ascii_downcase)) |
+                select((.address as $a | $old | index($a)) == null)][0]) as $w |
+            if $w == null then "" else "\($w.workspace.id) \($w.address)" end' 2>/dev/null)
+        if [ -n "$found" ]; then
+            # shellcheck disable=SC2086
+            set -- $found
+            actual_ws=$1
+            addr=$2
+            if [ "$actual_ws" != "$ws" ]; then
+                hyprctl dispatch movetoworkspacesilent "$ws,address:$addr" >/dev/null 2>&1
+                shimmer_daily_dev_log "$label: Hyprland's exec rule missed (landed on workspace $actual_ws), moved to $ws instead"
+            fi
+            printf '%s' "$addr"
+            return 0
+        fi
+        sleep 0.5
+        i=$((i + 1))
+    done
+    shimmer_daily_dev_log "$label: no new window of class '$class' appeared within 8s, gave up correcting its workspace"
+    return 1
+}
+
+# Is the window at ADDRESS still open? Checking Hyprland's live state, not this script's own
+# process group, since a placed window is spawned by Hyprland itself.
+shimmer_hyprland_window_alive() {
+    [ -n "$1" ] && hyprctl clients -j 2>/dev/null | jq -e --arg addr "$1" 'any(.[]; .address == $addr)' >/dev/null 2>&1
 }
 
 # Run COMMAND (already a full command line, e.g. "kitty btop" or "obsidian '/my/vault'"),
@@ -106,10 +120,21 @@ shimmer_hyprland_workspace_occupied() {
 # `note:` line saying why placement didn't happen. Either way LABEL is recorded as left open: a
 # window Hyprland itself spawns (not this script) is one `workspaces stop` can never find to
 # close, since it never goes through this script's own process group.
+#
+# SLOT names this launch for its own marker file (e.g. "editor", "chat") -- short and
+# filename-safe, not the human-readable LABEL. Whether this launch is "already open from the
+# last activate" is never guessed from class or workspace alone: several launches share one
+# class (every kitty-wrapped step reports "kitty"), and a workspace can already hold a window
+# that has nothing to do with this app at all (another terminal, a VM manager window) -- either
+# one looks exactly like "already placed" to a check that isn't keyed on the specific window
+# this exact SLOT created last time. The marker remembers that window's address; only that
+# address still being alive counts as "already open".
 shimmer_hyprland_launch() {
     place=$1
     command=$2
     label=$3
+    slot=$4
+    marker="$SHIMMER_STATE_DIR/hyprland-placed-$slot"
     if [ -z "$place" ]; then
         shimmer_daily_dev_log "$label: no placement set, opening plainly ($command)"
         sh -c "$command" >/dev/null 2>&1 &
@@ -135,61 +160,23 @@ shimmer_hyprland_launch() {
         shimmer_record_left_open "$label"
         return 0
     fi
-    class=${command%% *}
-    class=${class##*/}
-    if shimmer_hyprland_workspace_occupied "$ws" "$class"; then
-        msg="already open from the last activate: $label (workspace $ws, class $class)"
+    if [ -f "$marker" ] && shimmer_hyprland_window_alive "$(cat "$marker" 2>/dev/null)"; then
+        msg="already open from the last activate: $label"
         echo "$msg"
         shimmer_daily_dev_log "$msg"
         shimmer_record_left_open "$label (placed: workspace $ws, $key monitor)"
         return 0
     fi
-    # Every address that exists right before THIS dispatch, so the correction below can tell
-    # "the window this exact call just caused to appear" apart from any sibling step's
-    # same-class window (kitty wraps the editor and both monitors -- three separate launches
-    # that all report class "kitty").
+    rm -f "$marker"
+    class=${command%% *}
+    class=${class##*/}
     before=$(hyprctl clients -j 2>/dev/null | jq -r '.[].address' 2>/dev/null)
     shimmer_daily_dev_log "$label: placing on workspace $ws ($key monitor = $mon), class guess '$class': $command"
     hyprctl dispatch exec "[workspace $ws; monitor $mon] $command" >/dev/null 2>&1
     shimmer_record_left_open "$label (placed: workspace $ws, $key monitor)"
-    shimmer_hyprland_ensure_workspace "$ws" "$class" "$label" "$before"
-}
-
-# Some apps (notably Electron apps like Discord, which fork or re-exec into a different
-# process on startup) lose Hyprland's one-shot `[workspace N]` exec rule, since Hyprland tracks
-# it by the PID the dispatch call itself spawned -- a fork/re-exec can break that link, and the
-# window then opens wherever is currently focused instead. Poll (up to ~8s, since Electron apps
-# are often slow to actually map a window) for a window of CLASS whose address wasn't in BEFORE
-# -- genuinely new since this call's own dispatch, not just any window of that class, since
-# several launches can share one class (every kitty-wrapped step) -- and move it explicitly if
-# it didn't land on WORKSPACE. Still a one-shot dispatch, same as the original placement --
-# never a persistent window rule, never touching the Hyprland config.
-shimmer_hyprland_ensure_workspace() {
-    ws=$1
-    class=$2
-    label=$3
-    before=$4
-    i=0
-    while [ "$i" -lt 16 ]; do
-        found=$(hyprctl clients -j 2>/dev/null | jq -r --arg class "$class" --arg before "$before" '
-            ($before | split("\n")) as $old |
-            ([.[] | select((.class // "" | ascii_downcase) == ($class | ascii_downcase)) |
-                select((.address as $a | $old | index($a)) == null)][0]) as $w |
-            if $w == null then "" else "\($w.workspace.id) \($w.address)" end' 2>/dev/null)
-        if [ -n "$found" ]; then
-            # shellcheck disable=SC2086
-            set -- $found
-            actual_ws=$1
-            addr=$2
-            if [ "$actual_ws" = "$ws" ]; then
-                return 0
-            fi
-            hyprctl dispatch movetoworkspacesilent "$ws,address:$addr" >/dev/null 2>&1
-            shimmer_daily_dev_log "$label: Hyprland's exec rule missed (landed on workspace $actual_ws), moved to $ws instead"
-            return 0
-        fi
-        sleep 0.5
-        i=$((i + 1))
-    done
-    shimmer_daily_dev_log "$label: no new window of class '$class' appeared within 8s, gave up correcting its workspace"
+    addr=$(shimmer_hyprland_ensure_workspace "$ws" "$class" "$label" "$before")
+    if [ -n "$addr" ]; then
+        mkdir -p "$SHIMMER_STATE_DIR"
+        printf '%s' "$addr" >"$marker"
+    fi
 }

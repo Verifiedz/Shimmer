@@ -7,7 +7,7 @@
 term=${TERMINAL_APP:-auto}
 [ "$term" = "auto" ] && term=$(shimmer_terminal_auto)
 if [ -n "$MONITORS_PLACE" ] && [ "$term" = "kitty" ]; then
-    shimmer_hyprland_launch "$MONITORS_PLACE" "kitty $SYSTEM_MONITOR_COMMAND" "the system monitor window"
+    shimmer_hyprland_launch "$MONITORS_PLACE" "kitty $SYSTEM_MONITOR_COMMAND" "the system monitor window" system-monitor
 else
     if [ -n "$MONITORS_PLACE" ]; then
         msg="MONITORS_PLACE is set, but TERMINAL_APP resolves to '$term', not kitty: opening the system monitor without placement"

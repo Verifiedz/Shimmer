@@ -13,4 +13,4 @@ if [ -n "$BROWSER_URLS" ]; then
         command="$command $(shimmer_quote "$url")"
     done
 fi
-shimmer_hyprland_launch "$BROWSER_PLACE" "$command" "the $BROWSER_COMMAND window"
+shimmer_hyprland_launch "$BROWSER_PLACE" "$command" "the $BROWSER_COMMAND window" browser

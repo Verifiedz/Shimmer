@@ -60,7 +60,4 @@ for pair in "EDITOR_PLACE:$EDITOR_PLACE" "MONITORS_PLACE:$MONITORS_PLACE" "NOTES
     esac
 done
 
-# Taken once, now, before any step opens anything: see shimmer_hyprland_workspace_occupied.
-shimmer_hyprland_snapshot
-
 echo "ok${PROJECT_DIR:+, project: $PROJECT_DIR}${OBSIDIAN_VAULT:+, vault: $OBSIDIAN_VAULT}${SYSTEM_MONITOR_COMMAND:+, monitor: $SYSTEM_MONITOR_COMMAND}${GPU_MONITOR_COMMAND:+, gpu: $GPU_MONITOR_COMMAND}${DISCORD_COMMAND:+, chat: $DISCORD_COMMAND}${BROWSER_COMMAND:+, browser: $BROWSER_COMMAND}"
