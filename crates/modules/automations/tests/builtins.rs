@@ -8,7 +8,13 @@ use shimmer_automations::Automations;
 use shimmer_core::testing::TestEnv;
 use shimmer_core::{Catalog, CommandSpec, ErrorCode, Event, Execution, Module, ModuleId};
 
-const IDS: [&str; 4] = ["loop-stopped", "scheduled-task-failed", "workspace-dirty", "workspace-half-launched"];
+const IDS: [&str; 5] = [
+    "loop-stopped",
+    "scheduled-task-failed",
+    "scheduled-task-interrupted",
+    "workspace-dirty",
+    "workspace-half-launched",
+];
 
 fn env(with_notify: bool) -> TestEnv {
     let mut env = TestEnv::new("automations");
@@ -19,7 +25,8 @@ fn env(with_notify: bool) -> TestEnv {
         execution: Execution::Inline,
     };
     let ops: Vec<CommandSpec> = if with_notify { vec![op("notify.send")] } else { vec![op("records.update")] };
-    let topics = ["queue.task.failed", "workspaces.session.dirty", "automations.chain.stopped"];
+    let topics =
+        ["queue.task.failed", "workspaces.session.dirty", "automations.chain.stopped", "scheduler.trigger.interrupted"];
     env.ctx.catalog = Arc::new(Catalog::new(ops, topics.map(|t| (t.to_owned(), None))));
     env
 }
@@ -133,6 +140,11 @@ async fn each_built_in_says_what_happened_once() {
     assert_eq!(msg[0]["title"], "site was left half-launched");
     let normal = json!({"workspace": "site", "failed_step": "3/5 tmux", "log": "logs/site.log"});
     assert!(sent(&m, &env, ev("workspaces.session.dirty", normal)).await.is_empty(), "a failed task already said it");
+
+    let cut = json!({"trigger_id": "usr-1", "op": "notify.digest", "task_id": "01J", "scheduled_for": "2026-10-19T09:00:00Z"});
+    let msg = sent(&m, &env, ev("scheduler.trigger.interrupted", cut)).await;
+    assert_eq!(msg[0]["title"], "Scheduled notify.digest was cut off");
+    assert!(msg[0]["body"].as_str().unwrap().contains("shimmer scheduler show usr-1"), "{}", msg[0]);
 
     let stopped = json!({"rule": "again", "reason": "cycle", "chain": "c", "rules": ["again"], "event": {}});
     let msg = sent(&m, &env, ev("automations.chain.stopped", stopped)).await;

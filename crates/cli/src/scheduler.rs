@@ -187,7 +187,23 @@ pub async fn run(client: &mut Client, cmd: &SchedulerCmd, json: bool, prompt: &m
     };
     // Find the trigger first, then act on its full id, and say which one it was and what it runs:
     // never just echo what was typed (#183's review). A removed trigger can't be looked up after.
-    let trigger = client.call("scheduler.show", params).await?;
+    let trigger = match client.call("scheduler.show", params.clone()).await {
+        Ok(t) => t,
+        // A file the daemon couldn't read has no schedule to show (#263 finding 5): removing it by
+        // the id `scheduler list` gave it moves the file aside, and the daemon says so.
+        Err(e) if e.code == shimmer_core::ErrorCode::NotFound && op == "scheduler.remove" => {
+            let data = client.call(op, params).await.map_err(|_| e)?;
+            if json {
+                return Ok(render::json(&data));
+            }
+            let id = render::cell(&data["trigger_id"]);
+            return Ok(format!(
+                "✓ moved {id}'s unreadable file to {}: fix it there, then shimmer scheduler restore {id}",
+                render::cell(&data["file"])
+            ));
+        }
+        Err(e) => return Err(e),
+    };
     let full = trigger["id"].as_str().unwrap_or("?").to_string();
     let data = client.call(op, json!({ "trigger_id": full })).await?;
     if json {
@@ -251,11 +267,15 @@ fn list(data: &Value, now: DateTime<Utc>, schemas: &Schemas, all: bool) -> Strin
         let hidden = every.len() - mine.len();
         (mine, hidden)
     };
-    let footer = match hidden {
+    let mut footer = match hidden {
         0 => String::new(),
         1 => format!("\n{}", paint(Role::Hint, "+ 1 built-in schedule (shimmer scheduler list --all)")),
         n => format!("\n{}", paint(Role::Hint, &format!("+ {n} built-in schedules (shimmer scheduler list --all)"))),
     };
+    footer.push_str(&broken(data));
+    if triggers.is_empty() && !footer.is_empty() && hidden == 0 {
+        return footer.trim_start().to_owned();
+    }
     if triggers.is_empty() {
         return format!(
             "no triggers yet; add one with: shimmer scheduler add WHEN COMMAND (shimmer scheduler add --help){footer}"
@@ -293,6 +313,30 @@ fn list(data: &Value, now: DateTime<Utc>, schemas: &Schemas, all: bool) -> Strin
     format!("{}{footer}", table(&header, &rows))
 }
 
+/// Schedule files the daemon couldn't read (#263 finding 5), one warning line each, after the
+/// table: a schedule never silently stops existing. Empty when there are none.
+fn broken(data: &Value) -> String {
+    let broken = data["broken"].as_array().cloned().unwrap_or_default();
+    broken
+        .iter()
+        .map(|b| {
+            format!(
+                "\n{}",
+                paint(
+                    Role::Warning,
+                    &format!(
+                        "! {} can't be read: {} ({}). Fix it and restart (shimmer shutdown), or move it aside: shimmer scheduler remove {}",
+                        render::cell(&b["id"]),
+                        render::cell(&b["problem"]),
+                        render::cell(&b["file"]),
+                        render::cell(&b["id"]),
+                    )
+                )
+            )
+        })
+        .collect()
+}
+
 /// One trigger as label / value lines.
 fn trigger(t: &Value, now: DateTime<Utc>, schemas: &Schemas) -> String {
     let time = |v: &Value, none: &str| {
@@ -310,6 +354,24 @@ fn trigger(t: &Value, now: DateTime<Utc>, schemas: &Schemas) -> String {
     line("next run", time(&t["next_due"], "-"));
     line("last run", time(&t["last_run"], "never"));
     line("from", source(&t["source"]));
+    match t["waiting"].as_u64() {
+        Some(1) => line("waiting", "1 run in the queue".into()),
+        Some(n) if n > 1 => line("waiting", format!("{n} runs in the queue")),
+        _ => {}
+    }
+    if let Some(cut) = t["interrupted"].as_object() {
+        line(
+            "cut off",
+            paint(
+                Role::Warning,
+                &format!(
+                    "the run for {} was stopped mid-way by a shutdown and not run again (task {})",
+                    time(&cut["scheduled_for"].clone(), "?"),
+                    render::cell(&cut["task_id"])
+                ),
+            ),
+        );
+    }
     out.trim_end().to_string()
 }
 

@@ -59,6 +59,7 @@ pub async fn run(args: &Args, pack_warnings: &[String]) -> ExitCode {
     let mut checks = Vec::new();
     if let Some(mut client) = connect(args, &mut checks).await {
         checks.extend(packs(pack_warnings));
+        checks.extend(schedules(&mut client).await);
         checks.extend(modules(&mut client).await);
     }
     let failed = checks.iter().any(|c| c.status == Status::Fail);
@@ -126,6 +127,39 @@ fn packs(warnings: &[String]) -> Vec<Check> {
     }
     // Each warning already says which command shows the details.
     warnings.iter().map(|w| Check::new("packs", Status::Warn, w.clone())).collect()
+}
+
+/// Schedule files the daemon couldn't read (#263 finding 5): each one is a schedule that has
+/// stopped running, so it's a warning with the way out. The scheduler is a core service, not a
+/// module, so it has no `<module>.health` for `modules` to find.
+async fn schedules(client: &mut Client) -> Vec<Check> {
+    let data = match client.call("scheduler.list", json!({})).await {
+        Ok(d) => d,
+        Err(e) => {
+            return vec![Check::new("scheduler", Status::Fail, format!("scheduler.list failed: {}", render::error(&e)))]
+        }
+    };
+    let broken = data["broken"].as_array().cloned().unwrap_or_default();
+    if broken.is_empty() {
+        let n = data["triggers"].as_array().map_or(0, Vec::len);
+        return vec![Check::new("scheduler", Status::Ok, format!("{n} schedule(s), every file readable"))];
+    }
+    broken
+        .iter()
+        .map(|b| {
+            let id = render::cell(&b["id"]);
+            Check::new(
+                "scheduler",
+                Status::Warn,
+                format!(
+                    "{id} can't be read, so it doesn't run: {} ({})",
+                    render::cell(&b["problem"]),
+                    render::cell(&b["file"])
+                ),
+            )
+            .fix(format!("fix the file, or remove it: shimmer scheduler remove {id}"))
+        })
+        .collect()
 }
 
 /// Ask every module with a `<module>.health` op, in the manifest's order.
