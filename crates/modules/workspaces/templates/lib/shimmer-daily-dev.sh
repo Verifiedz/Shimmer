@@ -134,6 +134,31 @@ shimmer_hyprland_window_alive() {
     [ -n "$1" ] && hyprctl clients -j 2>/dev/null | jq -e --arg addr "$1" 'any(.[]; .address == $addr)' >/dev/null 2>&1
 }
 
+# A detached step is spawned and left running by the daemon, which doesn't wait for one
+# step's script to finish before starting the next (ADR 0010 S2a) -- so editor,
+# system-monitor and gpu-monitor's scripts can genuinely run at the same time, all three
+# reporting class "kitty". Without this, their before/after snapshots can interleave: one
+# step's "new window" poll can catch a sibling's window instead of its own. Serialize every
+# CLASS-matching launch against each other with a plain lock file, so only one of them is
+# between its own dispatch and identifying its own window at a time. Gives up (proceeds
+# anyway, same as a timeout elsewhere here) after 10s rather than waiting forever on a stale
+# lock from a crashed step.
+shimmer_hyprland_lock() {
+    lock="$SHIMMER_STATE_DIR/hyprland-lock-$1"
+    mkdir -p "$SHIMMER_STATE_DIR"
+    i=0
+    while [ "$i" -lt 40 ]; do
+        (set -C; : >"$lock") 2>/dev/null && return 0
+        sleep 0.25
+        i=$((i + 1))
+    done
+    return 0
+}
+
+shimmer_hyprland_unlock() {
+    rm -f "$SHIMMER_STATE_DIR/hyprland-lock-$1"
+}
+
 # Run COMMAND (already a full command line, e.g. "kitty btop" or "obsidian '/my/vault'"),
 # placed on PLACE's workspace and monitor if PLACE parses and both Hyprland and that monitor
 # are available right now; otherwise COMMAND runs as an ordinary background launch, with one
@@ -190,12 +215,14 @@ shimmer_hyprland_launch() {
     rm -f "$marker"
     class=${command%% *}
     class=${class##*/}
+    shimmer_hyprland_lock "$class"
     before=$(hyprctl clients -j 2>/dev/null | jq -r '.[].address' 2>/dev/null)
     shimmer_daily_dev_log "$label: placing on workspace $ws ($key monitor = $mon), class guess '$class': $command"
     hyprctl dispatch exec "[workspace $ws; monitor $mon] $command" >/dev/null 2>&1
     shimmer_record_left_open "$label (placed: workspace $ws, $key monitor)"
     addr=$(shimmer_hyprland_ensure_workspace "$ws" "$class" "$label" "$before")
     shimmer_hyprland_ensure_monitor "$ws" "$mon" "$label"
+    shimmer_hyprland_unlock "$class"
     if [ -n "$addr" ]; then
         mkdir -p "$SHIMMER_STATE_DIR"
         printf '%s' "$addr" >"$marker"
