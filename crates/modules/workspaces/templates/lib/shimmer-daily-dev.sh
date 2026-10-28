@@ -84,9 +84,15 @@ shimmer_hyprland_ensure_workspace() {
     before=$4
     i=0
     while [ "$i" -lt 16 ]; do
+        # CLASS is only a guess (the launching command's own first word), and several real
+        # classes don't match their command at all (zen-browser's window reports "zen",
+        # Obsidian's reports "md.obsidian.Obsidian") -- matched either direction as a
+        # substring, not exact equality, so the guess still finds the real window.
         found=$(hyprctl clients -j 2>/dev/null | jq -r --arg class "$class" --arg before "$before" '
             ($before | split("\n")) as $old |
-            ([.[] | select((.class // "" | ascii_downcase) == ($class | ascii_downcase)) |
+            ($class | ascii_downcase) as $want |
+            ([.[] | (.class // "" | ascii_downcase) as $got |
+                select($got != "" and ($got | contains($want) or ($want | contains($got)))) |
                 select((.address as $a | $old | index($a)) == null)][0]) as $w |
             if $w == null then "" else "\($w.workspace.id) \($w.address)" end' 2>/dev/null)
         if [ -n "$found" ]; then
@@ -104,8 +110,22 @@ shimmer_hyprland_ensure_workspace() {
         sleep 0.5
         i=$((i + 1))
     done
-    shimmer_daily_dev_log "$label: no new window of class '$class' appeared within 8s, gave up correcting its workspace"
+    shimmer_daily_dev_log "$label: no new window matching class '$class' appeared within 8s, gave up correcting its workspace"
     return 1
+}
+
+# Is WORKSPACE currently shown on MONITOR? The "monitor" clause in the original dispatch exec
+# rule can be bypassed when Hyprland has to create the workspace fresh, landing it on whatever
+# monitor was last active instead of the one asked for. Move the whole workspace there if not
+# -- still a one-shot dispatch, never a persistent monitor rule.
+shimmer_hyprland_ensure_monitor() {
+    ws=$1
+    mon=$2
+    label=$3
+    current=$(hyprctl monitors -j 2>/dev/null | jq -r --argjson ws "$ws" '[.[] | select(.activeWorkspace.id == $ws)][0].name // ""')
+    [ -n "$current" ] && [ "$current" != "$mon" ] || return 0
+    hyprctl dispatch moveworkspacetomonitor "$ws" "$mon" >/dev/null 2>&1
+    shimmer_daily_dev_log "$label: workspace $ws was showing on $current instead of $mon, moved"
 }
 
 # Is the window at ADDRESS still open? Checking Hyprland's live state, not this script's own
@@ -175,6 +195,7 @@ shimmer_hyprland_launch() {
     hyprctl dispatch exec "[workspace $ws; monitor $mon] $command" >/dev/null 2>&1
     shimmer_record_left_open "$label (placed: workspace $ws, $key monitor)"
     addr=$(shimmer_hyprland_ensure_workspace "$ws" "$class" "$label" "$before")
+    shimmer_hyprland_ensure_monitor "$ws" "$mon" "$label"
     if [ -n "$addr" ]; then
         mkdir -p "$SHIMMER_STATE_DIR"
         printf '%s' "$addr" >"$marker"
