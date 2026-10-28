@@ -147,4 +147,39 @@ shimmer_hyprland_launch() {
     shimmer_daily_dev_log "$label: placing on workspace $ws ($key monitor = $mon), class guess '$class': $command"
     hyprctl dispatch exec "[workspace $ws; monitor $mon] $command" >/dev/null 2>&1
     shimmer_record_left_open "$label (placed: workspace $ws, $key monitor)"
+    shimmer_hyprland_ensure_workspace "$ws" "$class" "$label"
+}
+
+# Some apps (notably Electron apps like Discord, which fork or re-exec into a different
+# process on startup) lose Hyprland's one-shot `[workspace N]` exec rule, since Hyprland tracks
+# it by the PID the dispatch call itself spawned -- a fork/re-exec can break that link, and the
+# window then opens wherever is currently focused instead. Poll for a new window of CLASS (up
+# to ~8s, since Electron apps are often slow to actually map a window) and move it explicitly
+# if it didn't land on WORKSPACE. Still a one-shot dispatch, same as the original placement --
+# never a persistent window rule, never touching the Hyprland config.
+shimmer_hyprland_ensure_workspace() {
+    ws=$1
+    class=$2
+    label=$3
+    i=0
+    while [ "$i" -lt 16 ]; do
+        found=$(hyprctl clients -j 2>/dev/null | jq -r --arg class "$class" \
+            '([.[] | select((.class // "" | ascii_downcase) == ($class | ascii_downcase))][0]) as $w |
+             if $w == null then "" else "\($w.workspace.id) \($w.address)" end' 2>/dev/null)
+        if [ -n "$found" ]; then
+            # shellcheck disable=SC2086
+            set -- $found
+            actual_ws=$1
+            addr=$2
+            if [ "$actual_ws" = "$ws" ]; then
+                return 0
+            fi
+            hyprctl dispatch movetoworkspacesilent "$ws,address:$addr" >/dev/null 2>&1
+            shimmer_daily_dev_log "$label: Hyprland's exec rule missed (landed on workspace $actual_ws), moved to $ws instead"
+            return 0
+        fi
+        sleep 0.5
+        i=$((i + 1))
+    done
+    shimmer_daily_dev_log "$label: no window of class '$class' appeared within 8s, gave up correcting its workspace"
 }
