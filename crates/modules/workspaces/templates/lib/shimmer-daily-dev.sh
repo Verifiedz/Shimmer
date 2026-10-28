@@ -144,28 +144,38 @@ shimmer_hyprland_launch() {
         shimmer_record_left_open "$label (placed: workspace $ws, $key monitor)"
         return 0
     fi
+    # Every address that exists right before THIS dispatch, so the correction below can tell
+    # "the window this exact call just caused to appear" apart from any sibling step's
+    # same-class window (kitty wraps the editor and both monitors -- three separate launches
+    # that all report class "kitty").
+    before=$(hyprctl clients -j 2>/dev/null | jq -r '.[].address' 2>/dev/null)
     shimmer_daily_dev_log "$label: placing on workspace $ws ($key monitor = $mon), class guess '$class': $command"
     hyprctl dispatch exec "[workspace $ws; monitor $mon] $command" >/dev/null 2>&1
     shimmer_record_left_open "$label (placed: workspace $ws, $key monitor)"
-    shimmer_hyprland_ensure_workspace "$ws" "$class" "$label"
+    shimmer_hyprland_ensure_workspace "$ws" "$class" "$label" "$before"
 }
 
 # Some apps (notably Electron apps like Discord, which fork or re-exec into a different
 # process on startup) lose Hyprland's one-shot `[workspace N]` exec rule, since Hyprland tracks
 # it by the PID the dispatch call itself spawned -- a fork/re-exec can break that link, and the
-# window then opens wherever is currently focused instead. Poll for a new window of CLASS (up
-# to ~8s, since Electron apps are often slow to actually map a window) and move it explicitly
-# if it didn't land on WORKSPACE. Still a one-shot dispatch, same as the original placement --
+# window then opens wherever is currently focused instead. Poll (up to ~8s, since Electron apps
+# are often slow to actually map a window) for a window of CLASS whose address wasn't in BEFORE
+# -- genuinely new since this call's own dispatch, not just any window of that class, since
+# several launches can share one class (every kitty-wrapped step) -- and move it explicitly if
+# it didn't land on WORKSPACE. Still a one-shot dispatch, same as the original placement --
 # never a persistent window rule, never touching the Hyprland config.
 shimmer_hyprland_ensure_workspace() {
     ws=$1
     class=$2
     label=$3
+    before=$4
     i=0
     while [ "$i" -lt 16 ]; do
-        found=$(hyprctl clients -j 2>/dev/null | jq -r --arg class "$class" \
-            '([.[] | select((.class // "" | ascii_downcase) == ($class | ascii_downcase))][0]) as $w |
-             if $w == null then "" else "\($w.workspace.id) \($w.address)" end' 2>/dev/null)
+        found=$(hyprctl clients -j 2>/dev/null | jq -r --arg class "$class" --arg before "$before" '
+            ($before | split("\n")) as $old |
+            ([.[] | select((.class // "" | ascii_downcase) == ($class | ascii_downcase)) |
+                select((.address as $a | $old | index($a)) == null)][0]) as $w |
+            if $w == null then "" else "\($w.workspace.id) \($w.address)" end' 2>/dev/null)
         if [ -n "$found" ]; then
             # shellcheck disable=SC2086
             set -- $found
@@ -181,5 +191,5 @@ shimmer_hyprland_ensure_workspace() {
         sleep 0.5
         i=$((i + 1))
     done
-    shimmer_daily_dev_log "$label: no window of class '$class' appeared within 8s, gave up correcting its workspace"
+    shimmer_daily_dev_log "$label: no new window of class '$class' appeared within 8s, gave up correcting its workspace"
 }
