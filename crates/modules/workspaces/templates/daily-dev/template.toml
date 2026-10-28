@@ -17,12 +17,12 @@ good_to_know = [
     "Neovim and the monitors each open in their own terminal (TERMINAL_APP)",
     "A *_PLACE question (e.g. EDITOR_PLACE = \"1:main\") puts that app on a workspace and monitor with hyprctl dispatch exec, the same way a hand-written Hyprland script would: nothing is ever read from or written to your Hyprland config",
     "Placement needs HYPRLAND_MAIN_MONITOR / HYPRLAND_SECOND_MONITOR filled in too (a substring of hyprctl monitors -j's description for each), and only works for Neovim and the monitors when TERMINAL_APP is kitty; everything else falls back to opening unplaced, with a note saying why",
-    "A window Shimmer places with Hyprland is always left running: Shimmer can't tell it apart from any other window that app already has open, so workspaces stop leaves it and says so. That's also true of Obsidian and your chat app even without placement",
+    "A window Shimmer places with Hyprland is closed by workspaces stop (CLOSE_ON_STOP permitting), by the exact window it remembers placing -- never by guessing from class or title, which could just as easily match a window that has nothing to do with this workspace. An app you didn't place (no *_PLACE answer) is always left running instead: with nothing placed, there's no specific window to target",
     "Your browser tabs open as arguments to BROWSER_COMMAND only if you fill in BROWSER_URLS; leave it empty if your browser already restores its tabs on its own",
     "Run it again while it's still active and it reuses what it already opened instead of piling up more: unplaced terminals by their own process, and a placed app by checking whether its workspace already has a window on it before the activation's own steps opened anything",
     "Every placement decision (placed, skipped as already open, or opened unplaced and why) is logged to logs/<id>-daily-dev.log in your Shimmer folder: the detached steps that do the placing have no other log (only check is supervised), so tail -f that file during activate to watch it live",
 ]
-on_stop = "Closes the terminals it opened for Neovim and the monitors, where CLOSE_ON_STOP allows it and they weren't placed with Hyprland. Everything else (Obsidian, your chat app, your browser, and anything placed with Hyprland) is always left open, and it says so."
+on_stop = "Closes the terminals it opened for Neovim and the monitors, and every window it placed with Hyprland, where CLOSE_ON_STOP allows it. An app you left unplaced (no *_PLACE answer) is always left open, and it says so."
 
 [[question]]
 name = "PROJECT_DIR"
@@ -134,4 +134,4 @@ prompt = "Close the terminals it opened when you run workspaces stop"
 kind = "choice"
 choices = ["yes", "no"]
 default = "yes"
-help = "Closed: the kitty/foot/alacritty/wezterm/ghostty/konsole/xterm terminals it opened for Neovim and the monitors, when they weren't placed with Hyprland. Never closed: GNOME Terminal and macOS Terminal/iTerm windows, Obsidian, your chat app, your browser, and anything placed with Hyprland."
+help = "Closed: the kitty/foot/alacritty/wezterm/ghostty/konsole/xterm terminals it opened for Neovim and the monitors, and every window it placed with Hyprland (by the exact window it remembers, never by guessing from class or title). Never closed: GNOME Terminal and macOS Terminal/iTerm windows, and any app you left unplaced (no *_PLACE answer)."

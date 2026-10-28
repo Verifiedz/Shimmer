@@ -159,6 +159,31 @@ shimmer_hyprland_unlock() {
     rm -f "$SHIMMER_STATE_DIR/hyprland-lock-$1"
 }
 
+# For cleanup: close every Hyprland-placed window this workspace still has a marker for,
+# where CLOSE_ON_STOP allows it, by its exact remembered address -- never by class or title,
+# which could just as easily match a window that has nothing to do with this workspace (the
+# same reason shimmer_hyprland_launch's own "already open" check isn't done that way either).
+# A dead marker (the window was already closed some other way) is just removed. Printed, not
+# logged: cleanup is a supervised step, so this already reaches a real log.
+shimmer_hyprland_close_all() {
+    for marker in "$SHIMMER_STATE_DIR"/hyprland-placed-*; do
+        [ -f "$marker" ] || continue
+        slot=${marker##*/hyprland-placed-}
+        addr=$(cat "$marker" 2>/dev/null)
+        if ! shimmer_hyprland_window_alive "$addr"; then
+            rm -f "$marker"
+            continue
+        fi
+        if [ "${CLOSE_ON_STOP:-yes}" = "yes" ]; then
+            hyprctl dispatch closewindow "address:$addr" >/dev/null 2>&1
+            echo "closed: $slot (placed with Hyprland)"
+            rm -f "$marker"
+        else
+            echo "left open (CLOSE_ON_STOP = no): $slot (placed with Hyprland)"
+        fi
+    done
+}
+
 # Run COMMAND (already a full command line, e.g. "kitty btop" or "obsidian '/my/vault'"),
 # placed on PLACE's workspace and monitor if PLACE parses and both Hyprland and that monitor
 # are available right now; otherwise COMMAND runs as an ordinary background launch, with one
