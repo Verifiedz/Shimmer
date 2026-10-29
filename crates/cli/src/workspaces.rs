@@ -34,7 +34,8 @@ commands:
   cleanup NAME [--wait] [--first]       run a dirty workspace's cleanup script
   force-relaunch NAME [--yes] [--wait]  launch a dirty workspace anyway (asks first)
        [--first]
-  reset NAME [--yes]                    clear dirty without running cleanup (asks first)
+  reset NAME [--yes]                    mark a dirty or active one ready without running
+                                        cleanup (asks first)
   stop NAME [--wait] [--first]          stop what an active workspace started (its dev server,
                                         services, the windows it can close) and say what it left
   remove NAME                           remove a workspace that isn't running

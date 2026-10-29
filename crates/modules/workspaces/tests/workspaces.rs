@@ -327,16 +327,40 @@ async fn reset_clears_dirty_and_records_what_it_cleared() {
         ev.payload,
         json!({"workspace": "deep-work", "prior": {
             "workspace": "deep-work", "reason": "exit code 1", "failed_step": "1/2 setup",
-            "failed_at": "2026-09-16T09:12:44Z", "log": "logs/deep-work-01JD2T.log"}})
+            "failed_at": "2026-09-16T09:12:44Z", "log": "logs/deep-work-01JD2T.log", "state": "dirty"}})
     );
 }
 
+/// ADR 0041: a vault copy's `active` was another folder's launch. `reset` forgets it and runs
+/// nothing; `stop` would run cleanup.sh and close the other folder's windows.
 #[tokio::test]
-async fn reset_is_refused_unless_the_workspace_is_dirty() {
+async fn reset_forgets_an_active_launch_and_runs_nothing() {
+    let (w, env) = setup().await;
+    put(&env, "deep-work/state.toml", "state = \"active\"\n");
+    let data = call(&w, &env, "workspaces.reset", json!({"id": "deep-work"})).await.unwrap();
+    assert_eq!(data, json!({"id": "deep-work", "state": "ready"}));
+    assert_eq!(file(&env, "deep-work/state.toml").unwrap(), "state = \"ready\"\n");
+    let ev = env.backend.events().pop().unwrap();
+    assert_eq!(ev.payload, json!({"workspace": "deep-work", "prior": {"workspace": "deep-work", "state": "active"}}));
+    assert!(env.launcher.received.lock().unwrap().is_empty(), "no script ran");
+}
+
+/// A `launching` workspace is a launch running now (a crashed one is made dirty at start).
+#[tokio::test]
+async fn reset_never_pulls_a_running_launch_out_from_under_it() {
+    let (w, env) = setup().await;
+    put(&env, "deep-work/state.toml", "state = \"launching\"\n");
+    let e = call(&w, &env, "workspaces.reset", json!({"id": "deep-work"})).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::Conflict, "{}", e.message);
+    assert_eq!(file(&env, "deep-work/state.toml").unwrap(), "state = \"launching\"\n", "unchanged");
+}
+
+#[tokio::test]
+async fn reset_is_refused_on_a_ready_workspace() {
     let (w, env) = setup().await;
     let e = call(&w, &env, "workspaces.reset", json!({"id": "deep-work"})).await.unwrap_err();
     assert_eq!(e.code, ErrorCode::InvalidParams);
-    assert!(e.message.contains("not dirty"), "{}", e.message);
+    assert!(e.message.contains("already ready"), "{}", e.message);
     assert!(file(&env, "deep-work/state.toml").is_none(), "nothing written");
     assert!(topics(&env).is_empty(), "no event");
 }

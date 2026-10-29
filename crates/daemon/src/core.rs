@@ -323,7 +323,7 @@ impl OpRunner for Core {
 
 /// The daemon's own topics, which no module declares, with what they mean (`docs/protocol.md`).
 /// `queue.task.progress` is left out: it's streamed only, never logged or seen by modules.
-const SERVICE_TOPICS: [(&str, &str); 19] = [
+const SERVICE_TOPICS: [(&str, &str); 20] = [
     ("queue.task.enqueued", "a task joined the queue"),
     ("queue.task.started", "a task started running"),
     ("queue.task.finished", "a task finished"),
@@ -337,6 +337,7 @@ const SERVICE_TOPICS: [(&str, &str); 19] = [
     ("scheduler.trigger.fired", "a schedule came due and queued its task"),
     ("scheduler.trigger.missed", "a schedule came due while the computer was off"),
     ("scheduler.trigger.skipped", "a schedule came due but didn't run"),
+    ("scheduler.trigger.interrupted", "a stop cut off a scheduled task while it ran; it wasn't run again"),
     ("scheduler.trigger.edited", "a schedule was changed, keeping its id"),
     ("scheduler.trigger.disabled", "a schedule was switched off"),
     ("scheduler.trigger.enabled", "a schedule was switched back on"),
