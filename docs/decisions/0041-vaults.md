@@ -99,7 +99,10 @@ workspace forbids `unsafe_code`, and `crates/daemon/src/secrets.rs` already decl
 that reason (CLAUDE.md §12 rule 8, Wasay on #312). Passing a resolved `Paths { home, socket }` down
 explicitly instead would work too, but touches every call site above for the same result. The cost of
 re-running is one extra exec, only when a vault other than the environment's is in use. `shimmer
-daemon` never re-runs: auto-start already pins its environment.
+daemon` never re-runs: auto-start already pins its environment. Nor does `shimmer vaults …`: it only
+reads and writes `cli.toml`, never a vault's folder, and `status` and `list` say which vault is in use
+*and why* from the line, the environment and `cli.toml` as they were given. After a re-run only the
+folder is known, not whether `--vault`, `use` or `SHIMMER_HOME` chose it.
 
 ### 4. Where vaults are kept
 
@@ -127,15 +130,19 @@ newer Shimmer can share the file.
   Linux, `~/Library/Application Support/shimmer-vaults/` on macOS): beside the main folder, never inside
   it, since the main folder is the one you sync with git. `--path DIR` must not exist or be empty
   (`made = true`), or already be a Shimmer folder, one with the store's `.gitignore` and `data/`
-  (**adopted**, `made = false`). Anything else is refused. The folder is filled in by its daemon the
-  first time a command runs there.
+  (**adopted**, `made = false`). Anything else is refused, and so is a `DIR` inside the main folder:
+  its files would be synced with main's, and main's daemon would sit around another vault's. The folder
+  is filled in by its daemon the first time a command runs there.
 - **`use`**: refuses a vault whose folder is gone, saying where it was expected. When `SHIMMER_HOME` is
   set in its own environment (a shell rc, say), it warns that plain commands still go there, since
   `SHIMMER_HOME` comes before `use` (§3).
 - **`rename`**: the name only. If it's the vault in use, `use` follows it.
 - **`remove`**: refuses `main`, the vault in use (`use` another first), and the vault `shimmer startup`
   starts at login (`startup off` first). It stops that vault's daemon (`core.shutdown` on its socket),
-  since nothing can name it any more, and keeps every file.
+  since nothing can name it any more, and keeps every file. It also refuses while a removed vault
+  already has that name (`purge` or `restore` it first). That differs from ADR 0038's "the latest
+  removal replaces an older one" on purpose: replacing it would forget a folder Shimmer made, which
+  `purge` could then never find to delete.
 - **`restore`**: `conflict` if a vault of that name exists again; `not_found` if nothing's removed.
 - **`purge`**: confirmed with `{"vaults": N}`, the same shape as every purge (ADR 0038 §4). It deletes a
   folder only when it was made by Shimmer (`made = true`), it still looks like a Shimmer folder, and it
@@ -273,6 +280,8 @@ in the scheduler and the queue, and needs Dev A's sign-off.
   `--vault` off the line; with no vault to switch to, nothing re-runs; no `SHIMMER_*` variable is
   added to the daemon's or a script's environment.
 - `vaults use` warns when `SHIMMER_HOME` is set; the active pack found from `main` in another vault.
+- `vaults status` after `--vault`, `use` and `SHIMMER_HOME` each names the right reason; `new --path`
+  inside main is refused; `remove` refuses while a removed vault has that name.
 - A copy has a fetchers source and an automation's delayed action switched off; a rule matching an
   event in the copied log doesn't fire at the copy's first start; a save waiting in VAULT's
   `.staging/` is finished in the copy, and one in `.staging/broken/` stays there.
