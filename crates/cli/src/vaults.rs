@@ -1061,6 +1061,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_names_the_reason_as_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut env = env(tmp.path());
+        go(&["new", "play"], &env).await.unwrap();
+        assert!(go(&["status"], &env).await.unwrap().contains("The default"));
+        go(&["use", "play"], &env).await.unwrap();
+        assert!(go(&["status"], &env).await.unwrap().contains("Chosen with 'shimmer vaults use'"));
+        env.env_home = Some(env.main.clone());
+        let out = go(&["status"], &env).await.unwrap();
+        assert!(out.contains("SHIMMER_HOME is set (instead of 'play'"), "{out}");
+        env.flag = Some("play".into());
+        assert!(go(&["status"], &env).await.unwrap().contains("Because --vault named it"));
+    }
+
+    #[tokio::test]
+    async fn remove_never_replaces_a_removed_vault_of_the_same_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = env(tmp.path());
+        go(&["new", "play"], &env).await.unwrap();
+        go(&["remove", "play"], &env).await.unwrap();
+        // `new` refuses the name too, so the only way to a second "play" is a hand-edited cli.toml.
+        assert!(go(&["new", "play"], &env).await.unwrap_err().message.contains("purge it first"));
+        let path = env.cli_toml.as_deref().unwrap();
+        let mut saved = settings::load(path).unwrap();
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        saved.vaults.insert("play".into(), Vault { path: other, made: true });
+        settings::save(path, &saved).unwrap();
+        let e = go(&["remove", "play"], &env).await.unwrap_err();
+        assert!(e.message.contains("purge it first"), "{}", e.message);
+        let saved = settings::load(path).unwrap();
+        assert_eq!(saved.removed_vaults["play"].path, tmp.path().join("data/shimmer-vaults/play"), "the first kept");
+    }
+
+    #[tokio::test]
     async fn use_refuses_a_missing_folder_and_warns_about_shimmer_home() {
         let tmp = tempfile::tempdir().unwrap();
         let mut env = env(tmp.path());
