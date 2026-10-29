@@ -176,9 +176,12 @@ newer Shimmer can share the file.
 
   **Resetting a copied workspace.** `workspaces.reset` is `dirty → ready` today; `stop` runs
   `cleanup.sh`, which in the copy would close the *source* vault's real windows and processes. So
-  `reset` grows to `active` and `launching` too: it forgets what the workspace thinks is running and
-  runs nothing, asking first as it already does. That's a §10.3 state-machine amendment (below),
-  owned by workspaces, so the daemon never edits a module's files.
+  `reset` grows to `active` too: it forgets what the workspace thinks is running and runs nothing,
+  asking first as it already does. Not to `launching`: the workspaces module already turns a launch
+  a stop cut off into `dirty` when it starts, so a copied `launching` workspace is `dirty` by the time
+  the CLI looks, and one that's `launching` while the daemon runs is a launch running now, which a
+  reset would pull the state out from under (found building part 2; `conflict`). That's a §10.3
+  state-machine amendment (below), owned by workspaces, so the daemon never edits a module's files.
 
   The next command in VAULT starts its daemon again, as auto-start always does.
 - **Packs** stay global (the active pack is in `cli.toml`), and a user pack is read from the vault in
@@ -239,8 +242,9 @@ in the scheduler and the queue, and needs Dev A's sign-off.
 
 ## Proposed changes to CLAUDE.md
 
-- §10.3, the `reset` bullet: "`workspaces.reset` also takes an `active` or `launching` workspace: it
-  forgets what the workspace thinks is running and runs nothing (ADR 0041, for a vault copy)."
+- §10.3, the `reset` bullet: "`workspaces.reset` also takes an `active` workspace: it forgets what
+  the launch started and runs nothing, for a vault copy whose `active` was another folder's launch
+  (ADR 0041). Never a `launching` one: that launch is running now."
 
 - §2, after "The daemon is the only process that opens the data directory for writing": "One
   exception: `shimmer vaults copy` and `purge` copy and delete a whole vault's folder while holding its
@@ -275,7 +279,9 @@ in the scheduler and the queue, and needs Dev A's sign-off.
   #312). `--live` leaves them on.
 - A copy interrupted before it's switched off (between steps 2 and 4) leaves no registered vault,
   and the next `copy` to that name removes the leftover `.copying` folder.
-- A copied `active` workspace is `ready` in the copy and its `cleanup.sh` never ran.
+- A copied `active` workspace is `ready` in the copy and its `cleanup.sh` never ran; a copied
+  `launching` one is `dirty` at the copy's start, then `ready`; `reset` on a launch running now is
+  `conflict`.
 - `--vault` re-runs once (the resolved-folder check stops a loop), keeps the exit code, and takes
   `--vault` off the line; with no vault to switch to, nothing re-runs; no `SHIMMER_*` variable is
   added to the daemon's or a script's environment.
