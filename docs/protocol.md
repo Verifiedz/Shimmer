@@ -373,11 +373,11 @@ client can say which one it hit.
 
 | Op | Execution | Params | Returns |
 |---|---|---|---|
-| `scheduler.list` | inline | `{"removed"?}` | `{"triggers":[…]}`, each `{"id","op","params","schedule","catch_up","lane","fallback","next_due","last_run","enabled","done","source"}`. `done` is a `once` trigger that has fired; `source` is `{"type":"user"}` or `{"type":"module","id"}`. With `"removed": true`, the removed triggers instead, same shape (ADR 0038). |
+| `scheduler.list` | inline | `{"removed"?}` | `{"triggers":[…],"broken":[…]}`, each trigger `{"id","op","params","schedule","catch_up","lane","fallback","next_due","last_run","enabled","done","source","waiting","interrupted"}`. `done` is a `once` trigger that has fired; `source` is `{"type":"user"}` or `{"type":"module","id"}`. `waiting` counts its firings whose task hasn't ended; `interrupted` is `null` or `{"task_id","scheduled_for","noticed"}`, the latest run a stop cut off mid-way, not run again (ADR 0004). `broken` lists schedule files that can't be read, `{"id","file","problem"}`: they don't run, and are kept as they are until fixed or removed (#263). With `"removed": true`, the removed triggers instead, same shape, without `broken` (ADR 0038). |
 | `scheduler.show` | inline | `{"trigger_id"}` | One trigger, same shape as a `scheduler.list` entry, or `not_found`. |
-| `scheduler.add` | inline | `{"schedule","op","params","catch_up","lane"?,"fallback"?}` | `{"trigger_id"}` |
+| `scheduler.add` | inline | `{"schedule","op","params","catch_up","lane"?,"fallback"?}` | `{"trigger_id"}`. A `once` already past with `catch_up: "skip"` is `invalid_params`: it could never run (ADR 0004). |
 | `scheduler.edit` | inline | `{"trigger_id","schedule","op","params","catch_up","lane"?,"fallback"?}` | The trigger, same shape as a `scheduler.list` entry: a new schedule for the same id, keeping whether it's enabled and its `last_run`, counting from now. Checked as `scheduler.add` is. A module's own trigger is `conflict`. Emits `scheduler.trigger.edited` (payload as `.added`). ADR 0038 §6. |
-| `scheduler.remove` | inline | `{"trigger_id"}` | `{"removed":true,"trigger_id"}` (the full id). Moves the trigger to `data/scheduler/removed/<id>.json`, where it never fires (the latest removal of an id replaces an older one). A module's own trigger is `conflict`: disable it instead. ADR 0038. |
+| `scheduler.remove` | inline | `{"trigger_id"}` | `{"removed":true,"trigger_id"}` (the full id). Moves the trigger to `data/scheduler/removed/<id>.json`, where it never fires (the latest removal of an id replaces an older one). A module's own trigger is `conflict`: disable it instead. The full id of a `broken` file moves that file, unchanged, to `data/scheduler/removed/<id>.json` instead, answering `{"removed":true,"trigger_id","was":"broken","file"}`: fixed there, `scheduler.restore` brings it back, and `purge` never deletes it while it can't be read. One fixed in place since the daemon started is `conflict` (it loads on the next start). ADR 0038. |
 | `scheduler.restore` | inline | `{"trigger_id"}` | The trigger, same shape as a `scheduler.list` entry, back as removed (paused or not). Counts from now, like `resume`: a recurring trigger's `next_due` is its next time after now; a `once` keeps its time, and its `catch_up` decides if that has passed. `trigger_id` may be a unique ending of a removed one's. `not_found` with nothing to restore; `conflict` if that id exists again; the `scheduler.add` errors if its op or lane has gone. Emits `scheduler.trigger.restored`. ADR 0038. |
 | `scheduler.purge` | inline | `{"trigger_id"?,"confirm"?}` | `{"purged":N}`. Permanently deletes one removed trigger, or every one. Without a matching `confirm`, `confirmation_required` with `detail: {"triggers":N}`; re-send with `"confirm": {"triggers":N}`. `{"purged":0}` without asking when nothing is removed; `not_found` for a `trigger_id` that isn't removed. Emits `scheduler.trigger.purged`. ADR 0038. |
 | `scheduler.disable` | inline | `{"trigger_id"}` | `{"enabled":false,"trigger_id"}`: it won't fire until enabled. ADR 0038 §6. |
@@ -584,7 +584,7 @@ saved and loaded: its `on` pattern, its `when` filter, every op exists and none 
 | `automations.health` | inline | `{}` | `{"checks":[…]}` in ADR 0033's shape: a `fail` per unusable file, a `warn` for a recently stopped loop, or one `ok` line. |
 
 **Built-in rules** (ADR 0035 §10): `workspace-dirty`, `workspace-half-launched`,
-`scheduled-task-failed` and `loop-stopped` are always listed (`"builtin": true`) once the ops they run
+`scheduled-task-failed`, `scheduled-task-interrupted` and `loop-stopped` are always listed (`"builtin": true`) once the ops they run
 are installed (they send with `notify.send`). `get` shows their text; `enable`/`disable` switch them
 in `settings.toml`'s `[builtin]` (and their event carries `"builtin": true`); `remove`, `save`, and
 `create` or `restore` with their ids are `conflict`. A rule file of yours with a built-in's id is
@@ -643,13 +643,14 @@ tolerate unknown topics.
 | `queue.task.progress` | Module called `ctx.progress`. Payload `{fraction, note}`. |
 | `queue.task.finished` | Task succeeded. |
 | `queue.task.failed` | Task failed. Payload includes `error`, `attempts`, `lane`, `origin`, and `fallback`: `true` only when a fallback is being sent for this failure (ADR 0005, 0032 §4). |
-| `queue.task.cancelled` | Task cancelled before or during execution. |
+| `queue.task.cancelled` | Task cancelled before or during execution. `"by": "shutdown"` when the daemon stopping cut it off mid-run, rather than a cancel someone asked for (ADR 0004). |
 | `queue.task.promoted` | A task jumped the lane. Payload lists displaced task ids. |
 | `queue.task.reordered` | A waiting task moved within its lane. Payload `{task_id, lane, before, queue_version}`. |
 | `queue.fallback.enqueued` | A failed task's fallback was enqueued (ADR 0005). Payload `{task_id, fallback_task_id, op, lane}`. |
 | `queue.fallback.failed` | A failed task's fallback couldn't be enqueued, e.g. no `notify` module. Payload `{task_id, op, error, code}`. Never stalls the lane; nothing retries. |
 | `scheduler.trigger.fired` | Trigger fired and enqueued a task. |
 | `scheduler.trigger.skipped` | Trigger fired while its previous task was still pending (`reason: "overlap"`), or its task could not be enqueued (`reason: "enqueue_failed"`). |
+| `scheduler.trigger.interrupted` | On start: a scheduled task had started and never ended (the daemon stopped mid-run). Not run again. Payload `{trigger_id, op, task_id, scheduled_for}` (ADR 0004). A firing whose task never started is queued again instead, as `scheduler.trigger.fired` with `after_restart: true`. |
 | `scheduler.trigger.missed` | A `catch_up` policy dropped due occurrences. Payload `{trigger_id, count, catch_up}`. |
 | `scheduler.trigger.added` / `.edited` / `.removed` / `.disabled` / `.enabled` / `.restored` | Trigger lifecycle. `.restored`: `{trigger_id}` (ADR 0038). |
 | `scheduler.trigger.purged` | `scheduler.purge` deleted removed triggers for good. `{triggers}`, plus `trigger_id` when one was purged. ADR 0038. |
