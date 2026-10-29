@@ -1,5 +1,6 @@
 //! Append-only event log: `events/YYYY-MM-DD.jsonl`, one JSON `Event` per line.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -48,19 +49,38 @@ fn ends_with_newline(f: &mut File) -> io::Result<bool> {
     Ok(b[0] == b'\n')
 }
 
-/// Whether an event with this id is already in its day's file.
-pub fn contains(home: &Path, event: &Event) -> Result<bool> {
-    let text = match fs::read_to_string(day_file(home, event)) {
+/// The ids already in each day's file, each file read once: what recovery checks against
+/// before appending an event a crash may have logged already. A normal commit never needs it:
+/// it has just staged its events, so they can't be in the log yet (#260 finding 1).
+#[derive(Default)]
+pub struct Logged {
+    by_day: HashMap<PathBuf, HashSet<ulid::Ulid>>,
+}
+
+impl Logged {
+    /// Append `event` unless its id is already in its day's file.
+    pub fn append_once(&mut self, home: &Path, event: &Event) -> Result<()> {
+        let file = day_file(home, event);
+        if !self.by_day.contains_key(&file) {
+            let ids = ids_in(&file)?;
+            self.by_day.insert(file.clone(), ids);
+        }
+        let ids = self.by_day.get_mut(&file).expect("just read");
+        if !ids.contains(&event.id) {
+            append(home, event)?;
+            ids.insert(event.id);
+        }
+        Ok(())
+    }
+}
+
+fn ids_in(file: &Path) -> Result<HashSet<ulid::Ulid>> {
+    let text = match fs::read_to_string(file) {
         Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(HashSet::new()),
         Err(e) => return Err(e.into()),
     };
-    let needle = event.id.to_string();
-    Ok(text
-        .lines()
-        .filter(|l| l.contains(&needle))
-        .filter_map(|l| serde_json::from_str::<Event>(l).ok())
-        .any(|e| e.id == event.id))
+    Ok(text.lines().filter_map(|l| serde_json::from_str::<Event>(l).ok()).map(|e| e.id).collect())
 }
 
 pub fn read_all(home: &Path) -> Result<EventScan> {
