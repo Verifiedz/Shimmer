@@ -103,7 +103,12 @@ async fn connect(args: &Args, checks: &mut Vec<Check>) -> Option<Client> {
             return None;
         }
     };
-    checks.push(daemon(started, up, client.daemon_version(), env!("CARGO_PKG_VERSION")));
+    let mut check = daemon(started, up, client.daemon_version(), env!("CARGO_PKG_VERSION"));
+    // In another vault, say which (ADR 0041 §5): the report is about that folder.
+    if let Some(vault) = crate::vaults::current_name() {
+        check.message.push_str(&format!(", in vault {vault}"));
+    }
+    checks.push(check);
     Some(client)
 }
 

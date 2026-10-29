@@ -28,7 +28,7 @@ use crate::style::{Palette, Role};
 const DAEMON_WAIT: Duration = Duration::from_millis(500);
 
 /// The modules with their own help page, by the command word that opens it.
-fn modules() -> [(&'static str, &'static str); 9] {
+fn modules() -> [(&'static str, &'static str); 10] {
     [
         ("records", crate::records::USAGE),
         ("workspaces", crate::workspaces::USAGE),
@@ -39,6 +39,7 @@ fn modules() -> [(&'static str, &'static str); 9] {
         ("fetchers", crate::fetchers::USAGE),
         ("notify", crate::notify::USAGE),
         ("startup", crate::startup::USAGE),
+        ("vaults", crate::vaults::USAGE),
     ]
 }
 
@@ -356,6 +357,9 @@ pub struct Context<'a> {
     pub pack: Option<&'a Pack>,
     /// Pack folders under `$SHIMMER_HOME/packs`, besides the built-in ones.
     pub pack_folders: Vec<String>,
+    /// Vault names, main first, and removed ones (ADR 0041), from `cli.toml`.
+    pub vaults: Vec<String>,
+    pub removed_vaults: Vec<String>,
 }
 
 /// The suggestions for the last of `words` (the one being typed; empty after a space). `words[0]`
@@ -693,6 +697,13 @@ impl Groups {
             }
             ("workspaces", "NAME") if command != "new" => self.workspaces(source).await,
             ("packs", "NAME") | ("", "NAME") => self.packs(cx),
+            ("vaults", "VAULT") => self.vaults(cx),
+            ("vaults", "REMOVED") => {
+                for v in &cx.removed_vaults {
+                    self.add("vaults", "removed vaults", v.clone(), "");
+                }
+            }
+            ("vaults", "DIR") => self.files(),
             ("packs", "NAME|FOLDER") => {
                 self.packs(cx);
                 self.files();
@@ -725,6 +736,7 @@ impl Groups {
                 self.add("values", "values", "none", "plain names, no pack");
             }
             Some("--socket") => self.files(),
+            Some("--vault") => self.vaults(cx),
             _ => {}
         }
     }
@@ -912,6 +924,12 @@ impl Groups {
             for c in m["commands"].as_array().into_iter().flatten() {
                 self.add("ops", "ops", text(&c["op"]), text(&c["summary"]));
             }
+        }
+    }
+
+    fn vaults(&mut self, cx: &Context<'_>) {
+        for v in &cx.vaults {
+            self.add("vaults", "vaults", v.clone(), "");
         }
     }
 
@@ -1139,7 +1157,7 @@ mod tests {
             words.truncate(1);
             words.push(String::new());
         }
-        let cx = Context { pack: None, pack_folders: Vec::new() };
+        let cx = Context { pack: None, pack_folders: Vec::new(), vaults: Vec::new(), removed_vaults: Vec::new() };
         complete(&words, &cx, source).await.into_iter().flat_map(|g| g.candidates).map(|c| c.word).collect()
     }
 
@@ -1178,8 +1196,8 @@ mod tests {
             assert!(top.contains(&word.to_owned()), "{word} missing from {top:?}");
         }
         // Each module's commands, as the pack targets know them: the same list, read twice.
-        // `packs` and `startup` run in the client alone: no op for an alias to name.
-        for (module, usage) in modules().into_iter().filter(|(m, _)| *m != "packs" && *m != "startup") {
+        // `packs`, `startup` and `vaults` run in the client alone: no op for an alias to name.
+        for (module, usage) in modules().into_iter().filter(|(m, _)| !matches!(*m, "packs" | "startup" | "vaults")) {
             let read: Vec<String> = commands(usage).into_iter().map(|c| c.word).collect();
             let targets: std::collections::BTreeSet<&str> = crate::packs::pack::TARGETS
                 .iter()
@@ -1290,7 +1308,8 @@ mod tests {
     #[tokio::test]
     async fn a_schedule_offers_and_follows_the_packs_aliases() {
         let pack = crate::packs::builtin::builtin("short").unwrap();
-        let cx = Context { pack: Some(&pack), pack_folders: Vec::new() };
+        let cx =
+            Context { pack: Some(&pack), pack_folders: Vec::new(), vaults: Vec::new(), removed_vaults: Vec::new() };
         let at = |line: &str| -> Vec<String> {
             std::iter::once("shimmer").chain(line.split(' ')).map(String::from).collect()
         };
@@ -1396,8 +1415,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vault_names_where_a_vault_goes() {
+        let cx = Context {
+            pack: None,
+            pack_folders: Vec::new(),
+            vaults: vec!["main".into(), "play".into()],
+            removed_vaults: vec!["old".into()],
+        };
+        let got = |line: &str| {
+            let line: Vec<String> = line.split(' ').map(String::from).collect();
+            let cx = &cx;
+            async move {
+                complete(&line, cx, &mut Canned(BTreeMap::new()))
+                    .await
+                    .into_iter()
+                    .flat_map(|g| g.candidates)
+                    .map(|c| c.word)
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(got("shimmer --vault ").await, ["main", "play"]);
+        assert_eq!(got("shimmer vaults use p").await, ["play"]);
+        assert_eq!(got("shimmer vaults restore ").await, ["old"]);
+        assert!(got("shimmer vaults ").await.contains(&"status".to_owned()));
+        assert!(got("shimmer ").await.contains(&"vaults".to_owned()));
+    }
+
+    #[tokio::test]
     async fn files_where_a_file_goes() {
-        let cx = Context { pack: None, pack_folders: Vec::new() };
+        let cx = Context { pack: None, pack_folders: Vec::new(), vaults: Vec::new(), removed_vaults: Vec::new() };
         let line: Vec<String> = ["shimmer", "records", "import", "lc", ""].map(String::from).to_vec();
         let groups = complete(&line, &cx, &mut daemon()).await;
         assert!(groups.iter().any(|g| g.tag == "files"), "{groups:?}");
@@ -1407,7 +1453,8 @@ mod tests {
     async fn a_packs_aliases_complete_like_their_commands() {
         let pack = crate::packs::builtin::builtin("anime-tropes").unwrap();
         let (alias, _) = pack.aliases.iter().find(|(_, t)| t.op == "workspaces.activate").unwrap();
-        let cx = Context { pack: Some(&pack), pack_folders: Vec::new() };
+        let cx =
+            Context { pack: Some(&pack), pack_folders: Vec::new(), vaults: Vec::new(), removed_vaults: Vec::new() };
         let mut d = daemon();
         // `shimmer ikuzo <Tab>` and `ikuzo <Tab>`, linked on its own.
         for line in [vec!["shimmer", alias.as_str(), ""], vec![alias.as_str(), ""]] {
