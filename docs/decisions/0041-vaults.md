@@ -3,7 +3,9 @@
 Status: proposed · Raised by Dev B · Needs sign-off: Dev A (`crates/app/src/main.rs` re-runs itself
 in the chosen vault, §3; a quiet start for the daemon, §5a; the CLAUDE.md §2, §7, §10.3 and §15
 wording below) · No `core` or `proto` change · Depends on #293 (ADR 0039: one socket per Shimmer folder),
-merged · Revised after Wasay's two reviews on #312
+merged; the quiet start (§5a) builds on #308's scheduler recovery, so the implementation follows #322
+(data safety) into master · Revised after Wasay's two reviews on #312, and checked against #308, #309,
+#310, #320 and #323 once they merged
 
 ## Context
 
@@ -145,17 +147,22 @@ newer Shimmer can share the file.
      moments, none.
   2. It copies into a temporary folder beside the target (`<target>.copying`), everything except what's
      derived or tied to the machine: `index.sqlite*`, `cache/`, `logs/`, the socket and the lock.
-     `.staging/` *is* copied, so the copy's own recovery finishes any save that was committed (ADR 0040).
+     `.staging/` *is* copied, so the copy's own recovery finishes any save that was committed (ADR 0040),
+     including one still waiting to be applied; `.staging/broken/` comes too, so a damaged save kept
+     aside in VAULT is kept aside in the copy, and `doctor` reports it in both.
      With `--path DIR`, the temporary folder sits beside DIR. Then it releases VAULT's lock.
   3. **The copy is switched off while it's still the temporary folder** (§5a), so it never sends a
      duplicate reminder or email, and a vault that's registered is always a quiet one (Wasay on #312:
      a copy interrupted after registering but before switching off would otherwise start live).
      `<target>.copying` gets its own daemon (ADR 0039: its own socket, by its own path), started quiet,
-     and the CLI switches things off **through their own ops**: `scheduler.disable` for every enabled
-     schedule, `automations.disable` for every enabled rule, `fetchers.disable` for every enabled
-     source, `notify.pause {"all": true}` (held until `notify resume`), and `workspaces.reset` for any
-     workspace whose copied state isn't `ready` (it can't have launched anything in the copy; see
-     below). Then it stops that daemon. `--live` skips this step.
+     and the CLI switches things off **through their own ops**, in this order: `fetchers.disable` for
+     every enabled source (#320; it removes the source's own next-run schedule, so the source and its
+     schedule agree), `automations.disable` for every enabled rule, then `scheduler.disable` for every
+     schedule still enabled, which includes the one-time schedules modules added for themselves
+     (`ctx.schedules`: an automation's delayed action, ADR 0035 §5.6), `notify.pause {"all": true}`
+     (held until `notify resume`), and `workspaces.reset` for any workspace whose copied state isn't
+     `ready` (it can't have launched anything in the copy; see below). Then it stops that daemon.
+     `--live` skips this step.
   4. Only then it renames `<target>.copying` to the target and registers NEW (`made = true`). An
      interrupted copy, at any step, leaves no registered vault, only a `.copying` folder, removed by the
      next `copy` to that name. The `✓` line says what was switched off and how to turn it back on.
@@ -194,6 +201,12 @@ copy's first start. During a quiet start:
   `queue.task.enqueued` is logged, `queue list` never shows it, and nothing is left for a later
   recovery to mistake for an unfinished firing. Tasks a person asks for run as usual, which is how the
   CLI switches things off.
+
+**Copied events don't need anything.** The copy's event log is VAULT's history, but a module only
+reacts to events emitted after its daemon started: catching up after a lag reads the log from that
+start onward, never before it (#310), and every module has finished `init` before any reacts (#323).
+So a rule never fires again on an event copied in; what's left to stop is what the daemon does by
+itself, above.
 
 The **mode** isn't written down, so it lasts for that one run; **what it settles is** (the forgotten
 firings, the recounted schedules, and whatever the CLI switches off). Once the CLI has switched
@@ -259,8 +272,10 @@ in the scheduler and the queue, and needs Dev A's sign-off.
 - `--vault` re-runs once (the resolved-folder check stops a loop), keeps the exit code, and takes
   `--vault` off the line; with no vault to switch to, nothing re-runs; no `SHIMMER_*` variable is
   added to the daemon's or a script's environment.
-- `vaults use` warns when `SHIMMER_HOME` is set; an interrupted copy leaves no registered vault; a
-  copied `active` workspace is `ready` in the copy; the active pack found from `main` in another vault.
+- `vaults use` warns when `SHIMMER_HOME` is set; the active pack found from `main` in another vault.
+- A copy has a fetchers source and an automation's delayed action switched off; a rule matching an
+  event in the copied log doesn't fire at the copy's first start; a save waiting in VAULT's
+  `.staging/` is finished in the copy, and one in `.staging/broken/` stays there.
 
 - Which vault wins: `--vault` > `SHIMMER_HOME` > `use` > `main`, as a plain function with no
   environment changed.
