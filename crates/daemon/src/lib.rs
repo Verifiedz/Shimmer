@@ -56,6 +56,9 @@ pub struct DaemonConfig {
     pub clock: Clock,
     /// How often the scheduler looks at the clock. Firing precision is one tick.
     pub scheduler_tick: Duration,
+    /// A quiet start (ADR 0041 §5a), for a vault copy's first run: the scheduler settles what was
+    /// copied in and doesn't tick, and the queue refuses tasks modules ask for. Lasts this run only.
+    pub quiet: bool,
 }
 
 impl DaemonConfig {
@@ -66,6 +69,7 @@ impl DaemonConfig {
             socket: shimmer_proto::paths::socket_path(),
             clock: Clock::system(),
             scheduler_tick: Duration::from_secs(1),
+            quiet: false,
         }
     }
 }
@@ -143,6 +147,11 @@ impl Daemon {
             index.clone(),
         );
         let tracker = TaskTracker::new();
+        // Before any module starts: automations and notify react from `init` (ADR 0041 §5a).
+        if config.quiet {
+            core.queue.set_quiet();
+            tracing::info!("quiet start: the scheduler won't tick and modules can't queue tasks this run");
+        }
 
         // Subscribe before init so events a module emits while initialising are not missed.
         // Taken before subscribing: a module's catch-up after a lag never reaches before it (#310).
@@ -202,16 +211,24 @@ impl Daemon {
         ));
         scheduler.load()?;
         scheduler.register_module_triggers(declared)?;
-        // Firings a stop left unfinished: queued again if they never started (#263 finding 1).
-        // A failure here is logged, not fatal: the firings stay on disk for the next start.
-        let events = recovery_index.clone();
-        if let Err(e) = scheduler.recover(|pattern, since| {
-            events.lock().unwrap_or_else(|e| e.into_inner()).events_matching_since(pattern, since)
-        }) {
-            tracing::error!(error = %e, "couldn't check unfinished scheduled tasks; checked again next start");
+        if config.quiet {
+            // A copy's first start (ADR 0041 §5a): what was copied in was another folder's run, so
+            // it's settled, never run, and nothing ticks until the next, ordinary start.
+            scheduler.quiet_start()?;
+        } else {
+            // Firings a stop left unfinished: queued again if they never started (#263 finding 1).
+            // A failure here is logged, not fatal: the firings stay on disk for the next start.
+            let events = recovery_index.clone();
+            if let Err(e) = scheduler.recover(|pattern, since| {
+                events.lock().unwrap_or_else(|e| e.into_inner()).events_matching_since(pattern, since)
+            }) {
+                tracing::error!(error = %e, "couldn't check unfinished scheduled tasks; checked again next start");
+            }
         }
         let _ = core.scheduler.set(scheduler.clone());
-        tracker.spawn(scheduler.run(config.scheduler_tick, shutdown.clone()));
+        if !config.quiet {
+            tracker.spawn(scheduler.run(config.scheduler_tick, shutdown.clone()));
+        }
 
         let listener = bind(&config.socket)?;
         tracker.spawn(ipc::serve(core.clone(), listener, tracker.clone()));

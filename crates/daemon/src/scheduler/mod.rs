@@ -578,6 +578,38 @@ impl Scheduler {
         Ok(())
     }
 
+    /// On a quiet start (ADR 0041 §5a), instead of [`recover`](Self::recover): every firing copied in
+    /// as unfinished is forgotten, never run (it was another folder's run), and every enabled
+    /// recurring schedule counts from now, as `enable` does, so the next ordinary start has nothing
+    /// to catch up. Both are written to the trigger files: recovery doesn't ask whether a trigger is
+    /// enabled, so a forget kept only in memory would be queued again next start (#312's review).
+    pub fn quiet_start(&self) -> Result<()> {
+        let now = self.clock.now();
+        let mut st = self.lock();
+        let mut gone = Vec::new();
+        for (id, e) in st.iter_mut() {
+            let unfinished = e.stored.unfinished.clone();
+            if !unfinished.is_empty() && !self.forget(e, &unfinished) {
+                gone.push(id.clone());
+                continue;
+            }
+            if !e.stored.unfinished.is_empty() {
+                return Err(Error::unavailable(format!("couldn't forget {id}'s copied firings")));
+            }
+            let recurring = !matches!(e.stored.spec.schedule, Schedule::Once(_));
+            if !e.stored.paused && !e.stored.done && recurring && e.stored.next_due.is_some_and(|due| due <= now) {
+                let mut next = e.stored.clone();
+                next.next_due = e.parsed.next_after(now);
+                self.write(&next, None)?;
+                e.stored = next;
+            }
+        }
+        for id in gone {
+            st.remove(&id);
+        }
+        Ok(())
+    }
+
     fn emit(&self, topic: &str, payload: Value) {
         if let Err(e) = self.emitter.emit(topic, payload) {
             tracing::error!(topic, error = %e, "could not log scheduler event");

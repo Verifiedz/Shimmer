@@ -33,10 +33,19 @@ async fn main() -> ExitCode {
     }
     match std::env::args().nth(1).as_deref() {
         Some("daemon") => {
+            // `--quiet`: a vault copy's first start (ADR 0041 §5a). Nothing else is taken.
+            let quiet = match std::env::args().skip(2).collect::<Vec<_>>().as_slice() {
+                [] => false,
+                [flag] if flag == "--quiet" => true,
+                _ => {
+                    eprintln!("usage: shimmer daemon [--quiet]");
+                    return ExitCode::from(2);
+                }
+            };
             // Autostart (crates/cli/src/autostart.rs) nulls the child's stderr, so this is the
             // only trace of a cold-start crash unless it also lands in a file (ADR 0007).
             let _guard = init_daemon_logging(&shimmer_proto::paths::shimmer_home());
-            run_daemon().await
+            run_daemon(quiet).await
         }
         Some("mockd") => {
             init_stderr_logging();
@@ -106,7 +115,7 @@ fn init_daemon_logging(home: &Path) -> Option<WorkerGuard> {
     }
 }
 
-async fn run_daemon() -> ExitCode {
+async fn run_daemon(quiet: bool) -> ExitCode {
     // Every module the daemon runs. A new module is one more line here.
     let modules: Vec<Arc<dyn Module>> = vec![
         Arc::new(shimmer_records::Records::default()),
@@ -116,6 +125,7 @@ async fn run_daemon() -> ExitCode {
         Arc::new(shimmer_notify::Notify::default()),
     ];
     let mut config = DaemonConfig::from_env();
+    config.quiet = quiet;
     // Run in `/`, never in the folder whatever started it was in (#266 finding 3): a drive the
     // daemon sits in can't be unmounted. Its folder and socket are made absolute first, so a
     // relative `SHIMMER_HOME` still means the folder it named.

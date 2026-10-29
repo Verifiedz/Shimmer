@@ -450,12 +450,18 @@ impl Env {
     }
 
     pub async fn try_start(&self, modules: Vec<Arc<dyn Module>>) -> Result<Daemon> {
+        self.try_start_as(modules, false).await
+    }
+
+    /// [`try_start`](Self::try_start), quiet or not (ADR 0041 §5a).
+    pub async fn try_start_as(&self, modules: Vec<Arc<dyn Module>>, quiet: bool) -> Result<Daemon> {
         Daemon::start(
             DaemonConfig {
                 home: self.home.path().to_owned(),
                 socket: self.sock.clone(),
                 clock: self.clock.clone(),
                 scheduler_tick: Duration::from_millis(10),
+                quiet,
             },
             modules,
         )

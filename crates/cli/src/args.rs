@@ -41,7 +41,8 @@ under the hood:
   manifest              list registered modules, their ops and lanes
   call OP [PARAMS]      send any op; PARAMS is a JSON object (default {});
        [--first [--yes]]  --first: a queued op ahead of its lane (asks first)
-  daemon                run the daemon in the foreground (Ctrl-C to stop)
+  daemon [--quiet]      run the daemon in the foreground (Ctrl-C to stop); --quiet: nothing
+                        scheduled runs and modules can't queue tasks, for this run only
   mockd                 run the mock daemon for building clients (shimmer mockd --help)
 
 options:
