@@ -223,7 +223,7 @@ pub fn parse(rest: Vec<String>) -> std::result::Result<NotifyCmd, String> {
             [n] => n.parse().map(|n| NotifyCmd::Cap(Some(n))).map_err(|_| format!("the cap is a number, not '{n}'")),
             _ => Err("'notify cap' takes one number".into()),
         },
-        other => Err(format!("unknown notify command '{other}'")),
+        other => Err(crate::suggest::unknown_command(Some("notify"), other, USAGE)),
     }
 }
 

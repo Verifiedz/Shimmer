@@ -151,20 +151,31 @@ impl Daemon {
         let recovery_index = index.clone();
         tracker.spawn(indexer::run(index, store.clone(), bus.subscribe(), shutdown.clone()));
 
+        // Every module is initialised before any of them reacts to an event. A module reacting
+        // while a later one is still starting could queue that one's op (automations sending
+        // notify.send about a workspace found half-launched at start) and have it refused as
+        // "not initialised", losing the message. Events emitted meanwhile wait in each module's
+        // receiver, subscribed above.
+        let mut started = Vec::new();
         for (entry, rx) in core.registry.entries.iter().zip(receivers) {
             let id = entry.manifest.id.clone();
             let ctx = core.ctxs[&id].clone();
             match entry.module.init(&ctx).await {
-                Ok(()) => entry.ready.store(true, Ordering::Release),
+                Ok(()) => {
+                    entry.ready.store(true, Ordering::Release);
+                    started.push((entry, rx, id, ctx));
+                }
                 Err(e) => {
                     // One broken module must not take the daemon down: its ops answer
                     // `unavailable` and everything else keeps working.
                     tracing::error!(module = %id, error = %e, "module init failed; ops will answer unavailable");
-                    continue;
                 }
             }
+        }
+        for (entry, rx, id, ctx) in started {
             // Every event, in order, a lag caught up from the log and a panic kept to its event
-            // (#261 findings 1, 2).
+            // (#261 findings 1, 2). Lags are likeliest here: each receiver holds every event emitted
+            // during all the modules' inits, and the catch-up makes that lossless.
             tracker.spawn(delivery::run(
                 id,
                 entry.module.clone(),
@@ -270,8 +281,19 @@ async fn lock_home(home: &Path) -> Result<File> {
 
 /// Bind the socket, clearing a stale one left by a daemon that died without cleanup.
 fn bind(path: &Path) -> Result<UnixListener> {
+    // A path the OS can't take as a socket says so plainly (ADR 0039 §5).
+    if let Some(why) = shimmer_proto::paths::too_long(path) {
+        return Err(Error::invalid_params(why));
+    }
     if let Some(parent) = path.parent().filter(|p| !p.exists()) {
         fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+    }
+    // The short folder is in a shared `/tmp`: someone else may have made it first.
+    let uid = shimmer_proto::paths::owner_uid();
+    if shimmer_proto::paths::in_short_socket_dir(path, uid) {
+        if let Some(parent) = path.parent() {
+            shimmer_proto::paths::check_private_dir(parent, uid).map_err(Error::conflict)?;
+        }
     }
     if path.exists() {
         if std::os::unix::net::UnixStream::connect(path).is_ok() {

@@ -126,7 +126,7 @@ pub fn parse(words: Vec<String>) -> std::result::Result<SchedulerCmd, String> {
             [id] => Ok(SchedulerCmd::Purge { id: Some(id.clone()), yes: flags.has("--yes") }),
             _ => Err("usage: shimmer scheduler purge [REMOVED] [--yes]".into()),
         },
-        other => Err(format!("unknown scheduler command '{other}'; see 'shimmer scheduler --help'")),
+        other => Err(crate::suggest::unknown_command(Some("scheduler"), other, USAGE)),
     }
 }
 
@@ -278,7 +278,7 @@ fn list(data: &Value, now: DateTime<Utc>, schemas: &Schemas, all: bool) -> Strin
     }
     if triggers.is_empty() {
         return format!(
-            "no triggers yet; add one with: shimmer scheduler add WHEN COMMAND (shimmer scheduler add --help){footer}"
+            "no schedules yet; add one with: shimmer scheduler add WHEN COMMAND (shimmer scheduler add --help){footer}"
         );
     }
     let ids: Vec<String> = triggers.iter().map(|t| render::cell(&t["id"])).collect();
@@ -749,7 +749,7 @@ mod tests {
             row(2),
             ["digest", "notify.digest {}", "cron 0 9 * * 1 (UTC)", "skip", "-", "3m ago", "off", "module notify"]
         );
-        assert!(list(&json!({"triggers": []}), now, &Schemas::new(), false).starts_with("no triggers yet"));
+        assert!(list(&json!({"triggers": []}), now, &Schemas::new(), false).starts_with("no schedules yet"));
     }
 
     #[test]
@@ -769,7 +769,7 @@ mod tests {
         let modules_only = json!({"triggers": [sample(now)["triggers"][1].clone()]});
         assert_eq!(
             list(&modules_only, now, &Schemas::new(), false),
-            "no triggers yet; add one with: shimmer scheduler add WHEN COMMAND (shimmer scheduler add --help)\n+ 1 built-in schedule (shimmer scheduler list --all)"
+            "no schedules yet; add one with: shimmer scheduler add WHEN COMMAND (shimmer scheduler add --help)\n+ 1 built-in schedule (shimmer scheduler list --all)"
         );
         assert!(!list(&sample(now), now, &Schemas::new(), true).contains("built-in schedule"), "--all hides nothing");
     }

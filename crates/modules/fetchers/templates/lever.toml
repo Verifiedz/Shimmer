@@ -1,0 +1,28 @@
+[template]
+label = "A Lever job board"
+description = "Open roles from a company's public Lever job board"
+category = "job-boards"
+kind = "json-api"
+good_to_know = [
+    "Works for any public Lever board -- the company id is the part of its own careers url after jobs.lever.co/",
+]
+
+[[question]]
+name = "COMPANY"
+prompt = "The company's Lever id (e.g. netflix)"
+kind = "name"
+required = true
+
+[source]
+text = '''
+[source]
+enabled = false
+interval = "daily"
+kind = "json-api"
+
+[kind]
+url = "https://api.lever.co/v0/postings/${COMPANY}?mode=json"
+id_field = "id"
+title_field = "text"
+url_field = "hostedUrl"
+'''

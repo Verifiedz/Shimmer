@@ -293,7 +293,7 @@ pub fn parse(words: Vec<String>) -> std::result::Result<WorkspacesCmd, String> {
                 _ => Err("usage: shimmer workspaces templates [CATEGORY | TEMPLATE]".into()),
             }
         }
-        other => Err(format!("unknown workspaces command '{other}'; see 'shimmer workspaces --help'")),
+        other => Err(crate::suggest::unknown_command(Some("workspaces"), other, USAGE)),
     }
 }
 
