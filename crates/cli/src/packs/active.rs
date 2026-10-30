@@ -24,6 +24,9 @@ pub struct Front {
     /// `--no-color`: plain output (#189). Before the command only, so it never takes a name from
     /// a record's fields.
     pub no_color: bool,
+    /// `--vault NAME` (ADR 0041 §3). The binary has already re-run in that vault, or found it's the
+    /// one in use; only `shimmer vaults` reads it.
+    pub vault: Option<String>,
 }
 
 /// Flags `shimmer` itself takes before the command word, and whether each takes a value.
@@ -35,13 +38,15 @@ const GLOBAL_FLAGS: &[(&str, bool)] = &[
     ("--pack", true),
     ("--canonical", false),
     ("--no-color", false),
+    ("--vault", true),
 ];
 
 /// Take `--pack NAME` and `--canonical` off the front of the command line. They only count
 /// before the command word, so `shimmer records add … --pack x` still reaches a records field
 /// called `pack`.
 pub fn take_front_flags(args: Vec<String>) -> Result<Front, String> {
-    let mut front = Front { args: Vec::with_capacity(args.len()), pack: None, canonical: false, no_color: false };
+    let mut front =
+        Front { args: Vec::with_capacity(args.len()), pack: None, canonical: false, no_color: false, vault: None };
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let (flag, inline) = split_flag(&arg);
@@ -49,6 +54,10 @@ pub fn take_front_flags(args: Vec<String>) -> Result<Front, String> {
             ("--pack", _) => {
                 let value = inline.map(str::to_string).or_else(|| args.next()).filter(|v| !v.is_empty());
                 front.pack = Some(value.ok_or("--pack needs a value: a pack name, or 'none'")?);
+            }
+            ("--vault", _) => {
+                let value = inline.map(str::to_string).or_else(|| args.next()).filter(|v| !v.is_empty());
+                front.vault = Some(value.ok_or("--vault needs a value: a vault's name")?);
             }
             ("--canonical", _) => front.canonical = true,
             ("--no-color", _) => front.no_color = true,
@@ -184,14 +193,17 @@ impl std::fmt::Display for FindError {
 }
 
 /// Pack `name`: the folder `$SHIMMER_HOME/packs/<name>/` if there is one, which replaces a
-/// built-in of the same name, else the built-in (ADR 0013 §4).
+/// built-in of the same name, else main's `packs/<name>/` (in another vault, so switching vaults
+/// doesn't lose your pack, ADR 0041 §5), else the built-in (ADR 0013 §4).
 pub fn find(name: &str, home: &Path) -> Result<Pack, FindError> {
     if let Some(why) = name_problem(name) {
         return Err(FindError::BadName { name: name.into(), why });
     }
-    let dir = home.join("packs").join(name);
-    if dir.is_dir() {
-        return check_folder(&dir).map_err(|problems| FindError::Invalid { name: name.into(), problems });
+    let main = crate::vaults::main_home();
+    for dir in [home.join("packs").join(name), main.join("packs").join(name)] {
+        if dir.is_dir() {
+            return check_folder(&dir).map_err(|problems| FindError::Invalid { name: name.into(), problems });
+        }
     }
     builtin(name).ok_or_else(|| FindError::Unknown(name.into()))
 }
@@ -221,10 +233,9 @@ pub fn is_known_alias(name: &str, cli_toml: Option<&Path>, home: &Path) -> bool 
     let in_builtin =
         super::builtin::BUILTIN.iter().filter_map(|(id, _)| builtin(id)).any(|p| p.aliases.contains_key(name));
     let in_folder = || {
-        std::fs::read_dir(home.join("packs"))
-            .into_iter()
-            .flatten()
-            .flatten()
+        [home.to_path_buf(), crate::vaults::main_home()]
+            .iter()
+            .flat_map(|h| std::fs::read_dir(h.join("packs")).into_iter().flatten().flatten())
             .any(|e| check_folder(&e.path()).is_ok_and(|p| p.aliases.contains_key(name)))
     };
     linked || in_builtin || in_folder()
@@ -292,10 +303,19 @@ mod tests {
         let f = take_front_flags(args(&["--pack", "short", "--json", "up"])).unwrap();
         assert_eq!(
             f,
-            Front { args: args(&["--json", "up"]), pack: Some("short".into()), canonical: false, no_color: false }
+            Front {
+                args: args(&["--json", "up"]),
+                pack: Some("short".into()),
+                canonical: false,
+                no_color: false,
+                vault: None
+            }
         );
         let f = take_front_flags(args(&["--pack=none", "--help", "--canonical"])).unwrap();
-        assert_eq!(f, Front { args: args(&["--help"]), pack: Some("none".into()), canonical: true, no_color: false });
+        assert_eq!(
+            f,
+            Front { args: args(&["--help"]), pack: Some("none".into()), canonical: true, no_color: false, vault: None }
+        );
         let f = take_front_flags(args(&["--no-color", "records", "add", "x", "--no-color", "y"])).unwrap();
         assert!(f.no_color, "taken before the command");
         assert_eq!(f.args, args(&["records", "add", "x", "--no-color", "y"]), "after it, it's the command's");

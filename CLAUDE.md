@@ -701,7 +701,9 @@ ready ──activate──> launching ──all steps ok──> active ──sto
   moves `dirty → ready`. If there is no cleanup script, `dirty` clears only via explicit
   force relaunch or `workspaces.reset`. The same script is what `workspaces.stop` runs on an
   `active` workspace (`active → ready`): it stops the processes the workspace started, never
-  the person's own windows (ADR 0026).
+  the person's own windows (ADR 0026). `workspaces.reset` also takes an `active` workspace: it
+  forgets what the launch started and runs nothing, for a vault copy whose `active` was another
+  folder's launch (ADR 0041). Never a `launching` one: that launch is running now.
 - **Force relaunch is loud.** A distinct op, not a casual flag. Emits
   `workspaces.session.forced` with the prior dirty reason attached, so if it breaks
   something worse there is a trail.

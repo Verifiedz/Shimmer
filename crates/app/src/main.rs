@@ -23,8 +23,22 @@ const LOG_RETAIN_FILES: usize = 8;
 /// success, so it isn't restarted every few seconds while a daemon a command started is running.
 const ALREADY_RUNNING: u8 = 3;
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    // The vault first (ADR 0041 §3): `--vault NAME`, or the one `shimmer vaults use` chose, runs
+    // this binary again with that folder's SHIMMER_HOME and SHIMMER_SOCKET, before any thread exists.
+    if let Some(code) = shimmer_cli::vaults::enter() {
+        return code;
+    }
+    match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(runtime) => runtime.block_on(run()),
+        Err(e) => {
+            eprintln!("shimmer: couldn't start: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> ExitCode {
     // Started through a command-pack link (`ikuzo deep-work`, ADR 0013 §10): the whole line is
     // the alias's, even `ikuzo daemon`. Started as `shimmer`, or anything else, nothing changes.
     if let Some(alias) = std::env::args().next().as_deref().and_then(shimmer_cli::invoked_alias) {
@@ -33,10 +47,19 @@ async fn main() -> ExitCode {
     }
     match std::env::args().nth(1).as_deref() {
         Some("daemon") => {
+            // `--quiet`: a vault copy's first start (ADR 0041 §5a). Nothing else is taken.
+            let quiet = match std::env::args().skip(2).collect::<Vec<_>>().as_slice() {
+                [] => false,
+                [flag] if flag == "--quiet" => true,
+                _ => {
+                    eprintln!("usage: shimmer daemon [--quiet]");
+                    return ExitCode::from(2);
+                }
+            };
             // Autostart (crates/cli/src/autostart.rs) nulls the child's stderr, so this is the
             // only trace of a cold-start crash unless it also lands in a file (ADR 0007).
             let _guard = init_daemon_logging(&shimmer_proto::paths::shimmer_home());
-            run_daemon().await
+            run_daemon(quiet).await
         }
         Some("mockd") => {
             init_stderr_logging();
@@ -63,8 +86,15 @@ fn init_stderr_logging() {
 /// not archived elsewhere. The returned guard must stay alive for the process lifetime or
 /// buffered lines are dropped.
 fn init_daemon_logging(home: &Path) -> Option<WorkerGuard> {
-    let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_filter(env_filter());
-    let logs_dir = home.join("logs");
+    // A start failure is printed to stderr as a plain line already (`run_daemon`); the log file
+    // gets it through tracing, and stderr would otherwise show it twice.
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(env_filter())
+        .with_filter(tracing_subscriber::filter::filter_fn(|m| m.target() != START_FAILED));
+    // Absolute: the daemon moves to `/` once it starts (#266 finding 3), and the appender opens
+    // each day's new file by this path.
+    let logs_dir = std::path::absolute(home).unwrap_or_else(|_| home.to_path_buf()).join("logs");
     // Pre-create the directory: on a fresh `$SHIMMER_HOME`, the appender would otherwise try (and
     // fail, noisily) to list it for pruning before the first file creates it.
     let appender = std::fs::create_dir_all(&logs_dir).map_err(|e| e.to_string()).and_then(|_| {
@@ -78,8 +108,13 @@ fn init_daemon_logging(home: &Path) -> Option<WorkerGuard> {
     match appender {
         Ok(appender) => {
             let (writer, guard) = tracing_appender::non_blocking(appender);
-            let file_layer =
-                tracing_subscriber::fmt::layer().with_ansi(false).with_writer(writer).with_filter(env_filter());
+            // A failed start is always written, whatever RUST_LOG says: auto-start reads the reason
+            // from here (#307's review).
+            let always = format!("{START_FAILED}=error")
+                .parse()
+                .map(|d| env_filter().add_directive(d))
+                .unwrap_or_else(|_| env_filter());
+            let file_layer = tracing_subscriber::fmt::layer().with_ansi(false).with_writer(writer).with_filter(always);
             tracing_subscriber::registry().with(stderr_layer).with(file_layer).init();
             Some(guard)
         }
@@ -94,7 +129,7 @@ fn init_daemon_logging(home: &Path) -> Option<WorkerGuard> {
     }
 }
 
-async fn run_daemon() -> ExitCode {
+async fn run_daemon(quiet: bool) -> ExitCode {
     // Every module the daemon runs. A new module is one more line here.
     let modules: Vec<Arc<dyn Module>> = vec![
         Arc::new(shimmer_records::Records::default()),
@@ -104,6 +139,7 @@ async fn run_daemon() -> ExitCode {
         Arc::new(shimmer_notify::Notify::default()),
     ];
     let mut config = DaemonConfig::from_env();
+    config.quiet = quiet;
     // Run in `/`, never in the folder whatever started it was in (#266 finding 3): a drive the
     // daemon sits in can't be unmounted. Its folder and socket are made absolute first, so a
     // relative `SHIMMER_HOME` still means the folder it named.
@@ -135,6 +171,9 @@ async fn run_daemon() -> ExitCode {
             }
         },
         Err(e) => {
+            // Into the log file too: an auto-started daemon's stderr goes nowhere, and the CLI
+            // quotes this line when it reports the failure (#266 finding 5).
+            tracing::error!(target: START_FAILED, "cannot start daemon: {e}");
             eprintln!("shimmer: cannot start daemon: {e}");
             return ExitCode::FAILURE;
         }
@@ -148,6 +187,10 @@ async fn run_daemon() -> ExitCode {
     daemon.wait().await;
     ExitCode::SUCCESS
 }
+
+/// The log target of a failed start. `crates/cli/src/autostart.rs` finds the line by its words,
+/// "cannot start daemon: ", so they stay the same.
+const START_FAILED: &str = "shimmer::start";
 
 /// How long a daemon that holds the lock may take to start answering. It takes the lock first,
 /// then recovers transactions, opens the index and starts modules, and only then binds the
