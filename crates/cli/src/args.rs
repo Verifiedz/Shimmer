@@ -14,6 +14,7 @@ use crate::queue::{self, QueueCmd};
 use crate::records::{self, RecordsCmd};
 use crate::scheduler::{self, SchedulerCmd};
 use crate::startup::{self, StartupCmd};
+use crate::vaults::{self, VaultsCmd};
 use crate::workspaces::{self, WorkspacesCmd};
 
 pub const USAGE: &str = "usage: shimmer [--socket PATH] [--json] <command>
@@ -32,6 +33,8 @@ commands:
   doctor                check everything and say how to fix what's wrong
   packs …               command packs: themed aliases for these commands (shimmer packs --help)
   startup …             start the daemon every time you log in (shimmer startup --help)
+  vaults …              separate Shimmer folders to switch between, e.g. one to test in
+                        (shimmer vaults --help)
   completions SHELL     print Tab completion for bash, zsh or fish, to load in your shell:
                         source <(shimmer completions zsh), e.g. in ~/.zshrc
   shutdown              stop the daemon
@@ -49,6 +52,8 @@ options:
   --socket PATH         talk to this socket instead of the default; never auto-starts
   --json                print the daemon's raw JSON instead of formatted output
   --pack NAME           use this command pack for one command ('none' for plain names);
+                        goes before the command
+  --vault NAME          run this command in another vault (shimmer vaults --help);
                         goes before the command
   --no-color            no colour (also when NO_COLOR is set, or output isn't a terminal);
                         goes before the command
@@ -79,6 +84,7 @@ pub enum Command {
     Packs(PacksCmd),
     Notify(NotifyCmd),
     Startup(StartupCmd),
+    Vaults(VaultsCmd),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -128,6 +134,7 @@ impl Args {
             (true, Some("notify")) => Command::Notify(NotifyCmd::Help),
             (true, Some("doctor")) => Command::DoctorHelp,
             (true, Some("startup")) => Command::Startup(StartupCmd::Help),
+            (true, Some("vaults")) => Command::Vaults(VaultsCmd::Help),
             (true, _) => Command::Help,
             (false, _) => command(words)?,
         };
@@ -171,6 +178,9 @@ fn command(words: Vec<String>) -> Result<Command, String> {
     }
     if word == "startup" {
         return startup::parse(rest).map(Command::Startup);
+    }
+    if word == "vaults" {
+        return vaults::parse(rest).map(Command::Vaults);
     }
     if word == "doctor" {
         return crate::doctor::parse(rest).map(|()| Command::Doctor);
