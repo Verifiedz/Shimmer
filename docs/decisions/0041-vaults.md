@@ -164,12 +164,16 @@ newer Shimmer can share the file.
      `<target>.copying` gets its own daemon (ADR 0039: its own socket, by its own path), started quiet,
      and the CLI switches things off **through their own ops**, in this order: `fetchers.disable` for
      every enabled source (#320; it removes the source's own next-run schedule, so the source and its
-     schedule agree), `automations.disable` for every enabled rule, then `scheduler.disable` for every
-     schedule still enabled, which includes the one-time schedules modules added for themselves
-     (`ctx.schedules`: an automation's delayed action, ADR 0035 §5.6), `notify.pause {"all": true}`
-     (held until `notify resume`), and `workspaces.reset` for any workspace whose copied state isn't
-     `ready` (it can't have launched anything in the copy; see below). Then it stops that daemon.
-     `--live` skips this step.
+     schedule agree), `automations.disable` for every enabled rule of the person's, then
+     `scheduler.disable` for every schedule still enabled that a person or a rule made, which includes
+     the one-time schedules modules added (`ctx.schedules`: an automation's delayed action, ADR 0035
+     §5.6), `notify.pause {"all": true}` (held until `notify resume`), and `workspaces.reset` for any
+     workspace whose copied state is `active` or `dirty` (it can't have launched anything in the copy;
+     see below). Then it stops that daemon. `--live` skips this step.
+
+     Left on, as Shimmer's own (found building part 3): the built-in alert rules, which only send
+     notifications and those are paused, and the schedules a module declares for itself (notify's
+     `notify.flush`), which are its plumbing and which a person wouldn't know to turn back on.
   4. Only then it renames `<target>.copying` to the target and registers NEW (`made = true`). An
      interrupted copy, at any step, leaves no registered vault, only a `.copying` folder, removed by the
      next `copy` to that name. The `✓` line says what was switched off and how to turn it back on.
