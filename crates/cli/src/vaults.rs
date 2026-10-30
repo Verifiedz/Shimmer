@@ -30,6 +30,11 @@ commands:
   status                     which vault your commands use now, and why
   new NAME [--path DIR]      a new, empty vault, beside your main folder unless --path says
                              where; DIR must be empty, or already a Shimmer folder
+  copy VAULT NEW [--path DIR] [--live]
+                             a new vault with VAULT's data, to try things on safely.
+                             Its schedules, automations and sources start switched off
+                             and its notifications paused, so nothing runs twice;
+                             --live: leave them as they are
   use VAULT                  make plain commands use it; 'use main' goes back
   rename VAULT NEW           its name only; the folder stays where it is
   remove VAULT               forget it and stop its daemon; its files are kept
@@ -50,6 +55,7 @@ pub enum VaultsCmd {
     Show { name: String },
     Status,
     New { name: String, path: Option<PathBuf> },
+    Copy { name: String, new: String, path: Option<PathBuf>, live: bool },
     Use { name: String },
     Rename { name: String, new: String },
     Remove { name: String },
@@ -64,6 +70,7 @@ pub fn parse(rest: Vec<String>) -> std::result::Result<VaultsCmd, String> {
     let (options, switches): (&[&'static str], &[&'static str]) = match verb.as_str() {
         "list" => (&[], &["--removed"]),
         "new" => (&["--path"], &[]),
+        "copy" => (&["--path"], &["--live"]),
         "purge" => (&[], &["--yes"]),
         _ => (&[], &[]),
     };
@@ -77,6 +84,12 @@ pub fn parse(rest: Vec<String>) -> std::result::Result<VaultsCmd, String> {
         ("status", []) => Ok(VaultsCmd::Status),
         ("show", [name]) => Ok(VaultsCmd::Show { name: name.clone() }),
         ("new", [name]) => Ok(VaultsCmd::New { name: name.clone(), path: flags.value("--path").map(PathBuf::from) }),
+        ("copy", [name, new]) => Ok(VaultsCmd::Copy {
+            name: name.clone(),
+            new: new.clone(),
+            path: flags.value("--path").map(PathBuf::from),
+            live: flags.has("--live"),
+        }),
         ("use", [name]) => Ok(VaultsCmd::Use { name: name.clone() }),
         ("rename", [name, new]) => Ok(VaultsCmd::Rename { name: name.clone(), new: new.clone() }),
         ("remove", [name]) => Ok(VaultsCmd::Remove { name: name.clone() }),
@@ -86,6 +99,7 @@ pub fn parse(rest: Vec<String>) -> std::result::Result<VaultsCmd, String> {
         ("show" | "use" | "remove", _) => Err(usage("VAULT")),
         ("new", _) => Err(usage("NAME [--path DIR]")),
         ("rename", _) => Err(usage("VAULT NEW")),
+        ("copy", _) => Err(usage("VAULT NEW [--path DIR] [--live]")),
         ("restore", _) => Err(usage("REMOVED")),
         ("purge", _) => Err(usage("[REMOVED] [--yes]")),
         (other, _) => Err(crate::suggest::unknown_command(Some("vaults"), other, USAGE)),
@@ -378,6 +392,9 @@ pub async fn run(cmd: &VaultsCmd, json: bool, env: &Env, prompt: &mut dyn Prompt
         VaultsCmd::Show { name } => show(name, env).await.map(|(d, t)| out(d, t)),
         VaultsCmd::Status => status(env).await.map(|(d, t)| out(d, t)),
         VaultsCmd::New { name, path } => new(name, path.as_deref(), env).map(|(d, t)| out(d, t)),
+        VaultsCmd::Copy { name, new, path, live } => {
+            copy(name, new, path.as_deref(), *live, env).await.map(|(d, t)| out(d, t))
+        }
         VaultsCmd::Use { name } => use_vault(name, env).map(|(d, t)| out(d, t)),
         VaultsCmd::Rename { name, new } => rename(name, new, env).map(|(d, t)| out(d, t)),
         VaultsCmd::Remove { name } => remove(name, env).await.map(|(d, t)| out(d, t)),
@@ -507,22 +524,7 @@ fn because(c: &Choice, saved: &Settings) -> String {
 fn new(name: &str, path: Option<&Path>, env: &Env) -> Result<(Value, String)> {
     let (file, mut saved) = env.load()?;
     check_new_name(name, &saved)?;
-    let path = match path {
-        Some(p) => std::path::absolute(p).map_err(|e| Error::invalid_params(format!("{}: {e}", p.display())))?,
-        None => default_path(name, &env.main),
-    };
-    let resolved = paths::resolve(&path);
-    let main = paths::resolve(&env.main);
-    if resolved.starts_with(&main) {
-        return Err(Error::invalid_params(format!(
-            "{} is inside your main folder ({}), which is meant to be synced with git; pick a folder outside it",
-            path.display(),
-            env.main.display()
-        )));
-    }
-    if let Some(other) = name_of(&path, &saved, &env.main) {
-        return Err(Error::conflict(format!("{} is already the vault '{other}'", path.display())));
-    }
+    let path = target_path(name, path, &saved, env)?;
     let made = if !path.exists() {
         std::fs::create_dir_all(&path)
             .map_err(|e| Error::unavailable(format!("couldn't make {}: {e}", path.display())))?;
@@ -548,6 +550,27 @@ fn new(name: &str, path: Option<&Path>, env: &Env) -> Result<(Value, String)> {
         path.display()
     );
     Ok((json!({"name": name, "path": path, "made": made}), text))
+}
+
+/// Where a new vault goes: `--path` made absolute, else beside main. Never inside main (its files
+/// would be synced with main's, and main's daemon would sit around another vault's), and never a
+/// folder that's already a vault.
+fn target_path(name: &str, path: Option<&Path>, saved: &Settings, env: &Env) -> Result<PathBuf> {
+    let path = match path {
+        Some(p) => std::path::absolute(p).map_err(|e| Error::invalid_params(format!("{}: {e}", p.display())))?,
+        None => default_path(name, &env.main),
+    };
+    if paths::resolve(&path).starts_with(paths::resolve(&env.main)) {
+        return Err(Error::invalid_params(format!(
+            "{} is inside your main folder ({}), which is meant to be synced with git; pick a folder outside it",
+            path.display(),
+            env.main.display()
+        )));
+    }
+    if let Some(other) = name_of(&path, saved, &env.main) {
+        return Err(Error::conflict(format!("{} is already the vault '{other}'", path.display())));
+    }
+    Ok(path)
 }
 
 fn check_new_name(name: &str, saved: &Settings) -> Result<()> {
@@ -740,6 +763,286 @@ fn is_empty(dir: &Path) -> bool {
 fn login_vault(saved: &Settings) -> Option<PathBuf> {
     let text = std::fs::read_to_string(&saved.startup.as_ref()?.file).ok()?;
     crate::startup::pinned_home(&text)
+}
+
+// ---------------------------------------------------------------- copy (§5)
+
+/// What a copy leaves out: derived or tied to this machine (§5). `.staging/` is copied, so the copy's
+/// own recovery finishes any save that was committed, and keeps aside one that's damaged (ADR 0040).
+fn left_out(name: &str) -> bool {
+    matches!(name, "cache" | "logs" | "daemon.sock" | ".daemon.lock") || name.starts_with("index.sqlite")
+}
+
+/// What `copy` switched off in the copy, through each feature's own ops.
+#[derive(Debug, Default)]
+struct SwitchedOff {
+    sources: Vec<String>,
+    rules: Vec<String>,
+    schedules: Vec<String>,
+    notify_paused: bool,
+    workspaces: Vec<String>,
+}
+
+async fn copy(name: &str, new: &str, path: Option<&Path>, live: bool, env: &Env) -> Result<(Value, String)> {
+    let (file, saved) = env.load()?;
+    let source = path_of(name, &saved, &env.main)?;
+    if !looks_like_shimmer(&source) {
+        return Err(Error::not_found(format!("vault '{name}' has nothing to copy yet ({})", source.display())));
+    }
+    check_new_name(new, &saved)?;
+    let target = target_path(new, path, &saved, env)?;
+    if paths::resolve(&target).starts_with(paths::resolve(&source)) {
+        return Err(Error::invalid_params(format!("{} is inside the vault being copied", target.display())));
+    }
+    if target.exists() && !(target.is_dir() && is_empty(&target)) {
+        return Err(Error::invalid_params(format!("{} already exists and isn't empty", target.display())));
+    }
+    // Built beside the target and renamed into place last, so an interrupted copy never leaves a
+    // vault that's registered, or one that isn't switched off yet (Wasay on #312).
+    let staging = target.with_file_name(format!(
+        "{}.copying",
+        target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    ));
+    if staging.exists() {
+        // An earlier copy to this name that was interrupted: only ever something this made.
+        if !(looks_like_shimmer(&staging) || is_empty(&staging)) || stop_daemon(&staging).await.is_err() {
+            return Err(Error::conflict(format!(
+                "{} is in the way and isn't a copy Shimmer left behind; move it",
+                staging.display()
+            )));
+        }
+        std::fs::remove_dir_all(&staging).map_err(|e| io_error("remove", &staging, e))?;
+    }
+
+    // One writer (CLAUDE.md §2): VAULT's daemon is stopped and its lock held, so none can start
+    // there mid-copy. For those moments there is no writer at all.
+    stop_daemon(&source).await?;
+    {
+        // Held until the copy is made, then let go.
+        let _lock = hold_lock(&source, name).await?;
+        let copied = copy_tree(&source, &staging, true);
+        if let Err(e) = copied {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+    }
+
+    let off = if live {
+        None
+    } else {
+        match switch_off(&staging).await {
+            Ok(off) => Some(off),
+            Err(e) => {
+                let _ = stop_daemon(&staging).await;
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(Error {
+                    message: format!("couldn't switch the copy off, so it wasn't made: {}", e.message),
+                    ..e
+                });
+            }
+        }
+    };
+
+    if target.exists() {
+        std::fs::remove_dir(&target).map_err(|e| io_error("replace", &target, e))?;
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| io_error("make", parent, e))?;
+    }
+    std::fs::rename(&staging, &target).map_err(|e| io_error("move into place", &target, e))?;
+    // Read again: `cli.toml` may have changed while the copy ran.
+    let (_, mut saved) = env.load()?;
+    saved.vaults.insert(new.to_owned(), Vault { path: target.clone(), made: true });
+    save(&file, &saved)?;
+
+    let mut text = format!("✓ copied {name} to {} at {}", paint(Role::Name, new), target.display());
+    let data_off = match &off {
+        None => {
+            text.push_str(
+                "
+  left on (--live): its schedules, automations and sources run when its daemon starts",
+            );
+            Value::Null
+        }
+        Some(off) => {
+            text.push_str(&describe_off(new, off));
+            json!({"schedules": off.schedules, "rules": off.rules, "sources": off.sources,
+                   "notify_paused": off.notify_paused, "workspaces_reset": off.workspaces})
+        }
+    };
+    let data = json!({"name": new, "from": name, "path": target, "made": true, "live": live, "switched_off": data_off});
+    Ok((data, text))
+}
+
+/// Take `home`'s `.daemon.lock`, so no daemon can start there. A daemon that was just told to stop
+/// lets go of it a moment after its socket goes, so this waits a little, as a starting daemon does.
+async fn hold_lock(home: &Path, name: &str) -> Result<std::fs::File> {
+    let lock = std::fs::File::create(home.join(".daemon.lock")).map_err(|e| io_error("lock", home, e))?;
+    let deadline = tokio::time::Instant::now() + LOCK_WAIT;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(lock),
+            Err(std::fs::TryLockError::WouldBlock) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(Error::conflict(format!("a daemon is running in '{name}' and didn't stop; try again")))
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(io_error("lock", home, e)),
+        }
+    }
+}
+
+/// How long `copy` waits for a stopped daemon's lock.
+const LOCK_WAIT: Duration = Duration::from_secs(5);
+
+fn io_error(what: &str, path: &Path, e: std::io::Error) -> Error {
+    Error::unavailable(format!("couldn't {what} {}: {e}", path.display()))
+}
+
+/// Copy `from` into a new folder `to`: files, folders and symlinks (as links, never followed). At
+/// the top, [`left_out`] isn't copied.
+fn copy_tree(from: &Path, to: &Path, top: bool) -> Result<()> {
+    std::fs::create_dir_all(to).map_err(|e| io_error("make", to, e))?;
+    for entry in std::fs::read_dir(from).map_err(|e| io_error("read", from, e))? {
+        let entry = entry.map_err(|e| io_error("read", from, e))?;
+        let name = entry.file_name();
+        if top && left_out(&name.to_string_lossy()) {
+            continue;
+        }
+        let (src, dst) = (entry.path(), to.join(&name));
+        let kind = entry.file_type().map_err(|e| io_error("read", &src, e))?;
+        if kind.is_symlink() {
+            let target = std::fs::read_link(&src).map_err(|e| io_error("read", &src, e))?;
+            std::os::unix::fs::symlink(target, &dst).map_err(|e| io_error("copy", &src, e))?;
+        } else if kind.is_dir() {
+            copy_tree(&src, &dst, false)?;
+        } else if kind.is_file() {
+            std::fs::copy(&src, &dst).map_err(|e| io_error("copy", &src, e))?;
+        }
+        // Sockets and other special files aren't data: left out.
+    }
+    Ok(())
+}
+
+/// Start the copy's daemon quiet (§5a), switch off everything that would act by itself, through
+/// each feature's own ops (the daemon never edits a module's files), then stop it. An op that isn't
+/// in the manifest is skipped: a module that isn't installed has nothing to switch off.
+async fn switch_off(home: &Path) -> Result<SwitchedOff> {
+    let socket = paths::default_socket(home);
+    let exe = crate::daemon_exe()?;
+    let mut c = crate::autostart::start_quiet(&exe, home, &socket).await?;
+    let manifest = c.call(ops::CORE_MANIFEST, json!({})).await?;
+    let has = |op: &str| {
+        manifest["modules"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|m| m["commands"].as_array().into_iter().flatten())
+            .any(|cmd| cmd["op"] == op)
+    };
+    // On, and not Shimmer's own: built-in alerts only send notifications, which are paused, and a
+    // schedule a module declares for itself (notify's flush) is its plumbing, which a person
+    // wouldn't know to turn back on.
+    let enabled = |list: &Value, key: &str| -> Vec<String> {
+        list[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|x| x["enabled"] == true && x["builtin"] != true && x["source"]["type"] != "module")
+            .filter_map(|x| x["id"].as_str().map(str::to_owned))
+            .collect()
+    };
+    let mut off = SwitchedOff::default();
+    // Sources first: disabling one also removes its own next-run schedule (#320).
+    if has("fetchers.disable") {
+        for id in enabled(&c.call("fetchers.list", json!({})).await?, "sources") {
+            c.call("fetchers.disable", json!({"id": id})).await?;
+            off.sources.push(id);
+        }
+    }
+    if has("automations.disable") {
+        for id in enabled(&c.call("automations.list", json!({})).await?, "rules") {
+            c.call("automations.disable", json!({"id": id})).await?;
+            off.rules.push(id);
+        }
+    }
+    // Every schedule still on, including the one-time ones modules added for you (an automation's
+    // delayed action, ADR 0035 §5.6: source "added").
+    for id in enabled(&c.call("scheduler.list", json!({})).await?, "triggers") {
+        c.call("scheduler.disable", json!({"trigger_id": id})).await?;
+        off.schedules.push(id);
+    }
+    if has("notify.pause") {
+        c.call("notify.pause", json!({"all": true})).await?;
+        off.notify_paused = true;
+    }
+    // A copied `active` was the source's launch; `launching` was made `dirty` as it started.
+    if has("workspaces.reset") {
+        let list = c.call("workspaces.list", json!({})).await?;
+        for w in list["workspaces"].as_array().into_iter().flatten() {
+            if matches!(w["state"].as_str(), Some("active" | "dirty")) {
+                if let Some(id) = w["id"].as_str() {
+                    c.call("workspaces.reset", json!({"id": id})).await?;
+                    off.workspaces.push(id.to_owned());
+                }
+            }
+        }
+    }
+    drop(c);
+    stop_daemon(home).await?;
+    Ok(off)
+}
+
+/// The lines after `✓ copied …`: what was switched off, and how to turn each back on.
+fn describe_off(new: &str, off: &SwitchedOff) -> String {
+    let n = |v: &[String], one: &str, many: &str| match v.len() {
+        1 => format!("1 {one}"),
+        k => format!("{k} {many}"),
+    };
+    let mut parts = Vec::new();
+    if !off.schedules.is_empty() {
+        parts.push(n(&off.schedules, "schedule", "schedules"));
+    }
+    if !off.rules.is_empty() {
+        parts.push(n(&off.rules, "automation", "automations"));
+    }
+    if !off.sources.is_empty() {
+        parts.push(n(&off.sources, "fetcher source", "fetcher sources"));
+    }
+    let mut text = String::new();
+    if parts.is_empty() {
+        text.push_str("\n  nothing in it was switched on");
+    } else {
+        text.push_str(&format!("\n  switched off, so nothing runs twice: {}", parts.join(", ")));
+    }
+    if off.notify_paused {
+        text.push_str("\n  notifications paused");
+    }
+    if !off.workspaces.is_empty() {
+        text.push_str(&format!(
+            "\n  {} reset to ready (it was the original's launch)",
+            n(&off.workspaces, "workspace", "workspaces")
+        ));
+    }
+    let mut back = Vec::new();
+    if !off.schedules.is_empty() {
+        back.push("scheduler enable ID");
+    }
+    if !off.rules.is_empty() {
+        back.push("automations enable ID");
+    }
+    if !off.sources.is_empty() {
+        back.push("fetchers enable ID");
+    }
+    if off.notify_paused {
+        back.push("notify resume");
+    }
+    if !back.is_empty() {
+        let hint = format!("→ turn things back on in it with: shimmer --vault {new} {}", back.join(", "));
+        text.push_str(&format!("\n  {}", paint(Role::Hint, &hint)));
+    }
+    text
 }
 
 // ---------------------------------------------------------------- daemons
@@ -953,6 +1256,18 @@ mod tests {
     }
 
     #[test]
+    fn a_copy_leaves_out_only_whats_derived_or_tied_to_the_machine() {
+        for out in
+            ["index.sqlite", "index.sqlite-wal", "index.sqlite-shm", "cache", "logs", "daemon.sock", ".daemon.lock"]
+        {
+            assert!(left_out(out), "{out}");
+        }
+        for kept in ["data", "events", ".staging", "config.toml", ".gitignore", "packs"] {
+            assert!(!left_out(kept), "{kept}");
+        }
+    }
+
+    #[test]
     fn commands_parse() {
         let p = |w: &[&str]| parse(s(w));
         assert_eq!(p(&[]), Ok(VaultsCmd::List { removed: false }));
@@ -964,6 +1279,11 @@ mod tests {
         assert_eq!(p(&["rename", "a", "b"]), Ok(VaultsCmd::Rename { name: "a".into(), new: "b".into() }));
         assert_eq!(p(&["purge"]), Ok(VaultsCmd::Purge { name: None, yes: false }));
         assert_eq!(p(&["purge", "old", "--yes"]), Ok(VaultsCmd::Purge { name: Some("old".into()), yes: true }));
+        assert_eq!(
+            p(&["copy", "main", "play", "--live"]),
+            Ok(VaultsCmd::Copy { name: "main".into(), new: "play".into(), path: None, live: true })
+        );
+        assert!(p(&["copy", "main"]).unwrap_err().contains("usage: shimmer vaults copy VAULT NEW"));
         assert!(p(&["use"]).unwrap_err().contains("usage: shimmer vaults use VAULT"));
         assert!(p(&["list", "--yes"]).is_err());
         assert!(p(&["bogus"]).is_err());

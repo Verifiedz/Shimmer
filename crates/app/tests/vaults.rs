@@ -189,3 +189,109 @@ fn completion_offers_vault_names() {
     let out = m.ok(&["__complete", "shimmer", "--vault", ""]);
     assert!(out.contains("main") && out.contains("play"), "{out}");
 }
+
+const RULE: &str = r#"
+[rule]
+label = "Tell me"
+on = "records.item.completed"
+
+[[do]]
+op = "records.list"
+params = { collection = "leetcode" }
+"#;
+
+const SITE: &str = "[workspace]\nlabel = \"Site\"\n\n[[step]]\nname = \"setup\"\nmode = \"supervised\"\ntimeout_s = 30\n\n[cleanup]\ntimeout_s = 30\n";
+
+/// `--json` output of `args` in `vault`.
+fn json_in(m: &Machine, vault: &str, args: &[&str]) -> serde_json::Value {
+    let mut all = vec!["--vault", vault];
+    all.extend_from_slice(args);
+    all.push("--json");
+    serde_json::from_str(&m.ok(&all)).unwrap()
+}
+
+/// `(id, enabled)` of every schedule a person or a rule made, and of notify's own flush.
+fn schedules(m: &Machine, vault: &str) -> (Vec<bool>, Option<bool>) {
+    let list = json_in(m, vault, &["scheduler", "list"]);
+    let triggers = list["triggers"].as_array().unwrap();
+    let mine = triggers.iter().filter(|t| t["source"]["type"] != "module").map(|t| t["enabled"] == true).collect();
+    let flush = triggers.iter().find(|t| t["id"] == "notify.flush").map(|t| t["enabled"] == true);
+    (mine, flush)
+}
+
+/// ADR 0041 §5: a copy has the data, leaves out what's derived or tied to the machine, and starts
+/// with everything that acts by itself switched off, so nothing runs twice.
+#[test]
+fn a_copy_has_the_data_and_starts_switched_off() {
+    let m = Machine::new();
+    let main = m.main();
+    m.ok(&["records", "add", "leetcode", "--title", "Two Sum"]);
+    let schedule =
+        r#"{"schedule":{"every":3600},"op":"records.list","params":{"collection":"leetcode"},"catch_up":"skip"}"#;
+    m.ok(&["call", "scheduler.add", schedule]);
+    let rule = m.dir.path().join("rule.toml");
+    std::fs::write(&rule, RULE).unwrap();
+    m.ok(&["automations", "new", "told", "--file", rule.to_str().unwrap()]);
+    // An active workspace whose cleanup leaves a mark: in the copy it must never run.
+    let mark = m.dir.path().join("cleanup-ran");
+    let site = main.join("data/workspaces/site");
+    std::fs::create_dir_all(site.join("steps")).unwrap();
+    std::fs::write(site.join("workspace.toml"), SITE).unwrap();
+    std::fs::write(site.join("steps/01-setup.sh"), "true\n").unwrap();
+    std::fs::write(site.join("cleanup.sh"), format!("touch '{}'\n", mark.display())).unwrap();
+    std::fs::write(site.join("state.toml"), "state = \"active\"\n").unwrap();
+    std::fs::create_dir_all(main.join("logs")).unwrap();
+    std::fs::write(main.join("logs/marker.txt"), "main's own log").unwrap();
+    // What an interrupted copy to this name leaves: removed by the next one.
+    let leftover = m.vault("play").with_file_name("play.copying");
+    std::fs::create_dir_all(leftover.join("data")).unwrap();
+    std::fs::write(leftover.join(".gitignore"), "").unwrap();
+
+    let out = m.ok(&["vaults", "copy", "main", "play"]);
+    assert!(out.contains("✓ copied main to play"), "{out}");
+    assert!(out.contains("1 schedule, 1 automation") && out.contains("notifications paused"), "{out}");
+    assert!(out.contains("1 workspace reset to ready"), "{out}");
+    assert!(!leftover.exists(), "the leftover .copying folder is gone");
+    let play = m.vault("play");
+    assert_eq!(m.records(&play).len(), 1, "the data came");
+    assert!(!play.join("logs/marker.txt").exists(), "logs stay with the machine");
+
+    // Off in the copy, as they were in main; Shimmer's own plumbing left alone.
+    assert_eq!(schedules(&m, "play"), (vec![false], Some(true)));
+    assert_eq!(schedules(&m, "main"), (vec![true], Some(true)));
+    let rules = json_in(&m, "play", &["automations", "list"]);
+    let rules = rules["rules"].as_array().unwrap();
+    assert!(rules.iter().any(|r| r["id"] == "told" && r["enabled"] == false), "{rules:?}");
+    assert!(rules.iter().filter(|r| r["builtin"] == true).all(|r| r["enabled"] == true), "built-in alerts left on");
+    assert!(json_in(&m, "play", &["notify", "status"])["paused"].is_object(), "paused in the copy");
+    assert!(json_in(&m, "main", &["notify", "status"])["paused"].is_null(), "not in main");
+    assert_eq!(json_in(&m, "play", &["workspaces", "show", "site"])["state"], "ready");
+    assert_eq!(json_in(&m, "main", &["workspaces", "show", "site"])["state"], "active");
+    assert!(!mark.exists(), "the copy never ran the original's cleanup");
+
+    // Two vaults from here on: a change in one isn't in the other.
+    m.ok(&["--vault", "play", "records", "add", "leetcode", "--title", "Only In Play"]);
+    assert_eq!((m.records(&main).len(), m.records(&play).len()), (1, 2));
+
+    // --live leaves things as they were.
+    let out = m.ok(&["vaults", "copy", "main", "live", "--live"]);
+    assert!(out.contains("left on (--live)"), "{out}");
+    assert_eq!(schedules(&m, "live"), (vec![true], Some(true)));
+}
+
+#[test]
+fn copy_refuses_what_it_shouldnt_touch() {
+    let m = Machine::new();
+    m.ok(&["vaults", "new", "empty"]);
+    let o = m.run(&["vaults", "copy", "empty", "x"]);
+    assert!(stderr(&o).contains("nothing to copy yet"), "{}", stderr(&o));
+    m.ok(&["ping"]);
+    let o = m.run(&["vaults", "copy", "main", "empty"]);
+    assert!(stderr(&o).contains("already a vault named 'empty'"), "{}", stderr(&o));
+    let busy = m.dir.path().join("busy");
+    std::fs::create_dir_all(&busy).unwrap();
+    std::fs::write(busy.join("notes.txt"), "mine").unwrap();
+    let o = m.run(&["vaults", "copy", "main", "x", "--path", busy.to_str().unwrap()]);
+    assert!(stderr(&o).contains("isn't empty"), "{}", stderr(&o));
+    assert_eq!(std::fs::read_to_string(busy.join("notes.txt")).unwrap(), "mine");
+}

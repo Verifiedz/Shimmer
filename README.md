@@ -299,6 +299,8 @@ folder you already have.
 ```sh
 shimmer vaults new play             # a new, empty vault beside your main folder
 shimmer --vault play records list   # one command in it
+shimmer vaults copy main sandbox    # a copy of your data to try things on, with schedules and
+                                    # automations switched off and notifications paused
 shimmer vaults use play             # plain commands use it from now on; 'vaults use main' goes back
 shimmer vaults status               # which vault you're in, and why
 shimmer vaults remove play          # forget it (files kept); 'vaults restore play' brings it back
