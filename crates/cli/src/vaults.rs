@@ -1076,8 +1076,10 @@ async fn stop_daemon(home: &Path) -> Result<bool> {
     client.call(ops::CORE_SHUTDOWN, json!({})).await?;
     let deadline = tokio::time::Instant::now() + STOP_WAIT;
     loop {
+        // Not answering isn't stopped yet: a daemon stops listening first, then finishes what it
+        // was running, and only then lets go of its lock. Until then it may still write here.
         match Client::connect_for(&socket, home).await {
-            Err(e) if e.nobody_listening() => return Ok(true),
+            Err(e) if e.nobody_listening() && lock_free(home) => return Ok(true),
             _ if tokio::time::Instant::now() >= deadline => {
                 return Err(Error::unavailable(format!(
                     "asked the daemon for {} to stop, but it still answers after {}s",
@@ -1087,6 +1089,19 @@ async fn stop_daemon(home: &Path) -> Result<bool> {
             }
             _ => tokio::time::sleep(Duration::from_millis(100)).await,
         }
+    }
+}
+
+/// Whether no daemon holds `home`'s `.daemon.lock`: none is running there, or one is done. Only
+/// looks: the lock is let go at once. No lock file means no daemon ever ran there.
+fn lock_free(home: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(home.join(".daemon.lock")) else { return true };
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = file.unlock();
+            true
+        }
+        Err(_) => false,
     }
 }
 
