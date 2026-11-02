@@ -719,8 +719,10 @@ async fn purge(name: Option<&str>, yes: bool, env: &Env, prompt: &mut dyn Prompt
     let (mut deleted, mut forgotten) = (Vec::new(), Vec::new());
     for (n, v) in &which {
         if deletable(v) {
-            // Its daemon goes first, and the folder once its socket has (§5).
+            // Its daemon goes first, and its lock is held while the folder goes, so none can start
+            // there mid-delete: still one writer (CLAUDE.md §2, ADR 0041).
             stop_daemon(&v.path).await?;
+            let _lock = hold_lock(&v.path, n).await?;
             std::fs::remove_dir_all(&v.path)
                 .map_err(|e| Error::unavailable(format!("couldn't delete {}: {e}", v.path.display())))?;
             deleted.push(n.clone());
@@ -784,7 +786,11 @@ struct SwitchedOff {
 }
 
 async fn copy(name: &str, new: &str, path: Option<&Path>, live: bool, env: &Env) -> Result<(Value, String)> {
-    let (file, saved) = env.load()?;
+    let (file, _) = env.load()?;
+    // One copy at a time, held until the new vault is registered: two copies to the same name
+    // would otherwise race between the checks below and the rename (#328's review).
+    let _one_copy = one_copy_at_a_time(&file)?;
+    let (_, saved) = env.load()?;
     let source = path_of(name, &saved, &env.main)?;
     if !looks_like_shimmer(&source) {
         return Err(Error::not_found(format!("vault '{name}' has nothing to copy yet ({})", source.display())));
@@ -890,6 +896,23 @@ async fn hold_lock(home: &Path, name: &str) -> Result<std::fs::File> {
             }
             Err(std::fs::TryLockError::Error(e)) => return Err(io_error("lock", home, e)),
         }
+    }
+}
+
+/// The lock beside `cli.toml` that `copy` holds from its first check to registering the vault.
+/// Another copy that finds it held is refused at once, never left waiting.
+fn one_copy_at_a_time(cli_toml: &Path) -> Result<std::fs::File> {
+    let path = cli_toml.with_file_name("vaults-copy.lock");
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| io_error("make", dir, e))?;
+    }
+    let lock = std::fs::File::create(&path).map_err(|e| io_error("lock", &path, e))?;
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            Err(Error::conflict("another 'shimmer vaults copy' is running; try again when it's done"))
+        }
+        Err(std::fs::TryLockError::Error(e)) => Err(io_error("lock", &path, e)),
     }
 }
 
@@ -1268,6 +1291,17 @@ mod tests {
         let main = tmp.path().join("main");
         assert_eq!(plan(&s(&["ping"]), true, None, Some(&toml), &main), Plan::Stay);
         assert!(matches!(plan(&s(&["--vault", "x", "ping"]), true, None, Some(&toml), &main), Plan::Fail(_)));
+    }
+
+    #[test]
+    fn only_one_copy_runs_at_a_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cli_toml = tmp.path().join("shimmer/cli.toml");
+        let first = one_copy_at_a_time(&cli_toml).unwrap();
+        let e = one_copy_at_a_time(&cli_toml).unwrap_err();
+        assert_eq!(e.code, shimmer_core::ErrorCode::Conflict, "{}", e.message);
+        drop(first);
+        assert!(one_copy_at_a_time(&cli_toml).is_ok(), "free again once the first is done");
     }
 
     #[test]
