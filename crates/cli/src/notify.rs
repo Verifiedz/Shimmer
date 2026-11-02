@@ -656,9 +656,11 @@ fn status(d: &Value, now: DateTime<Utc>) -> String {
     let paused = match d["paused"].as_object() {
         None => "no".to_owned(),
         Some(p) => {
-            let till = when::timestamp(&p["until"].clone())
+            // No `until` when paused until resumed: `get`, since indexing a map panics on a missing key.
+            let till = when::timestamp(&p.get("until").cloned().unwrap_or_default())
                 .map_or("until you resume".into(), |t| format!("until {} ({})", local_time(t), when::relative(t, now)));
-            let all = if p["all"] == true { ", everything waits" } else { ", high priority comes through" };
+            let all =
+                if p.get("all") == Some(&json!(true)) { ", everything waits" } else { ", high priority comes through" };
             paint(Role::Warning, &format!("yes, {till}{all}"))
         }
     };
@@ -883,6 +885,20 @@ mod tests {
             resent(&json!({"items": [{"state": "delivered"}, {"state": "failed"}]})),
             "✓ resent 2: 1 delivered, 1 still failed (shimmer notify list --failed)"
         );
+    }
+
+    /// Paused until resumed: the daemon sends no `until`. Reading it must not panic (found by
+    /// `vaults copy`, which pauses a copy's notify that way).
+    #[test]
+    fn paused_until_resumed_reads_plainly() {
+        crate::style::init(true, true, &Default::default());
+        let now: DateTime<Utc> = "2026-10-16T14:00:00Z".parse().unwrap();
+        let s = status(
+            &json!({"counts": {"total": 0}, "cap": 2000, "paused": {"since": "2026-10-16T13:00:00Z", "all": true},
+                    "quiet": {}, "quiet_now": false, "sinks": [], "settings_problem": null}),
+            now,
+        );
+        assert!(s.contains("paused     yes, until you resume, everything waits"), "{s}");
     }
 
     #[test]
