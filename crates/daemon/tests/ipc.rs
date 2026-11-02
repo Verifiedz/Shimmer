@@ -330,6 +330,7 @@ async fn second_daemon_on_the_same_home_is_refused() {
             socket: other.path().join("b.sock"),
             clock: Clock::system(),
             scheduler_tick: Duration::from_secs(1),
+            quiet: false,
         },
         vec![],
     )

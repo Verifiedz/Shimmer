@@ -10,6 +10,7 @@ mod backend;
 mod bus;
 mod config;
 mod core;
+mod delivery;
 mod desktop;
 mod http_backend;
 mod indexer;
@@ -32,7 +33,6 @@ use std::time::Duration;
 use shimmer_core::{Clock, Emitter, Error, Module, ModuleId, NamespacedStore, Result};
 use shimmer_store::Store;
 use tokio::net::UnixListener;
-use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -56,6 +56,9 @@ pub struct DaemonConfig {
     pub clock: Clock,
     /// How often the scheduler looks at the clock. Firing precision is one tick.
     pub scheduler_tick: Duration,
+    /// A quiet start (ADR 0041 §5a), for a vault copy's first run: the scheduler settles what was
+    /// copied in and doesn't tick, and the queue refuses tasks modules ask for. Lasts this run only.
+    pub quiet: bool,
 }
 
 impl DaemonConfig {
@@ -66,6 +69,7 @@ impl DaemonConfig {
             socket: shimmer_proto::paths::socket_path(),
             clock: Clock::system(),
             scheduler_tick: Duration::from_secs(1),
+            quiet: false,
         }
     }
 }
@@ -94,7 +98,21 @@ impl Daemon {
         // One writer: a second daemon on the same home would corrupt the ordering guarantees.
         let lock = lock_home(store.home()).await?;
         let recovered = store.recover()?;
-        if recovered != Default::default() {
+        // Each says only what's true of it (#309's second review): kept aside, left in place, or
+        // waiting to be retried.
+        if !recovered.broken.is_empty() {
+            tracing::warn!(broken = ?recovered.broken, "some committed saves are damaged; kept in .staging/broken/");
+        }
+        if !recovered.left_in_place.is_empty() {
+            tracing::error!(left = ?recovered.left_in_place, "some committed saves are damaged and couldn't be moved aside; left in .staging/");
+        }
+        if recovered.waiting > 0 {
+            tracing::warn!(
+                waiting = recovered.waiting,
+                "some committed saves couldn't be applied yet; retried before the next save"
+            );
+        }
+        if recovered.broken.is_empty() && recovered.left_in_place.is_empty() && recovered != Default::default() {
             tracing::info!(?recovered, "recovered interrupted transactions");
         }
 
@@ -129,9 +147,17 @@ impl Daemon {
             index.clone(),
         );
         let tracker = TaskTracker::new();
+        // Before any module starts: automations and notify react from `init` (ADR 0041 §5a).
+        if config.quiet {
+            core.queue.set_quiet();
+            tracing::info!("quiet start: the scheduler won't tick and modules can't queue tasks this run");
+        }
 
         // Subscribe before init so events a module emits while initialising are not missed.
+        // Taken before subscribing: a module's catch-up after a lag never reaches before it (#310).
+        let listening_since = config.clock.now();
         let receivers: Vec<_> = core.registry.entries.iter().map(|_| bus.subscribe()).collect();
+        let recovery_index = index.clone();
         tracker.spawn(indexer::run(index, store.clone(), bus.subscribe(), shutdown.clone()));
 
         // Every module is initialised before any of them reacts to an event. A module reacting
@@ -155,25 +181,20 @@ impl Daemon {
                 }
             }
         }
-        for (entry, mut rx, id, ctx) in started {
-            let (module, shutdown) = (entry.module.clone(), shutdown.clone());
-            tracker.spawn(async move {
-                loop {
-                    let ev = tokio::select! {
-                        _ = shutdown.cancelled() => return,
-                        ev = rx.recv() => ev,
-                    };
-                    match ev {
-                        Ok(ev) => {
-                            if let Err(e) = module.on_event(&ev, &ctx).await {
-                                tracing::warn!(module = %id, topic = %ev.topic, error = %e, "on_event failed");
-                            }
-                        }
-                        Err(RecvError::Lagged(n)) => tracing::warn!(module = %id, dropped = n, "module lagged the bus"),
-                        Err(RecvError::Closed) => return,
-                    }
-                }
-            });
+        for (entry, rx, id, ctx) in started {
+            // Every event, in order, a lag caught up from the log and a panic kept to its event
+            // (#261 findings 1, 2). Lags are likeliest here: each receiver holds every event emitted
+            // during all the modules' inits, and the catch-up makes that lossless.
+            tracker.spawn(delivery::run(
+                id,
+                entry.module.clone(),
+                ctx,
+                rx,
+                store.clone(),
+                shutdown.clone(),
+                listening_since,
+                tracker.clone(),
+            ));
         }
 
         // Modules are initialised, so anything that fires now can run. The first tick catches up
@@ -190,8 +211,24 @@ impl Daemon {
         ));
         scheduler.load()?;
         scheduler.register_module_triggers(declared)?;
+        if config.quiet {
+            // A copy's first start (ADR 0041 §5a): what was copied in was another folder's run, so
+            // it's settled, never run, and nothing ticks until the next, ordinary start.
+            scheduler.quiet_start()?;
+        } else {
+            // Firings a stop left unfinished: queued again if they never started (#263 finding 1).
+            // A failure here is logged, not fatal: the firings stay on disk for the next start.
+            let events = recovery_index.clone();
+            if let Err(e) = scheduler.recover(|pattern, since| {
+                events.lock().unwrap_or_else(|e| e.into_inner()).events_matching_since(pattern, since)
+            }) {
+                tracing::error!(error = %e, "couldn't check unfinished scheduled tasks; checked again next start");
+            }
+        }
         let _ = core.scheduler.set(scheduler.clone());
-        tracker.spawn(scheduler.run(config.scheduler_tick, shutdown.clone()));
+        if !config.quiet {
+            tracker.spawn(scheduler.run(config.scheduler_tick, shutdown.clone()));
+        }
 
         let listener = bind(&config.socket)?;
         tracker.spawn(ipc::serve(core.clone(), listener, tracker.clone()));

@@ -6,7 +6,7 @@
 //! own fallback is being sent (`fallback`) is left to that fallback: one message, never two.
 
 /// `(rule id, its [builtin] key, its text)`.
-pub const RULES: [(&str, &str, &str); 4] = [
+pub const RULES: [(&str, &str, &str); 5] = [
     (
         "workspace-dirty",
         "workspace_dirty",
@@ -47,6 +47,19 @@ when = { "origin.type" = "scheduler", code = { ne = "workspace_dirty" }, fallbac
 [[do]]
 op = "notify.send"
 params = { title = "Scheduled {op} failed", body = "{error}", priority = "high", from = "automation:scheduled-task-failed" }
+"#,
+    ),
+    (
+        "scheduled-task-interrupted",
+        "scheduled_task_interrupted",
+        r#"# Built in: switch it off with 'shimmer automations disable scheduled-task-interrupted'.
+[rule]
+label = "Tell me when a stop cut off a scheduled task"
+on = "scheduler.trigger.interrupted"
+
+[[do]]
+op = "notify.send"
+params = { title = "Scheduled {op} was cut off", body = "Shimmer stopped while it ran, so it wasn't run again: it may have half finished. Check, then: shimmer scheduler show {trigger_id}", priority = "high", from = "automation:scheduled-task-interrupted" }
 "#,
     ),
     (

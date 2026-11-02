@@ -13,14 +13,15 @@ pub mod fallback;
 mod state;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use shimmer_core::{
-    Clock, EnqueueRequest, Error, ErrorCode, Event, LaneConfig, LaneId, ModuleId, Priority, ProgressFn, Result, Task,
-    TaskHandle, TaskId, TaskSubmitter,
+    Clock, EnqueueRequest, Error, ErrorCode, Event, LaneConfig, LaneId, ModuleId, Origin, Priority, ProgressFn, Result,
+    Task, TaskHandle, TaskId, TaskSubmitter,
 };
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -96,6 +97,8 @@ pub struct QueueInner {
     runner: Weak<dyn OpRunner>,
     shutdown: CancellationToken,
     pub tracker: TaskTracker,
+    /// A quiet start (ADR 0041 §5a): a task a module asks for is refused, never enqueued.
+    quiet: AtomicBool,
 }
 
 /// What `Ctx::queue` talks to. Holds a `Weak` so modules' contexts do not keep the queue
@@ -131,7 +134,22 @@ impl QueueInner {
             lanes: lanes.iter().map(|l| (l.id.clone(), LaneState::new(l.clone()))).collect(),
             ..State::default()
         };
-        Arc::new(Self { state: Mutex::new(state), ops, backend, clock, runner, shutdown, tracker: TaskTracker::new() })
+        Arc::new(Self {
+            state: Mutex::new(state),
+            ops,
+            backend,
+            clock,
+            runner,
+            shutdown,
+            tracker: TaskTracker::new(),
+            quiet: AtomicBool::new(false),
+        })
+    }
+
+    /// From now on, refuse tasks modules ask for (`Origin::Module`: an automation's action, a
+    /// fallback). Tasks a person asks for still run: that's how `vaults copy` switches a copy off.
+    pub fn set_quiet(&self) {
+        self.quiet.store(true, Ordering::SeqCst);
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -170,6 +188,11 @@ impl QueueInner {
     /// before reporting a failure, so `queue.task.failed`'s `fallback` is decided before the
     /// fallback is enqueued, and its events come after the failure that caused it (#281's review).
     fn admits(&self, req: &EnqueueRequest) -> Result<LaneId> {
+        // Refused, so it's never enqueued: nothing in `queue list`, nothing for a later start to
+        // mistake for another run's unfinished work (ADR 0041 §5a).
+        if self.quiet.load(Ordering::SeqCst) && matches!(req.origin, Origin::Module { .. }) {
+            return Err(Error::unavailable("the daemon started quiet: modules can't queue tasks this run"));
+        }
         // Whatever the caller, an invalid fallback never reaches a lane (ADR 0005).
         fallback::validate(&req.op, req.fallback.as_ref())?;
         let declared =
@@ -307,7 +330,13 @@ impl QueueInner {
         // Only a task that ran and failed structurally can owe a fallback (§11.3).
         let mut fallback = None;
         let (status, topic, mut payload) = if token.is_cancelled() {
-            (Status::Cancelled, "queue.task.cancelled", json!({"task_id": task.id, "lane": task.lane, "op": task.op}))
+            let mut p = json!({"task_id": task.id, "lane": task.lane, "op": task.op});
+            // Cut off by the daemon stopping, not cancelled by anyone: the scheduler reports such a
+            // task as interrupted after the restart, rather than forgetting it (#308's review).
+            if self.shutdown.is_cancelled() {
+                p["by"] = json!("shutdown");
+            }
+            (Status::Cancelled, "queue.task.cancelled", p)
         } else {
             match result {
                 Ok(v) => (

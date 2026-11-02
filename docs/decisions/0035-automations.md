@@ -383,6 +383,7 @@ optional starting points; built-in rules are always there.
 | `workspace-dirty` | `queue.task.failed` with code `workspace_dirty`, `fallback` false | "site couldn't launch: step 2/5 failed. Log: …. Then: {detail.fix}" |
 | `workspace-half-launched` | `workspaces.session.dirty` with `recovered` true | "site was left half-launched…" |
 | `scheduled-task-failed` | `queue.task.failed`, origin scheduler, not `workspace_dirty`, `fallback` false | "Scheduled records.complete failed: …" |
+| `scheduled-task-interrupted` | `scheduler.trigger.interrupted` (ADR 0004 amendment, #263) | "Scheduled notify.digest was cut off: … not run again" |
 | `loop-stopped` | `automations.chain.stopped` | "Automation X was stopped: it would have triggered itself" |
 
 - **The fields they match exist on the event:** `queue.task.failed` carries `code` (protocol.md's

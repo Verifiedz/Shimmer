@@ -40,7 +40,7 @@ const TOPICS: [(&str, &str); 14] = [
     ("workspaces.session.forced", "a dirty workspace was force-relaunched"),
     ("workspaces.session.cleaned", "a dirty workspace's cleanup succeeded: it's ready again"),
     ("workspaces.session.abandoned", "a launch stopped before any step ran: the workspace is as it was"),
-    ("workspaces.workspace.reset", "a dirty workspace was reset without cleanup"),
+    ("workspaces.workspace.reset", "a dirty or active workspace was reset to ready without cleanup"),
     ("workspaces.workspace.created", "a workspace was made from a template"),
     ("workspaces.session.stopped", "a running workspace was stopped"),
     ("workspaces.workspace.removed", "a workspace was removed (it can be restored)"),
@@ -104,7 +104,12 @@ impl Module for Workspaces {
             ("workspaces.cleanup", "Run a dirty workspace's cleanup script", id.clone(), queued()),
             ("workspaces.force_relaunch", "Launch a dirty workspace anyway (logged as forced)", id.clone(), queued()),
             ("workspaces.stop", "Stop an active workspace by running its cleanup script", id.clone(), queued()),
-            ("workspaces.reset", "Clear dirty without running cleanup (last resort)", id.clone(), Execution::Inline),
+            (
+                "workspaces.reset",
+                "Mark a dirty or active workspace ready without running cleanup (last resort)",
+                id.clone(),
+                Execution::Inline,
+            ),
             (
                 "workspaces.remove",
                 "Remove a workspace that isn't running (restore brings it back)",
@@ -764,8 +769,8 @@ impl Workspaces {
         Ok(json!({"purged": workspaces}))
     }
 
-    /// `dirty → ready` without running cleanup (§10.3: the last resort when there is no
-    /// cleanup script). Also clears a `state.toml` Shimmer can't read, which is the one way to
+    /// `dirty → ready` or `active → ready` without running cleanup (§10.3: the last resort when
+    /// there is no cleanup script; ADR 0041 for a vault copy's `active`). Also clears a `state.toml` Shimmer can't read, which is the one way to
     /// recover from a hand-edit gone wrong.
     fn reset(&self, ctx: &Ctx, id: &str) -> Result<Value> {
         let _g = self.write.lock();
@@ -775,7 +780,9 @@ impl Workspaces {
             saved => {
                 let saved = saved.unwrap_or_else(|| Ok(Saved::ready()))?;
                 state::reset(&saved.state)?;
-                (dirty_payload(id, &saved.state), saved.last_session)
+                let mut prior = dirty_payload(id, &saved.state);
+                prior["state"] = json!(state_name(&saved.state));
+                (prior, saved.last_session)
             }
         };
         ctx.store.transaction(|tx| {

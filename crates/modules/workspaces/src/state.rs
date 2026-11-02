@@ -152,11 +152,20 @@ pub fn force_relaunch(state: &WorkspaceState) -> Result<WorkspaceState> {
 }
 
 /// `dirty -> ready` without running a cleanup script: the last resort when there is none
-/// (§10.3).
+/// (§10.3). Also `active -> ready`: forget what the launch started and run nothing, which `stop`
+/// can't do (it runs `cleanup.sh`). A vault copy needs it, whose `active` was the source folder's
+/// launch, and `stop` there would close the source's real windows (ADR 0041 §5).
+///
+/// Never `launching`: on start the module turns a launch it never finished into `dirty`, so a
+/// `launching` workspace is a launch running now, and resetting it would pull the state out from
+/// under it.
 pub fn reset(state: &WorkspaceState) -> Result<WorkspaceState> {
     match state {
-        WorkspaceState::Dirty { .. } => Ok(WorkspaceState::Ready),
-        _ => Err(not_dirty("reset")),
+        WorkspaceState::Dirty { .. } | WorkspaceState::Active => Ok(WorkspaceState::Ready),
+        WorkspaceState::Launching => {
+            Err(Error::conflict("the workspace is launching now; reset it once the launch has ended"))
+        }
+        WorkspaceState::Ready => Err(Error::invalid_params("the workspace is already ready: nothing to reset")),
     }
 }
 
@@ -345,11 +354,11 @@ mod tests {
     }
 
     #[test]
-    fn reset_clears_dirty_without_cleanup_and_is_refused_otherwise() {
+    fn reset_clears_dirty_or_active_without_cleanup_and_never_a_running_launch() {
         assert_eq!(reset(&dirty()).unwrap(), WorkspaceState::Ready);
-        for s in NOT_DIRTY {
-            assert_eq!(reset(&s).unwrap_err().code, ErrorCode::InvalidParams);
-        }
+        assert_eq!(reset(&WorkspaceState::Active).unwrap(), WorkspaceState::Ready, "ADR 0041");
+        assert_eq!(reset(&WorkspaceState::Launching).unwrap_err().code, ErrorCode::Conflict);
+        assert_eq!(reset(&WorkspaceState::Ready).unwrap_err().code, ErrorCode::InvalidParams);
     }
 
     #[test]
