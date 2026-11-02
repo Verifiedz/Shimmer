@@ -23,8 +23,22 @@ const LOG_RETAIN_FILES: usize = 8;
 /// success, so it isn't restarted every few seconds while a daemon a command started is running.
 const ALREADY_RUNNING: u8 = 3;
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    // The vault first (ADR 0041 §3): `--vault NAME`, or the one `shimmer vaults use` chose, runs
+    // this binary again with that folder's SHIMMER_HOME and SHIMMER_SOCKET, before any thread exists.
+    if let Some(code) = shimmer_cli::vaults::enter() {
+        return code;
+    }
+    match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(runtime) => runtime.block_on(run()),
+        Err(e) => {
+            eprintln!("shimmer: couldn't start: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> ExitCode {
     // Started through a command-pack link (`ikuzo deep-work`, ADR 0013 §10): the whole line is
     // the alias's, even `ikuzo daemon`. Started as `shimmer`, or anything else, nothing changes.
     if let Some(alias) = std::env::args().next().as_deref().and_then(shimmer_cli::invoked_alias) {

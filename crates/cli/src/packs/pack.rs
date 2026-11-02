@@ -46,6 +46,7 @@ pub const RESERVED: &[&str] = &[
     "calendar",
     "tui",
     "doctor",
+    "vaults",
     "completions",
     "version",
     "shimmer",

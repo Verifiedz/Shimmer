@@ -492,6 +492,10 @@ fn status(env: &Env, services: &mut impl Services) -> Result<String> {
         Some(_) => {}
         None => warnings.push("can't tell which shimmer it runs: run 'shimmer startup on' again".to_owned()),
     }
+    // One login service, for one vault (ADR 0041 §5): say which, unless it's main.
+    if let Some(vault) = pinned_home(&text).and_then(|home| crate::vaults::name_for(&home)) {
+        out.push(format!("  for the vault {vault}"));
+    }
     out.extend(warnings.iter().map(|w| warning_line(w)));
     Ok(out.join("\n"))
 }
@@ -506,6 +510,29 @@ fn old_socket(text: &str, env: &Env) -> Result<Option<String>> {
     Ok(pins_another.then(|| {
         "the login service uses a different socket than your commands (an older Shimmer wrote it): run 'shimmer startup on' again".to_owned()
     }))
+}
+
+/// The `SHIMMER_HOME` a unit or plist `on` wrote pins, if any (ADR 0041 §5: `vaults remove`
+/// refuses the vault that starts at login). Undoes `systemd_quote` or `xml`.
+pub(crate) fn pinned_home(text: &str) -> Option<PathBuf> {
+    if let Some(quoted) = text.lines().find_map(|l| l.strip_prefix("Environment=\"SHIMMER_HOME=")) {
+        let (mut out, mut chars) = (String::new(), quoted.strip_suffix('"')?.chars());
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => out.extend(chars.next()),
+                // `%%`: one `%`.
+                '%' => {
+                    chars.next();
+                    out.push('%');
+                }
+                c => out.push(c),
+            }
+        }
+        return Some(PathBuf::from(out));
+    }
+    let value = text.split("<key>SHIMMER_HOME</key><string>").nth(1)?.split("</string>").next()?;
+    let value = value.replace("&quot;", "\"").replace("&gt;", ">").replace("&lt;", "<").replace("&amp;", "&");
+    Some(PathBuf::from(value))
 }
 
 fn running(by_service: bool, up: bool) -> String {
@@ -909,6 +936,17 @@ mod tests {
         };
         assert!(off(&t.env, &mut broken).unwrap_err().message.contains("Access denied"));
         assert!(unit_file(&t).exists());
+    }
+
+    #[test]
+    fn the_pinned_folder_is_read_back_from_either_file() {
+        let home = "/data/my \"odd\" 100% <shimmer> & co\\x";
+        let pinned = [("SHIMMER_HOME".to_owned(), home.to_owned()), ("SHIMMER_SOCKET".to_owned(), "/s".to_owned())];
+        let unit = systemd_unit(Path::new("/bin/shimmer"), &pinned, false).unwrap();
+        assert_eq!(pinned_home(&unit), Some(PathBuf::from(home)), "{unit}");
+        let plist = launchd_plist(Path::new("/bin/shimmer"), &pinned).unwrap();
+        assert_eq!(pinned_home(&plist), Some(PathBuf::from(home)), "{plist}");
+        assert_eq!(pinned_home("[Service]\nExecStart=x daemon\n"), None);
     }
 
     #[test]
