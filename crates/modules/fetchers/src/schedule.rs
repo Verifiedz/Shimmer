@@ -1,150 +1,330 @@
-//! The fetchers heartbeat: a single, fixed-period scheduler trigger (ADR 0028 §5), and the
-//! per-source due-check and last-run bookkeeping it drives.
+//! Per-source scheduling, via `ctx.schedules` (ADR 0028 §6), and last-run bookkeeping.
 //!
-//! `Module::triggers()` has no `Ctx`/config access (`crates/core/src/module.rs:25-27`, called
-//! before `Config::load` and before `Module::init`, `crates/daemon/src/lib.rs:95-96,98-102,120`)
-//! -- so the trigger's own firing period is a fixed constant here, not a `config.toml` key.
-//! Only which *sources* are due, and how often each one runs, is read from
-//! `[modules.fetchers]` when the trigger actually fires and the handler gets a real `Ctx`.
-//!
-//! (Amends ADR 0028 §5's own example config, which still showed a `tick_interval_s` key --
-//! that was never actually readable by `triggers()`, so it is dropped here rather than built.)
+//! There is no fixed heartbeat trigger: each source schedules its own next run directly
+//! (`Module::triggers()` stays empty) -- see `module.rs`'s `schedule_run`/`cancel_schedule`/
+//! `reconcile_schedule` for when that happens. This file owns only the per-source state that
+//! decision needs: the pending schedule itself (`ScheduleState`) and `last_run.toml`.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
 
-use chrono::{DateTime, Utc};
-use serde::Deserialize;
-use serde_json::Value;
-use shimmer_core::{CatchUp, Ctx, Error, Result, Schedule, TriggerSpec};
+use chrono::{DateTime, NaiveDate, Utc};
+use chrono_tz::Tz;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
+use shimmer_core::filter::Filter;
+use shimmer_core::{Ctx, Error, Result};
 
-/// How often the heartbeat fires.
-pub const TICK_INTERVAL: Duration = Duration::from_secs(300);
-pub const TICK_OP: &str = "fetchers.tick";
-pub const FETCH_OP: &str = "fetchers.run";
+/// The real fetch work, queued (ADR 0028 §5) -- internal; `fetchers.run` (inline) checks the
+/// source exists, then enqueues this. Also what a source's own schedule fires (ADR 0028 §6).
+pub const RUN_TASK_OP: &str = "fetchers.run_task";
 
 /// Floors below which a source's own cadence may not be set, per `Method` (ADR 0028 §5/§7).
 /// An API source hits a known, source-maintained endpoint built for this kind of polling; a
 /// scraped page is a much heavier, more easily-noticed load on a host that never agreed to
-/// be polled, so it gets a much higher floor. `crate::source::find`'s registry (which exists
-/// now, unlike when a single uniform floor was first written here) is what lets
-/// `FetchersConfig::from_value` look a source's `Method` up and apply the right one
-/// (PR #126 review -- a single `MIN_INTERVAL_S` let `weworkremotely`, a `Method::Scrape`
-/// source, be polled as often as every 15 minutes).
+/// be polled, so it gets a much higher floor.
 pub const MIN_INTERVAL_API_S: u64 = 1800;
 pub const MIN_INTERVAL_SCRAPE_S: u64 = 21_600;
 
-/// The one `TriggerSpec` this module registers (ADR 0028 §5). `lane: None` defers to
-/// `fetchers.tick`'s own `CommandSpec` (`Execution::Queued { lane: "fetchers" }`) rather than
-/// repeating the lane name here.
-pub fn trigger() -> TriggerSpec {
-    TriggerSpec {
-        id: TICK_OP.into(),
-        schedule: Schedule::Every(TICK_INTERVAL),
-        catch_up: CatchUp::Skip,
-        op: TICK_OP.into(),
-        params: Value::Null,
-        lane: None,
-        fallback: None,
-    }
+/// Where a source's own file lives (ADR 0028 §4): `data/fetchers/sources/<id>.toml`.
+pub const SOURCES_DIR: &str = "sources";
+/// Where `fetchers.remove` moves a source's file, until `restore` or `purge` (ADR 0038 §1).
+pub const REMOVED_DIR: &str = "removed";
+
+pub(crate) fn path(id: &str) -> String {
+    format!("{SOURCES_DIR}/{id}.toml")
 }
 
-#[derive(Debug, Default, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
-pub struct FetchersConfig {
+pub(crate) fn removed_path(id: &str) -> String {
+    format!("{REMOVED_DIR}/{id}.toml")
+}
+
+/// The ids of removed sources, to restore or purge.
+pub(crate) fn removed(ctx: &Ctx) -> Result<Vec<String>> {
+    let prefix = format!("{REMOVED_DIR}/");
+    Ok(ctx
+        .store
+        .list(REMOVED_DIR)?
+        .iter()
+        .filter_map(|f| f.strip_prefix(&prefix).and_then(|f| f.strip_suffix(".toml")))
+        .map(str::to_owned)
+        .collect())
+}
+
+/// `data/fetchers/sources/<id>.state.toml` (ADR 0028 §6): `{trigger_id, due_at}` for whatever
+/// `ctx.schedules` entry is currently pending for this source. Written by the module, never
+/// hand-edited, same spirit as workspaces' own `state.toml`; [`Sources::load`] skips it rather
+/// than trying to parse it as a source.
+fn schedule_state_path(id: &str) -> String {
+    format!("{SOURCES_DIR}/{id}.state.toml")
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ScheduleState {
+    pub trigger_id: String,
+    pub due_at: DateTime<Utc>,
+}
+
+/// `None` when this source has no pending schedule (never enabled, or disabled/removed since).
+pub(crate) fn load_schedule_state(ctx: &Ctx, id: &str) -> Result<Option<ScheduleState>> {
+    let Some(text) = ctx.store.read_string(&schedule_state_path(id))? else { return Ok(None) };
+    let raw: BTreeMap<String, String> =
+        toml::from_str(&text).map_err(|e| Error::internal(format!("fetchers {id}.state.toml: {e}")))?;
+    let bad = || Error::internal(format!("fetchers {id}.state.toml: missing trigger_id or due_at"));
+    let trigger_id = raw.get("trigger_id").cloned().ok_or_else(bad)?;
+    let due_at = raw
+        .get("due_at")
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&Utc))
+        .ok_or_else(bad)?;
+    Ok(Some(ScheduleState { trigger_id, due_at }))
+}
+
+pub(crate) fn save_schedule_state(ctx: &Ctx, id: &str, trigger_id: &str, due_at: DateTime<Utc>) -> Result<()> {
+    let mut raw = BTreeMap::new();
+    raw.insert("trigger_id", trigger_id.to_owned());
+    raw.insert("due_at", due_at.to_rfc3339());
+    ctx.store.write(&schedule_state_path(id), toml::to_string(&raw).unwrap_or_default())
+}
+
+pub(crate) fn delete_schedule_state(ctx: &Ctx, id: &str) -> Result<()> {
+    ctx.store.delete(&schedule_state_path(id))
+}
+
+/// Every source whose file loaded, plus every one that didn't (ADR 0028 §5). Loaded once at
+/// `Module::init`, re-read on `fetchers.reload` and after any write -- never re-scanned on
+/// every op call, the same shape `automations::State` already uses for its rule files.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Sources {
     pub sources: BTreeMap<String, SourceConfig>,
-    /// Sources whose own entry could not be read, by id, with why. They are kept out of
-    /// [`FetchersConfig::sources`] entirely -- never fetched, never scheduled -- but they are
-    /// *not* an error for everything else (#126's review, B1): one typo in one source used to
-    /// fail every `fetchers.tick`, `fetchers.list` and `fetchers.status`, which with the
-    /// built-in `scheduled-task-failed` alert meant a high-priority popup every five minutes.
-    /// `fetchers.list`/`status` report these so a broken source is visible rather than silent.
-    #[serde(skip)]
+    /// A source file that couldn't be used, by id, with why. Kept out of [`Sources::sources`]
+    /// entirely -- never fetched, never scheduled -- but not an error for everything else
+    /// (#126's review, B1): one broken file must not take every other source down with it.
     pub problems: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct SourceConfig {
-    /// Every source starts disabled (ADR 0028 §5) -- the user opts in explicitly.
-    #[serde(default)]
-    pub enabled: bool,
-    pub interval: IntervalSpec,
-    /// Absent: `id` must already be one of the fixed, compiled-in sources
-    /// (`crate::source::registry`) -- today's behavior, unchanged. Present: build a new
-    /// instance of this *kind* instead (ADR 0028 §2a) -- currently only `"rss"`.
-    #[serde(default)]
-    pub kind: Option<String>,
-    /// The `rss` kind's one required setting (ADR 0028 §2a), and the `json-api` kind's own
-    /// endpoint (ADR 0028 §15, which also reuses this field rather than inventing a second
-    /// one). Meaningless, and left unvalidated, when `kind` is absent or neither of those.
-    #[serde(default)]
-    pub url: Option<String>,
-    /// `json-api` only (ADR 0028 §15): dot-separated path from the response root to the
-    /// items array. Omitted (or empty) means the response root is already that array.
-    #[serde(default)]
-    pub items_path: Option<String>,
-    /// `json-api` only: the field within each item holding its dedup key.
-    #[serde(default)]
-    pub id_field: Option<String>,
-    /// `json-api` only: the field within each item holding its title.
-    #[serde(default)]
-    pub title_field: Option<String>,
-    /// `json-api` only: the field within each item holding its url.
-    #[serde(default)]
-    pub url_field: Option<String>,
-    /// `json-api` only: prepended to `url_field`'s value when that field is a site-relative
-    /// path rather than already absolute (e.g. Amazon's own job search endpoint).
-    #[serde(default)]
-    pub url_base: Option<String>,
-    /// `json-api` only: `"none"` (default, everything in one response) or `"offset"` (`url`
-    /// must contain a literal `{offset}` placeholder, driven by `page_size`).
-    #[serde(default)]
-    pub pagination: Option<String>,
-    /// `json-api` only: required, and must be greater than 0, when `pagination = "offset"`.
-    #[serde(default)]
-    pub page_size: Option<u32>,
-    /// `json-api` only: the field within each item that marks it still open. When set, an
-    /// item whose value there is the boolean `false` is dropped before dedup ever sees it --
-    /// a feed that keeps already-closed postings around (e.g. a community-maintained
-    /// listings archive) would otherwise surface dead links as "new". Missing, non-boolean,
-    /// or `true` all pass through unfiltered; omitted entirely means no such field exists
-    /// and nothing is dropped on this basis.
-    #[serde(default)]
-    pub active_field: Option<String>,
-    /// A title must contain at least one of these (case-insensitive substring, OR-matched)
-    /// to be kept. Empty means no inclusion filter at all -- everything passes this stage.
-    #[serde(default)]
-    pub title_contains: Vec<String>,
-    /// A title containing any of these (same matching as `title_contains`) is dropped, even
-    /// if `title_contains` would have kept it. Checked against every source's own title
-    /// only (ADR 0028 §13) -- a source whose `raw_data` carries a longer description is not
-    /// searched.
-    #[serde(default)]
-    pub title_excludes: Vec<String>,
-}
-
-impl SourceConfig {
-    /// Whether an item's title should be kept, given this source's own filter lists. See
-    /// [`matches_title`] for the matching rule itself.
-    pub fn matches_title(&self, title: &str) -> bool {
-        matches_title(title, &self.title_contains, &self.title_excludes)
+impl Sources {
+    /// Reads and parses every `data/fetchers/sources/*.toml`. One bad file is recorded in
+    /// `problems` and left out of `sources`; every other file still loads. A missing
+    /// `sources/` folder at all (a fresh install) is empty, not an error.
+    pub fn load(ctx: &Ctx) -> Result<Self> {
+        let mut sources = BTreeMap::new();
+        let mut problems = BTreeMap::new();
+        let prefix = format!("{SOURCES_DIR}/");
+        for file in ctx.store.list(SOURCES_DIR)? {
+            // A source's own schedule state (ADR 0028 §6) is a sibling `<id>.state.toml` in
+            // this same folder, not a source -- skipped here, read only through
+            // `load_schedule_state`.
+            if file.ends_with(".state.toml") {
+                continue;
+            }
+            let Some(id) = file.strip_prefix(&prefix).and_then(|f| f.strip_suffix(".toml")) else { continue };
+            // Read raw bytes, not `read_string` -- that errors on non-UTF-8, and the `?` this
+            // used to be written with failed `Module::init` for every source over one bad
+            // file, against this function's own "one bad file is recorded in problems"
+            // contract (#303's review, blocking).
+            let bytes = ctx.store.read(&file)?.unwrap_or_default();
+            let result = match String::from_utf8(bytes) {
+                Ok(text) => SourceConfig::parse(id, &text),
+                Err(_) => Err("not UTF-8".to_owned()),
+            };
+            match result {
+                Ok(config) => {
+                    sources.insert(id.to_owned(), config);
+                }
+                Err(e) => {
+                    problems.insert(id.to_owned(), e);
+                }
+            }
+        }
+        Ok(Self { sources, problems })
     }
 }
 
-/// A title matching nothing in `contains` is dropped only when that list is non-empty; a
-/// title matching anything in `excludes` is always dropped, regardless of `contains`. Both
-/// are case-insensitive substrings, OR'd within each list. A free function, not only
-/// [`SourceConfig::matches_title`], so an ad-hoc CLI override (ADR 0028 §14) can run the
-/// identical rule against lists that never came from `config.toml` at all.
-pub fn matches_title(title: &str, contains: &[String], excludes: &[String]) -> bool {
-    let lower = title.to_lowercase();
-    let included = contains.is_empty() || contains.iter().any(|w| lower.contains(&w.to_lowercase()));
-    let excluded = excludes.iter().any(|w| lower.contains(&w.to_lowercase()));
-    included && !excluded
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceConfig {
+    /// Optional, free text, like a workspace's or automation's label.
+    pub label: Option<String>,
+    /// Every source starts disabled (ADR 0028 §5) -- the user opts in explicitly.
+    pub enabled: bool,
+    pub interval: IntervalSpec,
+    /// Every source names a kind (ADR 0028 §10 -- no fixed, compiled-in registry): built from
+    /// this source's own `[kind]` table via `crate::kind::kind` (ADR 0028 §2a/§3).
+    pub kind: String,
+    /// A `core::filter::Filter` (ADR 0028 §8), checked against `{"title": …}` only -- a source
+    /// whose `raw_data` carries a longer description is not searched. `None` keeps everything.
+    /// Kept as raw JSON, not a parsed `Filter` (which has no way back to JSON), so
+    /// `view()`/`fetchers.show`'s `text` can show it unchanged; already validated once, at
+    /// parse time, via [`matches_title`].
+    pub filter: Option<Map<String, Value>>,
+    /// This source's `kind`'s own fields, from the file's `[kind]` table, untouched and
+    /// opaque to this struct -- `crate::kind::Kind::parse` is the only thing that knows what
+    /// any of these keys mean (ADR 0028 §3).
+    pub kind_params: Map<String, Value>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+/// The file as written, `data/fetchers/sources/<id>.toml` (ADR 0028 §4): `[source]`, the
+/// envelope every kind shares, and `[kind]`, that kind's own fields. Also `Serialize` --
+/// [`render`] builds this same shape from `fetchers.new`/`.edit`'s structured params, so a
+/// structured command and a hand-edited file go through the exact same [`SourceConfig::parse`].
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceFile {
+    source: SourceMeta,
+    #[serde(default)]
+    kind: toml::Table,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    #[serde(default)]
+    enabled: bool,
+    interval: IntervalSpec,
+    kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    filter: Option<toml::Table>,
+}
+
+/// Builds a source file's TOML text from `fetchers.new`/`.edit`'s structured params (ADR 0028
+/// §9) -- the mechanical inverse of [`SourceConfig::parse`], so a structured command, a
+/// template (later), and a hand-edited-then-`fetchers.reload`ed file all produce and accept
+/// the identical on-disk shape. Validation stays centralized in `SourceConfig::parse`, called
+/// on this function's own output by the caller -- this function only renders text, it never
+/// decides whether that text is valid.
+pub(crate) fn render(
+    label: Option<&str>,
+    kind: &str,
+    enabled: bool,
+    interval: &IntervalSpec,
+    params: &Map<String, Value>,
+    filter: Option<&Map<String, Value>>,
+) -> std::result::Result<String, String> {
+    let as_table = |m: &Map<String, Value>, what: &str| match toml::Value::try_from(m) {
+        Ok(toml::Value::Table(t)) => Ok(t),
+        Ok(_) => unreachable!("a JSON object always serializes to a toml table"),
+        Err(e) => Err(format!("{what}: {e}")),
+    };
+    let kind_table = as_table(params, "params")?;
+    let filter_table = filter.map(|f| as_table(f, "filter")).transpose()?;
+    let file = SourceFile {
+        source: SourceMeta {
+            label: label.map(str::to_owned),
+            enabled,
+            interval: interval.clone(),
+            kind: kind.to_owned(),
+            filter: filter_table,
+        },
+        kind: kind_table,
+    };
+    toml::to_string(&file).map_err(|e| format!("internal: {e}"))
+}
+
+impl SourceConfig {
+    /// `id`'s file text, checked: its id's own charset, its `filter` (a `core::filter::Filter`,
+    /// ADR 0028 §8), and -- the bulk of it -- its `kind`'s own fields, dispatched through
+    /// `crate::kind::kind` (ADR 0028 §3). One sentence naming what's wrong, the same
+    /// convention `Rule::parse` already uses in `automations`, so a broken file looks the
+    /// same regardless of which module it's from.
+    pub fn parse(id: &str, text: &str) -> std::result::Result<Self, String> {
+        // An id becomes a folder name under the module's own store namespace
+        // (`dedup::path`), so it is checked here with the same charset rule every other
+        // user-named thing uses, rather than only failing at the first fetch when the store
+        // rejects the path (#126's review, B14).
+        if !shimmer_core::ids::is_valid_id(id) {
+            return Err("not a usable source id -- lowercase letters, digits, '-' and '_' only".into());
+        }
+        let file: SourceFile = toml::from_str(text).map_err(|e| format!("not a source file: {}", e.message()))?;
+        let filter = file
+            .source
+            .filter
+            .as_ref()
+            .map(|t| serde_json::to_value(t).ok().and_then(|v| v.as_object().cloned()).unwrap_or_default());
+        if let Some(f) = &filter {
+            only_title_keys(f)?;
+            // `Filter::parse`'s own errors already name the key ("filter on 'title': …").
+            Filter::parse(f)?;
+        }
+        let kind_params =
+            serde_json::to_value(&file.kind).ok().and_then(|v| v.as_object().cloned()).unwrap_or_default();
+        // Every source names a `kind` (ADR 0028 §10: no fixed, compiled-in registry any
+        // more -- `hn-whoishiring`/`wwr` are ordinary kinds too). Each `Method` gets its own
+        // floor (ADR 0028 §5/§7) -- a scraped page must not be pollable at an API source's
+        // much lower cadence (PR #126 review). `Kind::method` is static per kind, so this
+        // needs no built `Source` to ask.
+        let kind_name = &file.source.kind;
+        let kind = crate::kind::kind(kind_name)
+            .ok_or_else(|| format!("unknown kind \"{kind_name}\" (known: {})", crate::kind::known_names()))?;
+        kind.parse(&kind_params).map_err(|m| format!("kind \"{kind_name}\" {m}"))?;
+        let floor = match kind.method() {
+            crate::source::Method::Api => MIN_INTERVAL_API_S,
+            crate::source::Method::Scrape => MIN_INTERVAL_SCRAPE_S,
+        };
+        file.source.interval.resolve(floor).map_err(|e| format!("interval: {e}"))?;
+        Ok(Self {
+            label: file.source.label,
+            enabled: file.source.enabled,
+            interval: file.source.interval,
+            kind: file.source.kind,
+            filter,
+            kind_params,
+        })
+    }
+
+    /// Whether an item's title should be kept, given this source's own filter. See
+    /// [`matches_title`] for the matching rule itself.
+    pub fn matches_title(&self, title: &str, today: NaiveDate, tz: Tz) -> bool {
+        matches_title(self.filter.as_ref(), title, today, tz)
+    }
+}
+
+/// `filter` must check only `title`, plain or inside an `"or"` alternative -- `Filter` has no
+/// schema behind it (its own doc comment), so a key like `company = {"contains": "x"}` parses
+/// as a perfectly good filter and then silently matches nothing, every time, once it's
+/// checked against `{"title": …}` only below (#311's review, blocking; #299's review point
+/// 5). Shared by [`SourceConfig::parse`] (a source's own file) and `module::validate_filter`
+/// (an ad-hoc `fetchers.run`/`.test`/`.new` override), so neither path can drift from the
+/// other's idea of what a filter here is allowed to name.
+pub(crate) fn only_title_keys(filter: &Map<String, Value>) -> std::result::Result<(), String> {
+    for (key, value) in filter {
+        if key == "or" {
+            // A malformed "or" (not a list, an empty alternative) is left to `Filter::parse`'s
+            // own, better-worded error -- this only needs to recurse into whatever alternatives
+            // *are* shaped like filters.
+            if let Some(list) = value.as_array() {
+                for alt in list {
+                    if let Some(obj) = alt.as_object() {
+                        only_title_keys(obj)?;
+                    }
+                }
+            }
+            continue;
+        }
+        if key != "title" {
+            return Err(format!("filter on '{key}': only 'title' is checked against an item; nothing else matches"));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `title` passes `filter` (ADR 0028 §8) -- `None` keeps everything. A free function,
+/// not only [`SourceConfig::matches_title`], so an ad-hoc CLI override can run the identical
+/// rule against a filter that never came from a source's own file at all. `filter` is already
+/// validated (by `SourceConfig::parse`, or by the ad-hoc override's own check before this is
+/// ever called) -- a parse failure here would mean that validation has a gap, so it reads as
+/// "keep everything," the same safe direction an unset value already takes.
+pub fn matches_title(filter: Option<&Map<String, Value>>, title: &str, today: NaiveDate, tz: Tz) -> bool {
+    match filter {
+        None => true,
+        Some(f) => match Filter::parse(f) {
+            Ok(parsed) => parsed.matches(&json!({"title": title}), today, tz),
+            Err(_) => true,
+        },
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum IntervalSpec {
     Preset(String),
@@ -154,8 +334,8 @@ pub enum IntervalSpec {
 impl IntervalSpec {
     /// A named preset, or a raw seconds count, checked against `floor_s`. The right floor
     /// depends on the source's `Method` (`MIN_INTERVAL_API_S` / `MIN_INTERVAL_SCRAPE_S`), so
-    /// the caller supplies it -- only `FetchersConfig::from_value` can look a source's
-    /// `Method` up (via `crate::source::find`) to know which one applies.
+    /// the caller supplies it -- only [`SourceConfig::parse`] can look a source's `Method` up
+    /// (via `crate::source::find`/`crate::kind::kind`) to know which one applies.
     pub fn resolve(&self, floor_s: u64) -> Result<u64> {
         let secs = match self {
             Self::Seconds(n) => *n,
@@ -177,247 +357,56 @@ impl IntervalSpec {
     }
 }
 
-impl FetchersConfig {
-    /// Pure parse, no `Ctx` -- [`load`] is the thin wrapper that supplies `ctx.config.raw()`.
-    ///
-    /// Each source is read and validated **on its own** (#126's review, B1). One entry with a
-    /// bad `url`, an unknown `kind`, a misspelled id or the wrong type for a field is recorded
-    /// in `problems` and left out of `sources`; every other source still loads and still runs.
-    /// Only a `[modules.fetchers]` section that isn't a table at all, or an unknown key at the
-    /// top level, is fatal -- at that point there is no per-source structure to salvage.
-    pub fn from_value(raw: &Value) -> Result<Self> {
-        // `ModuleConfig::default()` (no `[modules.fetchers]` section attached at all, e.g.
-        // `shimmer_core::testing::TestEnv`) wraps `Value::Null`, not `{}` -- both mean "no
-        // config given", so both resolve to every default.
-        if raw.is_null() {
-            return Ok(Self::default());
-        }
-        // Deserialized in two steps on purpose: `sources` as raw JSON first, so one entry whose
-        // *type* is wrong (`interval = {}`) fails only itself, where deserializing the whole
-        // `FetchersConfig` in one go would fail the lot.
-        #[derive(Default, Deserialize)]
-        #[serde(default, deny_unknown_fields)]
-        struct Outer {
-            sources: BTreeMap<String, Value>,
-        }
-        let outer: Outer = serde_json::from_value(raw.clone())
-            .map_err(|e| Error::invalid_params(format!("[modules.fetchers]: {e}")))?;
+/// `data/fetchers/last_run.toml` -- one small file for every source, read-modified-written
+/// together rather than one file per source.
+pub(crate) const LAST_RUN_PATH: &str = "last_run.toml";
 
-        let mut cfg = Self::default();
-        for (id, entry) in outer.sources {
-            match serde_json::from_value::<SourceConfig>(entry)
-                .map_err(|e| Error::invalid_params(format!("sources.{id}: {e}")))
-                .and_then(|source| validate_source(&id, &source).map(|()| source))
-            {
-                Ok(source) => {
-                    cfg.sources.insert(id, source);
-                }
-                Err(e) => {
-                    cfg.problems.insert(id, e.message);
-                }
-            }
-        }
-        Ok(cfg)
-    }
-    pub fn load(ctx: &Ctx) -> Result<Self> {
-        Self::from_value(ctx.config.raw())
-    }
+/// One source's entry in `last_run.toml`: when it last ran, and -- when that run failed --
+/// why (ADR 0028 §11). `error`/`reason` are `None` exactly when the most recent run
+/// succeeded; the next successful run clears them, so this is always the *most recent*
+/// outcome, never a history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct LastRunEntry {
+    at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
-/// Everything that must be true of one source's own entry, checked at load rather than on the
-/// first tick that happens to look at it. Returns the reason as an error for the caller to
-/// record against that one source (#126's review, B1) -- it never decides the fate of any
-/// other source.
-fn validate_source(id: &str, source: &SourceConfig) -> Result<()> {
-    // An id becomes a folder name under the module's own store namespace
-    // (`dedup::path`), so it is checked here with the same charset rule every other
-    // user-named thing uses, rather than only failing at the first fetch when the store
-    // rejects the path (#126's review, B14).
-    if !shimmer_core::ids::is_valid_id(id) {
-        return Err(Error::invalid_params(format!(
-            "sources.{id}: not a usable source id -- lowercase letters, digits, '-' and '_' only"
-        )));
-    }
-    for (what, terms) in [("title_contains", &source.title_contains), ("title_excludes", &source.title_excludes)] {
-        // An empty or whitespace term is a substring of every title, so one stray comma in
-        // `title_excludes = ["senior", ""]` excludes everything, and in `title_contains`
-        // matches everything (#126's review, B3). Neither can be what anyone meant.
-        if terms.iter().any(|t| t.trim().is_empty()) {
-            return Err(Error::invalid_params(format!(
-                "sources.{id}.{what}: an empty term matches every title -- remove it (a trailing comma?)"
-            )));
-        }
-    }
-    // Each `Method` gets its own floor (ADR 0028 §5/§7) -- a scraped page must not be
-    // pollable at an API source's much lower cadence (PR #126 review). For a `kind`
-    // entry there is no fixed `Source` to ask yet (it is only ever built by
-    // `crate::source::resolve`, lazily, per `Ctx`) -- but `sources::rss::Rss::method`
-    // always answers `Method::Api` (a feed url is a known endpoint, not a crawled
-    // page), so the `"rss"` floor can be hardcoded here rather than instantiating one
-    // just to ask.
-    let floor = match source.kind.as_deref() {
-        None => {
-            let Some(found) = crate::source::find(id) else {
-                let known_sources = crate::source::registry();
-                let known: Vec<&str> = known_sources.iter().map(|s| s.id()).collect();
-                return Err(Error::invalid_params(format!(
-                    "sources.{id}: unknown source id (known: {})",
-                    known.join(", ")
-                )));
-            };
-            match found.method() {
-                crate::source::Method::Api => MIN_INTERVAL_API_S,
-                crate::source::Method::Scrape => MIN_INTERVAL_SCRAPE_S,
-            }
-        }
-        Some(kind) => {
-            // A `kind` entry builds a brand-new instance (`crate::source::resolve`)
-            // rather than adjusting a fixed, compiled-in one -- so an id that
-            // already belongs to the fixed registry would either sit alongside it
-            // as a silent duplicate (`crate::source::known`) or shadow it outright
-            // (`crate::source::resolve` always prefers the `kind` branch). Neither
-            // is a real "this source is both configured and reconfigured" case we
-            // want to allow; reject it at load time rather than let one silently
-            // win.
-            if crate::source::find(id).is_some() {
-                return Err(Error::invalid_params(format!(
-                    "sources.{id}: kind \"{kind}\" collides with a fixed, compiled-in source of the same id"
-                )));
-            }
-            match kind {
-                "rss" => {
-                    let url = source.url.as_deref().unwrap_or_default().trim();
-                    if url.is_empty() {
-                        return Err(Error::invalid_params(format!("sources.{id}: kind \"rss\" needs a non-empty url")));
-                    }
-                    if !is_http_url(url) {
-                        return Err(Error::invalid_params(format!(
-                            "sources.{id}: kind \"rss\" url must be a well-formed http:// or https:// url, got '{url}'"
-                        )));
-                    }
-                    MIN_INTERVAL_API_S
-                }
-                "json-api" => {
-                    let url = source.url.as_deref().unwrap_or_default().trim();
-                    if url.is_empty() {
-                        return Err(Error::invalid_params(format!(
-                            "sources.{id}: kind \"json-api\" needs a non-empty url"
-                        )));
-                    }
-                    if !is_http_url(url) {
-                        return Err(Error::invalid_params(format!(
-                                "sources.{id}: kind \"json-api\" url must be a well-formed http:// or https:// url, got '{url}'"
-                            )));
-                    }
-                    for (field_name, value) in [
-                        ("id_field", &source.id_field),
-                        ("title_field", &source.title_field),
-                        ("url_field", &source.url_field),
-                    ] {
-                        if value.as_deref().unwrap_or_default().trim().is_empty() {
-                            return Err(Error::invalid_params(format!(
-                                "sources.{id}: kind \"json-api\" needs a non-empty {field_name}"
-                            )));
-                        }
-                    }
-                    if let Some(field) = &source.active_field {
-                        if field.trim().is_empty() {
-                            return Err(Error::invalid_params(format!(
-                                "sources.{id}: kind \"json-api\" active_field must be non-empty when given"
-                            )));
-                        }
-                    }
-                    match source.pagination.as_deref().unwrap_or("none") {
-                        "none" => {}
-                        "offset" => {
-                            if source.page_size.unwrap_or(0) == 0 {
-                                return Err(Error::invalid_params(format!(
-                                    "sources.{id}: kind \"json-api\" pagination \"offset\" needs page_size > 0"
-                                )));
-                            }
-                            if !url.contains("{offset}") {
-                                return Err(Error::invalid_params(format!(
-                                        "sources.{id}: kind \"json-api\" pagination \"offset\" needs a literal '{{offset}}' placeholder in url"
-                                    )));
-                            }
-                        }
-                        other => {
-                            return Err(Error::invalid_params(format!(
-                                    "sources.{id}: kind \"json-api\" has unknown pagination \"{other}\" (known: none, offset)"
-                                )));
-                        }
-                    }
-                    MIN_INTERVAL_API_S
-                }
-                other => {
-                    return Err(Error::invalid_params(format!(
-                        "sources.{id}: unknown kind \"{other}\" (known: rss, json-api)"
-                    )));
-                }
-            }
-        }
-    };
-    source.interval.resolve(floor).map_err(|e| Error::invalid_params(format!("sources.{id}.interval: {e}")))?;
-    Ok(())
+/// A corrupt or unparseable `last_run.toml` is treated as empty, never an error (#126's
+/// review, B1). The next successful run rewrites the file cleanly.
+fn load_raw(ctx: &Ctx) -> BTreeMap<String, LastRunEntry> {
+    let Ok(Some(text)) = ctx.store.read_string(LAST_RUN_PATH) else { return BTreeMap::new() };
+    toml::from_str(&text).unwrap_or_default()
 }
 
-/// `url` is deliberately not a free-text field: an `rss` source feeds straight into
-/// `http::get` (ADR 0028 §2a), so a malformed value would otherwise surface as a cryptic
-/// connection error deep in the first tick rather than a clear one at load time.
-fn is_http_url(candidate: &str) -> bool {
-    matches!(url::Url::parse(candidate), Ok(u) if u.scheme() == "http" || u.scheme() == "https")
+fn write_raw(ctx: &Ctx, all: &BTreeMap<String, LastRunEntry>) -> Result<()> {
+    ctx.store.write(LAST_RUN_PATH, toml::to_string(all).unwrap_or_default())
 }
 
-/// Every enabled, configured source whose interval has elapsed since its last run (or that
-/// has never run at all). Deterministic order (`BTreeMap`'s own id order).
-pub fn due_sources(
-    config: &FetchersConfig,
-    last_run: &BTreeMap<String, DateTime<Utc>>,
-    now: DateTime<Utc>,
-) -> Vec<String> {
-    config
-        .sources
-        .iter()
-        .filter(|(_, c)| c.enabled)
-        .filter_map(|(id, c)| {
-            // Already validated (against the right per-`Method` floor) by
-            // `FetchersConfig::load` -- a floor of 0 here only converts units, it never
-            // re-checks anything.
-            let interval = c.interval.resolve(0).ok()?;
-            let due = match last_run.get(id) {
-                None => true,
-                // A `last_run` in the future (a clock correction, or a `$SHIMMER_HOME` copied
-                // from a machine whose clock was ahead) used to park a source until that time
-                // actually arrived -- up to a silent month-long stall (#126's review, B10).
-                // Ahead of `now` means the record can't be trusted, so the source is due.
-                Some(last) if *last > now => true,
-                Some(last) => now.signed_duration_since(*last).num_seconds() >= interval as i64,
-            };
-            due.then(|| id.clone())
+/// Individual unparseable *entries* (an unreadable timestamp) are dropped, keeping the good
+/// ones -- that source reads as due, which is the safe direction.
+pub fn load_last_run(ctx: &Ctx) -> Result<BTreeMap<String, DateTime<Utc>>> {
+    Ok(load_raw(ctx)
+        .into_iter()
+        .filter_map(|(id, e)| DateTime::parse_from_rfc3339(&e.at).ok().map(|at| (id, at.with_timezone(&Utc))))
+        .collect())
+}
+
+/// Every source whose most recent run failed, with when and why (ADR 0028 §11) --
+/// `fetchers.health`'s own reading of `last_run.toml`. Cleared by that source's next
+/// successful run; an entry with an unreadable timestamp is dropped, same as
+/// [`load_last_run`].
+pub fn load_last_failures(ctx: &Ctx) -> BTreeMap<String, (DateTime<Utc>, String, String)> {
+    load_raw(ctx)
+        .into_iter()
+        .filter_map(|(id, e)| {
+            let (error, reason) = (e.error?, e.reason?);
+            let at = DateTime::parse_from_rfc3339(&e.at).ok()?.with_timezone(&Utc);
+            Some((id, (at, error, reason)))
         })
         .collect()
-}
-
-/// `data/fetchers/last_run.toml` -- one small file for every source, read-modified-written
-/// together rather than one file per source, since a tick always reads and updates it as a
-/// whole.
-const LAST_RUN_PATH: &str = "last_run.toml";
-
-/// A corrupt or unparseable `last_run.toml` is logged and treated as empty, never an error
-/// (#126's review, B1): failing here failed every `fetchers.tick`, so a single bad line in a
-/// bookkeeping file stopped all fetching. Empty means every source reads as due, so the worst
-/// case is one extra round of fetches -- which `seen.toml` then dedupes to zero new items --
-/// rather than no fetching at all. The next successful run rewrites the file cleanly.
-/// Individual unparseable *entries* are dropped the same way, keeping the good ones.
-pub fn load_last_run(ctx: &Ctx) -> Result<BTreeMap<String, DateTime<Utc>>> {
-    let Some(text) = ctx.store.read_string(LAST_RUN_PATH)? else { return Ok(BTreeMap::new()) };
-    let Ok(raw) = toml::from_str::<BTreeMap<String, String>>(&text) else { return Ok(BTreeMap::new()) };
-    // An entry whose timestamp doesn't parse is dropped, keeping the good ones -- that source
-    // reads as due, which is the safe direction.
-    Ok(raw
-        .into_iter()
-        .filter_map(|(id, at)| DateTime::parse_from_rfc3339(&at).ok().map(|at| (id, at.with_timezone(&Utc))))
-        .collect())
 }
 
 /// Why `last_run.toml` could not be read, if it exists and is unreadable -- reported by
@@ -426,21 +415,93 @@ pub fn load_last_run(ctx: &Ctx) -> Result<BTreeMap<String, DateTime<Utc>>> {
 /// deliberately doesn't care, because "treat everything as due" is already the safe answer.
 pub fn last_run_problem(ctx: &Ctx) -> Option<String> {
     let text = ctx.store.read_string(LAST_RUN_PATH).ok()??;
-    match toml::from_str::<BTreeMap<String, String>>(&text) {
+    match toml::from_str::<BTreeMap<String, LastRunEntry>>(&text) {
         Ok(raw) => raw
             .iter()
-            .find(|(_, at)| DateTime::parse_from_rfc3339(at).is_err())
+            .find(|(_, e)| DateTime::parse_from_rfc3339(&e.at).is_err())
             .map(|(id, _)| format!("last_run.toml: '{id}' has an unreadable timestamp; that source reads as due")),
         Err(e) => Some(format!("last_run.toml is unreadable ({e}); every source reads as due")),
     }
 }
 
-/// Records that `source` ran at `now`; every other source's record is left untouched.
+/// Records that `source` ran, successfully, at `now` -- clearing any previous failure of
+/// its (ADR 0028 §11: health reports only the *most recent* outcome). Every other source's
+/// record is left untouched.
 pub fn record_run(ctx: &Ctx, source: &str, now: DateTime<Utc>) -> Result<()> {
+    let mut all = load_raw(ctx);
+    all.insert(source.to_owned(), LastRunEntry { at: now.to_rfc3339(), error: None, reason: None });
+    write_raw(ctx, &all)
+}
+
+/// Records that `source`'s run at `now` failed, with `error` (`Error::message`) and `reason`
+/// (`fetchers.fetch.failed`'s own classification, ADR 0028 §9) -- the same payload shape that
+/// event already carries, so `fetchers.health` needs no new failure taxonomy of its own.
+pub fn record_failure(ctx: &Ctx, source: &str, now: DateTime<Utc>, error: &str, reason: &str) -> Result<()> {
+    let mut all = load_raw(ctx);
+    all.insert(
+        source.to_owned(),
+        LastRunEntry { at: now.to_rfc3339(), error: Some(error.to_owned()), reason: Some(reason.to_owned()) },
+    );
+    write_raw(ctx, &all)
+}
+
+/// `last_run.toml`'s text with `from`'s entry moved to `to`, if `from` had one; `None` if
+/// `from` never ran -- a never-run source being renamed needs no `last_run.toml` write at all
+/// (ADR 0028 §7). The caller puts the result in the same `ctx.store.transaction` as the
+/// source file's own move, so the rename is one atomic unit (CLAUDE.md §7.1). Carries a
+/// pending failure (if any) over to the new id too -- a rename is not a successful run.
+pub(crate) fn rename_last_run(ctx: &Ctx, from: &str, to: &str) -> Result<Option<String>> {
+    let mut all = load_raw(ctx);
+    let Some(entry) = all.remove(from) else { return Ok(None) };
+    all.insert(to.to_owned(), entry);
+    Ok(Some(toml::to_string(&all).unwrap_or_default()))
+}
+
+/// `last_run.toml`'s text with every id in `ids` dropped, if any of them had an entry;
+/// `None` if none did -- a purge of sources that never ran needs no `last_run.toml` write at
+/// all. Same "the caller puts this in its own transaction" contract as [`rename_last_run`]
+/// (#305's review, should-fix: `purge` left this behind, so a new source reusing a purged
+/// id inherited its old last-run time and had its first run delayed).
+pub(crate) fn remove_last_run(ctx: &Ctx, ids: &[String]) -> Result<Option<String>> {
     let mut all = load_last_run(ctx)?;
-    all.insert(source.to_owned(), now);
+    let mut changed = false;
+    for id in ids {
+        changed |= all.remove(id).is_some();
+    }
+    if !changed {
+        return Ok(None);
+    }
     let raw: BTreeMap<&str, String> = all.iter().map(|(id, at)| (id.as_str(), at.to_rfc3339())).collect();
-    ctx.store.write(LAST_RUN_PATH, toml::to_string(&raw).unwrap_or_default())
+    Ok(Some(toml::to_string(&raw).unwrap_or_default()))
+}
+
+/// Shared across this crate's own tests (`schedule`, `source`, `module`): a source file's text
+/// from one flat JSON fixture, the same shape tests wrote before sources moved to files, split
+/// into `[source]`/`[kind]` by whether a key is part of the shared envelope.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use shimmer_core::testing::TestEnv;
+
+    use super::*;
+
+    const ENVELOPE_KEYS: &[&str] = &["label", "enabled", "interval", "kind", "filter"];
+
+    pub(crate) fn source_file(fields: &Value) -> String {
+        let mut source = toml::Table::new();
+        let mut kind = toml::Table::new();
+        for (k, v) in fields.as_object().expect("test fixture must be an object") {
+            let tv: toml::Value = serde_json::from_value(v.clone()).expect("test fixture value must convert to toml");
+            if ENVELOPE_KEYS.contains(&k.as_str()) { &mut source } else { &mut kind }.insert(k.clone(), tv);
+        }
+        let mut file = toml::Table::new();
+        file.insert("source".into(), toml::Value::Table(source));
+        file.insert("kind".into(), toml::Value::Table(kind));
+        toml::to_string(&file).unwrap()
+    }
+
+    pub(crate) fn write_source(env: &TestEnv, id: &str, fields: Value) {
+        env.ctx.store.write(&format!("{SOURCES_DIR}/{id}.toml"), source_file(&fields)).unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -448,19 +509,18 @@ mod tests {
     use serde_json::json;
     use shimmer_core::testing::TestEnv;
 
+    use super::test_support::{source_file, write_source};
     use super::*;
 
     fn at(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
     }
 
-    /// A bad source entry no longer fails the whole load (#126's review, B1): it is dropped
-    /// from `sources` and its reason recorded in `problems`. Returns that reason, asserting
-    /// the source really was kept out of the live set.
-    fn problem_for(raw: Value, id: &str) -> String {
-        let cfg = FetchersConfig::from_value(&raw).expect("one bad source must not fail the load");
-        assert!(!cfg.sources.contains_key(id), "a source that failed validation must not be live");
-        cfg.problems.get(id).cloned().unwrap_or_else(|| panic!("no problem recorded for {id}: {:?}", cfg.problems))
+    /// A bad source file doesn't fail the whole load (#126's review, B1): it is dropped from
+    /// `sources` and its reason recorded in `problems`. Returns that reason, asserting the
+    /// source really was kept out of the live set.
+    fn problem_for(fields: Value, id: &str) -> String {
+        SourceConfig::parse(id, &source_file(&fields)).expect_err("this source must fail to parse")
     }
 
     #[test]
@@ -485,136 +545,200 @@ mod tests {
 
     #[test]
     fn a_scrape_source_below_its_own_higher_floor_is_rejected_even_at_an_interval_an_api_source_would_accept() {
-        let why =
-            problem_for(json!({"sources": {"weworkremotely": {"enabled": true, "interval": 3600}}}), "weworkremotely");
+        let why = problem_for(
+            json!({"enabled": true, "interval": 3600, "kind": "wwr", "category": "remote-full-stack-programming-jobs"}),
+            "my-wwr",
+        );
         assert!(why.contains(&MIN_INTERVAL_SCRAPE_S.to_string()), "{why}");
 
         // The identical interval is fine for an API source -- the floor is per-`Method`, not
         // one uniform number.
-        FetchersConfig::from_value(&json!({
-            "sources": {"hn-whoishiring": {"enabled": true, "interval": 3600}}
-        }))
+        SourceConfig::parse(
+            "my-hn",
+            &source_file(&json!({"enabled": true, "interval": 3600, "kind": "hn-whoishiring"})),
+        )
         .unwrap();
     }
 
     #[test]
-    fn an_absent_modules_section_is_no_sources_not_an_error() {
-        let cfg = FetchersConfig::from_value(&json!({})).unwrap();
-        assert!(cfg.sources.is_empty());
+    fn a_folder_with_no_source_files_at_all_is_empty_not_an_error() {
+        let env = TestEnv::new("fetchers");
+        let loaded = Sources::load(&env.ctx).unwrap();
+        assert!(loaded.sources.is_empty() && loaded.problems.is_empty());
     }
 
     #[test]
-    fn a_null_config_is_also_no_sources_not_an_error() {
-        // `ModuleConfig::default()` wraps `Value::Null`, not `{}` -- both must mean the same
-        // thing, not a type error.
-        let cfg = FetchersConfig::from_value(&Value::Null).unwrap();
-        assert!(cfg.sources.is_empty());
+    fn load_reads_every_source_file_and_reports_one_broken_one_without_losing_the_rest() {
+        let env = TestEnv::new("fetchers");
+        write_source(
+            &env,
+            "good",
+            json!({"enabled": true, "interval": "daily", "kind": "rss", "url": "https://example.test/f.xml"}),
+        );
+        write_source(&env, "bad", json!({"enabled": true, "interval": "daily", "kind": "rss", "url": "not-a-url"}));
+        let loaded = Sources::load(&env.ctx).unwrap();
+        assert_eq!(loaded.sources.keys().collect::<Vec<_>>(), vec!["good"]);
+        assert_eq!(loaded.problems.len(), 1);
+        assert!(loaded.problems.get("bad").is_some_and(|p| p.contains("url")));
     }
 
     #[test]
-    fn a_configured_source_parses_with_its_interval_validated_up_front() {
-        let cfg = FetchersConfig::from_value(&json!({
-            "sources": {
-                "hn-whoishiring": {"enabled": true, "interval": "daily"},
-                "weworkremotely": {"enabled": false, "interval": MIN_INTERVAL_SCRAPE_S},
-            }
-        }))
+    fn an_unreadable_source_file_is_reported_without_a_toml_parser_panic() {
+        let env = TestEnv::new("fetchers");
+        env.ctx.store.write(&format!("{SOURCES_DIR}/broken.toml"), "this is not [[[ valid toml").unwrap();
+        let loaded = Sources::load(&env.ctx).unwrap();
+        assert!(loaded.sources.is_empty());
+        assert!(loaded.problems.get("broken").is_some_and(|p| p.contains("not a source file")));
+    }
+
+    fn today() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()
+    }
+
+    #[test]
+    fn a_non_utf8_source_file_is_a_problem_not_a_load_failure() {
+        // #303's review, blocking: `Sources::load` used `read_string`, which errors on
+        // non-UTF-8 and propagated via `?`, failing `Module::init` -- and with it every
+        // other source -- over one bad byte sequence in one file.
+        let env = TestEnv::new("fetchers");
+        env.ctx.store.write(&format!("{SOURCES_DIR}/latin1.toml"), vec![b's', 0xe9]).unwrap();
+        let loaded = Sources::load(&env.ctx).expect("one non-UTF-8 file must not fail the whole load");
+        assert!(loaded.sources.is_empty());
+        assert!(loaded.problems.get("latin1").is_some_and(|p| p.contains("UTF-8")), "{:?}", loaded.problems);
+    }
+
+    #[test]
+    fn a_filter_round_trips_through_a_file() {
+        let cfg = SourceConfig::parse(
+            "my-hn",
+            &source_file(&json!({
+                "enabled": true, "interval": "daily", "kind": "hn-whoishiring",
+                "filter": {"or": [{"title": {"contains": "junior"}}, {"title": {"contains": "entry level"}}],
+                           "title": {"not_contains": "senior"}},
+            })),
+        )
         .unwrap();
-        assert!(cfg.sources["hn-whoishiring"].enabled);
-        assert!(!cfg.sources["weworkremotely"].enabled);
+        assert!(cfg.matches_title("Junior Engineer", today(), chrono_tz::UTC));
+        assert!(!cfg.matches_title("Senior Engineer", today(), chrono_tz::UTC));
     }
 
     #[test]
-    fn a_title_filter_round_trips_through_config() {
-        let cfg = FetchersConfig::from_value(&json!({
-            "sources": {
-                "hn-whoishiring": {
-                    "enabled": true, "interval": "daily",
-                    "title_contains": ["junior", "entry level"],
-                    "title_excludes": ["senior", "staff"],
-                },
-            }
-        }))
-        .unwrap();
-        let hn = &cfg.sources["hn-whoishiring"];
-        assert_eq!(hn.title_contains, vec!["junior".to_string(), "entry level".to_string()]);
-        assert_eq!(hn.title_excludes, vec!["senior".to_string(), "staff".to_string()]);
+    fn a_filter_on_any_field_but_title_is_rejected_at_load_not_silently_matching_nothing() {
+        // #311's review, blocking: `Filter` has no schema, so `company = {"contains": "Acme"}`
+        // used to load fine and then match nothing, forever -- the filter is checked against
+        // `{"title": …}` only. Same for a key inside an "or" alternative.
+        let why = problem_for(
+            json!({"enabled": true, "interval": "daily", "kind": "hn-whoishiring", "filter": {"company": {"contains": "Acme"}}}),
+            "hn-whoishiring",
+        );
+        assert!(why.contains("company"), "{why}");
+
+        let why = problem_for(
+            json!({"enabled": true, "interval": "daily", "kind": "hn-whoishiring", "filter": {"or": [{"company": {"contains": "Acme"}}]}}),
+            "hn-whoishiring",
+        );
+        assert!(why.contains("company"), "{why}");
+    }
+
+    #[test]
+    fn a_typo_d_field_on_hn_or_wwr_is_rejected_not_silently_ignored() {
+        // #302's review: `hn-whoishiring` and `wwr` are ordinary `Kind`s now (ADR 0028 §10),
+        // each still validated through `Kind::parse` -> `reject_unknown` -- a stray key in
+        // `[kind]` must fail to load, not sit there doing nothing. The rebase onto #313
+        // dropped this test without changing the behaviour it covers; put back.
+        let why = problem_for(
+            json!({"enabled": true, "interval": "daily", "kind": "hn-whoishiring", "title_exclude": ["intern"]}),
+            "hn-whoishiring",
+        );
+        assert!(why.contains("title_exclude"), "{why}");
+
+        let why = problem_for(
+            json!({"enabled": true, "interval": 3600, "kind": "wwr", "categroy": "remote-full-stack-programming-jobs"}),
+            "my-wwr",
+        );
+        assert!(why.contains("categroy"), "{why}");
     }
 
     #[test]
     fn matches_title_with_no_filter_configured_keeps_everything() {
         let s = source(true, MIN_INTERVAL_API_S);
-        assert!(s.matches_title("Senior Staff Engineer"));
-        assert!(s.matches_title(""));
+        assert!(s.matches_title("Senior Staff Engineer", today(), chrono_tz::UTC));
+        assert!(s.matches_title("", today(), chrono_tz::UTC));
     }
 
     #[test]
     fn matches_title_requires_one_of_contains_case_insensitively() {
         let mut s = source(true, MIN_INTERVAL_API_S);
-        s.title_contains = vec!["junior".into(), "entry level".into()];
-        assert!(s.matches_title("Junior Software Engineer"));
-        assert!(s.matches_title("JUNIOR SOFTWARE ENGINEER"), "must be case-insensitive");
-        assert!(s.matches_title("Entry Level Developer"));
-        assert!(!s.matches_title("Senior Software Engineer"), "matches neither term");
+        s.filter = Some(
+            json!({"or": [{"title": {"contains": "junior"}}, {"title": {"contains": "entry level"}}]})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        assert!(s.matches_title("Junior Software Engineer", today(), chrono_tz::UTC));
+        assert!(s.matches_title("JUNIOR SOFTWARE ENGINEER", today(), chrono_tz::UTC), "must be case-insensitive");
+        assert!(s.matches_title("Entry Level Developer", today(), chrono_tz::UTC));
+        assert!(!s.matches_title("Senior Software Engineer", today(), chrono_tz::UTC), "matches neither term");
     }
 
     #[test]
     fn matches_title_excludes_always_wins_over_contains() {
         let mut s = source(true, MIN_INTERVAL_API_S);
-        s.title_contains = vec!["engineer".into()];
-        s.title_excludes = vec!["senior".into()];
-        assert!(s.matches_title("Junior Engineer"));
-        assert!(!s.matches_title("Senior Engineer"), "excludes must win even though 'engineer' is in title_contains");
+        s.filter =
+            Some(json!({"title": {"contains": "engineer", "not_contains": "senior"}}).as_object().unwrap().clone());
+        assert!(s.matches_title("Junior Engineer", today(), chrono_tz::UTC));
+        assert!(
+            !s.matches_title("Senior Engineer", today(), chrono_tz::UTC),
+            "excludes must win even though 'engineer' matches contains"
+        );
     }
 
     #[test]
     fn a_bad_interval_fails_at_load_time_not_on_the_first_tick() {
-        let why = problem_for(
-            json!({"sources": {"hn-whoishiring": {"enabled": true, "interval": "fortnightly"}}}),
-            "hn-whoishiring",
-        );
+        let why = problem_for(json!({"enabled": true, "interval": "fortnightly", "kind": "hn-whoishiring"}), "my-hn");
         assert!(why.contains("interval"), "{why}");
     }
 
     #[test]
-    fn an_unknown_top_level_key_is_rejected() {
-        let err = FetchersConfig::from_value(&json!({"tick_interval_s": 60})).unwrap_err();
-        assert_eq!(err.code, shimmer_core::ErrorCode::InvalidParams);
+    fn an_unknown_field_in_the_source_table_is_rejected() {
+        let err = SourceConfig::parse(
+            "hn-whoishiring",
+            "[source]\nenabled = true\ninterval = \"daily\"\ntick_interval_s = 60\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("tick_interval_s") || err.contains("unknown field"), "{err}");
     }
 
     #[test]
-    fn a_misspelled_source_id_fails_at_load_time_not_on_the_first_tick() {
-        let why = problem_for(
-            json!({"sources": {"hn-whoishirign": {"enabled": true, "interval": "daily"}}}),
-            "hn-whoishirign",
-        );
-        assert!(why.contains("hn-whoishiring"), "the reason should name the real ids: {why}");
+    fn a_source_with_no_kind_at_all_fails_at_load_time() {
+        // ADR 0028 §10 -- there is no fixed, compiled-in registry to fall back to; every
+        // source must name a kind, however it is spelled.
+        let why = problem_for(json!({"enabled": true, "interval": "daily"}), "my-hn");
+        assert!(why.contains("kind"), "{why}");
     }
 
     #[test]
     fn a_configured_rss_kind_with_a_url_parses() {
-        let cfg = FetchersConfig::from_value(&json!({
-            "sources": {
-                "my-team-blog": {"enabled": true, "interval": "hourly", "kind": "rss", "url": "https://example.test/feed.xml"},
-            }
-        }))
+        let cfg = SourceConfig::parse(
+            "my-team-blog",
+            &source_file(
+                &json!({"enabled": true, "interval": "hourly", "kind": "rss", "url": "https://example.test/feed.xml"}),
+            ),
+        )
         .unwrap();
-        assert_eq!(cfg.sources["my-team-blog"].kind.as_deref(), Some("rss"));
+        assert_eq!(cfg.kind, "rss");
     }
 
     #[test]
     fn an_rss_kind_with_no_url_fails_at_load_time() {
-        let why = problem_for(
-            json!({"sources": {"my-team-blog": {"enabled": true, "interval": "hourly", "kind": "rss"}}}),
-            "my-team-blog",
-        );
+        let why = problem_for(json!({"enabled": true, "interval": "hourly", "kind": "rss"}), "my-team-blog");
         assert!(why.contains("url"), "{why}");
     }
 
     #[test]
     fn an_rss_kind_with_a_non_http_url_fails_at_load_time() {
         let why = problem_for(
-            json!({"sources": {"my-team-blog": {"enabled": true, "interval": "hourly", "kind": "rss", "url": "not-a-url"}}}),
+            json!({"enabled": true, "interval": "hourly", "kind": "rss", "url": "not-a-url"}),
             "my-team-blog",
         );
         assert!(why.contains("url"), "{why}");
@@ -623,7 +747,7 @@ mod tests {
     #[test]
     fn an_rss_kind_with_a_non_http_scheme_url_fails_at_load_time() {
         let why = problem_for(
-            json!({"sources": {"my-team-blog": {"enabled": true, "interval": "hourly", "kind": "rss", "url": "ftp://example.test/feed.xml"}}}),
+            json!({"enabled": true, "interval": "hourly", "kind": "rss", "url": "ftp://example.test/feed.xml"}),
             "my-team-blog",
         );
         assert!(why.contains("url"), "{why}");
@@ -631,46 +755,34 @@ mod tests {
 
     #[test]
     fn an_rss_kind_with_an_https_url_parses() {
-        let cfg = FetchersConfig::from_value(&json!({
-            "sources": {"my-team-blog": {"enabled": true, "interval": "hourly", "kind": "rss", "url": "https://example.test/feed.xml"}}
-        }))
+        let cfg = SourceConfig::parse(
+            "my-team-blog",
+            &source_file(
+                &json!({"enabled": true, "interval": "hourly", "kind": "rss", "url": "https://example.test/feed.xml"}),
+            ),
+        )
         .unwrap();
-        assert_eq!(cfg.sources["my-team-blog"].url.as_deref(), Some("https://example.test/feed.xml"));
-    }
-
-    #[test]
-    fn a_kind_entry_whose_id_collides_with_a_fixed_source_fails_at_load_time() {
-        for id in ["hn-whoishiring", "weworkremotely"] {
-            let why = problem_for(
-                json!({"sources": {id: {"enabled": true, "interval": "hourly", "kind": "rss", "url": "https://example.test/feed.xml"}}}),
-                id,
-            );
-            assert!(why.contains("collides"), "id {id}: {why}");
-        }
+        assert_eq!(cfg.kind_params.get("url").and_then(Value::as_str), Some("https://example.test/feed.xml"));
     }
 
     #[test]
     fn an_unknown_kind_is_rejected() {
-        let why = problem_for(
-            json!({"sources": {"my-team-blog": {"enabled": true, "interval": "hourly", "kind": "carrier-pigeon"}}}),
-            "my-team-blog",
-        );
+        let why = problem_for(json!({"enabled": true, "interval": "hourly", "kind": "carrier-pigeon"}), "my-team-blog");
         assert!(why.contains("carrier-pigeon"), "{why}");
     }
 
     #[test]
     fn a_json_api_kind_with_every_required_field_parses() {
-        let cfg = FetchersConfig::from_value(&json!({
-            "sources": {
-                "figma-jobs": {
-                    "enabled": true, "interval": "daily", "kind": "json-api",
-                    "url": "https://boards-api.greenhouse.io/v1/boards/figma/jobs",
-                    "items_path": "jobs", "id_field": "id", "title_field": "title", "url_field": "absolute_url",
-                },
-            }
-        }))
+        let cfg = SourceConfig::parse(
+            "figma-jobs",
+            &source_file(&json!({
+                "enabled": true, "interval": "daily", "kind": "json-api",
+                "url": "https://boards-api.greenhouse.io/v1/boards/figma/jobs",
+                "items_path": "jobs", "id_field": "id", "title_field": "title", "url_field": "absolute_url",
+            })),
+        )
         .unwrap();
-        assert_eq!(cfg.sources["figma-jobs"].kind.as_deref(), Some("json-api"));
+        assert_eq!(cfg.kind, "json-api");
     }
 
     #[test]
@@ -682,7 +794,7 @@ mod tests {
                 "items_path": "jobs", "id_field": "id", "title_field": "title", "url_field": "url",
             });
             fields.as_object_mut().unwrap().remove(missing);
-            let why = problem_for(json!({"sources": {"acme-jobs": fields}}), "acme-jobs");
+            let why = problem_for(fields, "acme-jobs");
             assert!(why.contains(missing), "missing {missing}: {why}");
         }
     }
@@ -698,7 +810,7 @@ mod tests {
             for (k, v) in extra.as_object().unwrap() {
                 fields.as_object_mut().unwrap().insert(k.clone(), v.clone());
             }
-            json!({"sources": {"acme-jobs": fields}})
+            fields
         };
 
         let why = problem_for(raw(json!({"page_size": 0})), "acme-jobs");
@@ -707,21 +819,22 @@ mod tests {
         let why = problem_for(raw(json!({"page_size": 50, "url": "https://example.test/jobs"})), "acme-jobs");
         assert!(why.contains("{offset}"), "{why}");
 
-        let good = FetchersConfig::from_value(&raw(
-            json!({"page_size": 50, "url": "https://example.test/jobs?offset={offset}"}),
-        ))
+        let good = SourceConfig::parse(
+            "acme-jobs",
+            &source_file(&raw(json!({"page_size": 50, "url": "https://example.test/jobs?offset={offset}"}))),
+        )
         .unwrap();
-        assert!(good.sources.contains_key("acme-jobs") && good.problems.is_empty());
+        assert_eq!(good.kind, "json-api");
     }
 
     #[test]
     fn a_json_api_kind_with_an_unknown_pagination_is_rejected() {
         let why = problem_for(
-            json!({"sources": {"acme-jobs": {
+            json!({
                 "enabled": true, "interval": "daily", "kind": "json-api",
                 "url": "https://example.test/jobs", "id_field": "id", "title_field": "title", "url_field": "url",
                 "pagination": "cursor",
-            }}}),
+            }),
             "acme-jobs",
         );
         assert!(why.contains("cursor"), "{why}");
@@ -729,25 +842,26 @@ mod tests {
 
     #[test]
     fn a_json_api_kind_takes_an_optional_active_field() {
-        let cfg = FetchersConfig::from_value(&json!({
-            "sources": {"acme-jobs": {
+        let cfg = SourceConfig::parse(
+            "acme-jobs",
+            &source_file(&json!({
                 "enabled": true, "interval": "daily", "kind": "json-api",
                 "url": "https://example.test/jobs", "id_field": "id", "title_field": "title", "url_field": "url",
                 "active_field": "active",
-            }}
-        }))
+            })),
+        )
         .unwrap();
-        assert_eq!(cfg.sources["acme-jobs"].active_field.as_deref(), Some("active"));
+        assert_eq!(cfg.kind_params.get("active_field").and_then(Value::as_str), Some("active"));
     }
 
     #[test]
     fn a_json_api_kind_rejects_a_blank_active_field() {
         let why = problem_for(
-            json!({"sources": {"acme-jobs": {
+            json!({
                 "enabled": true, "interval": "daily", "kind": "json-api",
                 "url": "https://example.test/jobs", "id_field": "id", "title_field": "title", "url_field": "url",
                 "active_field": "  ",
-            }}}),
+            }),
             "acme-jobs",
         );
         assert!(why.contains("active_field"), "{why}");
@@ -755,101 +869,68 @@ mod tests {
 
     fn source(enabled: bool, interval_s: u64) -> SourceConfig {
         SourceConfig {
+            label: None,
             enabled,
             interval: IntervalSpec::Seconds(interval_s),
-            kind: None,
-            url: None,
-            items_path: None,
-            id_field: None,
-            title_field: None,
-            url_field: None,
-            url_base: None,
-            pagination: None,
-            page_size: None,
-            active_field: None,
-            title_contains: Vec::new(),
-            title_excludes: Vec::new(),
+            kind: "rss".into(),
+            filter: None,
+            kind_params: Map::new(),
         }
-    }
-
-    #[test]
-    fn a_never_run_enabled_source_is_due() {
-        let mut cfg = FetchersConfig::default();
-        cfg.sources.insert("hn-whoishiring".into(), source(true, MIN_INTERVAL_API_S));
-        let due = due_sources(&cfg, &BTreeMap::new(), at("2026-01-01T00:00:00Z"));
-        assert_eq!(due, vec!["hn-whoishiring".to_string()]);
-    }
-
-    #[test]
-    fn a_disabled_source_is_never_due() {
-        let mut cfg = FetchersConfig::default();
-        cfg.sources.insert("hn-whoishiring".into(), source(false, MIN_INTERVAL_API_S));
-        let due = due_sources(&cfg, &BTreeMap::new(), at("2026-01-01T00:00:00Z"));
-        assert!(due.is_empty());
-    }
-
-    #[test]
-    fn a_source_run_within_its_interval_is_not_due_yet() {
-        let mut cfg = FetchersConfig::default();
-        cfg.sources.insert("hn-whoishiring".into(), source(true, 3600));
-        let mut last = BTreeMap::new();
-        last.insert("hn-whoishiring".to_string(), at("2026-01-01T00:00:00Z"));
-        let due = due_sources(&cfg, &last, at("2026-01-01T00:30:00Z"));
-        assert!(due.is_empty(), "only 30 minutes have passed of a 1-hour interval");
-    }
-
-    #[test]
-    fn a_source_run_past_its_interval_is_due_again() {
-        let mut cfg = FetchersConfig::default();
-        cfg.sources.insert("hn-whoishiring".into(), source(true, 3600));
-        let mut last = BTreeMap::new();
-        last.insert("hn-whoishiring".to_string(), at("2026-01-01T00:00:00Z"));
-        let due = due_sources(&cfg, &last, at("2026-01-01T01:00:01Z"));
-        assert_eq!(due, vec!["hn-whoishiring".to_string()]);
     }
 
     #[test]
     fn one_bad_source_does_not_stop_the_good_ones() {
-        // #126's review, B1: this used to make `from_value` -- and so every `fetchers.tick`,
-        // `list` and `status` -- fail outright, so one typo stopped all fetching and (with the
-        // built-in scheduled-task-failed alert) popped a high-priority notification every five
-        // minutes.
-        let cfg = FetchersConfig::from_value(&json!({
-            "sources": {
-                "good": {"enabled": true, "interval": "daily", "kind": "rss", "url": "https://example.test/f.xml"},
-                "bad": {"enabled": true, "interval": "daily", "kind": "rss", "url": "not-a-url"},
-                "also-bad": {"enabled": true, "interval": "daily", "kind": "carrier-pigeon"},
-                "wrong-type": {"enabled": true, "interval": {}},
-            }
-        }))
-        .unwrap();
-        assert_eq!(cfg.sources.keys().collect::<Vec<_>>(), vec!["good"], "the good source still loads");
-        assert_eq!(cfg.problems.len(), 3, "each bad source is reported on its own: {:?}", cfg.problems);
+        // #126's review, B1: this used to make loading -- and so every `fetchers.list`/
+        // `.status` -- fail outright, so one typo stopped all fetching.
+        let env = TestEnv::new("fetchers");
+        write_source(
+            &env,
+            "good",
+            json!({"enabled": true, "interval": "daily", "kind": "rss", "url": "https://example.test/f.xml"}),
+        );
+        write_source(&env, "bad", json!({"enabled": true, "interval": "daily", "kind": "rss", "url": "not-a-url"}));
+        write_source(&env, "also-bad", json!({"enabled": true, "interval": "daily", "kind": "carrier-pigeon"}));
+        env.ctx
+            .store
+            .write(&format!("{SOURCES_DIR}/wrong-type.toml"), "[source]\nenabled = true\ninterval = {}\n")
+            .unwrap();
+        let loaded = Sources::load(&env.ctx).unwrap();
+        assert_eq!(loaded.sources.keys().collect::<Vec<_>>(), vec!["good"], "the good source still loads");
+        assert_eq!(loaded.problems.len(), 3, "each bad source is reported on its own: {:?}", loaded.problems);
         for id in ["bad", "also-bad", "wrong-type"] {
-            assert!(cfg.problems.contains_key(id), "{id} should be reported: {:?}", cfg.problems);
+            assert!(loaded.problems.contains_key(id), "{id} should be reported: {:?}", loaded.problems);
         }
-
-        // And the good one is still schedulable.
-        let due = due_sources(&cfg, &BTreeMap::new(), at("2026-01-01T00:00:00Z"));
-        assert_eq!(due, vec!["good".to_string()]);
     }
 
     #[test]
-    fn an_empty_filter_term_is_rejected_rather_than_matching_every_title() {
-        // #126's review, B3: `--excludes senior,` becomes ["senior", ""], and "" is a substring
-        // of every title, so everything got excluded. Same the other way for `title_contains`.
-        for field in ["title_excludes", "title_contains"] {
-            let why = problem_for(
-                json!({"sources": {"hn-whoishiring": {"enabled": true, "interval": "daily", field: ["senior", ""]}}}),
-                "hn-whoishiring",
-            );
-            assert!(why.contains(field), "{field}: {why}");
-        }
-        // Whitespace-only counts as empty.
-        problem_for(
-            json!({"sources": {"hn-whoishiring": {"enabled": true, "interval": "daily", "title_contains": ["  "]}}}),
-            "hn-whoishiring",
+    fn a_sources_own_state_toml_is_never_mistaken_for_a_source() {
+        let env = TestEnv::new("fetchers");
+        write_source(
+            &env,
+            "good",
+            json!({"enabled": true, "interval": "daily", "kind": "rss", "url": "https://example.test/f.xml"}),
         );
+        save_schedule_state(&env.ctx, "good", "trig-1", at("2026-01-01T00:00:00Z")).unwrap();
+        let loaded = Sources::load(&env.ctx).unwrap();
+        assert_eq!(loaded.sources.keys().collect::<Vec<_>>(), vec!["good"]);
+        assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
+    }
+
+    #[test]
+    fn an_empty_filter_operator_value_is_rejected_at_load_time() {
+        // #126's review, B3's original concern ("" is a substring of every title, so an empty
+        // term matched/excluded everything) is now `core::filter::Op::parse`'s own job --
+        // `contains`/`not_contains` already refuse an empty value.
+        for op in ["contains", "not_contains"] {
+            let mut title = Map::new();
+            title.insert(op.to_owned(), json!(""));
+            let mut filter = Map::new();
+            filter.insert("title".to_owned(), Value::Object(title));
+            let mut fields = json!({"enabled": true, "interval": "daily", "kind": "hn-whoishiring"});
+            fields.as_object_mut().unwrap().insert("filter".to_owned(), Value::Object(filter));
+            let why = problem_for(fields, "my-hn");
+            assert!(why.contains(op), "{op}: {why}");
+        }
     }
 
     #[test]
@@ -858,7 +939,7 @@ mod tests {
         // id should be checked where every other user-named thing is -- at load.
         for id in ["../records", "has space", "UPPER", "has/slash"] {
             let why = problem_for(
-                json!({"sources": {id: {"enabled": true, "interval": "daily", "kind": "rss", "url": "https://e.test/f"}}}),
+                json!({"enabled": true, "interval": "daily", "kind": "rss", "url": "https://e.test/f"}),
                 id,
             );
             assert!(why.contains("source id"), "id {id}: {why}");
@@ -866,39 +947,20 @@ mod tests {
     }
 
     #[test]
-    fn a_last_run_in_the_future_reads_as_due_rather_than_stalling_the_source() {
-        // #126's review, B10: a clock correction, or a $SHIMMER_HOME copied from a machine
-        // running ahead, parked a source until that future time actually arrived.
-        let mut cfg = FetchersConfig::default();
-        cfg.sources.insert("hn-whoishiring".into(), source(true, 3600));
-        let mut last = BTreeMap::new();
-        last.insert("hn-whoishiring".to_string(), at("2026-02-01T00:00:00Z"));
-        let due = due_sources(&cfg, &last, at("2026-01-01T00:00:00Z"));
-        assert_eq!(due, vec!["hn-whoishiring".to_string()], "a future last_run must not stall the source");
-    }
-
-    #[test]
     fn a_corrupt_last_run_file_does_not_stop_every_source() {
-        // #126's review, B1's other half: this returned `Err`, failing the whole tick.
         let env = TestEnv::new("fetchers");
         env.ctx.store.write(LAST_RUN_PATH, "this is not: valid toml [[[").unwrap();
-        assert!(load_last_run(&env.ctx).unwrap().is_empty(), "unreadable means every source is due, not an error");
+        assert!(load_last_run(&env.ctx).unwrap().is_empty(), "unreadable reads as empty, not an error");
         assert!(last_run_problem(&env.ctx).is_some(), "but it is reported, not silent");
 
         // A single unreadable entry keeps the good ones.
-        env.ctx.store.write(LAST_RUN_PATH, "good = \"2026-01-01T00:00:00Z\"\nbad = \"not a date\"\n").unwrap();
+        env.ctx
+            .store
+            .write(LAST_RUN_PATH, "good = { at = \"2026-01-01T00:00:00Z\" }\nbad = { at = \"not a date\" }\n")
+            .unwrap();
         let runs = load_last_run(&env.ctx).unwrap();
         assert_eq!(runs.keys().collect::<Vec<_>>(), vec!["good"]);
         assert!(last_run_problem(&env.ctx).is_some_and(|p| p.contains("bad")));
-    }
-
-    #[test]
-    fn trigger_shape_matches_adr_0028() {
-        let t = trigger();
-        assert_eq!(t.op, TICK_OP);
-        assert_eq!(t.schedule, Schedule::Every(TICK_INTERVAL));
-        assert_eq!(t.catch_up, CatchUp::Skip);
-        assert!(t.lane.is_none(), "defers to fetchers.tick's own CommandSpec lane");
     }
 
     #[test]
@@ -922,5 +984,75 @@ mod tests {
     fn load_last_run_with_nothing_recorded_yet_is_empty_not_an_error() {
         let env = TestEnv::new("fetchers");
         assert!(load_last_run(&env.ctx).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_failure_is_recorded_and_cleared_by_the_next_success_leaving_other_sources_alone() {
+        let env = TestEnv::new("fetchers");
+        record_run(&env.ctx, "blog", at("2026-01-01T00:00:00Z")).unwrap();
+        record_failure(&env.ctx, "hn-whoishiring", at("2026-01-02T00:00:00Z"), "boom", "network").unwrap();
+
+        let failures = load_last_failures(&env.ctx);
+        assert_eq!(failures.len(), 1);
+        let (failed_at, error, reason) = failures.get("hn-whoishiring").unwrap();
+        assert_eq!(*failed_at, at("2026-01-02T00:00:00Z"));
+        assert_eq!(error, "boom");
+        assert_eq!(reason, "network");
+        // A failed run still updates last_run_at (ADR 0028 §6: a broken source still waits a
+        // full interval, not retried immediately).
+        assert_eq!(load_last_run(&env.ctx).unwrap().get("hn-whoishiring"), Some(&at("2026-01-02T00:00:00Z")));
+        // The other source's own record is untouched.
+        assert!(!failures.contains_key("blog"));
+
+        // The next success clears it -- health reports only the most recent outcome.
+        record_run(&env.ctx, "hn-whoishiring", at("2026-01-03T00:00:00Z")).unwrap();
+        assert!(load_last_failures(&env.ctx).is_empty());
+    }
+
+    #[test]
+    fn renaming_a_source_carries_its_pending_failure_to_the_new_id() {
+        let env = TestEnv::new("fetchers");
+        record_failure(&env.ctx, "blog", at("2026-01-01T00:00:00Z"), "boom", "network").unwrap();
+        let text = rename_last_run(&env.ctx, "blog", "team-blog").unwrap().expect("blog had a record");
+        env.ctx.store.write(LAST_RUN_PATH, text).unwrap();
+
+        let failures = load_last_failures(&env.ctx);
+        assert!(!failures.contains_key("blog"));
+        let (_, error, reason) = failures.get("team-blog").expect("the failure followed the rename");
+        assert_eq!(error, "boom");
+        assert_eq!(reason, "network");
+    }
+
+    #[test]
+    fn render_builds_a_file_that_parses_back_to_the_same_fields() {
+        let filter = json!({"title": {"contains": "junior", "not_contains": "staff"}}).as_object().unwrap().clone();
+        let text = render(
+            Some("My Team's Blog"),
+            "rss",
+            true,
+            &IntervalSpec::Preset("hourly".into()),
+            &json!({"url": "https://example.test/feed.xml"}).as_object().unwrap().clone(),
+            Some(&filter),
+        )
+        .unwrap();
+        let cfg = SourceConfig::parse("my-team-blog", &text).unwrap();
+        assert_eq!(cfg.label.as_deref(), Some("My Team's Blog"));
+        assert_eq!(cfg.kind, "rss");
+        assert!(cfg.enabled);
+        assert_eq!(cfg.interval, IntervalSpec::Preset("hourly".into()));
+        assert_eq!(cfg.kind_params.get("url").and_then(Value::as_str), Some("https://example.test/feed.xml"));
+        assert_eq!(cfg.filter, Some(filter));
+    }
+
+    #[test]
+    fn render_omits_label_and_filter_entirely_when_absent_but_kind_is_always_written() {
+        // ADR 0028 §10: no fixed, compiled-in registry any more -- `hn-whoishiring` is an
+        // ordinary kind, with no fields of its own.
+        let text = render(None, "hn-whoishiring", false, &IntervalSpec::Seconds(MIN_INTERVAL_API_S), &Map::new(), None)
+            .unwrap();
+        let cfg = SourceConfig::parse("my-hn", &text).unwrap();
+        assert_eq!(cfg.label, None);
+        assert_eq!(cfg.kind, "hn-whoishiring");
+        assert_eq!(cfg.filter, None);
     }
 }

@@ -4,7 +4,8 @@ Status: proposed · Raised by Dev B (#228) · Needs sign-off: Dev A (§5's `core
 three helpers moved into `core`, `Manifest.topic_descriptions`, one-time module schedules,
 `Ctx.catalog`; CLAUDE.md
 §1.1 gains a row, CLAUDE.md §4) · Dev C notified (new ops and topics, §8) · Amends ADR 0032 §4–§5
-(notify's alerts and rules), ADR 0033 (a `fix` in workspaces' dirty detail, §10)
+(notify's alerts and rules), ADR 0033 (a `fix` in workspaces' dirty detail, §10) · Amended (ADR 0028
+§8, fetchers): `core::filter::Op` gains `not_contains`, so `when` picks it up too — see §5.3
 
 ## Context
 
@@ -79,7 +80,8 @@ params = { title = "Interview stage: {title}", priority = "high" }
   description (§5.5), so a rule can be written without reading the protocol.
 - **`when`** (optional): conditions on the event's payload, in **records' filter language**
   (ADR 0019, ADR 0024 §5): a plain value is equality; an object holds operators that must all pass:
-  `eq`, `ne`, `lt`, `lte`, `gt`, `gte`, `in`, `set`, `contains`, `has`; a top-level
+  `eq`, `ne`, `lt`, `lte`, `gt`, `gte`, `in`, `set`, `contains`, `not_contains` (ADR 0028 §8, text not
+  containing this, ignoring case; unset or non-text passes), `has`; a top-level
   `or = [{…}, {…}]` passes when any one of its alternatives does (§5.3); relative dates (`today+3`)
   resolve in the local timezone. Keys are payload fields; `item.<field>` reaches into a record
   event's record (ADR 0017 §7); dotted paths reach nested fields (`detail.workspace`).

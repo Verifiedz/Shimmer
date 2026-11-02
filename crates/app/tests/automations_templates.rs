@@ -142,8 +142,8 @@ fn stage_creates_workspace_makes_opens_and_stops_one_per_record() {
     let history = ok(&home, &["automations", "history", "prep-open"]);
     assert!(history.contains("prep-open on workspaces.workspace.created: queued workspaces.activate"), "{history}");
     // A detached step is started, not waited on: `active` can come before it has written its pid.
-    until("smoke-test's background step saved its pid", || background_pid().is_some());
-    let (pid, dir) = background_pid().expect("smoke-test's background step saved its pid");
+    until("smoke-test's background step saved its pid", || background_pid(&home).is_some());
+    let (pid, dir) = background_pid(&home).expect("smoke-test's background step saved its pid");
     let _cleanup = Cleanup { pid, dir };
     assert!(alive(pid), "the background step runs while it's open");
 
@@ -169,19 +169,20 @@ impl Drop for Cleanup {
 
 /// smoke-test's background step writes its pid to `background.pid` in its state folder, under
 /// the temporary folder: `shimmer-<uid>-<home tag>-<workspace>` (its lib/shimmer-open.sh).
-fn state_dir() -> Option<std::path::PathBuf> {
+/// This test's own folder, worked out the way the script does, never the newest match: one left
+/// by an earlier run, or another run at the same time, has a pid that isn't this test's.
+fn state_dir(home: &Home) -> std::path::PathBuf {
     let tmp = std::env::var_os("TMPDIR").map_or_else(|| "/tmp".into(), std::path::PathBuf::from);
-    std::fs::read_dir(tmp)
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().ends_with("-acme-smoke-test")))
-        .filter(|p| p.join("background.pid").exists())
-        .max_by_key(|p| std::fs::metadata(p.join("background.pid")).and_then(|m| m.modified()).ok())
+    let uid = std::process::Command::new("id").arg("-u").output().unwrap();
+    let uid = String::from_utf8_lossy(&uid.stdout).trim().to_owned();
+    // shimmer_home_tag: h = (h * 31 + byte) % 2147483647 over $SHIMMER_HOME, as 8 hex digits.
+    let shimmer_home = home.dir.path().join("home");
+    let tag = shimmer_home.to_string_lossy().bytes().fold(0u64, |h, b| (h * 31 + u64::from(b)) % 2_147_483_647);
+    tmp.join(format!("shimmer-{uid}-{tag:08x}-acme-smoke-test"))
 }
 
-fn background_pid() -> Option<(u32, std::path::PathBuf)> {
-    let dir = state_dir()?;
+fn background_pid(home: &Home) -> Option<(u32, std::path::PathBuf)> {
+    let dir = state_dir(home);
     let pid = std::fs::read_to_string(dir.join("background.pid")).ok()?.trim().parse().ok()?;
     Some((pid, dir))
 }

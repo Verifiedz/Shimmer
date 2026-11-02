@@ -62,20 +62,12 @@ pub struct When {
     pub words: String,
 }
 
-/// The words that start a command: the entries of `shimmer --help`'s "commands:" section, read
-/// from the help text itself so a new command is known here with no second list to keep (#185's
-/// review). An alias of the active pack starts one too, rewritten before this is asked.
+/// The words that start a command: every entry of `shimmer --help`, in any of its sections, read
+/// from the help text itself (the reader Tab completion uses) so a new command is known here with
+/// no second list to keep (#185's review). An alias of the active pack starts one too, rewritten
+/// before this is asked.
 fn is_command_word(word: &str) -> bool {
-    let commands = crate::args::USAGE.split("commands:\n").nth(1).unwrap_or_default();
-    word == "help"
-        || commands
-            .split("\n\n")
-            .next()
-            .unwrap_or_default()
-            .lines()
-            .filter(|l| l.starts_with("  ") && !l.starts_with("   "))
-            .filter_map(|l| l.split_whitespace().next())
-            .any(|w| w == word)
+    word == "help" || crate::complete::command_words(crate::args::USAGE).iter().any(|w| w == word)
 }
 
 /// What can be scheduled: the commands that make exactly one change (ADR 0031 §1). Running one

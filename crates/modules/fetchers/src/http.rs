@@ -14,8 +14,22 @@ use shimmer_core::{Ctx, Error, HttpResponse, Result, RetryPolicy};
 /// 2s) -- never a 4xx, and never a response already in cooldown (`retry_after_secs.is_some()`,
 /// ADR 0028 §6: "no retry... into a host the gateway has put in cooldown").
 pub async fn get(ctx: &Ctx, url: &str) -> Result<HttpResponse> {
+    get_as(ctx, url, None).await
+}
+
+/// [`get`], attaching `credential` (ADR 0036, ADR 0028 §4) -- a `[credentials.<name>]` binding
+/// the daemon resolves and attaches as a header, never seen by this module. Used by a `json-api`
+/// or `rss` source configured with one; every other caller stays on [`get`].
+pub async fn get_with_credential(ctx: &Ctx, url: &str, credential: &str) -> Result<HttpResponse> {
+    get_as(ctx, url, Some(credential)).await
+}
+
+async fn get_as(ctx: &Ctx, url: &str, credential: Option<&str>) -> Result<HttpResponse> {
     ctx.retry_with_backoff(RetryPolicy::standard(), |_attempt| async {
-        let resp = ctx.http.get(url).await?;
+        let resp = match credential {
+            Some(c) => ctx.http.get_with_credential(url, c).await?,
+            None => ctx.http.get(url).await?,
+        };
         if resp.retry_after_secs.is_none() && resp.status >= 500 {
             return Err(Error::unavailable(format!("http {} fetching {url}", resp.status)));
         }

@@ -18,25 +18,29 @@ use crate::workspaces::{self, WorkspacesCmd};
 
 pub const USAGE: &str = "usage: shimmer [--socket PATH] [--json] <command>
 
+new here? start from a template: shimmer records templates, or shimmer workspaces templates
+
 commands:
-  ping                  check the daemon is up
-  manifest              list registered modules, their ops and lanes
   records …             add, list and complete records (shimmer records --help)
   workspaces …          list, inspect and reset workspaces (shimmer workspaces --help)
-  queue …               what's running and waiting, and cancel or reorder it (shimmer queue --help)
   scheduler …           run commands on a schedule, and list, disable or remove them
                         (shimmer scheduler --help)
-  fetchers …            sources that reach outward for new items (shimmer fetchers --help)
   automations …         rules: when something happens, run a command (shimmer automations --help)
   notify …              your messages: the inbox, quiet hours, pause (shimmer notify --help)
-  packs …               command packs: themed aliases for these commands (shimmer packs --help)
+  fetchers …            sources that reach outward for new items (shimmer fetchers --help)
+  queue …               what's running and waiting, and cancel or reorder it (shimmer queue --help)
   doctor                check everything and say how to fix what's wrong
+  packs …               command packs: themed aliases for these commands (shimmer packs --help)
   startup …             start the daemon every time you log in (shimmer startup --help)
-  call OP [PARAMS]      send any op; PARAMS is a JSON object (default {});
-       [--first [--yes]]  --first: a queued op ahead of its lane (asks first)
-  shutdown              stop the daemon
   completions SHELL     print Tab completion for bash, zsh or fish, to load in your shell:
                         source <(shimmer completions zsh), e.g. in ~/.zshrc
+  shutdown              stop the daemon
+
+under the hood:
+  ping                  check the daemon is up
+  manifest              list registered modules, their ops and lanes
+  call OP [PARAMS]      send any op; PARAMS is a JSON object (default {});
+       [--first [--yes]]  --first: a queued op ahead of its lane (asks first)
   daemon                run the daemon in the foreground (Ctrl-C to stop)
   mockd                 run the mock daemon for building clients (shimmer mockd --help)
 
@@ -186,7 +190,7 @@ fn command(words: Vec<String>) -> Result<Command, String> {
         other if other.starts_with('-') && other.len() > 1 => {
             Err(format!("unknown option '{}'", other.split('=').next().unwrap_or(other)))
         }
-        other => Err(format!("unknown command '{other}'")),
+        other => Err(crate::suggest::unknown_command(None, other, USAGE)),
     }
 }
 

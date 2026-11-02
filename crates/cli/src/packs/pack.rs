@@ -124,7 +124,20 @@ pub const TARGETS: &[Target] = &[
     Target { op: "scheduler.purge", words: &["scheduler", "purge"] },
     // ADR 0028: fetchers' own ops.
     Target { op: "fetchers.list", words: &["fetchers", "list"] },
+    Target { op: "fetchers.show", words: &["fetchers", "show"] },
+    Target { op: "fetchers.new", words: &["fetchers", "new"] },
+    Target { op: "fetchers.templates", words: &["fetchers", "templates"] },
+    Target { op: "fetchers.peek", words: &["fetchers", "peek"] },
+    Target { op: "fetchers.edit", words: &["fetchers", "edit"] },
+    Target { op: "fetchers.remove", words: &["fetchers", "remove"] },
+    Target { op: "fetchers.restore", words: &["fetchers", "restore"] },
+    Target { op: "fetchers.purge", words: &["fetchers", "purge"] },
+    Target { op: "fetchers.enable", words: &["fetchers", "enable"] },
+    Target { op: "fetchers.disable", words: &["fetchers", "disable"] },
+    Target { op: "fetchers.rename", words: &["fetchers", "rename"] },
+    Target { op: "fetchers.copy", words: &["fetchers", "copy"] },
     Target { op: "fetchers.status", words: &["fetchers", "status"] },
+    Target { op: "fetchers.reload", words: &["fetchers", "reload"] },
     Target { op: "fetchers.test", words: &["fetchers", "test"] },
     Target { op: "fetchers.run", words: &["fetchers", "run"] },
     // `items` has no op of its own -- it reads `core.events.list` -- so it's named like
@@ -473,7 +486,7 @@ label = "My Pack"
 
     #[test]
     fn every_target_is_an_op_with_its_command_words() {
-        assert_eq!(TARGETS.len(), 95);
+        assert_eq!(TARGETS.len(), 108);
         // Every command's word is its op's verb (ADR 0038 §6): no exceptions are left.
         for t in TARGETS {
             let (module, verb) = t.op.split_once('.').unwrap();

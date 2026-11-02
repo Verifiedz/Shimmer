@@ -35,7 +35,8 @@ impl Flags {
             } else if let Some(sw) = switches.iter().find(|s| **s == name).filter(|_| inline.is_none()) {
                 flags.switches.push(sw);
             } else {
-                return Err(format!("unknown option '{name}'"));
+                let known: Vec<&str> = options.iter().chain(switches).copied().collect();
+                return Err(crate::suggest::unknown_option(&name, &known));
             }
         }
         Ok(flags)

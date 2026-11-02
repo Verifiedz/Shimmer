@@ -41,7 +41,10 @@ An alias stands for shimmer plus a whole command. In pack.toml it names one of t
   queue.list  queue.show  queue.cancel  queue.move
   scheduler.list  scheduler.show  scheduler.add  scheduler.edit  scheduler.disable
   scheduler.enable  scheduler.remove  scheduler.restore  scheduler.purge
-  fetchers.list  fetchers.status  fetchers.test  fetchers.run  fetchers.items
+  fetchers.list  fetchers.show  fetchers.new  fetchers.templates  fetchers.peek
+  fetchers.edit  fetchers.remove  fetchers.restore  fetchers.purge  fetchers.enable
+  fetchers.disable  fetchers.rename  fetchers.copy  fetchers.status  fetchers.reload
+  fetchers.test  fetchers.run  fetchers.items
   automations.list  automations.show  automations.new  automations.edit  automations.remove
   automations.restore  automations.purge  automations.rename  automations.copy
   automations.enable  automations.disable  automations.test
@@ -88,7 +91,7 @@ pub fn parse(rest: Vec<String>) -> std::result::Result<PacksCmd, String> {
         "show" => one("a pack name").map(|name| PacksCmd::Show { name }),
         "check" => one("a pack name or folder").map(|target| PacksCmd::Check { target }),
         "use" => one("a pack name, or 'none'").map(|name| PacksCmd::Use { name, link: !no_link }),
-        other => Err(format!("unknown packs command '{other}'")),
+        other => Err(crate::suggest::unknown_command(Some("packs"), other, USAGE)),
     }
 }
 

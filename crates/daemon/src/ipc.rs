@@ -110,7 +110,8 @@ async fn connection(core: Arc<Core>, stream: UnixStream, tracker: TaskTracker) -
         Err(e) => return write_frame(&mut wr, &ServerFrame::error(e)).await,
     }
     let session = ulid::Ulid::new().to_string();
-    write_frame(&mut wr, &ServerFrame::welcome(env!("CARGO_PKG_VERSION"), session)).await?;
+    write_frame(&mut wr, &ServerFrame::welcome_for(env!("CARGO_PKG_VERSION"), session, core.backend.store.home()))
+        .await?;
 
     let subs: Arc<Mutex<Vec<String>>> = Arc::default();
     let (out_tx, out_rx) = mpsc::channel::<ServerFrame>(256);

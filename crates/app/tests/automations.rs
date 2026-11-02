@@ -102,8 +102,12 @@ params = {{ collection = "leetcode", id = "two-sum", fields = {{ url = "https://
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(fired(&home, "looping"), settled, "it kept firing after it was stopped");
     // Bounded, not once: a rule on `*` reacts once to each of its first task's few events
-    // (enqueued, started, finished, the record's update); every follow-up is then a cycle.
-    assert!(settled <= 10, "fired {settled} times before the guard stopped it for good");
+    // (enqueued, started, finished, the record's update); every follow-up is then a cycle. It
+    // also reacts to the events of the built-in alert about the stop (notify's message, its
+    // delivery and any fallback), and how many of those land before it settles depends on the
+    // machine's load: 15 on a busy CI-like run. A runaway fires hundreds of times a second, so
+    // this bound only has to tell "a handful" from "unbounded"; the check above is the real one.
+    assert!(settled <= 50, "fired {settled} times before the guard stopped it for good");
 }
 
 #[test]

@@ -34,7 +34,47 @@ const MAX_THREAD_CANDIDATES: usize = 5;
 /// threads `user/whoishiring.json` also lists, often right next to it (PR #126 review).
 const WHO_IS_HIRING_PREFIX: &str = "Ask HN: Who is hiring?";
 
-pub struct HnWhoIsHiring;
+pub struct HnWhoIsHiring {
+    id: String,
+}
+
+impl HnWhoIsHiring {
+    pub fn new(id: String) -> Self {
+        Self { id }
+    }
+}
+
+/// The `hn-whoishiring` kind (ADR 0028 §10): no fields of its own, same posture as this
+/// source itself -- it needs nothing beyond `enabled`/`interval`/`filter`, every source's own
+/// envelope fields.
+pub struct HnKind;
+
+impl crate::kind::Kind for HnKind {
+    fn name(&self) -> &'static str {
+        "hn-whoishiring"
+    }
+
+    fn method(&self) -> Method {
+        Method::Api
+    }
+
+    fn parse(
+        &self,
+        params: &serde_json::Map<String, serde_json::Value>,
+    ) -> std::result::Result<Box<dyn crate::kind::KindConfig>, String> {
+        crate::kind::reject_unknown(params, &[])?;
+        Ok(Box::new(HnConfig))
+    }
+}
+
+#[derive(Debug)]
+struct HnConfig;
+
+impl crate::kind::KindConfig for HnConfig {
+    fn build(&self, id: String) -> std::sync::Arc<dyn Source> {
+        std::sync::Arc::new(HnWhoIsHiring::new(id))
+    }
+}
 
 #[derive(Deserialize)]
 struct UserItem {
@@ -64,7 +104,7 @@ struct HnItem {
 #[async_trait]
 impl Source for HnWhoIsHiring {
     fn id(&self) -> &str {
-        "hn-whoishiring"
+        &self.id
     }
 
     fn method(&self) -> Method {
@@ -248,7 +288,7 @@ mod tests {
         let env = TestEnv::new("fetchers");
         stub_full_thread(&env);
 
-        let page = HnWhoIsHiring.fetch_page(&env.ctx, None).await.unwrap();
+        let page = HnWhoIsHiring::new("hn-whoishiring".into()).fetch_page(&env.ctx, None).await.unwrap();
         // 3 kids, well under PAGE_SIZE, so this is the whole thread in one page: 10 and 12
         // are valid, 11 is deleted and must not become an item.
         assert_eq!(page.items.len(), 2, "45000011 is deleted and must not become an item");
@@ -260,9 +300,21 @@ mod tests {
     }
 
     #[test]
-    fn id_is_hn_whoishiring_and_method_is_api() {
-        assert_eq!(HnWhoIsHiring.id(), "hn-whoishiring");
-        assert_eq!(HnWhoIsHiring.method(), Method::Api);
+    fn id_is_whatever_it_was_constructed_with_and_method_is_api() {
+        let hn = HnWhoIsHiring::new("my-hn".into());
+        assert_eq!(hn.id(), "my-hn");
+        assert_eq!(hn.method(), Method::Api);
+    }
+
+    #[test]
+    fn hn_kind_takes_no_fields_of_its_own() {
+        use crate::kind::Kind;
+        assert_eq!(HnKind.name(), "hn-whoishiring");
+        assert_eq!(HnKind.method(), Method::Api);
+        assert!(HnKind.parse(&serde_json::Map::new()).is_ok());
+        let mut extra = serde_json::Map::new();
+        extra.insert("nope".into(), json!(true));
+        assert!(HnKind.parse(&extra).is_err());
     }
 
     #[tokio::test]
@@ -273,7 +325,7 @@ mod tests {
         stub(&env, "/item/45000001.json", ok(THREAD));
         stub(&env, "/item/45000012.json", ok(COMMENT_12));
 
-        let page = HnWhoIsHiring.fetch_page(&env.ctx, Some("45000001:2")).await.unwrap();
+        let page = HnWhoIsHiring::new("hn-whoishiring".into()).fetch_page(&env.ctx, Some("45000001:2")).await.unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].source_id, "45000012");
         assert!(page.next_cursor.is_none(), "every kid has now been paged through");
@@ -282,7 +334,7 @@ mod tests {
     #[tokio::test]
     async fn no_stub_at_all_is_a_transport_failure_not_a_module_error() {
         let env = TestEnv::new("fetchers"); // nothing stubbed
-        let err = HnWhoIsHiring.fetch_page(&env.ctx, None).await.unwrap_err();
+        let err = HnWhoIsHiring::new("hn-whoishiring".into()).fetch_page(&env.ctx, None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::Unavailable);
     }
 
@@ -294,7 +346,7 @@ mod tests {
             "/user/whoishiring.json",
             HttpResponse { status: 404, body: Vec::new(), from_cache: false, stale: false, retry_after_secs: None },
         );
-        let err = HnWhoIsHiring.fetch_page(&env.ctx, None).await.unwrap_err();
+        let err = HnWhoIsHiring::new("hn-whoishiring".into()).fetch_page(&env.ctx, None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::ModuleError);
         assert!(err.message.starts_with("http_error:"), "{}", err.message);
     }
@@ -303,7 +355,7 @@ mod tests {
     async fn malformed_json_is_a_classifiable_parse_failure() {
         let env = TestEnv::new("fetchers");
         stub(&env, "/user/whoishiring.json", ok(MALFORMED));
-        let err = HnWhoIsHiring.fetch_page(&env.ctx, None).await.unwrap_err();
+        let err = HnWhoIsHiring::new("hn-whoishiring".into()).fetch_page(&env.ctx, None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::ModuleError);
         assert!(err.message.starts_with("parse_empty:"), "{}", err.message);
     }
@@ -312,7 +364,7 @@ mod tests {
     async fn no_submitted_threads_at_all_is_also_a_classifiable_parse_failure() {
         let env = TestEnv::new("fetchers");
         stub(&env, "/user/whoishiring.json", ok(USER_EMPTY));
-        let err = HnWhoIsHiring.fetch_page(&env.ctx, None).await.unwrap_err();
+        let err = HnWhoIsHiring::new("hn-whoishiring".into()).fetch_page(&env.ctx, None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::ModuleError);
         assert!(err.message.starts_with("parse_empty:"), "{}", err.message);
     }
@@ -325,7 +377,7 @@ mod tests {
         let env = TestEnv::new("fetchers");
         stub_full_thread(&env);
 
-        let page = HnWhoIsHiring.fetch_page(&env.ctx, None).await.unwrap();
+        let page = HnWhoIsHiring::new("hn-whoishiring".into()).fetch_page(&env.ctx, None).await.unwrap();
         assert!(
             page.examined_only.contains(&"45000011".to_string()),
             "the deleted comment must be reported as examined: {:?}",
@@ -374,7 +426,7 @@ mod tests {
         stub(&env, "/item/45000011.json", ok(COMMENT_11_DELETED));
         stub(&env, "/item/45000012.json", ok(COMMENT_12));
 
-        let page = HnWhoIsHiring.fetch_page(&env.ctx, None).await.unwrap();
+        let page = HnWhoIsHiring::new("hn-whoishiring".into()).fetch_page(&env.ctx, None).await.unwrap();
         assert_eq!(page.items.len(), 2, "must have picked 45000001, the real hiring thread, not the sibling");
     }
 
@@ -388,7 +440,7 @@ mod tests {
             ok(&json!({"id": 45000099, "type": "story", "title": "Ask HN: Freelancer? Seeking freelancer?", "kids": []})
                 .to_string()),
         );
-        let err = HnWhoIsHiring.fetch_page(&env.ctx, None).await.unwrap_err();
+        let err = HnWhoIsHiring::new("hn-whoishiring".into()).fetch_page(&env.ctx, None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::ModuleError);
         assert!(err.message.starts_with("parse_empty:"), "{}", err.message);
     }
@@ -407,7 +459,7 @@ mod tests {
         env.ctx.store.write(&crate::dedup::path("hn-whoishiring"), seen.to_toml()).unwrap();
         stub(&env, "/item/45000012.json", ok(COMMENT_12));
 
-        let page = HnWhoIsHiring.fetch_page(&env.ctx, None).await.unwrap();
+        let page = HnWhoIsHiring::new("hn-whoishiring".into()).fetch_page(&env.ctx, None).await.unwrap();
         assert_eq!(page.items.len(), 1, "only the not-yet-seen kid must have been fetched");
         assert_eq!(page.items[0].source_id, "45000012");
         assert!(page.next_cursor.is_none(), "every kid, seen or not, has now been examined");
@@ -422,7 +474,7 @@ mod tests {
         stub(&env, "/item/45000011.json", ok(COMMENT_11_DELETED));
         stub(&env, "/item/45000012.json", ok(COMMENT_12));
 
-        let page = HnWhoIsHiring.fetch_page(&env.ctx, None).await.unwrap();
+        let page = HnWhoIsHiring::new("hn-whoishiring".into()).fetch_page(&env.ctx, None).await.unwrap();
         assert_eq!(
             page.items.len(),
             1,
@@ -435,7 +487,8 @@ mod tests {
     async fn a_null_thread_item_is_a_hard_error_not_a_silently_empty_page() {
         let env = TestEnv::new("fetchers");
         stub(&env, "/item/45000001.json", ok("null"));
-        let err = HnWhoIsHiring.fetch_page(&env.ctx, Some("45000001:0")).await.unwrap_err();
+        let err =
+            HnWhoIsHiring::new("hn-whoishiring".into()).fetch_page(&env.ctx, Some("45000001:0")).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::ModuleError);
         assert!(err.message.starts_with("parse_empty:"), "{}", err.message);
     }
@@ -453,7 +506,7 @@ mod tests {
         stub_full_thread(&env);
         env.ctx.cancel.cancel();
 
-        let err = HnWhoIsHiring.fetch_page(&env.ctx, None).await.unwrap_err();
+        let err = HnWhoIsHiring::new("hn-whoishiring".into()).fetch_page(&env.ctx, None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::ModuleError);
         assert!(err.message.contains("cancelled"), "{}", err.message);
     }

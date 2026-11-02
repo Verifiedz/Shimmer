@@ -216,7 +216,7 @@ pub fn parse(words: Vec<String>) -> std::result::Result<AutomationsCmd, String> 
             _ => return Err(usage("[CATEGORY]")),
         },
         "peek" => AutomationsCmd::Peek { template: id("TEMPLATE")? },
-        other => return Err(format!("unknown automations command '{other}'; see 'shimmer automations --help'")),
+        other => return Err(crate::suggest::unknown_command(Some("automations"), other, USAGE)),
     })
 }
 
@@ -753,7 +753,8 @@ fn ago(v: &Value, now: DateTime<Utc>, none: &str) -> String {
 fn list(data: &Value, now: DateTime<Utc>) -> String {
     let rules = data["rules"].as_array().cloned().unwrap_or_default();
     let mut out = if rules.is_empty() {
-        "no rules yet; make one with: shimmer automations new RULE".to_owned()
+        "no rules yet: see 'shimmer automations templates', then 'shimmer automations new RULE --from TEMPLATE'"
+            .to_owned()
     } else {
         let rows: Vec<Vec<String>> = rules
             .iter()
@@ -777,7 +778,14 @@ fn list(data: &Value, now: DateTime<Utc>) -> String {
             .collect();
         // on/off under STATE, coloured like every other feature's states (ADR 0038 §6).
         let header = ["RULE", "STATE", "REACTS TO", "DOES", "LAST FIRED", ""].map(String::from);
-        table(&header, &rows)
+        let mut out = table(&header, &rows);
+        // A fresh install has only the built-in ones: say how to make your own, as an empty list would.
+        if rules.iter().all(|r| r["builtin"] == true) {
+            out.push_str(
+                "\nnone of your own yet: see 'shimmer automations templates', then 'shimmer automations new RULE --from TEMPLATE'",
+            );
+        }
+        out
     };
     out.push_str(&problems(&data["problems"]));
     out
