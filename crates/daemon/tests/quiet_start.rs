@@ -63,6 +63,8 @@ async fn copied_firings_and_overdue_schedules_never_run_then_or_at_the_next_star
     c.call("demo.spin", json!({})).await.unwrap();
     let once = add(&mut c, json!({"once": iso(60)}), "run_once").await;
     let hourly = add(&mut c, json!({"every": 3600}), "run_once").await;
+    // Due a day later, while the folder is stopped: overdue by the time it's copied.
+    let late = add(&mut c, json!({"once": iso(DAY)}), "run_once").await;
     env.clock.advance(Duration::from_secs(120));
     c.event("scheduler.trigger.fired").await;
     stop(d).await;
@@ -79,6 +81,8 @@ async fn copied_firings_and_overdue_schedules_never_run_then_or_at_the_next_star
     assert_eq!(trigger(&mut c, &once).await["waiting"], 0, "the copied firing was forgotten");
     let next = trigger(&mut c, &hourly).await["next_due"].as_str().unwrap().to_owned();
     assert!(next > iso(2 * DAY + 120), "counts from now, not two days ago: {next}");
+    let late = trigger(&mut c, &late).await;
+    assert!(late["next_due"].is_null(), "the overdue one-time schedule is done, never caught up: {late}");
     // A person can still run things: that's how `vaults copy` switches the copy off.
     c.call("scheduler.disable", json!({"trigger_id": hourly})).await.unwrap();
     assert_eq!(c.call("demo.echo", json!({"x": 1})).await.unwrap(), json!({"x": 1}));

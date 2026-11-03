@@ -34,7 +34,8 @@ commands:
                              a new vault with VAULT's data, to try things on safely.
                              Its schedules, automations and sources start switched off
                              and its notifications paused, so nothing runs twice;
-                             --live: leave them as they are
+                             --live: leave them on (nothing overdue or unfinished
+                             from VAULT runs again either way)
   use VAULT                  make plain commands use it; 'use main' goes back
   rename VAULT NEW           its name only; the folder stays where it is
   remove VAULT               forget it and stop its daemon; its files are kept
@@ -769,10 +770,12 @@ fn login_vault(saved: &Settings) -> Option<PathBuf> {
 
 // ---------------------------------------------------------------- copy (§5)
 
-/// What a copy leaves out: derived or tied to this machine (§5). `.staging/` is copied, so the copy's
+/// What a copy leaves out: derived or tied to this machine (§5), and `.git`: main is the folder
+/// you sync with git, and a copy that kept its history would push to the same remote, so a sandbox
+/// could overwrite your real backup. A copy starts with no history; `git init` it if you want one. `.staging/` is copied, so the copy's
 /// own recovery finishes any save that was committed, and keeps aside one that's damaged (ADR 0040).
 fn left_out(name: &str) -> bool {
-    matches!(name, "cache" | "logs" | "daemon.sock" | ".daemon.lock") || name.starts_with("index.sqlite")
+    matches!(name, "cache" | "logs" | "daemon.sock" | ".daemon.lock" | ".git") || name.starts_with("index.sqlite")
 }
 
 /// What `copy` switched off in the copy, through each feature's own ops.
@@ -833,19 +836,16 @@ async fn copy(name: &str, new: &str, path: Option<&Path>, live: bool, env: &Env)
         }
     }
 
-    let off = if live {
-        None
-    } else {
-        match switch_off(&staging).await {
-            Ok(off) => Some(off),
-            Err(e) => {
-                let _ = stop_daemon(&staging).await;
-                let _ = std::fs::remove_dir_all(&staging);
-                return Err(Error {
-                    message: format!("couldn't switch the copy off, so it wasn't made: {}", e.message),
-                    ..e
-                });
-            }
+    // Quiet first, even with --live: what was copied in was VAULT's run, never replayed here.
+    let off = match first_start(&staging, live).await {
+        Ok(off) => off,
+        Err(e) => {
+            let _ = stop_daemon(&staging).await;
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(Error {
+                message: format!("couldn't start the copy quiet, so it wasn't made: {}", e.message),
+                ..e
+            });
         }
     };
 
@@ -865,8 +865,8 @@ async fn copy(name: &str, new: &str, path: Option<&Path>, live: bool, env: &Env)
     let data_off = match &off {
         None => {
             text.push_str(
-                "
-  left on (--live): its schedules, automations and sources run when its daemon starts",
+                "\n  left on (--live): its schedules, automations and sources run from now on; nothing \
+                 overdue or unfinished from the original runs again",
             );
             Value::Null
         }
@@ -948,13 +948,20 @@ fn copy_tree(from: &Path, to: &Path, top: bool) -> Result<()> {
     Ok(())
 }
 
-/// Start the copy's daemon quiet (§5a), switch off everything that would act by itself, through
-/// each feature's own ops (the daemon never edits a module's files), then stop it. An op that isn't
-/// in the manifest is skipped: a module that isn't installed has nothing to switch off.
-async fn switch_off(home: &Path) -> Result<SwitchedOff> {
+/// Start the copy's daemon quiet (§5a), which settles what was copied in: VAULT's unfinished
+/// firings are forgotten and overdue schedules count from now, so nothing of VAULT's run happens
+/// again here. Unless `live`, switch off everything that would act by itself, through each
+/// feature's own ops (the daemon never edits a module's files). Then stop it. An op that isn't in the
+/// manifest is skipped: a module that isn't installed has nothing to switch off. `None` when `live`.
+async fn first_start(home: &Path, live: bool) -> Result<Option<SwitchedOff>> {
     let socket = paths::default_socket(home);
     let exe = crate::daemon_exe()?;
     let mut c = crate::autostart::start_quiet(&exe, home, &socket).await?;
+    if live {
+        drop(c);
+        stop_daemon(home).await?;
+        return Ok(None);
+    }
     let manifest = c.call(ops::CORE_MANIFEST, json!({})).await?;
     let has = |op: &str| {
         manifest["modules"]
@@ -1014,7 +1021,7 @@ async fn switch_off(home: &Path) -> Result<SwitchedOff> {
     }
     drop(c);
     stop_daemon(home).await?;
-    Ok(off)
+    Ok(Some(off))
 }
 
 /// The lines after `✓ copied …`: what was switched off, and how to turn each back on.
@@ -1311,6 +1318,7 @@ mod tests {
         {
             assert!(left_out(out), "{out}");
         }
+        assert!(left_out(".git"), "a copy never pushes to main's remote");
         for kept in ["data", "events", ".staging", "config.toml", ".gitignore", "packs"] {
             assert!(!left_out(kept), "{kept}");
         }
