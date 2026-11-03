@@ -139,7 +139,7 @@ pub fn parse(words: Vec<String>) -> std::result::Result<AutomationsCmd, String> 
         return from_template(words.into_iter().skip(1));
     }
     let mut words = words.into_iter();
-    let Some(sub) = words.next() else { return Ok(AutomationsCmd::List { removed: false }) };
+    let Some(sub) = words.next() else { return Ok(AutomationsCmd::Help) };
     let options: &[&str] = match sub.as_str() {
         "new" | "edit" => &["--file"],
         "copy" => &["--label"],
@@ -934,7 +934,8 @@ mod tests {
 
     #[test]
     fn commands_parse() {
-        assert_eq!(p(""), Ok(AutomationsCmd::List { removed: false }));
+        assert_eq!(p(""), Ok(AutomationsCmd::Help), "bare prints help, like every feature (#337)");
+        assert_eq!(p("list"), Ok(AutomationsCmd::List { removed: false }));
         assert_eq!(p("list --removed"), Ok(AutomationsCmd::List { removed: true }));
         assert_eq!(p("rename a b"), Ok(AutomationsCmd::Rename { id: "a".into(), to: "b".into() }));
         let copy = AutomationsCmd::Copy { id: "a".into(), to: "b".into(), label: Some("B".into()) };

@@ -46,7 +46,7 @@ The words are ADR 0038 §6's, so they mean what they mean everywhere else. The s
 other client-only command.
 
 ```
-shimmer vaults                              same as list
+shimmer vaults                              its help, as for every feature (amended in #337; was: same as list)
 shimmer vaults list [--removed]             every vault: NAME, PATH, whether it's the one in use, its daemon
 shimmer vaults show VAULT                   one vault in full: path, socket, daemon, size, made by Shimmer or adopted
 shimmer vaults status                       which vault you're in and why (--vault, SHIMMER_HOME, use, or main), and which daemons run

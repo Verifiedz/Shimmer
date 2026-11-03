@@ -304,6 +304,7 @@ async fn execute(args: &Args, help: String, vault: Option<String>) -> Result<Opt
         Command::Scheduler(SchedulerCmd::Help) => return Ok(Some(scheduler::USAGE.into())),
         Command::Automations(AutomationsCmd::Help) => return Ok(Some(automations::USAGE.into())),
         Command::Fetchers(FetchersCmd::Help) => return Ok(Some(fetchers::USAGE.into())),
+        Command::Notify(notify::NotifyCmd::Help) => return Ok(Some(notify::USAGE.into())),
         Command::DoctorHelp => return Ok(Some(doctor::USAGE.into())),
         // Packs live entirely in the client: no daemon needed.
         Command::Packs(cmd) => return packs::cmd::run(cmd, &packs::cmd::Env::from_process()).map(Some),
