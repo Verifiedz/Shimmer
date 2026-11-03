@@ -289,9 +289,23 @@ fn apply(home: &Path, dir: &Path, logged: Option<&mut log::Logged>) -> Result<Ve
             }
         }
     }
-    fs::remove_dir_all(dir)?;
-    fsync_dir(&staging_root(home))?;
+    // Landed: files in place, events logged. Clearing the folder away can't undo that, so a
+    // failure here is only logged: retrying the save would get nowhere and hold up every later one.
+    if let Err(e) = clear(home, dir) {
+        tracing::warn!(tx = %dir.display(), error = %e, "a finished save's staging folder couldn't be removed; the next start settles it");
+    }
     Ok(staged.events)
+}
+
+/// Removes an applied staging folder. It's un-committed first, so a crash partway through
+/// `remove_dir_all` leaves a folder with no marker, discarded quietly on the next start, never one
+/// flagged as damaged for a save that fully landed (#322's review). One whose marker couldn't be
+/// removed is rolled forward again on the next start, which changes nothing.
+fn clear(home: &Path, dir: &Path) -> std::io::Result<()> {
+    fs::remove_file(dir.join(COMMITTED))?;
+    fsync_dir(dir)?;
+    fs::remove_dir_all(dir)?;
+    fsync_dir(&staging_root(home))
 }
 
 /// `pending`: where a committed transaction that can't be applied *yet* goes, to be retried
