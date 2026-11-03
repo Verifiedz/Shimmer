@@ -345,6 +345,7 @@ impl Scheduler {
                 gone.push(id.clone());
                 continue;
             }
+            self.clear_cut(entry, &ended);
             if entry.stored.paused || entry.stored.done {
                 continue;
             }
@@ -384,6 +385,24 @@ impl Scheduler {
         e.pending.retain(|(_, at)| !ats.contains(at));
         e.stored = next;
         !finished
+    }
+
+    /// A cut-off run stops being news once a later run of the same schedule has ended (#322's
+    /// review): `interrupted` is cleared, on disk first. A failed write keeps it; the warning
+    /// stays until a later run clears it, never wrongly hidden.
+    fn clear_cut(&self, e: &mut Entry, ended: &[DateTime<Utc>]) {
+        let Some(cut) = &e.stored.interrupted else { return };
+        if !ended.iter().any(|at| *at > cut.scheduled_for) {
+            return;
+        }
+        let mut next = e.stored.clone();
+        next.interrupted = None;
+        match self.write(&next, None) {
+            Ok(()) => e.stored = next,
+            Err(err) => {
+                tracing::error!(trigger = %e.stored.spec.id, error = %err, "could not clear an interrupted firing")
+            }
+        }
     }
 
     /// False when the entry is gone (a module's one-time schedule that fired nothing).
@@ -532,9 +551,13 @@ impl Scheduler {
                 continue;
             }
             let (mut settled, mut rerun, mut cut) = (Vec::new(), Vec::new(), None);
+            let mut finished = Vec::new();
             for at in e.stored.unfinished.clone() {
                 match task_for.get(&(id.clone(), at)) {
-                    Some(task) if ended.contains(task) => settled.push(at),
+                    Some(task) if ended.contains(task) => {
+                        settled.push(at);
+                        finished.push(at);
+                    }
                     Some(task) if started.contains(task) => {
                         settled.push(at);
                         cut = Some(Interrupted { task_id: *task, scheduled_for: at, noticed: now });
@@ -560,6 +583,11 @@ impl Scheduler {
             if !settled.is_empty() && !self.forget(e, &settled) {
                 gone.push(id.clone());
                 continue;
+            }
+            // A later run that ended while the daemon was down clears an older cut, as a tick would
+            // (#334's review). Not one found in this same pass: that's news now.
+            if cut.is_none() {
+                self.clear_cut(e, &finished);
             }
             let spec = e.stored.spec.clone();
             let mut failed = Vec::new();
@@ -792,6 +820,8 @@ impl Scheduler {
         next.next_due = parsed.first_due(self.clock.now());
         next.done = false;
         next.zone = parsed.is_local().then(|| self.local_tz.name().to_owned());
+        // An edited schedule is a new one: a run cut off under the old one isn't its news (#322's review).
+        next.interrupted = None;
         self.write(&next, Some(("scheduler.trigger.edited", added_payload(&next))))?;
         e.stored = next;
         e.parsed = parsed;
@@ -872,6 +902,7 @@ impl Scheduler {
         stored.zone = parsed.is_local().then(|| self.local_tz.name().to_owned());
         // Firings from before it was removed aren't this schedule's any more: it counts from now.
         stored.unfinished.clear();
+        stored.interrupted = None;
         let json = serde_json::to_vec_pretty(&stored).map_err(|e| Error::internal(format!("encode trigger: {e}")))?;
         self.store.transaction(|tx| {
             tx.put(&path(&id), json)?;

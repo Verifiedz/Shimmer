@@ -484,7 +484,9 @@ $SHIMMER_HOME/
                            and held/ markers (ADR 0032). A message no sink could deliver stays in
                            the inbox as failed (§11.3).
   packs/<name>/            Command packs: aliases + animations (§15.1). Client-read only.
-  .staging/<txid>/         In-flight store transactions (§7.1). Never edit by hand.
+  .staging/<order>-<txid>/ In-flight store transactions (§7.1, ADR 0040). Never edit by hand.
+  .staging/broken/<txid>/  Damaged committed transactions, kept aside for a person to look at
+                           (ADR 0040). Never deleted by Shimmer; `shimmer doctor` reports them.
   cache/http/<module>/     Gateway response cache (ADR 0027), per module. Safe to delete.
   index.sqlite             DERIVED. Gitignored. Safe to delete.
   logs/                    daemon.log.<date>: rotated daily at UTC midnight, oldest deleted past
@@ -520,13 +522,18 @@ because the laptop lost power mid-write.
 - **Single file writes** are write-to-temp in the same directory, `fsync`, then `rename`.
   Never write in place. A reader sees the old file or the new file, never a torn one.
 - **Multi-file mutations go through a store transaction.** `ctx.store.transaction(|tx| …)`
-  stages every write under `$SHIMMER_HOME/.staging/<txid>/`, fsyncs, writes a `COMMITTED`
-  marker, then moves files into place and appends the event. The event id is assigned at
-  staging time.
+  stages every write under `$SHIMMER_HOME/.staging/<order>-<txid>/`, fsyncs, writes a
+  `COMMITTED` marker, then moves files into place and appends the event. The event id is
+  assigned at staging time. Once `COMMITTED` is written the transaction has happened: a
+  failure applying it is finished later (before the next commit, or by recovery), never
+  reported to the caller as a failed write (ADR 0040).
 - **Recovery on daemon start:** a staging directory with a `COMMITTED` marker is rolled
   forward — finish the moves, append the event if its id is not already in the log. One
   without the marker is deleted. Roll-forward is idempotent, so a crash during recovery is
-  also safe.
+  also safe. Each folder is recovered on its own: a marked one that is damaged (its manifest or
+  a staged file missing or unreadable) is moved to `.staging/broken/` and kept; an intact one
+  that can't be applied just then waits, retried before the next commit. Either way the daemon
+  starts (ADR 0040).
 - **The index uses SQLite transactions.** An index update for one event commits entirely
   or not at all; a crash mid-reindex leaves the previous consistent index, and the rebuild
   simply runs again.
