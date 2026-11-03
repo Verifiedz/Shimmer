@@ -295,3 +295,112 @@ fn copy_refuses_what_it_shouldnt_touch() {
     assert!(stderr(&o).contains("isn't empty"), "{}", stderr(&o));
     assert_eq!(std::fs::read_to_string(busy.join("notes.txt")).unwrap(), "mine");
 }
+
+const LATER: &str = r#"
+[rule]
+label = "Revisit it later"
+on = "records.item.completed"
+when = { collection = "leetcode" }
+
+[[do]]
+op = "records.update"
+params = { collection = "leetcode", id = "{id}", fields = { url = "https://x.test/{id}" } }
+after = "60d"
+"#;
+
+/// How many events in `home`'s log have this topic, and (for queue tasks) aren't notify's own.
+fn logged(home: &Path, topic: &str) -> usize {
+    let mut n = 0;
+    for entry in std::fs::read_dir(home.join("events")).into_iter().flatten().flatten() {
+        for line in std::fs::read_to_string(entry.path()).unwrap_or_default().lines() {
+            let Ok(ev) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            let notify_own = ev["payload"]["op"].as_str().is_some_and(|op| op.starts_with("notify."));
+            if ev["topic"] == topic && !notify_own {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+fn until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(Instant::now() < deadline, "never: {what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// ADR 0041's test list, the rest of it: what was in flight when the copy was made. A save waiting
+/// in `.staging/` is finished in the copy and a damaged one stays aside; a fetcher source and an
+/// automation's delayed action are off; a half-launched workspace is ready; and the copy's next
+/// ordinary start fires no rule over the copied log and runs no task.
+#[cfg(unix)]
+#[test]
+fn a_copy_settles_what_was_in_flight_and_its_next_start_runs_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let m = Machine::new();
+    let main = m.main();
+    m.ok(&["records", "add", "leetcode/two-sum", "--title", "Two Sum"]);
+    // A delayed action waiting: completing the record has automations add a one-time schedule.
+    let rule = m.dir.path().join("later.toml");
+    std::fs::write(&rule, LATER).unwrap();
+    m.ok(&["automations", "new", "later", "--file", rule.to_str().unwrap()]);
+    m.ok(&["records", "complete", "leetcode/two-sum"]);
+    let added = || {
+        let list = json_in(&m, "main", &["scheduler", "list"]);
+        list["triggers"].as_array().unwrap().iter().filter(|t| t["source"]["type"] == "added").count()
+    };
+    until("the delayed action is scheduled", || added() == 1);
+    // A fetcher source, on (its address answers nothing: no network here).
+    m.ok(&["fetchers", "new", "blog", "--from", "rss", "--set", "URL=http://127.0.0.1:9/feed", "--yes"]);
+    m.ok(&["fetchers", "enable", "blog"]); // a template's source starts off
+                                           // A workspace a launch was cut off in.
+    let half = main.join("data/workspaces/half");
+    std::fs::create_dir_all(half.join("steps")).unwrap();
+    std::fs::write(half.join("workspace.toml"), SITE.replace("Site", "Half")).unwrap();
+    std::fs::write(half.join("steps/01-setup.sh"), "true\n").unwrap();
+    std::fs::write(half.join("cleanup.sh"), "true\n").unwrap();
+    std::fs::write(half.join("state.toml"), "state = \"launching\"\n").unwrap();
+    // A save waiting (its folder can't be written), and a damaged one an earlier start kept aside.
+    let items = main.join("data/records/items/leetcode");
+    std::fs::set_permissions(&items, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let root = std::fs::File::create(items.join("probe")).is_ok(); // root ignores permissions
+    if !root {
+        m.ok(&["records", "update", "leetcode/two-sum", "--title", "Two Sum, waiting"]);
+    }
+    let broken = main.join(".staging/broken/01jabcdefghjkmnpqrstvwxyz0");
+    std::fs::create_dir_all(&broken).unwrap();
+    std::fs::write(broken.join("manifest.json"), "{ half written").unwrap();
+
+    let out = m.ok(&["vaults", "copy", "main", "play"]);
+    std::fs::set_permissions(&items, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(out.contains("1 fetcher source"), "{out}");
+    assert!(out.contains("1 workspace reset to ready"), "{out}");
+    let play = m.vault("play");
+
+    if !root {
+        let file = std::fs::read_to_string(play.join("data/records/items/leetcode/two-sum.toml")).unwrap();
+        assert!(file.contains("Two Sum, waiting"), "the waiting save was finished in the copy: {file}");
+    }
+    assert!(play.join(".staging/broken/01jabcdefghjkmnpqrstvwxyz0/manifest.json").exists(), "kept aside");
+    let sources = json_in(&m, "play", &["fetchers", "list"]);
+    assert_eq!(sources["sources"][0]["enabled"], false, "{sources}");
+    assert_eq!(json_in(&m, "main", &["fetchers", "list"])["sources"][0]["enabled"], true);
+    let list = json_in(&m, "play", &["scheduler", "list"]);
+    let delayed: Vec<_> =
+        list["triggers"].as_array().unwrap().iter().filter(|t| t["source"]["type"] == "added").collect();
+    assert!(delayed.len() == 1 && delayed[0]["enabled"] == false, "the delayed action is off: {delayed:?}");
+    assert_eq!(json_in(&m, "play", &["workspaces", "show", "half"])["state"], "ready");
+
+    // The copy's next start is ordinary, and does nothing by itself.
+    let (fired, ran) = (logged(&play, "automations.rule.fired"), logged(&play, "queue.task.started"));
+    m.ok(&["--vault", "play", "shutdown"]);
+    m.ok(&["--vault", "play", "ping"]);
+    std::thread::sleep(Duration::from_secs(2));
+    m.ok(&["--vault", "play", "ping"]);
+    assert_eq!(logged(&play, "automations.rule.fired"), fired, "no rule fired over the copied log");
+    assert_eq!(logged(&play, "queue.task.started"), ran, "no task ran");
+    m.ok(&["--vault", "play", "shutdown"]);
+    m.ok(&["shutdown"]);
+}

@@ -1,8 +1,8 @@
 # 0041. Vaults: named Shimmer folders you can switch between
 
-Status: proposed · Raised by Dev B · Needs sign-off: Dev A (`crates/app/src/main.rs` re-runs itself
-in the chosen vault, §3; a quiet start for the daemon, §5a; the CLAUDE.md §2, §7, §10.3 and §15
-wording below) · No `core` or `proto` change · Depends on #293 (ADR 0039: one socket per Shimmer folder),
+Status: accepted (#312) · Raised by Dev B · Signed off by Dev A (Verifiedz) on #312 and on the
+implementation, #326–#328 (`crates/app/src/main.rs` re-runs itself in the chosen vault, §3; a quiet
+start for the daemon, §5a; the CLAUDE.md §2, §7, §10.3 and §15 wording below, all now in CLAUDE.md) · No `core` or `proto` change · Depends on #293 (ADR 0039: one socket per Shimmer folder),
 merged; the quiet start (§5a) builds on #308's scheduler recovery, so the implementation follows #322
 (data safety) into master · Revised after Wasay's two reviews on #312, and checked against #308, #309,
 #310, #320 and #323 once they merged
