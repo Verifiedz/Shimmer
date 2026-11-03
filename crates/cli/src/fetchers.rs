@@ -823,6 +823,9 @@ fn show(s: &Value, now: DateTime<Utc>) -> String {
     line("interval", s["interval_s"].as_u64().map(when::format_duration).unwrap_or_else(|| "-".into()));
     // How the last run went, so `show` answers "is this working" on its own (#337).
     let mut last = when::timestamp(&s["last_run_at"]).map_or("never".into(), |t| when::relative(t, now));
+    if let Some(n) = s["last_new_items"].as_u64() {
+        last.push_str(&format!(", {n} new"));
+    }
     if s["running"] == true {
         last.push_str(", running now");
     }
@@ -1283,7 +1286,8 @@ mod tests {
         assert!(out.contains("last error  connection refused (network)"), "{out}");
     }
 
-    /// #337: `show` says when the source last ran, and whether it's running now.
+    /// #337: `show` says when the source last ran, how many new items it found, and whether it's
+    /// running now.
     #[test]
     fn show_says_when_it_last_ran() {
         let now = Utc::now();
@@ -1294,7 +1298,11 @@ mod tests {
         let never = show(&source(Value::Null, false), now);
         assert!(never.contains("last run    never\n"), "{never}");
         let ran = show(&source(json!((now - chrono::Duration::minutes(3)).to_rfc3339()), false), now);
-        assert!(ran.contains("last run    3m ago\n"), "{ran}");
+        assert!(ran.contains("last run    3m ago\n"), "no count from an older daemon: {ran}");
+        let mut counted = source(json!((now - chrono::Duration::minutes(3)).to_rfc3339()), false);
+        counted["last_new_items"] = json!(4);
+        let counted = show(&counted, now);
+        assert!(counted.contains("last run    3m ago, 4 new\n"), "{counted}");
         let running = show(&source(json!((now - chrono::Duration::hours(2)).to_rfc3339()), true), now);
         assert!(running.contains("last run    2h ago, running now\n"), "{running}");
     }
