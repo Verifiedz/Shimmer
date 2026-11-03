@@ -170,3 +170,39 @@ async fn a_task_a_module_asks_for_is_refused_and_never_queued() {
         }
     }
 }
+
+/// Wasay's #329 review: a run cut off in the folder copied from is shown there, not in the copy.
+/// The quiet start clears it, on disk, so the copy's next ordinary start doesn't show it either.
+#[tokio::test]
+async fn a_run_cut_off_in_the_copied_folder_is_not_shown_in_the_copy() {
+    let env = Env::fake_clock();
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    c.subscribe(&["scheduler.trigger.*"]).await;
+    c.call("demo.spin", json!({})).await.unwrap();
+    let daily = add(&mut c, json!({"every": DAY}), "skip").await;
+    env.clock.advance(Duration::from_secs(DAY + 60));
+    let task = c.event("scheduler.trigger.fired").await.payload["task_id"].clone();
+    stop(d).await;
+    // What a crash mid-run leaves: the task's start is in the log, its end never is.
+    let started = Event::new(
+        "queue".into(),
+        "queue.task.started",
+        json!({"task_id": task, "lane": "slow", "op": "demo.quick"}),
+        env.clock.now(),
+    );
+    shimmer_store::Store::open(env.home.path()).unwrap().append_event(&started).unwrap();
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    settle(&mut c).await;
+    assert!(trigger(&mut c, &daily).await["interrupted"].is_object(), "shown in the folder it happened in");
+    stop(d).await;
+
+    for quiet in [true, false] {
+        let d = env.try_start_as(vec![Arc::new(Demo::default())], quiet).await.unwrap();
+        let mut c = Client::connect(&env.sock).await;
+        let t = trigger(&mut c, &daily).await;
+        assert!(t["interrupted"].is_null(), "not shown in the copy (quiet start: {quiet}): {t}");
+        stop(d).await;
+    }
+}
