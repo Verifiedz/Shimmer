@@ -20,7 +20,15 @@ impl Home {
         // Notify's popups are logged, never shown: no test may pop anything up on a developer's
         // screen (ADR 0032 §2).
         std::fs::create_dir_all(dir.path().join("home")).unwrap();
-        std::fs::write(dir.path().join("home/config.toml"), "[desktop]\nshow = false\n").unwrap();
+        // The gateway refuses private/loopback/link-local addresses by default (#267 finding
+        // 4); every e2e test that stands up its own local test server (fetchers templates,
+        // scrape sources) is binding loopback on purpose, not accidentally reaching for a real
+        // host, so it's allow-listed here rather than in each test.
+        std::fs::write(
+            dir.path().join("home/config.toml"),
+            "[desktop]\nshow = false\n\n[http]\nallow_private = [\"127.0.0.1\", \"localhost\"]\n",
+        )
+        .unwrap();
         Self { dir }
     }
 

@@ -433,6 +433,11 @@ impl Env {
     fn with_clock(clock: Clock) -> Self {
         let home = TempDir::new().unwrap();
         let sock = home.path().join("daemon.sock");
+        // The gateway refuses private/loopback/link-local addresses by default (#267 finding
+        // 4); tests that stand up a local test server are deliberately reaching loopback, so
+        // it's allow-listed here rather than in each one.
+        std::fs::write(home.path().join("config.toml"), "[http]\nallow_private = [\"127.0.0.1\", \"localhost\"]\n")
+            .unwrap();
         Self { home, sock, clock }
     }
 
