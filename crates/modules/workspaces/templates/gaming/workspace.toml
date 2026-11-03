@@ -1,4 +1,5 @@
-# Gaming: Steam and a game of your choice, opened together. Created from Shimmer's gaming
+# Gaming: Steam, a game of your choice (or a picker over several, GAME_LIBRARY), and a VM
+# (VM_NAME, opened in Virtual Machine Manager), opened together. Created from Shimmer's gaming
 # template. It's your folder now: edit it freely.
 #
 #   shimmer workspaces activate <id> --wait     open it all
@@ -15,7 +16,7 @@
 
 [workspace]
 label = "Gaming"
-description = "Steam and a game, opened together"
+description = "Steam, a game, and a VM, opened together"
 
 [[step]]
 name = "check"
@@ -30,7 +31,12 @@ mode = "detached"
 
 [[step]]
 name = "game"
-description = "Launch your game, placed by GAME_PLACE if set"
+description = "Launch your game (or the GAME_LIBRARY picker), placed by GAME_PLACE if set"
+mode = "detached"
+
+[[step]]
+name = "vm"
+description = "Open Virtual Machine Manager on VM_NAME, placed by VM_PLACE if set"
 mode = "detached"
 
 [cleanup]

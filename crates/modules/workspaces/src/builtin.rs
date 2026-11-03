@@ -66,6 +66,7 @@ const BUILTINS: &[(&str, &[(&str, &str)])] = &[
             file!("steps/01-check.sh", "gaming/steps/01-check.sh"),
             file!("steps/02-steam.sh", "gaming/steps/02-steam.sh"),
             file!("steps/03-game.sh", "gaming/steps/03-game.sh"),
+            file!("steps/04-vm.sh", "gaming/steps/04-vm.sh"),
             file!("cleanup.sh", "gaming/cleanup.sh"),
             HELPER,
             HYPRLAND_HELPER,

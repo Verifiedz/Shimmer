@@ -12,13 +12,30 @@ if [ -n "$STEAM_COMMAND" ]; then
     shimmer_has "${STEAM_COMMAND%% *}" || shimmer_fail "STEAM_COMMAND's ${STEAM_COMMAND%% *} isn't installed"
 fi
 
-if [ -n "$GAME_COMMAND" ]; then
+if [ -n "$GAME_LIBRARY" ]; then
+    shimmer_has_picker "${GAME_PICKER:-auto}" ||
+        shimmer_fail "GAME_LIBRARY is set, but no picker is available (install rofi, wofi or fuzzel, or set GAME_PICKER)"
+    (
+        IFS='|'
+        set -f
+        for entry in $GAME_LIBRARY; do
+            label=${entry%%=*}
+            cmd=${entry#*=}
+            [ -n "$label" ] && [ "$label" != "$entry" ] || shimmer_fail "GAME_LIBRARY entry '$entry' isn't Label=command"
+            shimmer_has "${cmd%% *}" || shimmer_fail "GAME_LIBRARY's '$label' (${cmd%% *}) isn't installed"
+        done
+    ) || exit 1
+elif [ -n "$GAME_COMMAND" ]; then
     shimmer_has "${GAME_COMMAND%% *}" || shimmer_fail "GAME_COMMAND's ${GAME_COMMAND%% *} isn't installed"
+fi
+
+if [ -n "$VM_NAME" ]; then
+    shimmer_has virt-manager || shimmer_fail "VM_NAME is set, but virt-manager isn't installed"
 fi
 
 # Every *_PLACE answer: a valid "WORKSPACE:KEY" shape, and its monitor question filled in. A
 # typo here should stop the launch, not silently open unplaced.
-for pair in "STEAM_PLACE:$STEAM_PLACE" "GAME_PLACE:$GAME_PLACE"; do
+for pair in "STEAM_PLACE:$STEAM_PLACE" "GAME_PLACE:$GAME_PLACE" "VM_PLACE:$VM_PLACE"; do
     name=${pair%%:*}
     value=${pair#*:}
     [ -n "$value" ] || continue
@@ -31,4 +48,9 @@ for pair in "STEAM_PLACE:$STEAM_PLACE" "GAME_PLACE:$GAME_PLACE"; do
     esac
 done
 
-echo "ok${STEAM_COMMAND:+, steam: $STEAM_COMMAND}${GAME_COMMAND:+, game: $GAME_COMMAND}"
+if [ -n "$GAME_LIBRARY" ]; then
+    game_summary=", game: picker over $(printf '%s' "$GAME_LIBRARY" | tr '|' '\n' | wc -l) titles"
+else
+    game_summary="${GAME_COMMAND:+, game: $GAME_COMMAND}"
+fi
+echo "ok${STEAM_COMMAND:+, steam: $STEAM_COMMAND}${game_summary}${VM_NAME:+, vm: $VM_NAME}"
