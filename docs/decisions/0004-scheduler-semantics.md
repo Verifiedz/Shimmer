@@ -1,6 +1,7 @@
 # 0004. Scheduler semantics
 
-Status: accepted (M2) · Needs sign-off: Dev A
+Status: accepted (M2) · Needs sign-off: Dev A · Amended (#263 findings 1, 3 and 5) in #308, accepted
+with #322: signed off by Dev A (Verifiedz), who approved #322
 
 CLAUDE.md §6.3 fixes the shape (`TriggerSpec`, `CatchUp`, never overlap, persisted state,
 injected clock). These are the points it left open.
@@ -60,8 +61,11 @@ injected clock). These are the points it left open.
 * **Storage.** `data/scheduler/triggers/<id>.json`, pretty-printed and hand-editable. JSON
   rather than TOML because params are arbitrary JSON, which TOML cannot represent (no null).
   An unreadable file is skipped, never overwritten, and listed (`scheduler.list`'s `broken`,
-  `shimmer scheduler list`, `shimmer doctor`) until fixed or `scheduler.remove`d, which deletes
-  it (#263 finding 5). A module's own trigger is written again from its declaration.
+  `shimmer scheduler list`, `shimmer doctor`) until fixed or `scheduler.remove`d. Removing one
+  never deletes it: the file is moved, byte for byte, to `data/scheduler/removed/<id>.json`, to
+  be fixed there and brought back with `scheduler.restore` (ADR 0038). `scheduler.purge` can't
+  reach it while it's unreadable, so it's never deleted unseen (#263 finding 5). A module's own
+  trigger is written again from its declaration.
 * **A `once` already past with `skip`** is refused at `scheduler.add`/`edit` (`invalid_params`):
   it could never run (#263 finding 3). `run_once`/`backfill` run it now.
 * **Finished `once`.** Kept with `done: true` so a module re-declaring it does not fire it again.
