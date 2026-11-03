@@ -774,27 +774,7 @@ fn in_full(t: &Value, categories: &[Value]) -> String {
             full(g)
         ));
     }
-    out.push_str(&format!(
-        "
-{}
-",
-        paint(Role::Heading, "Questions")
-    ));
-    for q in t["questions"].as_array().into_iter().flatten() {
-        let mut how = full(&q["kind"]);
-        if q["required"] == true {
-            how.push_str(", required");
-        }
-        if let Some(d) = q["default"].as_str() {
-            how.push_str(&format!(", default {d}"));
-        }
-        out.push_str(&format!(
-            "  {}  {} ({how})
-",
-            full(&q["name"]),
-            full(&q["prompt"])
-        ));
-    }
+    out.push_str(&crate::workspaces::questions_block(t["questions"].as_array().map(Vec::as_slice).unwrap_or_default()));
     out.push_str(&format!(
         "
 {}
