@@ -1,5 +1,6 @@
 //! Append-only event log: `events/YYYY-MM-DD.jsonl`, one JSON `Event` per line.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -48,25 +49,59 @@ fn ends_with_newline(f: &mut File) -> io::Result<bool> {
     Ok(b[0] == b'\n')
 }
 
-/// Whether an event with this id is already in its day's file.
-pub fn contains(home: &Path, event: &Event) -> Result<bool> {
-    let text = match fs::read_to_string(day_file(home, event)) {
+/// The ids already in each day's file, each file read once: what recovery checks against
+/// before appending an event a crash may have logged already. A normal commit never needs it:
+/// it has just staged its events, so they can't be in the log yet (#260 finding 1).
+#[derive(Default)]
+pub struct Logged {
+    by_day: HashMap<PathBuf, HashSet<ulid::Ulid>>,
+}
+
+impl Logged {
+    /// Append `event` unless its id is already in its day's file.
+    pub fn append_once(&mut self, home: &Path, event: &Event) -> Result<()> {
+        let file = day_file(home, event);
+        if !self.by_day.contains_key(&file) {
+            let ids = ids_in(&file)?;
+            self.by_day.insert(file.clone(), ids);
+        }
+        let ids = self.by_day.get_mut(&file).expect("just read");
+        if !ids.contains(&event.id) {
+            append(home, event)?;
+            ids.insert(event.id);
+        }
+        Ok(())
+    }
+}
+
+fn ids_in(file: &Path) -> Result<HashSet<ulid::Ulid>> {
+    let text = match fs::read_to_string(file) {
         Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(HashSet::new()),
         Err(e) => return Err(e.into()),
     };
-    let needle = event.id.to_string();
-    Ok(text
-        .lines()
-        .filter(|l| l.contains(&needle))
-        .filter_map(|l| serde_json::from_str::<Event>(l).ok())
-        .any(|e| e.id == event.id))
+    Ok(text.lines().filter_map(|l| serde_json::from_str::<Event>(l).ok()).map(|e| e.id).collect())
 }
 
 pub fn read_all(home: &Path) -> Result<EventScan> {
+    read_from(home, None)
+}
+
+/// Events logged at or after `since`, oldest first: only the day files from `since`'s day on
+/// are read (a day file holds the events whose `at` falls on it). For a module that fell
+/// behind the bus, catching up from where it was (#261 finding 1).
+pub fn read_since(home: &Path, since: chrono::DateTime<chrono::Utc>) -> Result<EventScan> {
+    let mut scan = read_from(home, Some(&format!("{}.jsonl", since.format("%Y-%m-%d"))))?;
+    scan.events.retain(|e| e.at >= since);
+    Ok(scan)
+}
+
+/// `first`: the earliest day file to read, by name (they sort by date).
+fn read_from(home: &Path, first: Option<&str>) -> Result<EventScan> {
     let mut files: Vec<PathBuf> = fs::read_dir(home.join("events"))?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .filter(|p| first.is_none_or(|first| p.file_name().is_some_and(|n| n.to_string_lossy().as_ref() >= first)))
         .collect();
     files.sort();
     let mut scan = EventScan { events: Vec::new(), skipped: 0 };
@@ -82,4 +117,29 @@ pub fn read_all(home: &Path) -> Result<EventScan> {
         }
     }
     Ok(scan)
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::TimeZone;
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn read_since_reads_from_that_day_on_and_only_what_came_since() {
+        let home = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(home.path().join("events")).unwrap();
+        let at = |d, h| chrono::Utc.with_ymd_and_hms(2026, 10, d, h, 0, 0).unwrap();
+        let ev = |d, h| Event::new("records".into(), "records.item.created", json!({"d": d, "h": h}), at(d, h));
+        let (old, before, after, next_day) = (ev(18, 9), ev(19, 8), ev(19, 10), ev(20, 7));
+        for e in [&old, &before, &after, &next_day] {
+            append(home.path(), e).unwrap();
+        }
+        // A line no older file could hold is never even read: break the 18th's file.
+        fs::write(home.path().join("events/2026-10-18.jsonl"), [0xff, 0xfe]).unwrap();
+        let scan = read_since(home.path(), at(19, 9)).unwrap();
+        assert_eq!(scan.events, [after, next_day]);
+        assert_eq!(scan.skipped, 0, "the 18th's file wasn't read");
+    }
 }

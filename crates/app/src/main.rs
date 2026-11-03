@@ -63,8 +63,15 @@ fn init_stderr_logging() {
 /// not archived elsewhere. The returned guard must stay alive for the process lifetime or
 /// buffered lines are dropped.
 fn init_daemon_logging(home: &Path) -> Option<WorkerGuard> {
-    let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_filter(env_filter());
-    let logs_dir = home.join("logs");
+    // A start failure is printed to stderr as a plain line already (`run_daemon`); the log file
+    // gets it through tracing, and stderr would otherwise show it twice.
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(env_filter())
+        .with_filter(tracing_subscriber::filter::filter_fn(|m| m.target() != START_FAILED));
+    // Absolute: the daemon moves to `/` once it starts (#266 finding 3), and the appender opens
+    // each day's new file by this path.
+    let logs_dir = std::path::absolute(home).unwrap_or_else(|_| home.to_path_buf()).join("logs");
     // Pre-create the directory: on a fresh `$SHIMMER_HOME`, the appender would otherwise try (and
     // fail, noisily) to list it for pruning before the first file creates it.
     let appender = std::fs::create_dir_all(&logs_dir).map_err(|e| e.to_string()).and_then(|_| {
@@ -78,8 +85,13 @@ fn init_daemon_logging(home: &Path) -> Option<WorkerGuard> {
     match appender {
         Ok(appender) => {
             let (writer, guard) = tracing_appender::non_blocking(appender);
-            let file_layer =
-                tracing_subscriber::fmt::layer().with_ansi(false).with_writer(writer).with_filter(env_filter());
+            // A failed start is always written, whatever RUST_LOG says: auto-start reads the reason
+            // from here (#307's review).
+            let always = format!("{START_FAILED}=error")
+                .parse()
+                .map(|d| env_filter().add_directive(d))
+                .unwrap_or_else(|_| env_filter());
+            let file_layer = tracing_subscriber::fmt::layer().with_ansi(false).with_writer(writer).with_filter(always);
             tracing_subscriber::registry().with(stderr_layer).with(file_layer).init();
             Some(guard)
         }
@@ -135,6 +147,9 @@ async fn run_daemon() -> ExitCode {
             }
         },
         Err(e) => {
+            // Into the log file too: an auto-started daemon's stderr goes nowhere, and the CLI
+            // quotes this line when it reports the failure (#266 finding 5).
+            tracing::error!(target: START_FAILED, "cannot start daemon: {e}");
             eprintln!("shimmer: cannot start daemon: {e}");
             return ExitCode::FAILURE;
         }
@@ -148,6 +163,10 @@ async fn run_daemon() -> ExitCode {
     daemon.wait().await;
     ExitCode::SUCCESS
 }
+
+/// The log target of a failed start. `crates/cli/src/autostart.rs` finds the line by its words,
+/// "cannot start daemon: ", so they stay the same.
+const START_FAILED: &str = "shimmer::start";
 
 /// How long a daemon that holds the lock may take to start answering. It takes the lock first,
 /// then recovers transactions, opens the index and starts modules, and only then binds the

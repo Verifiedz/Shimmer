@@ -68,8 +68,8 @@ fn rules_are_made_shown_tested_switched_and_brought_back() {
     assert!(ok(&home, &["automations", "depth", "4"]).contains("✓ depth is 4"));
     assert!(ok(&home, &["automations", "status"]).contains("depth: 4"));
     assert!(
-        ok(&home, &["automations", "reload"]).contains("✓ read 6 rules"),
-        "yours (solved and its copy) and the four built in"
+        ok(&home, &["automations", "reload"]).contains("✓ read 7 rules"),
+        "yours (solved and its copy) and the five built in"
     );
     assert!(ok(&home, &["automations", "history"]).contains("nothing yet"));
 

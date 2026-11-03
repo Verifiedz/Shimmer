@@ -307,7 +307,13 @@ impl QueueInner {
         // Only a task that ran and failed structurally can owe a fallback (§11.3).
         let mut fallback = None;
         let (status, topic, mut payload) = if token.is_cancelled() {
-            (Status::Cancelled, "queue.task.cancelled", json!({"task_id": task.id, "lane": task.lane, "op": task.op}))
+            let mut p = json!({"task_id": task.id, "lane": task.lane, "op": task.op});
+            // Cut off by the daemon stopping, not cancelled by anyone: the scheduler reports such a
+            // task as interrupted after the restart, rather than forgetting it (#308's review).
+            if self.shutdown.is_cancelled() {
+                p["by"] = json!("shutdown");
+            }
+            (Status::Cancelled, "queue.task.cancelled", p)
         } else {
             match result {
                 Ok(v) => (

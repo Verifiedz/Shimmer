@@ -192,6 +192,32 @@ impl Index {
         Ok(events)
     }
 
+    /// Every event matching `pattern` (`a.b.c`, `a.*`, `*`) logged at or after `since`, oldest
+    /// first. For the scheduler's restart check (#263 finding 1): it needs only the events since
+    /// its oldest unfinished firing, not the whole history. `at` is stored as RFC 3339 in UTC,
+    /// which sorts as text.
+    pub fn events_matching_since(&self, pattern: &str, since: chrono::DateTime<chrono::Utc>) -> Result<Vec<Event>> {
+        let since = since.to_rfc3339();
+        let (sql, arg) = match pattern.strip_suffix(".*") {
+            _ if pattern == "*" => ("SELECT json FROM events WHERE at >= ?2 ORDER BY rowid".to_owned(), String::new()),
+            Some(prefix) => (
+                "SELECT json FROM events WHERE at >= ?2 AND substr(topic, 1, length(?1)) = ?1 ORDER BY rowid"
+                    .to_owned(),
+                format!("{prefix}."),
+            ),
+            None => {
+                ("SELECT json FROM events WHERE at >= ?2 AND topic = ?1 ORDER BY rowid".to_owned(), pattern.to_owned())
+            }
+        };
+        let mut stmt = self.conn.prepare(&sql).map_err(db_err)?;
+        let rows = stmt.query_map(params![arg, since], |r| r.get::<_, String>(0)).map_err(db_err)?;
+        rows.map(|r| {
+            let json = r.map_err(db_err)?;
+            serde_json::from_str(&json).map_err(|e| Error::internal(format!("index row: {e}")))
+        })
+        .collect()
+    }
+
     /// Ordered by `rowid`, SQLite's own implicit insertion-order column, not `id` -- two
     /// events applied within the same millisecond share a `Ulid::from_datetime` timestamp
     /// prefix, and the random suffix that breaks the tie is not insertion order (confirmed by
