@@ -551,9 +551,13 @@ impl Scheduler {
                 continue;
             }
             let (mut settled, mut rerun, mut cut) = (Vec::new(), Vec::new(), None);
+            let mut finished = Vec::new();
             for at in e.stored.unfinished.clone() {
                 match task_for.get(&(id.clone(), at)) {
-                    Some(task) if ended.contains(task) => settled.push(at),
+                    Some(task) if ended.contains(task) => {
+                        settled.push(at);
+                        finished.push(at);
+                    }
                     Some(task) if started.contains(task) => {
                         settled.push(at);
                         cut = Some(Interrupted { task_id: *task, scheduled_for: at, noticed: now });
@@ -579,6 +583,11 @@ impl Scheduler {
             if !settled.is_empty() && !self.forget(e, &settled) {
                 gone.push(id.clone());
                 continue;
+            }
+            // A later run that ended while the daemon was down clears an older cut, as a tick would
+            // (#334's review). Not one found in this same pass: that's news now.
+            if cut.is_none() {
+                self.clear_cut(e, &finished);
             }
             let spec = e.stored.spec.clone();
             let mut failed = Vec::new();

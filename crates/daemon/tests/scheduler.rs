@@ -1015,6 +1015,43 @@ async fn a_cut_off_run_stops_being_shown_once_a_later_run_ends() {
     stop(d).await;
 }
 
+/// #334's review: a later run that ended while the daemon was down (it stopped before a tick
+/// forgot the firing) clears the old cut too, when the next start settles it.
+#[tokio::test]
+async fn a_later_run_that_ended_while_down_clears_a_cut_off_run_at_the_next_start() {
+    let env = Env::fake_clock();
+    let (d, _c, id) = cut_off_daily(&env).await;
+    stop(d).await;
+    // What a stop right after a later run ended leaves: the firing still listed on the trigger,
+    // and its whole run in the log.
+    let later = iso(2 * DAY);
+    let file = env.home.path().join(format!("data/scheduler/triggers/{id}.json"));
+    let mut stored: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    stored["unfinished"] = json!([later]);
+    std::fs::write(&file, serde_json::to_vec_pretty(&stored).unwrap()).unwrap();
+    let task = json!(shimmer_core::TaskId::new());
+    let store = shimmer_store::Store::open(env.home.path()).unwrap();
+    for (source, topic, payload) in [
+        ("scheduler", "scheduler.trigger.fired", json!({"trigger_id": id, "scheduled_for": later, "task_id": task})),
+        ("queue", "queue.task.started", json!({"task_id": task, "lane": "slow", "op": "demo.quick"})),
+        ("queue", "queue.task.finished", json!({"task_id": task, "lane": "slow", "op": "demo.quick"})),
+    ] {
+        // Logged after the time it was for, as a real run is.
+        let at = t0() + chrono::Duration::seconds(2 * DAY as i64 + 30);
+        store.append_event(&Event::new(source.into(), topic, payload, at)).unwrap();
+    }
+
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    settle(&mut c).await;
+    let t = trigger(&mut c, &id).await.unwrap();
+    assert!(t["interrupted"].is_null() && t["waiting"] == 0, "settled and cleared: {t}");
+    assert_eq!(logged(&env, "scheduler.trigger.interrupted").len(), 1, "the old cut only, not a new one");
+    // The cut-off run and the later one: settled from the log, never run again.
+    assert_eq!(logged_for_op(&env, "queue.task.started", "demo.quick").len(), 2, "not run again");
+    stop(d).await;
+}
+
 /// #322's review: an edit or a restore starts the schedule afresh, so an old cut-off run isn't shown.
 #[tokio::test]
 async fn an_edit_or_a_restore_clears_a_cut_off_run() {
