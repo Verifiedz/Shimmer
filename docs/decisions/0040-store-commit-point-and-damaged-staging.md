@@ -1,7 +1,8 @@
 # 0040. The store: a committed write has happened, and a damaged one never blocks a start
 
-Status: proposed · Raised by Dev B (#260, data safety before dogfooding) · Needs sign-off: Dev A
-(`crates/store`, CLAUDE.md §7.1) · No `core` or `proto` change
+Status: accepted (#322) · Raised by Dev B (#260, data safety before dogfooding) · Signed off by
+Dev A (Verifiedz), who approved #322 (`crates/store`; the CLAUDE.md §7 and §7.1 wording below, now
+in CLAUDE.md) · No `core` or `proto` change
 
 ## Context
 
@@ -58,13 +59,16 @@ wrong:
    The last rename wins whole, and no writer fails. Pairing the HTTP cache's body and metadata
    files as one unit is left to #115.
 
-## Proposed change to CLAUDE.md §7.1
+## Change to CLAUDE.md §7 and §7.1
 
 To the **Recovery on daemon start** bullet, add: "Each folder is recovered on its own: a marked
-one that can't be applied is moved to `.staging/broken/` and kept, and the daemon starts."
+one that is damaged (its manifest or a staged file missing or unreadable) is moved to
+`.staging/broken/` and kept; an intact one that can't be applied just then waits, retried before
+the next commit. Either way the daemon starts (ADR 0040)."
 After **Multi-file mutations**, add: "Once `COMMITTED` is written the transaction has happened: a
 failure applying it is finished later (before the next commit, or by recovery), never reported to
-the caller as a failed write."
+the caller as a failed write." In the §7 layout, `.staging/` lists its `<order>-<txid>/` folders
+and `broken/` (#322's review).
 
 ## Consequences
 

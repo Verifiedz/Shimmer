@@ -289,9 +289,28 @@ fn apply(home: &Path, dir: &Path, logged: Option<&mut log::Logged>) -> Result<Ve
             }
         }
     }
-    fs::remove_dir_all(dir)?;
-    fsync_dir(&staging_root(home))?;
+    // Landed: files in place, events logged. Once the marker is gone, a leftover is discarded
+    // quietly on the next start and a retry could never succeed, so that's only logged. While the
+    // folder is still marked it stays on the retry list: the next start would otherwise roll it
+    // forward over every later save to the same files (#334's review).
+    if let Err(e) = clear(home, dir) {
+        if dir.join(COMMITTED).try_exists().unwrap_or(true) {
+            return Err(e.into());
+        }
+        tracing::warn!(tx = %dir.display(), error = %e, "a finished save's staging folder couldn't be removed; the next start discards it");
+    }
     Ok(staged.events)
+}
+
+/// Removes an applied staging folder. It's un-committed first, so a crash partway through
+/// `remove_dir_all` leaves a folder with no marker, discarded quietly on the next start, never one
+/// flagged as damaged for a save that fully landed (#322's review). One whose marker couldn't be
+/// removed is still committed: `apply` fails, and it's retried before the next save.
+fn clear(home: &Path, dir: &Path) -> std::io::Result<()> {
+    fs::remove_file(dir.join(COMMITTED))?;
+    fsync_dir(dir)?;
+    fs::remove_dir_all(dir)?;
+    fsync_dir(&staging_root(home))
 }
 
 /// `pending`: where a committed transaction that can't be applied *yet* goes, to be retried
@@ -670,6 +689,36 @@ mod tests {
         logged_ok(store.commit_logged("records", one("b.toml", b"x", vec![later.clone()])));
         assert_eq!(store.read("records", "a.toml").unwrap().unwrap(), b"new", "the newer content, not the older");
         assert_eq!(logged(&store), [older, later]);
+        assert_eq!(fs::read_dir(home.path().join(".staging")).unwrap().count(), 0);
+    }
+
+    /// #334's review (Wasay's probe): a save lands but its marker can't be removed. It must stay
+    /// on the retry list, finished before anything newer, or the next start rolls the old content
+    /// forward over a later save to the same file.
+    #[cfg(unix)]
+    #[test]
+    fn a_landed_save_whose_marker_cant_be_removed_never_overwrites_a_later_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TempDir::new().unwrap();
+        let store = Store::open(home.path()).unwrap();
+        let first = event("records.item.created");
+        let dir = stage(home.path(), "records", &one("a.toml", b"1", vec![first.clone()])).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        if File::create(dir.join("probe")).is_ok() {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            return; // root ignores permissions
+        }
+        let r = store.recover().expect("a start is never blocked");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!((r.waiting, r.rolled_forward), (1, 0), "still marked, so still waiting: {r:?}");
+        let second = event("records.item.updated");
+        logged_ok(store.commit_logged("records", one("a.toml", b"2", vec![second.clone()])));
+        assert_eq!(store.read("records", "a.toml").unwrap().unwrap(), b"2");
+        // The next start finds nothing to roll forward over the later save.
+        let store = Store::open(home.path()).unwrap();
+        store.recover().unwrap();
+        assert_eq!(store.read("records", "a.toml").unwrap().unwrap(), b"2", "the later save survives a restart");
+        assert_eq!(logged(&store), [first, second], "each event once");
         assert_eq!(fs::read_dir(home.path().join(".staging")).unwrap().count(), 0);
     }
 

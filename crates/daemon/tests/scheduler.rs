@@ -8,6 +8,7 @@ use std::time::Duration;
 use common::*;
 use serde_json::{json, Value};
 use shimmer_core::{CatchUp, ErrorCode, Event, Schedule, TriggerId, TriggerSpec};
+use shimmer_daemon::Daemon;
 
 const DAY: u64 = 86_400;
 
@@ -967,8 +968,109 @@ async fn a_firing_cut_off_mid_run_is_reported_as_interrupted_not_run_again() {
     stop(d).await;
 }
 
+/// A daily schedule whose first run was cut off mid-run (a crash), with the daemon started again
+/// and the cut reported on the trigger. Returns the trigger's id.
+async fn cut_off_daily(env: &Env) -> (Daemon, Client, String) {
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    c.subscribe(&["scheduler.trigger.*"]).await;
+    c.call("demo.spin", json!({})).await.unwrap();
+    let id = add(&mut c, json!({"every": DAY}), "demo.quick", "skip").await;
+    advance(env, DAY + 60);
+    let task = c.event("scheduler.trigger.fired").await.payload["task_id"].clone();
+    stop(d).await;
+    let started = Event::new(
+        "queue".into(),
+        "queue.task.started",
+        json!({"task_id": task, "lane": "slow", "op": "demo.quick"}),
+        env.clock.now(),
+    );
+    shimmer_store::Store::open(env.home.path()).unwrap().append_event(&started).unwrap();
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    settle(&mut c).await;
+    assert!(trigger(&mut c, &id).await.unwrap()["interrupted"].is_object(), "cut off and shown");
+    (d, c, id)
+}
+
+/// #322's review: the cut-off warning isn't permanent. Once a later run of the same schedule has
+/// ended, it's cleared, on disk too.
+#[tokio::test]
+async fn a_cut_off_run_stops_being_shown_once_a_later_run_ends() {
+    let env = Env::fake_clock();
+    let (d, mut c, id) = cut_off_daily(&env).await;
+    advance(&env, DAY);
+    until_logged_for_op(&env, "queue.task.finished", "demo.quick").await;
+    for _ in 0..300 {
+        if trigger(&mut c, &id).await.unwrap()["interrupted"].is_null() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(trigger(&mut c, &id).await.unwrap()["interrupted"].is_null(), "cleared by the later run");
+    stop(d).await;
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    assert!(trigger(&mut c, &id).await.unwrap()["interrupted"].is_null(), "cleared on disk");
+    stop(d).await;
+}
+
+/// #334's review: a later run that ended while the daemon was down (it stopped before a tick
+/// forgot the firing) clears the old cut too, when the next start settles it.
+#[tokio::test]
+async fn a_later_run_that_ended_while_down_clears_a_cut_off_run_at_the_next_start() {
+    let env = Env::fake_clock();
+    let (d, _c, id) = cut_off_daily(&env).await;
+    stop(d).await;
+    // What a stop right after a later run ended leaves: the firing still listed on the trigger,
+    // and its whole run in the log.
+    let later = iso(2 * DAY);
+    let file = env.home.path().join(format!("data/scheduler/triggers/{id}.json"));
+    let mut stored: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    stored["unfinished"] = json!([later]);
+    std::fs::write(&file, serde_json::to_vec_pretty(&stored).unwrap()).unwrap();
+    let task = json!(shimmer_core::TaskId::new());
+    let store = shimmer_store::Store::open(env.home.path()).unwrap();
+    for (source, topic, payload) in [
+        ("scheduler", "scheduler.trigger.fired", json!({"trigger_id": id, "scheduled_for": later, "task_id": task})),
+        ("queue", "queue.task.started", json!({"task_id": task, "lane": "slow", "op": "demo.quick"})),
+        ("queue", "queue.task.finished", json!({"task_id": task, "lane": "slow", "op": "demo.quick"})),
+    ] {
+        // Logged after the time it was for, as a real run is.
+        let at = t0() + chrono::Duration::seconds(2 * DAY as i64 + 30);
+        store.append_event(&Event::new(source.into(), topic, payload, at)).unwrap();
+    }
+
+    let d = env.start().await;
+    let mut c = Client::connect(&env.sock).await;
+    settle(&mut c).await;
+    let t = trigger(&mut c, &id).await.unwrap();
+    assert!(t["interrupted"].is_null() && t["waiting"] == 0, "settled and cleared: {t}");
+    assert_eq!(logged(&env, "scheduler.trigger.interrupted").len(), 1, "the old cut only, not a new one");
+    // The cut-off run and the later one: settled from the log, never run again.
+    assert_eq!(logged_for_op(&env, "queue.task.started", "demo.quick").len(), 2, "not run again");
+    stop(d).await;
+}
+
+/// #322's review: an edit or a restore starts the schedule afresh, so an old cut-off run isn't shown.
+#[tokio::test]
+async fn an_edit_or_a_restore_clears_a_cut_off_run() {
+    let env = Env::fake_clock();
+    let (d, mut c, id) = cut_off_daily(&env).await;
+    let edit = json!({"trigger_id": id, "schedule": {"every": 2 * DAY}, "op": "demo.quick", "catch_up": "skip"});
+    assert!(c.call("scheduler.edit", edit).await.unwrap()["interrupted"].is_null(), "edit clears it");
+    stop(d).await;
+
+    let env = Env::fake_clock();
+    let (d, mut c, id) = cut_off_daily(&env).await;
+    c.call("scheduler.remove", json!({"trigger_id": id})).await.unwrap();
+    assert!(c.call("scheduler.restore", json!({"trigger_id": id})).await.unwrap()["interrupted"].is_null());
+    assert!(trigger(&mut c, &id).await.unwrap()["interrupted"].is_null(), "restore clears it");
+    stop(d).await;
+}
+
 /// #263 finding 5: a damaged schedule file doesn't stop the rest, and doesn't vanish: it's
-/// listed as broken, left as it is, and `scheduler.remove` deletes it.
+/// listed as broken, left as it is, and `scheduler.remove` moves it aside, restorable.
 #[tokio::test]
 async fn a_damaged_schedule_file_is_listed_as_broken_and_can_be_removed() {
     let env = Env::fake_clock();

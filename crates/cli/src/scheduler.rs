@@ -365,7 +365,7 @@ fn trigger(t: &Value, now: DateTime<Utc>, schemas: &Schemas) -> String {
             paint(
                 Role::Warning,
                 &format!(
-                    "the run for {} was stopped mid-way by a shutdown and not run again (task {})",
+                    "the run for {} was stopped mid-way (a crash or a shutdown) and not run again (task {})",
                     time(&cut["scheduled_for"].clone(), "?"),
                     render::cell(&cut["task_id"])
                 ),
