@@ -212,7 +212,13 @@ fn parse_http(http: &toml::Value) -> Result<HttpConfig> {
             as usize;
     }
     if let Some(v) = table.get("timeout_s") {
-        cfg.timeout = non_negative_secs("timeout_s", v)?;
+        // A zero timeout makes `reqwest` fail every request instantly (#115, #267 finding 6)
+        // -- not a meaningful "no timeout", just a footgun.
+        cfg.timeout = v
+            .as_integer()
+            .filter(|n| *n >= 1)
+            .map(|n| Duration::from_secs(n as u64))
+            .ok_or_else(|| Error::invalid_params("config.toml: http.timeout_s must be an integer >= 1"))?;
     }
     if let Some(v) = table.get("max_cooldown_wait_s") {
         cfg.max_cooldown_wait = non_negative_secs("max_cooldown_wait_s", v)?;
@@ -228,11 +234,26 @@ fn parse_http(http: &toml::Value) -> Result<HttpConfig> {
             as u64;
     }
     if let Some(v) = table.get("max_response_bytes") {
+        // A zero cap makes every non-empty response fail (#267 finding 6), same class of bug
+        // as `timeout_s = 0` above.
         cfg.max_response_bytes = v
             .as_integer()
-            .filter(|n| *n >= 0)
-            .ok_or_else(|| Error::invalid_params("config.toml: http.max_response_bytes must be an integer >= 0"))?
+            .filter(|n| *n >= 1)
+            .ok_or_else(|| Error::invalid_params("config.toml: http.max_response_bytes must be an integer >= 1"))?
             as u64;
+    }
+    if let Some(v) = table.get("allow_private") {
+        let items = v
+            .as_array()
+            .ok_or_else(|| Error::invalid_params("config.toml: http.allow_private must be an array of hostnames"))?;
+        cfg.allow_private = items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(|s| s.to_ascii_lowercase())
+                    .ok_or_else(|| Error::invalid_params("config.toml: http.allow_private entries must be strings"))
+            })
+            .collect::<Result<_>>()?;
     }
     if let Some(hosts) = table.get("host").and_then(|h| h.as_table()) {
         for (host, overrides) in hosts {
@@ -393,6 +414,31 @@ mod tests {
     #[test]
     fn rejects_a_non_positive_rate() {
         assert!(Config::parse("[http]\ndefault_requests_per_sec = 0\n").is_err());
+    }
+
+    #[test]
+    fn rejects_a_zero_timeout() {
+        // A zero `reqwest` timeout makes every request fail instantly (#115, #267 finding 6).
+        let e = Config::parse("[http]\ntimeout_s = 0\n").unwrap_err();
+        assert!(e.message.contains("timeout_s"), "{}", e.message);
+    }
+
+    #[test]
+    fn rejects_a_zero_max_response_bytes() {
+        let e = Config::parse("[http]\nmax_response_bytes = 0\n").unwrap_err();
+        assert!(e.message.contains("max_response_bytes"), "{}", e.message);
+    }
+
+    #[test]
+    fn parses_an_allow_private_list() {
+        let cfg = Config::parse("[http]\nallow_private = [\"NAS.local\", \"10.0.0.5\"]\n").unwrap();
+        assert!(cfg.http.allow_private.contains("nas.local"), "entries are lowercased");
+        assert!(cfg.http.allow_private.contains("10.0.0.5"));
+    }
+
+    #[test]
+    fn rejects_a_non_string_allow_private_entry() {
+        assert!(Config::parse("[http]\nallow_private = [1]\n").is_err());
     }
 
     #[test]
