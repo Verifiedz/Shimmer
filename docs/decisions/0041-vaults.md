@@ -1,8 +1,8 @@
 # 0041. Vaults: named Shimmer folders you can switch between
 
-Status: proposed · Raised by Dev B · Needs sign-off: Dev A (`crates/app/src/main.rs` re-runs itself
-in the chosen vault, §3; a quiet start for the daemon, §5a; the CLAUDE.md §2, §7, §10.3 and §15
-wording below) · No `core` or `proto` change · Depends on #293 (ADR 0039: one socket per Shimmer folder),
+Status: accepted (#312) · Raised by Dev B · Signed off by Dev A (Verifiedz) on #312 and on the
+implementation, #326–#328 (`crates/app/src/main.rs` re-runs itself in the chosen vault, §3; a quiet
+start for the daemon, §5a; the CLAUDE.md §2, §7, §10.3 and §15 wording below, all now in CLAUDE.md) · No `core` or `proto` change · Depends on #293 (ADR 0039: one socket per Shimmer folder),
 merged; the quiet start (§5a) builds on #308's scheduler recovery, so the implementation follows #322
 (data safety) into master · Revised after Wasay's two reviews on #312, and checked against #308, #309,
 #310, #320 and #323 once they merged
@@ -153,7 +153,9 @@ newer Shimmer can share the file.
      so no daemon can start there mid-copy. There is still exactly one writer (CLAUDE.md §2): for those
      moments, none.
   2. It copies into a temporary folder beside the target (`<target>.copying`), everything except what's
-     derived or tied to the machine: `index.sqlite*`, `cache/`, `logs/`, the socket and the lock.
+     derived or tied to the machine: `index.sqlite*`, `cache/`, `logs/`, the socket and the lock, and
+     `.git/` (found reviewing #329): main is the folder you sync with git, and a copy that kept its
+     history would push to the same remote, so a sandbox could overwrite your real backup.
      `.staging/` *is* copied, so the copy's own recovery finishes any save that was committed (ADR 0040),
      including one still waiting to be applied; `.staging/broken/` comes too, so a damaged save kept
      aside in VAULT is kept aside in the copy, and `doctor` reports it in both.
@@ -169,7 +171,9 @@ newer Shimmer can share the file.
      the one-time schedules modules added (`ctx.schedules`: an automation's delayed action, ADR 0035
      §5.6), `notify.pause {"all": true}` (held until `notify resume`), and `workspaces.reset` for any
      workspace whose copied state is `active` or `dirty` (it can't have launched anything in the copy;
-     see below). Then it stops that daemon. `--live` skips this step.
+     see below). Then it stops that daemon. `--live` skips the switching-off, **not the quiet start**
+     (found reviewing #329): live means the copy's schedules run from now on, never that VAULT's
+     unfinished firings or overdue schedules run a second time.
 
      Left on, as Shimmer's own (found building part 3): the built-in alert rules, which only send
      notifications and those are paused, and the schedules a module declares for itself (notify's
@@ -209,7 +213,8 @@ copy's first start. During a quiet start:
   vault's run, not this one's), through `forget()`, so it's **written to the trigger files**:
   otherwise the next ordinary start's recovery would queue them again, since recovery doesn't check
   whether a trigger is enabled (Wasay on #312). It counts every schedule from now instead of catching
-  up (as `enable` does), also written, and doesn't tick.
+  up (as `enable` does), and marks an overdue one-time schedule done (a module's added one is
+  deleted), both written, and doesn't tick.
 - **The queue refuses** a task a module asks for (`Origin::Module`: an automation's action, a
   fallback) with `unavailable` ("the daemon started quiet"), so it's never enqueued: no
   `queue.task.enqueued` is logged, `queue list` never shows it, and nothing is left for a later

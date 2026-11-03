@@ -27,6 +27,7 @@ mod schedules;
 mod startup;
 mod style;
 mod suggest;
+pub mod vaults;
 mod when;
 mod workspaces;
 
@@ -151,7 +152,7 @@ async fn run_line(alias: Option<String>, args: Vec<String>) -> ExitCode {
     if args.command == Command::Doctor {
         return doctor::run(&args, &active.warnings).await;
     }
-    match execute(&args, help).await {
+    match execute(&args, help, front.vault).await {
         Ok(Some(text)) => {
             // Output showing people's own data is printed as drawn: its tables are coloured as
             // they're built, and the finishing pass must never read a record's title as Shimmer's
@@ -168,15 +169,26 @@ async fn run_line(alias: Option<String>, args: Vec<String>) -> ExitCode {
     }
 }
 
-/// `shimmer __complete WORDS…`: the suggestions for the last word (#188). `--pack` and
-/// `--socket` on the line count, as they would when it runs.
+/// `shimmer __complete WORDS…`: the suggestions for the last word (#188). `--pack`, `--socket`
+/// and `--vault` on the line count, as they would when it runs.
 async fn complete_line(words: &[String]) -> ExitCode {
     let after = |flag: &str| flag_value(words, flag);
     let active = packs::active::load(after("--pack").as_deref());
-    let socket = after("--socket").map(PathBuf::from).unwrap_or_else(shimmer_proto::paths::socket_path);
+    let saved = packs::settings::path().and_then(|p| packs::settings::load(&p).ok()).unwrap_or_default();
+    // `shimmer --vault play records list <Tab>` asks play's daemon (ADR 0041 §6).
+    let home = after("--vault")
+        .and_then(|v| vaults::resolve(Some(&v), None, &saved, &vaults::main_home()).ok())
+        .map(|c| c.home);
+    let socket = match (after("--socket"), &home) {
+        (Some(s), _) => PathBuf::from(s),
+        (None, Some(home)) => shimmer_proto::paths::default_socket(home),
+        (None, None) => shimmer_proto::paths::socket_path(),
+    };
     let cx = complete::Context {
         pack: active.pack.as_ref(),
-        pack_folders: complete::pack_folders(&shimmer_proto::paths::shimmer_home()),
+        pack_folders: complete::pack_folders(&home.unwrap_or_else(shimmer_proto::paths::shimmer_home)),
+        vaults: std::iter::once(vaults::MAIN.to_owned()).chain(saved.vaults.keys().cloned()).collect(),
+        removed_vaults: saved.removed_vaults.keys().cloned().collect(),
     };
     let groups = complete::complete(words, &cx, &mut complete::Daemon::new(socket)).await;
     print!("{}", complete::print(&groups));
@@ -215,6 +227,7 @@ fn usage_for(args: &[String]) -> &'static str {
             "notify" => return notify::USAGE,
             "doctor" => return doctor::USAGE,
             "startup" => return startup::USAGE,
+            "vaults" => return vaults::USAGE,
             _ => return USAGE,
         }
     }
@@ -281,7 +294,8 @@ fn nudge_startup(json: bool, what: &str) {
 }
 
 /// `help` is the top-level help: [`USAGE`], plus the active pack's aliases unless `--canonical`.
-async fn execute(args: &Args, help: String) -> Result<Option<String>> {
+/// `vault`: `--vault NAME`, for `shimmer vaults` to say which vault is in use and why.
+async fn execute(args: &Args, help: String, vault: Option<String>) -> Result<Option<String>> {
     match &args.command {
         Command::Help => return Ok(Some(help)),
         Command::Records(RecordsCmd::Help) => return Ok(Some(records::USAGE.into())),
@@ -295,6 +309,11 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
         Command::Packs(cmd) => return packs::cmd::run(cmd, &packs::cmd::Env::from_process()).map(Some),
         // The login service is the operating system's, not the daemon's (ADR 0034).
         Command::Startup(cmd) => return startup::run(cmd, &startup::Env::from_process(), &mut startup::Real).map(Some),
+        // Vaults are the client's own (ADR 0041): which folder to use, kept in cli.toml.
+        Command::Vaults(cmd) => {
+            let env = vaults::Env::from_process(vault);
+            return vaults::run(cmd, args.json, &env, &mut workspaces::Terminal).await.map(Some);
+        }
         _ => {}
     }
     let Some(mut client) = connect(args).await? else { return Ok(None) };
@@ -343,7 +362,8 @@ async fn execute(args: &Args, help: String) -> Result<Option<String>> {
         | Command::Fetchers(_)
         | Command::Packs(_)
         | Command::Notify(_)
-        | Command::Startup(_) => {
+        | Command::Startup(_)
+        | Command::Vaults(_) => {
             unreachable!("handled above")
         }
     };
@@ -415,7 +435,8 @@ fn output(args: &Args, data: &Value) -> String {
         | Command::Fetchers(_)
         | Command::Packs(_)
         | Command::Notify(_)
-        | Command::Startup(_) => render::json(data),
+        | Command::Startup(_)
+        | Command::Vaults(_) => render::json(data),
     }
 }
 

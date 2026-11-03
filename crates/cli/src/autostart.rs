@@ -17,15 +17,27 @@ const POLL: Duration = Duration::from_millis(50);
 
 /// Launch `<exe> daemon` detached, bound to `socket`, and wait until it completes a handshake.
 pub async fn start_and_connect(exe: &Path, socket: &Path) -> Result<Client> {
+    start(exe, &shimmer_proto::paths::shimmer_home(), socket, false).await
+}
+
+/// [`start_and_connect`] for another folder, `home`, started quiet (ADR 0041 §5a): only `vaults copy`
+/// asks for it, for a copy's first start, so `doctor`, `startup` and ordinary auto-start can't
+/// start a quiet daemon by accident.
+pub(crate) async fn start_quiet(exe: &Path, home: &Path, socket: &Path) -> Result<Client> {
+    start(exe, home, socket, true).await
+}
+
+async fn start(exe: &Path, home: &Path, socket: &Path, quiet: bool) -> Result<Client> {
     // The daemon runs in `/`, never in the folder this command happens to be in (a USB drive's
     // folder couldn't be unmounted while it runs, #266 finding 3). So the folder and socket it's
     // given are made absolute first: a relative `SHIMMER_HOME=play` means this command's `play`.
     let absolute = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
-    let home = absolute(&shimmer_proto::paths::shimmer_home());
+    let home = absolute(home);
     // A second earlier, so a log line written in the same second as the start still counts.
     let started = chrono::Utc::now() - chrono::Duration::seconds(1);
     let mut child = Command::new(exe)
         .arg("daemon")
+        .args(quiet.then_some("--quiet"))
         // `socket` may itself have come from $SHIMMER_SOCKET or $XDG_RUNTIME_DIR; pinning it makes
         // the daemon bind exactly where this client is about to look.
         .env("SHIMMER_SOCKET", absolute(socket))
@@ -41,7 +53,7 @@ pub async fn start_and_connect(exe: &Path, socket: &Path) -> Result<Client> {
 
     let deadline = Instant::now() + START_TIMEOUT;
     loop {
-        match Client::connect(socket).await {
+        match Client::connect_for(socket, &home).await {
             Ok(client) => return Ok(client),
             Err(e) if !e.nobody_listening() => return Err(e.into_error(socket)),
             Err(_) => {}
@@ -49,7 +61,7 @@ pub async fn start_and_connect(exe: &Path, socket: &Path) -> Result<Client> {
         // Exited early: usually another daemon already owns this home (a second `shimmer` raced us
         // and won), or the home is unusable. One last look covers the race.
         if let Ok(Some(status)) = child.try_wait() {
-            return Client::connect(socket).await.map_err(|_| {
+            return Client::connect_for(socket, &home).await.map_err(|_| {
                 Error::unavailable(match start_failure(&home.join("logs"), started) {
                     Some(why) => format!("the daemon exited during startup ({status}): {why}"),
                     None => format!("the daemon exited during startup ({status}); run 'shimmer daemon' to see why"),

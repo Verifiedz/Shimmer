@@ -137,7 +137,9 @@ GUI ─┘   (bidirectional)
 ```
 
 - Modules are **async tasks inside the daemon**, never subprocesses.
-- The daemon is the only process that opens the data directory for writing.
+- The daemon is the only process that opens the data directory for writing. One exception:
+  `shimmer vaults copy` and `purge` copy and delete a whole vault's folder while holding its
+  `.daemon.lock`, so there is still at most one writer (ADR 0041).
 - Clients hold no business logic. A client that computes something is a bug.
 - The CLI auto-starts the daemon if the socket is dead, then retries once. The user never
   starts the daemon manually — same behaviour as `tmux` or `ssh-agent`.
@@ -503,7 +505,7 @@ Ship a `.gitignore` in `$SHIMMER_HOME` covering `index.sqlite`, `cache/`, `logs/
 transfer story.
 
 Client settings are not in `$SHIMMER_HOME`: the CLI keeps its own (the active command pack,
-§15.1) in `~/.config/shimmer/cli.toml`, which only the CLI reads and writes (ADR 0013).
+§15.1, and named vaults, ADR 0041) in `~/.config/shimmer/cli.toml`, which only the CLI reads and writes (ADR 0013).
 
 Secrets are not in `$SHIMMER_HOME` either, for the same reason inverted — that directory is
 meant to be copied between machines and committed to git, so nothing secret may ever live in
@@ -708,7 +710,9 @@ ready ──activate──> launching ──all steps ok──> active ──sto
   moves `dirty → ready`. If there is no cleanup script, `dirty` clears only via explicit
   force relaunch or `workspaces.reset`. The same script is what `workspaces.stop` runs on an
   `active` workspace (`active → ready`): it stops the processes the workspace started, never
-  the person's own windows (ADR 0026).
+  the person's own windows (ADR 0026). `workspaces.reset` also takes an `active` workspace: it
+  forgets what the launch started and runs nothing, for a vault copy whose `active` was another
+  folder's launch (ADR 0041). Never a `launching` one: that launch is running now.
 - **Force relaunch is loud.** A distinct op, not a casual flag. Emits
   `workspaces.session.forced` with the prior dirty reason attached, so if it breaks
   something worse there is a trail.
@@ -880,7 +884,8 @@ Commands have a **canonical name** and, when a command pack is active, an **alia
 work.
 
 - Canonical names are used everywhere internal: IPC ops, `commands()`, logs, docs, tests,
-  error messages. Boring on purpose — `records.list`, not `mite`.
+  error messages. Boring on purpose — `records.list`, not `mite`. A plain word that says what a
+  thing is (`vaults`, ADR 0041) is canonical; a themed word that doesn't (`mite`) is an alias.
 - Aliases are a **client presentation concern only**, supplied by a **command pack**.
   Nothing in the daemon, the protocol, or any module knows they exist.
 

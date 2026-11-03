@@ -1,12 +1,13 @@
 //! The CLI's own settings file, `cli.toml` (ADR 0013 §3): which pack is active, where bare
 //! commands are linked, which links Shimmer made, and the login service `shimmer startup on`
-//! wrote (ADR 0034 §6). It lives outside `$SHIMMER_HOME`, which
+//! wrote (ADR 0034 §6), and the named vaults (ADR 0041 §4). It lives outside `$SHIMMER_HOME`, which
 //! belongs to the daemon (CLAUDE.md §1.6, §7), and only the CLI reads or writes it.
 //!
 //! A broken `cli.toml` must never break a command, so problems here are reported and the caller
 //! carries on with no pack (ADR 0013 §8). An unknown key is only a warning, so a file written by
 //! a newer Shimmer still loads in an older one.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -30,6 +31,21 @@ pub struct Settings {
     pub startup: Option<Startup>,
     /// Told once that `shimmer startup on` exists, when a schedule was made (ADR 0034 §7).
     pub told_startup: bool,
+    /// The vault `shimmer vaults use` chose (ADR 0041 §4). `None`: main.
+    pub vault: Option<String>,
+    /// Every vault but main, by name.
+    pub vaults: BTreeMap<String, Vault>,
+    /// Vaults `shimmer vaults remove` forgot, until restored or purged.
+    pub removed_vaults: BTreeMap<String, Vault>,
+}
+
+/// `[vaults.NAME] path = "…", made = true`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Vault {
+    /// Its folder, always a full path.
+    pub path: PathBuf,
+    /// Made by `shimmer vaults new` rather than adopted: the only kind `purge` deletes.
+    pub made: bool,
 }
 
 /// `startup = { file = "…", target = "…" }`.
@@ -110,6 +126,26 @@ pub fn save(path: &Path, settings: &Settings) -> std::io::Result<()> {
     } else {
         table.remove("told_startup")
     };
+    let _ = match &settings.vault {
+        Some(name) => table.insert("vault".into(), Value::String(name.clone())),
+        None => table.remove("vault"),
+    };
+    for (key, vaults) in [("vaults", &settings.vaults), ("removed_vaults", &settings.removed_vaults)] {
+        let _ = if vaults.is_empty() {
+            table.remove(key)
+        } else {
+            let t = vaults
+                .iter()
+                .map(|(name, v)| {
+                    let mut t = Table::new();
+                    t.insert("path".into(), Value::String(v.path.display().to_string()));
+                    t.insert("made".into(), Value::Boolean(v.made));
+                    (name.clone(), Value::Table(t))
+                })
+                .collect();
+            table.insert(key.into(), Value::Table(t))
+        };
+    }
     let text = toml::to_string(&table).map_err(std::io::Error::other)?;
 
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
@@ -172,6 +208,26 @@ pub fn parse(file: &str, text: &str) -> Result<Loaded, Vec<String>> {
                 }
             }
             ("told_startup", Value::Boolean(b)) => loaded.settings.told_startup = *b,
+            ("vault", Value::String(name)) => match vault_name_problem(name) {
+                Some(why) => problems.push(format!("{file}: vault '{name}' {why}")),
+                None => loaded.settings.vault = Some(name.clone()),
+            },
+            ("vaults" | "removed_vaults", Value::Table(t)) => {
+                let into =
+                    if key == "vaults" { &mut loaded.settings.vaults } else { &mut loaded.settings.removed_vaults };
+                for (name, v) in t {
+                    match vault_entry(name, v) {
+                        Ok(vault) => {
+                            into.insert(name.clone(), vault);
+                        }
+                        Err(why) => problems.push(format!("{file}: {key}.{name} {why}")),
+                    }
+                }
+            }
+            ("vault", _) => problems.push(format!("{file}: vault must be a string")),
+            ("vaults" | "removed_vaults", _) => {
+                problems.push(format!("{file}: {key} must be a table of [{key}.NAME] entries"))
+            }
             ("startup", _) => {
                 problems.push(format!("{file}: startup must be {{ file = \"<full path>\", target = \"…\" }}"))
             }
@@ -185,6 +241,31 @@ pub fn parse(file: &str, text: &str) -> Result<Loaded, Vec<String>> {
         Ok(loaded)
     } else {
         Err(problems)
+    }
+}
+
+/// Why `name` can't be a vault's name, or `None` if it can (ADR 0041 §1).
+pub fn vault_name_problem(name: &str) -> Option<String> {
+    if name.len() > 64 {
+        return Some("is longer than 64 characters".into());
+    }
+    (!shimmer_core::ids::is_valid_id(name))
+        .then(|| "must be lowercase letters, digits, '-' and '_', starting with a letter or digit".into())
+}
+
+/// One `[vaults.NAME]` entry: a full `path`, and `made`.
+fn vault_entry(name: &str, v: &Value) -> Result<Vault, String> {
+    if let Some(why) = vault_name_problem(name) {
+        return Err(why);
+    }
+    if name == "main" {
+        return Err("can't be listed: main is always your default folder".into());
+    }
+    let t = v.as_table().ok_or("must be { path = \"<full path>\", made = true|false }")?;
+    match (t.get("path").and_then(Value::as_str), t.get("made").and_then(Value::as_bool)) {
+        // `purge` may delete this folder, so it must be a full path.
+        (Some(p), Some(made)) if Path::new(p).is_absolute() => Ok(Vault { path: PathBuf::from(p), made }),
+        _ => Err("must be { path = \"<full path>\", made = true|false }".into()),
     }
 }
 
@@ -270,6 +351,9 @@ mod tests {
                 target: "default.target".into(),
             }),
             told_startup: true,
+            vault: Some("play".into()),
+            vaults: BTreeMap::from([("play".into(), Vault { path: "/v/play".into(), made: true })]),
+            removed_vaults: BTreeMap::from([("old".into(), Vault { path: "/v/old".into(), made: false })]),
         };
         save(&path, &s).unwrap();
         assert_eq!(load(&path).unwrap(), s);
@@ -294,6 +378,24 @@ mod tests {
             assert!(problems(bad)[0].contains("startup must be"), "{bad}");
         }
         assert!(problems("told_startup = \"yes\"")[0].contains("true or false"));
+    }
+
+    #[test]
+    fn vaults_need_a_valid_name_and_a_full_path() {
+        let loaded = ok("vault = \"play\"\n[vaults.play]\npath = \"/v/play\"\nmade = true\n");
+        assert_eq!(loaded.settings.vault.as_deref(), Some("play"));
+        assert_eq!(loaded.settings.vaults["play"], Vault { path: "/v/play".into(), made: true });
+        for bad in [
+            "vault = 3",
+            "vault = \"Play\"",
+            "vaults = 3",
+            "[vaults.play]\npath = \"v/play\"\nmade = true",
+            "[vaults.play]\npath = \"/v/play\"",
+            "[vaults.main]\npath = \"/v/main\"\nmade = true",
+            "[removed_vaults.\"Bad Name\"]\npath = \"/v\"\nmade = true",
+        ] {
+            assert!(!problems(bad).is_empty(), "{bad}");
+        }
     }
 
     #[test]
