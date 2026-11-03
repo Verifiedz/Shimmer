@@ -660,7 +660,7 @@ impl Fetchers {
         let _g = self.write.lock();
         if !ctx.cancel.is_cancelled() {
             match &outcome {
-                Ok(_) => schedule::record_run(ctx, &source_id, ctx.clock.now())?,
+                Ok(new_items) => schedule::record_run(ctx, &source_id, ctx.clock.now(), *new_items)?,
                 // `fetchers.health`'s own reading of this file (ADR 0028 §11) -- the same
                 // classification `fetchers.fetch.failed` emits below, never a second one.
                 Err(e) => {
@@ -1072,6 +1072,7 @@ impl Fetchers {
         let last_run = schedule::load_last_run(ctx)?;
         let mut v = view(id, &cfg);
         v["last_run_at"] = json!(last_run.get(id));
+        v["last_new_items"] = json!(schedule::load_last_new_items(ctx).get(id));
         v["last_error"] = json!(schedule::load_last_failures(ctx)
             .get(id)
             .map(|(_, error, reason)| json!({"error": error, "reason": reason})));
@@ -1705,10 +1706,13 @@ mod tests {
         let last_run = schedule::load_last_run(&env.ctx).unwrap();
         assert_eq!(last_run.get("hn-whoishiring"), Some(&env.ctx.clock.now()));
         assert!(!fetchers.running.is_running("hn-whoishiring"), "the permit must be released on success");
+        // `show` says how many new items that run found (#337).
+        assert_eq!(fetchers.show(&env.ctx, "hn-whoishiring").unwrap()["last_new_items"], 1);
 
         // Re-running with the identical comment still present must not re-emit it.
         let second = fetchers.fetch(&env.ctx, "hn-whoishiring".into(), None).await.unwrap();
         assert_eq!(second["new_items"].as_u64(), Some(0));
+        assert_eq!(fetchers.show(&env.ctx, "hn-whoishiring").unwrap()["last_new_items"], 0, "the latest run's count");
         let found_after_second = env.backend.events().iter().filter(|e| e.topic == "fetchers.item.found").count();
         assert_eq!(found_after_second, 1, "an already-seen item must never be emitted twice");
 
@@ -2121,7 +2125,7 @@ mod tests {
         // the next call; health is read fresh every time, never accumulated.
         env.ctx.store.delete(&schedule::path("broken")).unwrap();
         fetchers.load(&env.ctx).unwrap();
-        schedule::record_run(&env.ctx, "my-hn", env.ctx.clock.now()).unwrap();
+        schedule::record_run(&env.ctx, "my-hn", env.ctx.clock.now(), 0).unwrap();
         let out = fetchers.health(&env.ctx).unwrap();
         assert_eq!(out["checks"][0]["status"], "ok");
     }
@@ -2348,11 +2352,11 @@ mod tests {
         let fetchers = Fetchers::default();
         {
             let _g = fetchers.write.lock();
-            schedule::record_run(&env.ctx, "hn-whoishiring", env.ctx.clock.now()).unwrap();
+            schedule::record_run(&env.ctx, "hn-whoishiring", env.ctx.clock.now(), 0).unwrap();
         }
         {
             let _g = fetchers.write.lock();
-            schedule::record_run(&env.ctx, "weworkremotely", env.ctx.clock.now()).unwrap();
+            schedule::record_run(&env.ctx, "weworkremotely", env.ctx.clock.now(), 0).unwrap();
         }
         let all = schedule::load_last_run(&env.ctx).unwrap();
         assert!(all.contains_key("hn-whoishiring") && all.contains_key("weworkremotely"));
@@ -2636,7 +2640,7 @@ mod tests {
         );
         fetchers.load(&env.ctx).unwrap();
         env.ctx.store.write(&dedup::path("blog"), "c-1 = \"2026-01-01T00:00:00Z\"\n").unwrap();
-        schedule::record_run(&env.ctx, "blog", env.ctx.clock.now()).unwrap();
+        schedule::record_run(&env.ctx, "blog", env.ctx.clock.now(), 0).unwrap();
 
         fetchers.remove(&env.ctx, "blog").unwrap();
         fetchers.purge(&env.ctx, Purge { id: Some("blog".into()), confirm: Some(json!({"sources": 1})) }).unwrap();
@@ -2695,7 +2699,7 @@ mod tests {
         );
         fetchers.load(&env.ctx).unwrap();
         env.ctx.store.write(&dedup::path("blog"), "c-1 = \"2026-01-01T00:00:00Z\"\n").unwrap();
-        schedule::record_run(&env.ctx, "blog", env.ctx.clock.now()).unwrap();
+        schedule::record_run(&env.ctx, "blog", env.ctx.clock.now(), 0).unwrap();
 
         let v = fetchers.rename(&env.ctx, MoveParams { id: "blog".into(), to: "team-blog".into() }).unwrap();
         assert_eq!(v["id"], "team-blog");
@@ -2806,7 +2810,7 @@ mod tests {
         );
         fetchers.load(&env.ctx).unwrap();
         env.ctx.store.write(&dedup::path("blog"), "c-1 = \"2026-01-01T00:00:00Z\"\n").unwrap();
-        schedule::record_run(&env.ctx, "blog", env.ctx.clock.now()).unwrap();
+        schedule::record_run(&env.ctx, "blog", env.ctx.clock.now(), 0).unwrap();
 
         let v = fetchers
             .copy(&env.ctx, CopyParams { id: "blog".into(), to: "blog-2".into(), label: Some("Blog copy".into()) })

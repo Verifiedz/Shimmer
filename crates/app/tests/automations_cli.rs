@@ -25,7 +25,7 @@ fn rules_are_made_shown_tested_switched_and_brought_back() {
 
     let out = ok(&home, &["automations", "new", "solved", "--file", file]);
     assert!(out.contains("✓ made rule solved (Tell me when it's solved): on records.item.completed"), "{out}");
-    let out = ok(&home, &["automations"]);
+    let out = ok(&home, &["automations", "list"]);
     assert!(out.contains("solved") && out.contains("records.update (after 8w 4d)") && out.contains("never"), "{out}");
     assert!(ok(&home, &["automations", "show", "solved"]).contains("[[do]]"));
 

@@ -139,7 +139,7 @@ pub fn parse(words: Vec<String>) -> std::result::Result<AutomationsCmd, String> 
         return from_template(words.into_iter().skip(1));
     }
     let mut words = words.into_iter();
-    let Some(sub) = words.next() else { return Ok(AutomationsCmd::List { removed: false }) };
+    let Some(sub) = words.next() else { return Ok(AutomationsCmd::Help) };
     let options: &[&str] = match sub.as_str() {
         "new" | "edit" => &["--file"],
         "copy" => &["--label"],
@@ -598,30 +598,7 @@ fn in_full(t: &Value, categories: &[Value]) -> String {
             full(g)
         ));
     }
-    out.push_str(&format!(
-        "
-{}
-",
-        paint(Role::Heading, "Questions")
-    ));
-    for q in t["questions"].as_array().into_iter().flatten() {
-        let mut how = full(&q["kind"]);
-        if q["required"] == true {
-            how.push_str(", required");
-        }
-        if let Some(d) = q["default"].as_str() {
-            how.push_str(&format!(", default {d}"));
-        }
-        if let Some(c) = q["choices"].as_array() {
-            how.push_str(&format!(": {}", c.iter().map(render::cell).collect::<Vec<_>>().join(", ")));
-        }
-        out.push_str(&format!(
-            "  {}  {} ({how})
-",
-            full(&q["name"]),
-            full(&q["prompt"])
-        ));
-    }
+    out.push_str(&crate::workspaces::questions_block(t["questions"].as_array().map(Vec::as_slice).unwrap_or_default()));
     let rules = t["rules"].as_array().map(Vec::as_slice).unwrap_or_default();
     out.push_str(&format!(
         "
@@ -934,7 +911,8 @@ mod tests {
 
     #[test]
     fn commands_parse() {
-        assert_eq!(p(""), Ok(AutomationsCmd::List { removed: false }));
+        assert_eq!(p(""), Ok(AutomationsCmd::Help), "bare prints help, like every feature (#337)");
+        assert_eq!(p("list"), Ok(AutomationsCmd::List { removed: false }));
         assert_eq!(p("list --removed"), Ok(AutomationsCmd::List { removed: true }));
         assert_eq!(p("rename a b"), Ok(AutomationsCmd::Rename { id: "a".into(), to: "b".into() }));
         let copy = AutomationsCmd::Copy { id: "a".into(), to: "b".into(), label: Some("B".into()) };

@@ -199,7 +199,7 @@ pub fn parse(words: Vec<String>) -> std::result::Result<FetchersCmd, String> {
         return parse_from_template(words.into_iter().skip(1));
     }
     let mut words = words.into_iter();
-    let Some(sub) = words.next() else { return Ok(FetchersCmd::List { removed: false }) };
+    let Some(sub) = words.next() else { return Ok(FetchersCmd::Help) };
     let rest: Vec<String> = words.collect();
     match sub.as_str() {
         "help" => Ok(FetchersCmd::Help),
@@ -399,7 +399,7 @@ pub async fn run(client: &mut Client, cmd: &FetchersCmd, json_out: bool, prompt:
         }
         FetchersCmd::Show { id } => {
             let data = client.call("fetchers.show", one(id)).await?;
-            Ok(if json_out { render::json(&data) } else { show(&data) })
+            Ok(if json_out { render::json(&data) } else { show(&data, Utc::now()) })
         }
         FetchersCmd::New(input) => {
             let data = client.call("fetchers.new", source_params(input)).await?;
@@ -774,27 +774,7 @@ fn in_full(t: &Value, categories: &[Value]) -> String {
             full(g)
         ));
     }
-    out.push_str(&format!(
-        "
-{}
-",
-        paint(Role::Heading, "Questions")
-    ));
-    for q in t["questions"].as_array().into_iter().flatten() {
-        let mut how = full(&q["kind"]);
-        if q["required"] == true {
-            how.push_str(", required");
-        }
-        if let Some(d) = q["default"].as_str() {
-            how.push_str(&format!(", default {d}"));
-        }
-        out.push_str(&format!(
-            "  {}  {} ({how})
-",
-            full(&q["name"]),
-            full(&q["prompt"])
-        ));
-    }
+    out.push_str(&crate::workspaces::questions_block(t["questions"].as_array().map(Vec::as_slice).unwrap_or_default()));
     out.push_str(&format!(
         "
 {}
@@ -834,13 +814,22 @@ fn full(v: &Value) -> String {
 }
 
 /// One source in full: its state and its file text.
-fn show(s: &Value) -> String {
+fn show(s: &Value, now: DateTime<Utc>) -> String {
     let mut out =
         format!("{}  ({})\n", paint(Role::Name, &full(&s["id"])), if s["enabled"] == true { "on" } else { "off" });
     let mut line = |label: &str, value: String| out.push_str(&format!("  {}{value}\n", crate::style::label(label, 12)));
     line("kind", s["kind"].as_str().unwrap_or("built in").to_owned());
     line("label", full(&s["label"]));
     line("interval", s["interval_s"].as_u64().map(when::format_duration).unwrap_or_else(|| "-".into()));
+    // How the last run went, so `show` answers "is this working" on its own (#337).
+    let mut last = when::timestamp(&s["last_run_at"]).map_or("never".into(), |t| when::relative(t, now));
+    if let Some(n) = s["last_new_items"].as_u64() {
+        last.push_str(&format!(", {n} new"));
+    }
+    if s["running"] == true {
+        last.push_str(", running now");
+    }
+    line("last run", last);
     // Same wording `fetchers.health` uses for `shimmer doctor`'s warn line (module.rs), so a
     // person who reaches for `show` instead of `doctor` still sees why a source stopped
     // working, not just a healthy-looking file.
@@ -1086,7 +1075,7 @@ mod tests {
 
     #[test]
     fn commands_parse() {
-        assert_eq!(p(&[]), Ok(FetchersCmd::List { removed: false }));
+        assert_eq!(p(&[]), Ok(FetchersCmd::Help), "bare prints help, like every feature (#337)");
         assert_eq!(p(&["list"]), Ok(FetchersCmd::List { removed: false }));
         assert_eq!(p(&["list", "--removed"]), Ok(FetchersCmd::List { removed: true }));
         assert_eq!(p(&["status"]), Ok(FetchersCmd::Status));
@@ -1287,13 +1276,35 @@ mod tests {
     fn show_surfaces_last_error_so_a_broken_source_does_not_look_healthy() {
         let healthy = json!({"id": "my-feed", "enabled": true, "kind": "rss", "label": null,
             "interval_s": 3600, "last_error": null, "text": "[source]\nkind = \"rss\"\n"});
-        assert!(!show(&healthy).contains("last error"), "{}", show(&healthy));
+        let now = Utc::now();
+        assert!(!show(&healthy, now).contains("last error"), "{}", show(&healthy, now));
 
         let broken = json!({"id": "my-feed", "enabled": true, "kind": "rss", "label": null,
             "interval_s": 3600, "last_error": {"error": "connection refused", "reason": "network"},
             "text": "[source]\nkind = \"rss\"\n"});
-        let out = show(&broken);
+        let out = show(&broken, now);
         assert!(out.contains("last error  connection refused (network)"), "{out}");
+    }
+
+    /// #337: `show` says when the source last ran, how many new items it found, and whether it's
+    /// running now.
+    #[test]
+    fn show_says_when_it_last_ran() {
+        let now = Utc::now();
+        let source = |last: Value, running: bool| {
+            json!({"id": "hn", "enabled": true, "kind": "rss", "label": null, "interval_s": 3600,
+                   "last_run_at": last, "running": running, "last_error": null, "text": ""})
+        };
+        let never = show(&source(Value::Null, false), now);
+        assert!(never.contains("last run    never\n"), "{never}");
+        let ran = show(&source(json!((now - chrono::Duration::minutes(3)).to_rfc3339()), false), now);
+        assert!(ran.contains("last run    3m ago\n"), "no count from an older daemon: {ran}");
+        let mut counted = source(json!((now - chrono::Duration::minutes(3)).to_rfc3339()), false);
+        counted["last_new_items"] = json!(4);
+        let counted = show(&counted, now);
+        assert!(counted.contains("last run    3m ago, 4 new\n"), "{counted}");
+        let running = show(&source(json!((now - chrono::Duration::hours(2)).to_rfc3339()), true), now);
+        assert!(running.contains("last run    2h ago, running now\n"), "{running}");
     }
 
     #[test]
