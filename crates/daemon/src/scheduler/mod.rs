@@ -579,9 +579,9 @@ impl Scheduler {
     }
 
     /// On a quiet start (ADR 0041 §5a), instead of [`recover`](Self::recover): every firing copied in
-    /// as unfinished is forgotten, never run (it was another folder's run), and every enabled
-    /// recurring schedule counts from now, as `enable` does, so the next ordinary start has nothing
-    /// to catch up. Both are written to the trigger files: recovery doesn't ask whether a trigger is
+    /// as unfinished is forgotten, never run (it was another folder's run), every enabled overdue
+    /// recurring schedule counts from now, as `enable` does, and an overdue one-time one is done, so
+    /// the next ordinary start has nothing to catch up. Both are written to the trigger files: recovery doesn't ask whether a trigger is
     /// enabled, so a forget kept only in memory would be queued again next start (#312's review).
     pub fn quiet_start(&self) -> Result<()> {
         let now = self.clock.now();
@@ -596,13 +596,29 @@ impl Scheduler {
             if !e.stored.unfinished.is_empty() {
                 return Err(Error::unavailable(format!("couldn't forget {id}'s copied firings")));
             }
-            let recurring = !matches!(e.stored.spec.schedule, Schedule::Once(_));
-            if !e.stored.paused && !e.stored.done && recurring && e.stored.next_due.is_some_and(|due| due <= now) {
-                let mut next = e.stored.clone();
-                next.next_due = e.parsed.next_after(now);
-                self.write(&next, None)?;
-                e.stored = next;
+            if e.stored.paused || e.stored.done || !e.stored.next_due.is_some_and(|due| due <= now) {
+                continue;
             }
+            let mut next = e.stored.clone();
+            if matches!(e.stored.spec.schedule, Schedule::Once(_)) {
+                // Its one time was in the copied folder's past: never fired here (`vaults copy --live`
+                // would otherwise catch it up, a second time). A module's added one is deleted, as
+                // `fire_due` does with one that fired nothing.
+                next.next_due = None;
+                next.done = true;
+                if matches!(next.source, Source::Added { .. }) {
+                    self.delete(
+                        next.spec.id.as_str(),
+                        ("scheduler.trigger.removed", json!({"trigger_id": next.spec.id, "reason": "skipped"})),
+                    )?;
+                    gone.push(id.clone());
+                    continue;
+                }
+            } else {
+                next.next_due = e.parsed.next_after(now);
+            }
+            self.write(&next, None)?;
+            e.stored = next;
         }
         for id in gone {
             st.remove(&id);

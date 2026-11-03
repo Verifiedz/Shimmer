@@ -242,6 +242,9 @@ fn a_copy_has_the_data_and_starts_switched_off() {
     std::fs::write(site.join("state.toml"), "state = \"active\"\n").unwrap();
     std::fs::create_dir_all(main.join("logs")).unwrap();
     std::fs::write(main.join("logs/marker.txt"), "main's own log").unwrap();
+    // Main synced with git: a copy must never carry its history, or its remote.
+    std::fs::create_dir_all(main.join(".git")).unwrap();
+    std::fs::write(main.join(".git/config"), "[remote \"origin\"]\n\turl = git@example.test:me/backup.git\n").unwrap();
     // What an interrupted copy to this name leaves: removed by the next one.
     let leftover = m.vault("play").with_file_name("play.copying");
     std::fs::create_dir_all(leftover.join("data")).unwrap();
@@ -255,6 +258,7 @@ fn a_copy_has_the_data_and_starts_switched_off() {
     let play = m.vault("play");
     assert_eq!(m.records(&play).len(), 1, "the data came");
     assert!(!play.join("logs/marker.txt").exists(), "logs stay with the machine");
+    assert!(!play.join(".git").exists(), "no git history, so no push to main's backup");
 
     // Off in the copy, as they were in main; Shimmer's own plumbing left alone.
     assert_eq!(schedules(&m, "play"), (vec![false], Some(true)));
@@ -403,4 +407,35 @@ fn a_copy_settles_what_was_in_flight_and_its_next_start_runs_nothing() {
     assert_eq!(logged(&play, "queue.task.started"), ran, "no task ran");
     m.ok(&["--vault", "play", "shutdown"]);
     m.ok(&["shutdown"]);
+}
+
+/// `--live` leaves things on, but never replays the original's run: a firing main left unfinished
+/// isn't queued again in the copy (it would send that reminder a second time).
+#[test]
+fn a_live_copy_never_runs_what_the_original_left_unfinished() {
+    let m = Machine::new();
+    let main = m.main();
+    let schedule =
+        r#"{"schedule":{"every":3600},"op":"records.list","params":{"collection":"leetcode"},"catch_up":"skip"}"#;
+    let added: serde_json::Value = serde_json::from_str(&m.ok(&["call", "scheduler.add", schedule])).unwrap();
+    let id = added["trigger_id"].as_str().unwrap().to_owned();
+    m.ok(&["shutdown"]);
+    // What a stop mid-firing leaves: a firing on disk that never got to run.
+    let file = main.join(format!("data/scheduler/triggers/{id}.json"));
+    let mut trigger: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    trigger["unfinished"] = serde_json::json!(["2026-01-01T00:00:00Z"]);
+    std::fs::write(&file, serde_json::to_vec_pretty(&trigger).unwrap()).unwrap();
+
+    let out = m.ok(&["vaults", "copy", "main", "live", "--live"]);
+    assert!(out.contains("left on (--live)"), "{out}");
+    let live = m.vault("live");
+    let ran = logged(&live, "queue.task.started");
+    m.ok(&["--vault", "live", "ping"]);
+    std::thread::sleep(Duration::from_secs(2));
+    m.ok(&["--vault", "live", "ping"]);
+    assert_eq!(logged(&live, "queue.task.started"), ran, "the original's unfinished firing didn't run in the copy");
+    let list = json_in(&m, "live", &["scheduler", "list"]);
+    let t = list["triggers"].as_array().unwrap().iter().find(|t| t["id"] == id.as_str()).cloned().unwrap();
+    assert_eq!((t["enabled"].clone(), t["waiting"].clone()), (serde_json::json!(true), serde_json::json!(0)), "{t}");
+    m.ok(&["--vault", "live", "shutdown"]);
 }
