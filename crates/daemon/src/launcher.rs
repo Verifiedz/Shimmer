@@ -7,9 +7,12 @@
 //! Linux/macOS (`cfg(unix)`) only, same scoping as ADR 0010 §7 — Windows is sketched there,
 //! not implemented.
 
+use std::collections::VecDeque;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -17,6 +20,7 @@ use shimmer_core::ids::is_valid_id;
 use shimmer_core::launcher::env_names;
 use shimmer_core::store::validate_path;
 use shimmer_core::{Clock, Error, LaunchBackend, LaunchStep, Result, SpawnMode, Step, StepOutcome};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
@@ -176,17 +180,21 @@ async fn run_supervised(
     if let Some(parent) = log_abs.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let stdout_file = std::fs::File::create(&log_abs)?;
-    let stderr_file = stdout_file.try_clone()?;
+    let log = Arc::new(Mutex::new(BoundedLog::new(std::fs::File::create(&log_abs)?)));
 
     let mut cmd = Command::new("sh");
     cmd.arg(script);
     inject_env(&mut cmd, home, socket, step, session_id);
-    cmd.stdin(Stdio::null()).stdout(Stdio::from(stdout_file)).stderr(Stdio::from(stderr_file));
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(unix)]
     cmd.process_group(0);
     let mut child = cmd.spawn().map_err(|e| Error::unavailable(format!("cannot spawn {}: {e}", script.display())))?;
     let pid = child.id();
+    // Always `Some` right after spawn, since both were set to `Stdio::piped()` above.
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let stdout_pump = tokio::spawn(pump_into_log(stdout, log.clone()));
+    let stderr_pump = tokio::spawn(pump_into_log(stderr, log.clone()));
 
     let (exit_code, timed_out) = tokio::select! {
         status = child.wait() => {
@@ -204,9 +212,102 @@ async fn run_supervised(
             (None, false)
         }
     };
+    // Both pipes' write ends close with the process, killed or exited, so each pump's `read`
+    // is guaranteed to see `Ok(0)` and return on its own; awaiting them just makes sure every
+    // byte already sitting in the kernel pipe buffer is drained into the log before `finish`
+    // writes the truncation marker and tail.
+    let _ = stdout_pump.await;
+    let _ = stderr_pump.await;
+    log.lock().unwrap().finish();
 
     prune_step_logs(home, &step.workspace_dir);
     Ok(StepOutcome { session_id: session_id.to_string(), exit_code, timed_out, log_path: log_rel })
+}
+
+/// A supervised step's combined stdout+stderr had no cap at all: a `yes` loop with a 3 s
+/// timeout wrote 1.26 GB in one run, and a full disk breaks every write Shimmer makes (#260)
+/// — #269 finding 1. Kept instead: the first [`STEP_LOG_HEAD_CAP_BYTES`] bytes, written
+/// straight to disk as they arrive (so `tail -f` on a running step still shows real content),
+/// then everything after that is dropped except the newest [`STEP_LOG_TAIL_CAP_BYTES`],
+/// appended once the step ends behind a marker naming how much was lost in between. The step
+/// itself keeps running regardless; only the log is bounded.
+const STEP_LOG_HEAD_CAP_BYTES: u64 = 5 * 1024 * 1024;
+const STEP_LOG_TAIL_CAP_BYTES: usize = 256 * 1024;
+
+/// Fed by both the stdout and stderr pump tasks under one lock, so a step that writes to
+/// both still gets one combined log with real interleaving, the same as the single
+/// dup'd file descriptor this replaced.
+struct BoundedLog {
+    file: std::fs::File,
+    /// Bytes written to `file` so far. Never exceeds `STEP_LOG_HEAD_CAP_BYTES`.
+    head_written: u64,
+    /// Bytes received after the head filled, kept only as the newest
+    /// `STEP_LOG_TAIL_CAP_BYTES` of them — a ring buffer, oldest evicted first.
+    tail: VecDeque<u8>,
+    /// Every byte ever offered to `tail`, including ones it has since evicted — `finish`
+    /// reports `dropped - tail.len()` as what never reached the log at all.
+    dropped: u64,
+}
+
+impl BoundedLog {
+    fn new(file: std::fs::File) -> Self {
+        Self { file, head_written: 0, tail: VecDeque::new(), dropped: 0 }
+    }
+
+    /// Splits one chunk between the head (written to `file` once, verbatim) and the tail
+    /// ring. A write error here is swallowed, not propagated — a log write must never fail
+    /// the step that produced it.
+    fn write_chunk(&mut self, buf: &[u8]) {
+        if self.head_written < STEP_LOG_HEAD_CAP_BYTES {
+            let room = (STEP_LOG_HEAD_CAP_BYTES - self.head_written) as usize;
+            if buf.len() <= room {
+                let _ = self.file.write_all(buf);
+                self.head_written += buf.len() as u64;
+                return;
+            }
+            let (head_part, rest) = buf.split_at(room);
+            let _ = self.file.write_all(head_part);
+            self.head_written += head_part.len() as u64;
+            self.push_tail(rest);
+        } else {
+            self.push_tail(buf);
+        }
+    }
+
+    fn push_tail(&mut self, buf: &[u8]) {
+        if buf.is_empty() {
+            return;
+        }
+        self.dropped += buf.len() as u64;
+        self.tail.extend(buf);
+        while self.tail.len() > STEP_LOG_TAIL_CAP_BYTES {
+            self.tail.pop_front();
+        }
+    }
+
+    /// Appends the truncation marker and the surviving tail, if anything was ever dropped.
+    /// Called once, after both pumps have seen their pipe's EOF.
+    fn finish(&mut self) {
+        if self.dropped == 0 {
+            return;
+        }
+        let lost = self.dropped.saturating_sub(self.tail.len() as u64);
+        let _ = writeln!(self.file, "\n… (truncated {lost} bytes) …");
+        let tail: Vec<u8> = std::mem::take(&mut self.tail).into_iter().collect();
+        let _ = self.file.write_all(&tail);
+    }
+}
+
+/// Drains one pipe into `log` until EOF, in fixed-size chunks so a step writing gigabytes
+/// never needs a gigabyte buffer to read into.
+async fn pump_into_log(mut reader: impl tokio::io::AsyncRead + Unpin, log: Arc<Mutex<BoundedLog>>) {
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => log.lock().unwrap().write_chunk(&buf[..n]),
+        }
+    }
 }
 
 /// Step logs to keep per workspace (#74): `logs/` gets a new file every supervised run
@@ -716,6 +817,51 @@ mod tests {
         assert!(!outcome.timed_out);
         let log = std::fs::read_to_string(home.path().join(&outcome.log_path)).unwrap();
         assert_eq!(log, "hello-from-setup\n");
+    }
+
+    #[tokio::test]
+    async fn a_runaway_steps_log_stays_bounded_and_keeps_its_last_lines() {
+        // #269 finding 1: the original report had a `yes` loop with a 3s timeout write 1.26
+        // GB. `yes x | head -c 20000000` writes the same kind of output a runaway script
+        // might, fast and deterministically: "x\n" repeated exactly 10,000,000 times.
+        let home = TempDir::new().unwrap();
+        write_step_script(home.path(), "deep-work", "setup", "yes x | head -c 20000000\n");
+
+        let backend = backend(&home);
+        let outcome = backend
+            .run(&supervised_step("deep-work", "setup", Duration::from_secs(5)), &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.exit_code, Some(0));
+        let log = std::fs::read(home.path().join(&outcome.log_path)).unwrap();
+        assert!(
+            log.len() < 6 * 1024 * 1024,
+            "log is {} bytes, expected well under the 5MB head + 256KB tail",
+            log.len()
+        );
+        assert!(log.starts_with(b"x\nx\nx\n"), "the head is kept verbatim from the start");
+        let expected_tail = "x\n".repeat(STEP_LOG_TAIL_CAP_BYTES / 2);
+        assert!(log.ends_with(expected_tail.as_bytes()), "the tail is kept verbatim up to the end");
+        assert!(String::from_utf8_lossy(&log).contains("truncated"), "a marker says how much was dropped in between");
+    }
+
+    #[tokio::test]
+    async fn a_steps_stdout_and_stderr_both_still_land_in_its_one_log() {
+        // The head/tail cap replaced a single dup'd file descriptor with two independent pump
+        // tasks (one per pipe); this guards against that split silently losing one stream.
+        let home = TempDir::new().unwrap();
+        write_step_script(home.path(), "deep-work", "setup", "echo from-stdout\necho from-stderr >&2\n");
+
+        let backend = backend(&home);
+        let outcome = backend
+            .run(&supervised_step("deep-work", "setup", Duration::from_secs(5)), &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let log = std::fs::read_to_string(home.path().join(&outcome.log_path)).unwrap();
+        assert!(log.contains("from-stdout"));
+        assert!(log.contains("from-stderr"));
     }
 
     #[tokio::test]
