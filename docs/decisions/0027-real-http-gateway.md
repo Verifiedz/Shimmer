@@ -1,7 +1,7 @@
 # 0027. The real HTTP gateway: `RealHttpBackend`
 
-Status: accepted (M6, #109) · Raised by Dev A · Signed off: Dev A, Dev B (CLAUDE.md §4, changes
-`core`) · No protocol change
+Status: accepted (M6, #109), amended below (#267) · Raised by Dev A · Signed off: Dev A, Dev B
+(CLAUDE.md §4, changes `core`) · No protocol change
 
 ## Context
 
@@ -194,3 +194,57 @@ its own proposal — not decided here.
   until there is a renderer to extract it from.
 - The `fetchers` module itself — Dev B's, not started here. (Since then: in progress on the
   `fetchers` umbrella, #126, with its own ADR 0028 there.)
+
+## Amendment (#267): robustness fixes now that `fetchers` is a real caller
+
+`fetchers` landing on master, and #277's rework making a source something any command (and
+later an automation rule or the AI layer, #228/#229) can create without a human reviewing the
+URL first, turned four gateway gaps from theoretical into reachable (#267, the gateway's
+robustness sub-issue). Fixed, each with a test:
+
+1. **Cache poisoning via a hash collision.** `cache_key` is a 64-bit FNV-1a hash of the URL,
+   not a security boundary, and `ResponseCache::read` never checked that the entry it found
+   actually belonged to the URL being asked for — a colliding hash (constructable on purpose;
+   part of a feed's URL, like a query string, is chosen by whoever runs the site) would answer
+   one URL with another's cached body. `read` now also checks `meta.url == url` and treats a
+   mismatch exactly like a miss.
+2. **A credential in the URL.** `https://me:hunter2@host/feed` was accepted, and the secret
+   went out over the wire, into `fetchers.fetch.failed` events (the permanent log, readable by
+   any client) and debug logs the moment the request failed. Refused outright now
+   (`check_no_userinfo`) — put it in a named credential instead (ADR 0036) — and, as a
+   backstop for any URL that reaches an error or log line some other way (a redirect target),
+   `redact_url` strips userinfo and replaces known key-like query values (`key`, `token`,
+   `api_key`, `access_token`, `sig`) with `redacted` wherever a URL is printed.
+3. **An `https` request silently downgraded to `http` by a redirect.** `redirect_target`
+   checked the target was `http`/`https` but not which — an `https` fetch could be redirected
+   to plain `http`, with the cached result still keyed on the original `https` URL as if it
+   had come back over TLS. A redirect from `https` to `http` is now refused (`unavailable`,
+   naming both URLs, redacted) — nothing legitimate needs one.
+4. **Nothing stopped a request to a private, loopback or link-local address.** A source
+   pointed at a router admin page or the cloud metadata endpoint (`169.254.169.254`) would
+   copy the response into `raw_data`, and so into events any local client can read. Every hop
+   (including a redirect target) is now checked against the *resolved* IP — not just the
+   hostname, so DNS can't sneak around it — and refused if it's loopback, RFC 1918/4193
+   private, link-local or unspecified (an IPv4-mapped IPv6 address is checked as the IPv4
+   address it actually is). `[http] allow_private = ["nas.local"]` exempts a hostname that's
+   genuinely meant to reach the LAN, checked before any DNS work.
+5. *(Already fixed when `fetchers` landed, not repeated here: every request carries
+   `User-Agent: Shimmer/<version>`.)*
+6. **`max_response_bytes = 0` and `timeout_s = 0` were both accepted,** making every
+   non-empty response fail and every request fail instantly respectively (same class of bug
+   as `timeout_s = 0`, #115). Both now require `>= 1` at config load, with an error naming the
+   key.
+8. **The daemon's proxy came from whoever started it.** `reqwest` reads `HTTP_PROXY` /
+   `HTTPS_PROXY` / `ALL_PROXY` from the environment by default; for a long-lived daemon that's
+   whatever its first command or login service happened to have (ADR 0033 wherever it covers
+   `shimmer startup`), and the same request could go through a proxy one day and not the next
+   with no change anyone made on purpose. Decided explicitly: `.no_proxy()` on the shared
+   client — no proxy, ever, until there's a real need for one to be configurable.
+
+**Not done here, by design:** finding 7 (cancellation — `HttpBackend::get` has no way for an
+in-flight rate-limit wait or cooldown sleep to be interrupted by `ctx.cancel`) needs a `core`
+signature change and is explicitly a decision for Dev A and Dev B to agree on (CLAUDE.md §4),
+not something to fold into a robustness pass silently. The rest of #115 (serving the stale
+cache on a `5xx`/`429` response and not only a transport error, honouring `Cache-Control:
+no-store`/`no-cache`, moving cache file I/O off the async threads, parsing `Retry-After`
+dates) is a separate, already-tracked issue and untouched by this amendment.
