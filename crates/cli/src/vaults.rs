@@ -64,10 +64,10 @@ pub enum VaultsCmd {
     Purge { name: Option<String>, yes: bool },
 }
 
-/// `rest` is what follows `shimmer vaults`. Nothing after it is the same as `list`.
+/// `rest` is what follows `shimmer vaults`. Nothing after it prints the help, as for every feature (#337).
 pub fn parse(rest: Vec<String>) -> std::result::Result<VaultsCmd, String> {
     let mut words = rest.into_iter();
-    let Some(verb) = words.next() else { return Ok(VaultsCmd::List { removed: false }) };
+    let Some(verb) = words.next() else { return Ok(VaultsCmd::Help) };
     let (options, switches): (&[&'static str], &[&'static str]) = match verb.as_str() {
         "list" => (&[], &["--removed"]),
         "new" => (&["--path"], &[]),
@@ -1327,7 +1327,7 @@ mod tests {
     #[test]
     fn commands_parse() {
         let p = |w: &[&str]| parse(s(w));
-        assert_eq!(p(&[]), Ok(VaultsCmd::List { removed: false }));
+        assert_eq!(p(&[]), Ok(VaultsCmd::Help), "bare prints help, like every feature (#337)");
         assert_eq!(p(&["list", "--removed"]), Ok(VaultsCmd::List { removed: true }));
         assert_eq!(
             p(&["new", "play", "--path", "/x"]),

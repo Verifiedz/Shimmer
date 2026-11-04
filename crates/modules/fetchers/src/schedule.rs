@@ -372,6 +372,10 @@ struct LastRunEntry {
     error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    /// How many new items the last successful run found (#337), for `fetchers show`. Absent
+    /// after a failed run, and in files written before it was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    new_items: Option<u64>,
 }
 
 /// A corrupt or unparseable `last_run.toml` is treated as empty, never an error (#126's
@@ -424,13 +428,20 @@ pub fn last_run_problem(ctx: &Ctx) -> Option<String> {
     }
 }
 
-/// Records that `source` ran, successfully, at `now` -- clearing any previous failure of
-/// its (ADR 0028 §11: health reports only the *most recent* outcome). Every other source's
-/// record is left untouched.
-pub fn record_run(ctx: &Ctx, source: &str, now: DateTime<Utc>) -> Result<()> {
+/// Records that `source` ran, successfully, at `now`, finding `new_items` new items -- clearing
+/// any previous failure of its (ADR 0028 §11: health reports only the *most recent* outcome).
+/// Every other source's record is left untouched.
+pub fn record_run(ctx: &Ctx, source: &str, now: DateTime<Utc>, new_items: usize) -> Result<()> {
     let mut all = load_raw(ctx);
-    all.insert(source.to_owned(), LastRunEntry { at: now.to_rfc3339(), error: None, reason: None });
+    let entry = LastRunEntry { at: now.to_rfc3339(), error: None, reason: None, new_items: Some(new_items as u64) };
+    all.insert(source.to_owned(), entry);
     write_raw(ctx, &all)
+}
+
+/// How many new items each source's last run found, for the sources whose last run succeeded
+/// and was recorded with a count (#337).
+pub fn load_last_new_items(ctx: &Ctx) -> BTreeMap<String, u64> {
+    load_raw(ctx).into_iter().filter_map(|(id, e)| e.new_items.map(|n| (id, n))).collect()
 }
 
 /// Records that `source`'s run at `now` failed, with `error` (`Error::message`) and `reason`
@@ -440,7 +451,12 @@ pub fn record_failure(ctx: &Ctx, source: &str, now: DateTime<Utc>, error: &str, 
     let mut all = load_raw(ctx);
     all.insert(
         source.to_owned(),
-        LastRunEntry { at: now.to_rfc3339(), error: Some(error.to_owned()), reason: Some(reason.to_owned()) },
+        LastRunEntry {
+            at: now.to_rfc3339(),
+            error: Some(error.to_owned()),
+            reason: Some(reason.to_owned()),
+            new_items: None,
+        },
     );
     write_raw(ctx, &all)
 }
@@ -966,15 +982,15 @@ mod tests {
     #[test]
     fn last_run_round_trips_and_leaves_other_sources_alone() {
         let env = TestEnv::new("fetchers");
-        record_run(&env.ctx, "hn-whoishiring", at("2026-01-01T00:00:00Z")).unwrap();
-        record_run(&env.ctx, "weworkremotely", at("2026-01-02T00:00:00Z")).unwrap();
+        record_run(&env.ctx, "hn-whoishiring", at("2026-01-01T00:00:00Z"), 0).unwrap();
+        record_run(&env.ctx, "weworkremotely", at("2026-01-02T00:00:00Z"), 0).unwrap();
 
         let all = load_last_run(&env.ctx).unwrap();
         assert_eq!(all.get("hn-whoishiring"), Some(&at("2026-01-01T00:00:00Z")));
         assert_eq!(all.get("weworkremotely"), Some(&at("2026-01-02T00:00:00Z")));
 
         // Re-recording one source must not disturb the other's timestamp.
-        record_run(&env.ctx, "hn-whoishiring", at("2026-01-03T00:00:00Z")).unwrap();
+        record_run(&env.ctx, "hn-whoishiring", at("2026-01-03T00:00:00Z"), 0).unwrap();
         let all = load_last_run(&env.ctx).unwrap();
         assert_eq!(all.get("hn-whoishiring"), Some(&at("2026-01-03T00:00:00Z")));
         assert_eq!(all.get("weworkremotely"), Some(&at("2026-01-02T00:00:00Z")));
@@ -989,7 +1005,7 @@ mod tests {
     #[test]
     fn a_failure_is_recorded_and_cleared_by_the_next_success_leaving_other_sources_alone() {
         let env = TestEnv::new("fetchers");
-        record_run(&env.ctx, "blog", at("2026-01-01T00:00:00Z")).unwrap();
+        record_run(&env.ctx, "blog", at("2026-01-01T00:00:00Z"), 0).unwrap();
         record_failure(&env.ctx, "hn-whoishiring", at("2026-01-02T00:00:00Z"), "boom", "network").unwrap();
 
         let failures = load_last_failures(&env.ctx);
@@ -1005,8 +1021,23 @@ mod tests {
         assert!(!failures.contains_key("blog"));
 
         // The next success clears it -- health reports only the most recent outcome.
-        record_run(&env.ctx, "hn-whoishiring", at("2026-01-03T00:00:00Z")).unwrap();
+        record_run(&env.ctx, "hn-whoishiring", at("2026-01-03T00:00:00Z"), 0).unwrap();
         assert!(load_last_failures(&env.ctx).is_empty());
+    }
+
+    /// #337: the last successful run's new-item count is kept for `fetchers show`; a failed run
+    /// has none, and a file written before the count was kept still reads.
+    #[test]
+    fn the_last_runs_new_item_count_is_kept_until_the_next_run() {
+        let env = TestEnv::new("fetchers");
+        record_run(&env.ctx, "blog", at("2026-01-01T00:00:00Z"), 4).unwrap();
+        assert_eq!(load_last_new_items(&env.ctx).get("blog"), Some(&4));
+        record_failure(&env.ctx, "blog", at("2026-01-02T00:00:00Z"), "boom", "network").unwrap();
+        assert_eq!(load_last_new_items(&env.ctx).get("blog"), None, "a failed run found nothing");
+
+        env.ctx.store.write(LAST_RUN_PATH, b"[old]\nat = \"2026-01-01T00:00:00Z\"\n".to_vec()).unwrap();
+        assert_eq!(load_last_run(&env.ctx).unwrap().get("old"), Some(&at("2026-01-01T00:00:00Z")), "still read");
+        assert!(load_last_new_items(&env.ctx).is_empty());
     }
 
     #[test]

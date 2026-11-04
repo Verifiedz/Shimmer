@@ -1484,11 +1484,22 @@ async fn a_planned_gift_is_given_once() {
         &r,
         &env,
         "records.add",
-        json!({"collection": "charity", "fields": {"recipient": "Food bank", "kind": "general"}}),
+        json!({"collection": "charity", "fields": {"recipient": "Food bank", "kind": "general", "amount": 50}}),
     )
     .await
     .unwrap();
     assert_eq!(general["id"], "food-bank-general");
+    // #325: how much is the point of the record, so a gift without an amount is refused.
+    let e = call(
+        &r,
+        &env,
+        "records.add",
+        json!({"collection": "charity", "fields": {"recipient": "Masjid", "kind": "sadaqah"}}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidParams);
+    assert!(e.message.contains("'amount' is required"), "{}", e.message);
 }
 
 #[tokio::test]

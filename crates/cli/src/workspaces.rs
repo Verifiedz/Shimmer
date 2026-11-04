@@ -877,6 +877,57 @@ impl Paths {
 /// The answers to send: `--set` ones first, then, at a terminal, each question not answered yet
 /// (an empty answer takes the template's default). Without a terminal nothing is asked
 /// (CLAUDE.md §15.1); the daemon then names any required answer that is missing.
+/// A template's questions, as every `peek` shows them (workspaces, automations, fetchers): each
+/// name as `--set` takes it, its prompt, and on the line below what kind of answer it wants, so a
+/// kind (`url`, `folder`) is never read as a second name (#337).
+pub(crate) fn questions_block(questions: &[Value]) -> String {
+    let mut out = String::new();
+    if questions.is_empty() {
+        let _ = writeln!(out, "\n{}", paint(Role::Heading, "No questions"));
+        return out;
+    }
+    let title = "Questions (asked when you make one; or answer with --set NAME=ANSWER)";
+    let _ = writeln!(out, "\n{}", paint(Role::Heading, title));
+    let width = questions.iter().map(|q| cell(&q["name"]).chars().count()).max().unwrap_or(0);
+    let pad = " ".repeat(width + 4);
+    for q in questions {
+        let name = q["name"].as_str().unwrap_or_default();
+        let gap = " ".repeat(width.saturating_sub(name.chars().count()));
+        let _ = writeln!(out, "  {}{gap}  {}", paint(Role::Name, name), q["prompt"].as_str().unwrap_or_default());
+        let mut facts = Vec::new();
+        if let Some(choices) = q["choices"].as_array() {
+            facts.push(choices.iter().map(|c| c.as_str().unwrap_or_default()).collect::<Vec<_>>().join(" | "));
+        } else if let Some(kind) = q["kind"].as_str() {
+            facts.push(format!("kind: {kind}"));
+        }
+        if q["required"] == true {
+            facts.push("required".into());
+        }
+        if let Some(d) = q["default"].as_str() {
+            facts.push(format!("default: {d}"));
+        }
+        let _ = writeln!(out, "{pad}{}", facts.join("   "));
+        if let Some(help) = q["help"].as_str() {
+            let _ = writeln!(out, "{pad}{}", wrap(help, 84, &pad));
+        }
+    }
+    out
+}
+
+/// A `--set` name as the template spells it: `url` answers `URL` when no other question differs
+/// from it only in case (#337). The daemon still takes names exactly; this is the CLI meeting
+/// the person halfway.
+fn question_name(questions: &Value, name: &str) -> String {
+    let names: Vec<&str> = questions.as_array().into_iter().flatten().filter_map(|q| q["name"].as_str()).collect();
+    if names.contains(&name) {
+        return name.to_owned();
+    }
+    match names.iter().filter(|n| n.eq_ignore_ascii_case(name)).collect::<Vec<_>>().as_slice() {
+        [one] => (**one).to_owned(),
+        _ => name.to_owned(),
+    }
+}
+
 pub(crate) fn answers(
     questions: &Value,
     set: &[(String, String)],
@@ -892,7 +943,9 @@ pub(crate) fn answers(
     };
     let mut out = serde_json::Map::new();
     for (name, answer) in set {
-        out.insert(name.clone(), json!(fix(name, answer)));
+        let name = question_name(questions, name);
+        let answer = fix(&name, answer);
+        out.insert(name, json!(answer));
     }
     if !prompt.interactive() {
         return Ok(out);
@@ -1079,36 +1132,7 @@ fn template_in_full(t: &Value, categories: &[Value]) -> String {
         let _ = writeln!(out, "\n{}\n  {}", paint(Role::Heading, "When you stop it"), wrap(stop, 88, "  "));
     }
 
-    let questions = list("questions");
-    if questions.is_empty() {
-        let _ = writeln!(out, "\n{}", paint(Role::Heading, "No questions"));
-    } else {
-        let title = "Questions (asked when you make one; or answer with --set NAME=ANSWER)";
-        let _ = writeln!(out, "\n{}", paint(Role::Heading, title));
-        let width = questions.iter().map(|q| cell(&q["name"]).chars().count()).max().unwrap_or(0);
-        let pad = " ".repeat(width + 4);
-        for q in &questions {
-            let name = q["name"].as_str().unwrap_or_default();
-            let gap = " ".repeat(width.saturating_sub(name.chars().count()));
-            let _ = writeln!(out, "  {}{gap}  {}", paint(Role::Name, name), q["prompt"].as_str().unwrap_or_default());
-            let mut facts = Vec::new();
-            if let Some(choices) = q["choices"].as_array() {
-                facts.push(choices.iter().map(|c| c.as_str().unwrap_or_default()).collect::<Vec<_>>().join(" | "));
-            } else {
-                facts.push(q["kind"].as_str().unwrap_or_default().to_owned());
-            }
-            if q["required"] == true {
-                facts.push("required".into());
-            }
-            if let Some(d) = q["default"].as_str() {
-                facts.push(format!("default: {d}"));
-            }
-            let _ = writeln!(out, "{pad}{}", facts.join("   "));
-            if let Some(help) = q["help"].as_str() {
-                let _ = writeln!(out, "{pad}{}", wrap(help, 84, &pad));
-            }
-        }
-    }
+    out.push_str(&questions_block(&list("questions")));
     let _ = write!(out, "\nmake one: shimmer workspaces new NAME --from {id}");
     out
 }
@@ -1747,6 +1771,30 @@ mod tests {
         assert_eq!(p.absolute(""), "");
     }
 
+    /// #337: `--set url=…` answers a question named `URL`, and is still a folder or file answer
+    /// when the question says so. An exact name wins; one that matches two questions only by case
+    /// is sent as typed, for the daemon to refuse with the names it asks.
+    #[test]
+    fn a_set_name_matches_its_question_whatever_the_case() {
+        let questions = json!([
+            {"name": "URL", "prompt": "The feed's url", "kind": "url", "required": true},
+            {"name": "PROJECT_DIR", "prompt": "Project folder", "kind": "folder"},
+            {"name": "Tag", "prompt": "A", "kind": "text"},
+            {"name": "TAG", "prompt": "B", "kind": "text"}
+        ]);
+        let set = [
+            ("url".to_owned(), " https://hnrss.org/frontpage ".to_owned()),
+            ("project_dir".to_owned(), "~/site".to_owned()),
+            ("TAG".to_owned(), "exact".to_owned()),
+            ("tag".to_owned(), "either".to_owned()),
+        ];
+        let got = answers(&questions, &set, &mut answer(false, false), &paths()).unwrap();
+        assert_eq!(
+            Value::Object(got),
+            json!({"URL": "https://hnrss.org/frontpage", "PROJECT_DIR": "/home/me/site", "TAG": "exact", "tag": "either"})
+        );
+    }
+
     #[test]
     fn answers_asks_what_set_left_and_retries_required_ones() {
         let questions = json!([
@@ -1852,7 +1900,7 @@ mod tests {
             e.message
         );
         assert!(full.starts_with("web-project: Web project  (Coding)\n  Editor and dev server\n"), "{full}");
-        assert!(full.contains("  PROJECT_DIR  Project folder\n               folder   required\n"), "{full}");
+        assert!(full.contains("  PROJECT_DIR  Project folder\n               kind: folder   required\n"), "{full}");
         assert!(
             full.contains("  MODE         Mode\n               a | b   default: a\n               a: one way.\n"),
             "{full}"

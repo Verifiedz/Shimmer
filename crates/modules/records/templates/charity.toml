@@ -45,8 +45,9 @@ name = "campaign"        # e.g. "Ramadan 2027 appeal"
 type = "string"
 
 [[field]]
-name = "amount"          # a whole number; cents round
+name = "amount"          # a whole number; cents round. For an in-kind gift, what it's worth
 type = "int"
+required = true
 
 [[field]]
 name = "currency"        # e.g. "CAD", "USD", "PKR"
