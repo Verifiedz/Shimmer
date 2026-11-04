@@ -1,36 +1,27 @@
 name: release-build
-# Manual, ad-hoc release binary builds (no automatic trigger). Used for a release draft asked
-# for out of band, not part of the normal CI check (ci.yml covers that). Builds whichever `ref`
-# is given, which is why this exists as its own workflow rather than extending ci.yml's matrix.
+# Ad-hoc release binary builds, for a release draft asked for out of band (not part of the
+# normal CI check — ci.yml covers that). `workflow_dispatch` only runs for a workflow file
+# already on the default branch, which this deliberately is not yet, so it triggers on push to
+# this one branch instead; drop the `push` trigger (or move this file to master) once that
+# stops being needed.
 on:
-  workflow_dispatch:
-    inputs:
-      ref:
-        description: "Branch, tag or commit to build"
-        required: true
-        default: master
-      os:
-        description: "Runner / target platform"
-        required: true
-        default: macos-latest
-        type: choice
-        options:
-          - macos-latest
-          - ubuntu-latest
+  push:
+    branches: [release-build]
 
 jobs:
   build:
-    runs-on: ${{ inputs.os }}
+    strategy:
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release --bin shimmer
       - run: |
           mkdir -p dist
-          cp target/release/shimmer dist/shimmer-${{ inputs.os == 'macos-latest' && 'macos-arm64' || 'linux-x86_64' }}
+          cp target/release/shimmer dist/shimmer-${{ matrix.os == 'macos-latest' && 'macos-arm64' || 'linux-x86_64' }}
       - uses: actions/upload-artifact@v4
         with:
-          name: shimmer-${{ inputs.os }}
+          name: shimmer-${{ matrix.os }}
           path: dist/*
