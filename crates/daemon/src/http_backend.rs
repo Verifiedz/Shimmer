@@ -1,7 +1,7 @@
 //! The real `HttpBackend` (ADR 0027): rate limiting, redirects, and the on-disk response
 //! cache. Cross-platform — unlike the launcher, nothing here is `cfg(unix)`-gated.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -68,6 +68,10 @@ pub struct HttpConfig {
     /// A response body larger than this aborts the request — enforced while streaming, so
     /// an oversized or lying `Content-Length` never gets buffered in memory first.
     pub max_response_bytes: u64,
+    /// Hostnames (no port, lowercased) exempt from the private/loopback/link-local address
+    /// block (`check_not_private`) — `[http] allow_private = ["nas.local"]` for someone who
+    /// really wants a LAN feed (ADR 0027 robustness amendment, #267 finding 4).
+    pub allow_private: HashSet<String>,
 }
 
 impl Default for HttpConfig {
@@ -81,6 +85,7 @@ impl Default for HttpConfig {
             cache_max_bytes: 100 * 1024 * 1024,
             cache_default_ttl: Duration::from_secs(300),
             max_response_bytes: 20 * 1024 * 1024,
+            allow_private: HashSet::new(),
         }
     }
 }
@@ -190,6 +195,13 @@ impl ResponseCache {
     fn read(&self, module: &ModuleId, url: &str) -> Option<(CacheMeta, Vec<u8>)> {
         let (meta_path, body_path) = self.paths(module, url);
         let meta: CacheMeta = serde_json::from_str(&std::fs::read_to_string(&meta_path).ok()?).ok()?;
+        if meta.url != url {
+            // `cache_key` is a 64-bit FNV-1a hash, not a security boundary -- a collision
+            // (achievable on purpose, since part of a feed's URL is chosen by whoever runs
+            // the site) would otherwise answer this request with a DIFFERENT url's cached
+            // body. Treat it exactly like a miss (#267 finding 1).
+            return None;
+        }
         let body = std::fs::read(&body_path).ok()?;
         if body.len() as u64 != meta.body_len {
             // A torn pair from two different writes (see `write`'s doc comment) -- treat it
@@ -329,6 +341,13 @@ impl RealHttpBackend {
             .timeout(config.timeout)
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(format!("Shimmer/{}", env!("CARGO_PKG_VERSION")))
+            // `reqwest` otherwise reads `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` from the
+            // environment, which for a long-lived daemon is whatever its first command or
+            // login service happened to have (#266 finding 4) -- the same request could go
+            // through a proxy one day and not the next with no change anyone made on purpose
+            // (#267 finding 8). Decided explicitly: no proxy, ever, until there's a real need
+            // for one to be configurable.
+            .no_proxy()
             .build()
             .map_err(|e| Error::internal(format!("building http client: {e}")))?;
         Ok(Self {
@@ -390,6 +409,42 @@ impl RealHttpBackend {
         self.clock.now() < meta.cached_at + ttl
     }
 
+    /// Refuses a request to a private, loopback or link-local address — checked on the
+    /// *resolved* IP, not just the hostname, so a DNS name can't sneak around it (#267 finding
+    /// 4). Only the user writes source URLs by hand today, but a source can now be created by
+    /// command (#277) and, later, by an automation rule or the AI layer (#228/#229) — a feed
+    /// pointed at a router admin page or the cloud metadata endpoint would otherwise copy the
+    /// response into `raw_data`, and so into events any local client can read. `allow_private`
+    /// (`[http] allow_private = ["nas.local"]`) is checked against the hostname before any DNS
+    /// work, for someone who really wants a LAN feed.
+    async fn check_not_private(&self, url: &reqwest::Url) -> Result<()> {
+        let host = url.host_str().ok_or_else(|| Error::invalid_params(format!("http url has no host: {url}")))?;
+        if self.config.allow_private.contains(&host.to_ascii_lowercase()) {
+            return Ok(());
+        }
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            return if is_disallowed_address(ip) {
+                Err(Error::invalid_params(format!(
+                    "refusing to fetch '{host}': a private, loopback or link-local address (allow it with http.allow_private)"
+                )))
+            } else {
+                Ok(())
+            };
+        }
+        let port = url.port_or_known_default().unwrap_or(80);
+        let addrs = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|e| Error::unavailable(format!("resolving '{host}': {e}")))?;
+        for addr in addrs {
+            if is_disallowed_address(addr.ip()) {
+                return Err(Error::invalid_params(format!(
+                    "refusing to fetch '{host}': resolves to a private, loopback or link-local address (allow it with http.allow_private)"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Rate limit, wait out any cooldown (or synthesize past it), then send exactly one
     /// request, optionally conditional on a cached entry's validator. Never follows a
     /// redirect itself — the caller's loop decides that.
@@ -402,6 +457,7 @@ impl RealHttpBackend {
         auth: Option<&ResolvedAuth>,
     ) -> Result<HopOutcome> {
         let host_key = host_key(url)?;
+        self.check_not_private(url).await?;
         let entry = self.host_entry(&host_key);
 
         let cooldown_remaining = {
@@ -465,8 +521,8 @@ impl RealHttpBackend {
                 req = req.header(a.header.as_str(), a.value.as_str());
             }
         }
-        tracing::debug!(module = %module, url = %url.as_str(), revalidating = if_none_match.is_some(), authenticated, "http: sending");
-        let resp = req.send().await.map_err(|e| Error::unavailable(format!("{url}: {e}")))?;
+        tracing::debug!(module = %module, url = %redact_url(url.as_str()), revalidating = if_none_match.is_some(), authenticated, "http: sending");
+        let resp = req.send().await.map_err(|e| Error::unavailable(format!("{}: {e}", redact_url(url.as_str()))))?;
         Ok(HopOutcome::Response(resp, permit))
     }
 
@@ -492,9 +548,12 @@ impl RealHttpBackend {
                 HopOutcome::Response(resp, permit) => {
                     if resp.status().is_redirection() {
                         if hop == MAX_REDIRECTS {
-                            return Err(Error::unavailable(format!("too many redirects fetching {current}")));
+                            return Err(Error::unavailable(format!(
+                                "too many redirects fetching {}",
+                                redact_url(current.as_str())
+                            )));
                         }
-                        if let Some(next) = redirect_target(&current, &resp) {
+                        if let Some(next) = redirect_target(&current, &resp)? {
                             // This hop's permit is dropped here (a redirect has no body worth
                             // holding it for); the next hop acquires its own, from its own
                             // host's semaphore.
@@ -673,6 +732,7 @@ fn max_age_from_cache_control(resp: &reqwest::Response) -> Option<u64> {
 fn parse_checked_url(url: &str) -> Result<reqwest::Url> {
     let parsed = reqwest::Url::parse(url).map_err(|e| Error::invalid_params(format!("invalid url '{url}': {e}")))?;
     check_scheme(&parsed)?;
+    check_no_userinfo(&parsed)?;
     Ok(parsed)
 }
 
@@ -680,6 +740,71 @@ fn check_scheme(url: &reqwest::Url) -> Result<()> {
     match url.scheme() {
         "http" | "https" => Ok(()),
         other => Err(Error::invalid_params(format!("unsupported url scheme '{other}' in '{url}'; only http/https"))),
+    }
+}
+
+/// A credential in the URL itself (`https://me:hunter2@host/…`) ends up verbatim in
+/// `fetchers.fetch.failed` events and debug logs the moment the request fails (#267 finding
+/// 2). Refused outright rather than stripped, so the caller finds out instead of silently
+/// having its credential dropped -- put it in a named credential instead (ADR 0036).
+fn check_no_userinfo(url: &reqwest::Url) -> Result<()> {
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(Error::invalid_params(format!(
+            "url '{}' carries a username or password; put credentials in a named credential, not the url (ADR 0036)",
+            redact_url(url.as_str())
+        )));
+    }
+    Ok(())
+}
+
+/// Query parameter names known to carry secrets, checked case-insensitively (#267 finding 2).
+const REDACTED_QUERY_KEYS: &[&str] = &["key", "token", "api_key", "access_token", "sig"];
+
+/// A URL as it's safe to put in an error, a log line, or an event -- userinfo stripped (should
+/// already be refused by `check_no_userinfo`, but this is the backstop for any url that
+/// reaches here some other way, e.g. a redirect target) and known key-like query values
+/// replaced with `redacted` (#267 finding 2). Falls back to the original string if it doesn't
+/// parse as a url at all.
+fn redact_url(url: &str) -> String {
+    let Ok(mut parsed) = reqwest::Url::parse(url) else { return url.to_owned() };
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    let redacted_pairs: Vec<(String, String)> = parsed
+        .query_pairs()
+        .map(|(k, v)| {
+            if REDACTED_QUERY_KEYS.iter().any(|redacted| k.eq_ignore_ascii_case(redacted)) {
+                (k.into_owned(), "redacted".to_owned())
+            } else {
+                (k.into_owned(), v.into_owned())
+            }
+        })
+        .collect();
+    if parsed.query().is_some() {
+        parsed.query_pairs_mut().clear().extend_pairs(&redacted_pairs);
+    }
+    parsed.to_string()
+}
+
+/// Loopback, RFC 1918/4193 private, link-local (including the `169.254.169.254` cloud
+/// metadata address) or unspecified — never a legitimate target for a feed the gateway
+/// reaches on this module's behalf (#267 finding 4). An IPv4-mapped IPv6 address is checked
+/// as the IPv4 address it actually is, so `::ffff:127.0.0.1` can't walk around this by
+/// spelling loopback a different way.
+fn is_disallowed_address(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified() || v4.is_broadcast()
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_disallowed_address(std::net::IpAddr::V4(v4));
+            }
+            let first = v6.segments()[0];
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (first & 0xfe00) == 0xfc00 // unique local, fc00::/7
+                || (first & 0xffc0) == 0xfe80 // link-local, fe80::/10
+        }
     }
 }
 
@@ -691,10 +816,31 @@ fn host_key(url: &reqwest::Url) -> Result<String> {
     Ok(format!("{host}:{port}"))
 }
 
-fn redirect_target(base: &reqwest::Url, resp: &reqwest::Response) -> Option<reqwest::Url> {
-    let location = resp.headers().get(reqwest::header::LOCATION)?.to_str().ok()?;
-    let next = base.join(location).ok()?;
-    (check_scheme(&next).is_ok()).then_some(next)
+/// `Ok(None)`: no redirect to follow (no/invalid `Location`, or a non-http(s) target).
+/// `Err`: a redirect this gateway refuses to follow even though it's well-formed -- today
+/// just the `https` -> `http` downgrade (#267 finding 3): nothing legitimate needs it, and
+/// following it silently would re-cache the response under the original `https` url as if it
+/// had come back over TLS.
+fn is_https_downgrade(base: &reqwest::Url, next: &reqwest::Url) -> bool {
+    base.scheme() == "https" && next.scheme() == "http"
+}
+
+fn redirect_target(base: &reqwest::Url, resp: &reqwest::Response) -> Result<Option<reqwest::Url>> {
+    let Some(location) = resp.headers().get(reqwest::header::LOCATION).and_then(|v| v.to_str().ok()) else {
+        return Ok(None);
+    };
+    let Ok(next) = base.join(location) else { return Ok(None) };
+    if check_scheme(&next).is_err() {
+        return Ok(None);
+    }
+    if is_https_downgrade(base, &next) {
+        return Err(Error::unavailable(format!(
+            "refusing to follow a redirect from {} to {} (https downgraded to http)",
+            redact_url(base.as_str()),
+            redact_url(next.as_str())
+        )));
+    }
+    Ok(Some(next))
 }
 
 fn retry_after_secs(resp: &reqwest::Response) -> Option<u64> {
@@ -844,13 +990,97 @@ mod tests {
     }
 
     fn generous_config() -> HttpConfig {
-        HttpConfig { default_requests_per_sec: 1000.0, default_concurrent: 10, ..HttpConfig::default() }
+        HttpConfig {
+            default_requests_per_sec: 1000.0,
+            default_concurrent: 10,
+            // Every test here talks to `TestServer`, which only ever binds loopback -- real
+            // private-address refusal (#267 finding 4) gets its own test below, against a
+            // config that doesn't carry this.
+            allow_private: HashSet::from(["127.0.0.1".to_owned(), "localhost".to_owned(), "::1".to_owned()]),
+            ..HttpConfig::default()
+        }
     }
 
     #[tokio::test]
     async fn non_http_scheme_is_rejected_before_any_network_work() {
         let (b, _home) = backend(generous_config(), Clock::system());
         let err = b.get(&ModuleId::new("test"), "ftp://example.com/file", None).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+    }
+
+    #[tokio::test]
+    async fn a_url_carrying_a_username_or_password_is_refused() {
+        let (b, _home) = backend(generous_config(), Clock::system());
+        let err = b.get(&ModuleId::new("test"), "https://me:hunter2@example.com/feed", None).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+        assert!(!err.message.contains("hunter2"), "the password must never appear in the error: {}", err.message);
+    }
+
+    #[test]
+    fn redact_url_strips_userinfo_and_key_like_query_values() {
+        assert_eq!(redact_url("https://me:hunter2@host/feed"), "https://host/feed");
+        assert_eq!(
+            redact_url("https://host/feed?api_key=hunter2&title=rust"),
+            "https://host/feed?api_key=redacted&title=rust"
+        );
+        assert_eq!(redact_url("not a url at all"), "not a url at all");
+    }
+
+    #[test]
+    fn an_https_to_http_redirect_is_a_downgrade_but_the_reverse_is_not() {
+        let https = reqwest::Url::parse("https://host/a").unwrap();
+        let http = reqwest::Url::parse("http://host/a").unwrap();
+        assert!(is_https_downgrade(&https, &http));
+        assert!(!is_https_downgrade(&http, &https));
+        assert!(!is_https_downgrade(&https, &https));
+    }
+
+    #[test]
+    fn private_loopback_link_local_and_unspecified_addresses_are_disallowed_but_public_ones_are_not() {
+        let disallowed = [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254", // cloud metadata
+            "0.0.0.0",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "::ffff:127.0.0.1", // IPv4-mapped loopback
+        ];
+        for addr in disallowed {
+            assert!(is_disallowed_address(addr.parse().unwrap()), "{addr} should be disallowed");
+        }
+        for addr in ["8.8.8.8", "2001:4860:4860::8888"] {
+            assert!(!is_disallowed_address(addr.parse().unwrap()), "{addr} should be allowed");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_literal_private_address_is_refused_without_an_allow_list_entry() {
+        let (b, _home) = backend(HttpConfig { default_concurrent: 10, ..HttpConfig::default() }, Clock::system());
+        let err = b.get(&ModuleId::new("test"), "http://127.0.0.1:1/x", None).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+    }
+
+    #[tokio::test]
+    async fn an_allow_listed_private_host_is_permitted() {
+        let server = TestServer::start(vec![OK]);
+        let mut cfg = HttpConfig { default_concurrent: 10, ..HttpConfig::default() };
+        cfg.allow_private.insert("127.0.0.1".to_owned());
+        let (b, _home) = backend(cfg, Clock::system());
+        let resp = b.get(&ModuleId::new("test"), &server.url("/a"), None).await.unwrap();
+        assert_eq!(resp.status, 200);
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_a_private_address_is_refused_without_the_hop_ever_being_sent() {
+        let redirect =
+            "HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data\r\nContent-Length: 0\r\n\r\n";
+        let server = TestServer::start(vec![redirect]);
+        let (b, _home) = backend(generous_config(), Clock::system());
+        let err = b.get(&ModuleId::new("test"), &server.url("/a"), None).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidParams);
     }
 
@@ -1096,6 +1326,36 @@ mod tests {
         let (_meta_path, body_path) = cache.paths(&module, "http://a");
         std::fs::write(&body_path, b"a much longer stale body").unwrap();
         assert!(cache.read(&module, "http://a").is_none(), "a body/meta length mismatch must read back as a miss");
+    }
+
+    #[test]
+    fn an_entry_landing_in_another_urls_hash_slot_is_never_served() {
+        // `cache_key` is a 64-bit hash, not a security boundary -- simulates the collision it
+        // doesn't rule out: `/other`'s slot holds `/a`'s entry (#267 finding 1).
+        let home = TempDir::new().unwrap();
+        let cache = ResponseCache { home: home.path().to_path_buf() };
+        let module = ModuleId::new("test");
+        let meta = CacheMeta {
+            url: "http://host/a".to_owned(),
+            status: 200,
+            etag: None,
+            last_modified: None,
+            max_age_secs: None,
+            cached_at: DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").unwrap().to_utc(),
+            body_len: 2,
+        };
+        cache.write(&module, "http://host/a", &meta, b"ok", u64::MAX);
+
+        // Force a collision by writing `/a`'s meta/body directly into `/other`'s paths.
+        let (other_meta_path, other_body_path) = cache.paths(&module, "http://host/other");
+        let (a_meta_path, a_body_path) = cache.paths(&module, "http://host/a");
+        std::fs::copy(&a_meta_path, &other_meta_path).unwrap();
+        std::fs::copy(&a_body_path, &other_body_path).unwrap();
+
+        assert!(
+            cache.read(&module, "http://host/other").is_none(),
+            "a cache slot holding a different url's entry must read back as a miss"
+        );
     }
 
     #[tokio::test]
