@@ -1,0 +1,36 @@
+name: release-build
+# Manual, ad-hoc release binary builds (no automatic trigger). Used for a release draft asked
+# for out of band, not part of the normal CI check (ci.yml covers that). Builds whichever `ref`
+# is given, which is why this exists as its own workflow rather than extending ci.yml's matrix.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or commit to build"
+        required: true
+        default: master
+      os:
+        description: "Runner / target platform"
+        required: true
+        default: macos-latest
+        type: choice
+        options:
+          - macos-latest
+          - ubuntu-latest
+
+jobs:
+  build:
+    runs-on: ${{ inputs.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --bin shimmer
+      - run: |
+          mkdir -p dist
+          cp target/release/shimmer dist/shimmer-${{ inputs.os == 'macos-latest' && 'macos-arm64' || 'linux-x86_64' }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shimmer-${{ inputs.os }}
+          path: dist/*
