@@ -672,5 +672,64 @@ shimmer_terminal_and_wait() {
     return "$(cat "$exit_file")"
 }
 
+# ---------------------------------------------------------------- choosing from a short list
+
+# The first picker found: rofi, wofi, fuzzel, or nothing.
+shimmer_picker_auto() {
+    for p in rofi wofi fuzzel; do
+        shimmer_has "$p" && {
+            echo "$p"
+            return
+        }
+    done
+}
+
+# Does PICKER (auto/rofi/wofi/fuzzel/none) resolve to something installed here? For the check
+# step: a LIBRARY question with no usable picker should stop the launch, not silently fall back
+# to nothing being offered.
+shimmer_has_picker() {
+    picker=$1
+    [ "$picker" = "auto" ] && picker=$(shimmer_picker_auto)
+    [ -n "$picker" ] && [ "$picker" != "none" ] && shimmer_has "$picker"
+}
+
+# Show PICKER (auto/rofi/wofi/fuzzel) listing each "Label" from LIBRARY ("Label=value|Label=value|…"),
+# and print the chosen entry's value (everything after its first "="). Fails (empty output, exit
+# 1) when the list is empty, no picker is available, or the user cancelled (Escape/closed window)
+# instead of choosing one.
+shimmer_pick() {
+    picker=$1
+    library=$2
+    prompt=$3
+    [ "$picker" = "auto" ] && picker=$(shimmer_picker_auto)
+    [ -n "$picker" ] && [ "$picker" != "none" ] && shimmer_has "$picker" || return 1
+
+    labels=$(
+        IFS='|'
+        set -f
+        for entry in $library; do printf '%s\n' "${entry%%=*}"; done
+    )
+    [ -n "$labels" ] || return 1
+    case "$picker" in
+        rofi) chosen=$(printf '%s\n' "$labels" | rofi -dmenu -p "$prompt") ;;
+        wofi) chosen=$(printf '%s\n' "$labels" | wofi --dmenu --prompt "$prompt") ;;
+        fuzzel) chosen=$(printf '%s\n' "$labels" | fuzzel --dmenu --prompt "$prompt: ") ;;
+        *) return 1 ;;
+    esac
+    [ -n "$chosen" ] || return 1
+    (
+        IFS='|'
+        set -f
+        for entry in $library; do
+            label=${entry%%=*}
+            if [ "$label" = "$chosen" ]; then
+                printf '%s' "${entry#*=}"
+                exit 0
+            fi
+        done
+        exit 1
+    )
+}
+
 # Every step that loads this file opens things where OPEN_ON says.
 shimmer_use_display

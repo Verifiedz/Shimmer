@@ -1,0 +1,94 @@
+[template]
+label = "Gaming"
+description = "Steam, a game of your choice (or a picker over several), and a VM, opened together"
+category = "daily"
+needs = [
+    "Steam, if you keep STEAM_COMMAND",
+    "Whatever GAME_COMMAND (or each entry of GAME_LIBRARY) launches, if you keep one",
+    "rofi, wofi or fuzzel, only if you fill in GAME_LIBRARY (the game picker)",
+    "virt-manager, only if you fill in VM_NAME",
+    "hyprctl and jq, only if you fill in a *_PLACE question (Hyprland placement)",
+]
+good_to_know = [
+    "Every app is optional: leave a question empty and that step does nothing",
+    "GAME_COMMAND is the whole launch line for one specific game, e.g. steam -applaunch 105600 for a Steam game (its app id, from its store page's url), or a direct path for anything else",
+    "GAME_LIBRARY, if you fill it in, replaces GAME_COMMAND with a picker over several games: Label=command pairs separated by |, e.g. Terraria=steam -applaunch 105600|Hollow Knight=steam -applaunch 367520. GAME_PICKER chooses the tool (auto: the first of rofi, wofi, fuzzel found)",
+    "VM_NAME, if you fill it in, opens Virtual Machine Manager (virt-manager) on that libvirt VM's console, starting it first if it isn't running already",
+    "A *_PLACE question (e.g. STEAM_PLACE = \"1:main\") puts that app on a workspace and monitor with hyprctl dispatch exec, the same technique the daily-dev template uses: nothing is ever read from or written to your Hyprland config",
+    "Placement needs HYPRLAND_MAIN_MONITOR / HYPRLAND_SECOND_MONITOR filled in too (a substring of hyprctl monitors -j's description for each)",
+    "workspaces stop closes a placed app by the exact window it remembers putting there (CLOSE_ON_STOP permitting), never by guessing from class or title. An app you left unplaced (no *_PLACE answer) is always left open instead. For VM_NAME this only closes the virt-manager window: the VM itself is never suspended or shut down by this template",
+    "Run it again while it's still active and it reuses what it already placed instead of piling up more",
+    "Every placement decision is logged to logs/<id>-hyprland.log in your Shimmer folder: a detached step has no other log, so tail -f that file during activate to watch it live",
+]
+on_stop = "Closes every window it placed with Hyprland (CLOSE_ON_STOP permitting), by the exact window it remembers. An app you left unplaced (no *_PLACE answer) is always left open. The VM itself (if VM_NAME is set) is never suspended or shut down, only its virt-manager window closed."
+
+[[question]]
+name = "STEAM_COMMAND"
+prompt = "Command to open Steam"
+kind = "command"
+default = "steam"
+help = "Leave empty to skip Steam entirely."
+
+[[question]]
+name = "STEAM_PLACE"
+prompt = "Steam's workspace:monitor"
+kind = "text"
+help = "e.g. 1:main. main/second match HYPRLAND_MAIN_MONITOR/HYPRLAND_SECOND_MONITOR below. Leave empty for no placement."
+
+[[question]]
+name = "GAME_COMMAND"
+prompt = "Command to launch your game"
+kind = "command"
+help = "e.g. steam -applaunch 105600 for Terraria on Steam, or a direct path for anything else. Leave empty to skip. Ignored once GAME_LIBRARY is set: the picker takes over."
+
+[[question]]
+name = "GAME_LIBRARY"
+prompt = "Your game library, for a picker instead of one fixed game (optional)"
+kind = "text"
+help = "Label=command pairs separated by |, e.g. Terraria=steam -applaunch 105600|Hollow Knight=steam -applaunch 367520|Stardew Valley=steam -applaunch 413150. When set, the game step shows GAME_PICKER's menu instead of launching GAME_COMMAND. Leave empty to just use GAME_COMMAND."
+
+[[question]]
+name = "GAME_PICKER"
+prompt = "Picker for GAME_LIBRARY"
+kind = "choice"
+choices = ["auto", "rofi", "wofi", "fuzzel", "none"]
+default = "auto"
+help = "auto: the first of rofi, wofi, fuzzel found. Only matters when GAME_LIBRARY is set."
+
+[[question]]
+name = "GAME_PLACE"
+prompt = "Your game's workspace:monitor"
+kind = "text"
+help = "e.g. 2:second. Applies whichever game is launched, fixed or picked. Leave empty for no placement."
+
+[[question]]
+name = "VM_NAME"
+prompt = "A libvirt VM to open in Virtual Machine Manager (optional)"
+kind = "text"
+help = "The VM's libvirt domain name (as `virsh list --all` shows it). Opens virt-manager on that VM's console, starting it first if it isn't running. Leave empty to skip."
+
+[[question]]
+name = "VM_PLACE"
+prompt = "The VM window's workspace:monitor"
+kind = "text"
+help = "e.g. 5:main. Leave empty for no placement."
+
+[[question]]
+name = "HYPRLAND_MAIN_MONITOR"
+prompt = "Main monitor (for *_PLACE = N:main)"
+kind = "text"
+help = "A substring of that monitor's description, as `hyprctl monitors -j` reports it, e.g. Odyssey G60SD. Leave empty if you're not using any *_PLACE question."
+
+[[question]]
+name = "HYPRLAND_SECOND_MONITOR"
+prompt = "Second monitor (for *_PLACE = N:second)"
+kind = "text"
+help = "A substring of that monitor's description, e.g. M27Q. Leave empty if you're not using any *_PLACE question."
+
+[[question]]
+name = "CLOSE_ON_STOP"
+prompt = "Close what it placed when you run workspaces stop"
+kind = "choice"
+choices = ["yes", "no"]
+default = "yes"
+help = "Closed: anything placed with Hyprland, by the exact window it remembers. Never closed: anything you left unplaced (no *_PLACE answer)."
