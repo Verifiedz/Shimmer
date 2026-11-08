@@ -17,6 +17,7 @@ mod first;
 mod flags;
 mod follow;
 mod notify;
+mod opener;
 pub mod packs;
 mod queue;
 mod records;

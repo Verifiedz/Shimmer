@@ -68,6 +68,7 @@ label = "Starship"
 "probe"             = "records.peek"
 "twin-fleet"        = "records.copy_collection"
 "drydock"           = "records.edit"
+"docking-bay"       = "records.open"  # open a 'path'-role field's file (ADR 0044)
 # fetchers (ADR 0028, ADR 0029)
 "scan-sector"       = "fetchers.list"
 "sensor-status"     = "fetchers.status"

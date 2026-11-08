@@ -69,6 +69,7 @@ label = "Anime Tropes"
 "hora"           = "records.peek"
 "futago"         = "records.copy_collection"
 "kaizou"         = "records.edit"
+"akero"          = "records.open"  # open a 'path'-role field's file (ADR 0044)
 # fetchers (ADR 0028, ADR 0029)
 "sagasu"         = "fetchers.list"
 "machiawase"     = "fetchers.status"

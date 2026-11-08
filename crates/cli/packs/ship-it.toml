@@ -68,6 +68,7 @@ label = "Ship It"
 "preview"        = "records.peek"
 "copy-pasta"     = "records.copy_collection"
 "tweak-schema"   = "records.edit"
+"crack-open"     = "records.open"  # open a 'path'-role field's file (ADR 0044)
 # fetchers (ADR 0028, ADR 0029)
 "sources"        = "fetchers.list"
 "crawler-status" = "fetchers.status"

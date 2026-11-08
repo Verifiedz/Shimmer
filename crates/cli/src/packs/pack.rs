@@ -68,6 +68,9 @@ pub const TARGETS: &[Target] = &[
     Target { op: "records.add", words: &["records", "add"] },
     Target { op: "records.list", words: &["records", "list"] },
     Target { op: "records.show", words: &["records", "show"] },
+    // ADR 0044: no op of its own either (it's `records.show` plus a local action), named the
+    // same way as `peek`/`edit` just below.
+    Target { op: "records.open", words: &["records", "open"] },
     Target { op: "records.update", words: &["records", "update"] },
     Target { op: "records.complete", words: &["records", "complete"] },
     Target { op: "records.reopen", words: &["records", "reopen"] },
@@ -487,7 +490,7 @@ label = "My Pack"
 
     #[test]
     fn every_target_is_an_op_with_its_command_words() {
-        assert_eq!(TARGETS.len(), 108);
+        assert_eq!(TARGETS.len(), 109);
         // Every command's word is its op's verb (ADR 0038 §6): no exceptions are left.
         for t in TARGETS {
             let (module, verb) = t.op.split_once('.').unwrap();

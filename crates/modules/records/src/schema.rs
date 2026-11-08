@@ -91,6 +91,10 @@ pub enum Role {
     Deadline,
     /// The record's link. `string` fields only; at most one per collection.
     Url,
+    /// A file on disk this record points at, e.g. a tailored résumé (ADR 0044). `string`
+    /// fields only; unlike `url`, a collection may have several — a record's own canonical
+    /// link and the files it keeps are different things.
+    Path,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,6 +214,9 @@ impl Collection {
                 }
                 (Some(Role::Url), k) if k != FieldType::String => {
                     return Err(bad(format!("field '{}': role \"url\" is only for string fields", f.name)));
+                }
+                (Some(Role::Path), k) if k != FieldType::String => {
+                    return Err(bad(format!("field '{}': role \"path\" is only for string fields", f.name)));
                 }
                 _ => {}
             }
@@ -631,6 +638,7 @@ mod tests {
         let cases = [
             ("[[field]]\nname = \"a\"\ntype = \"string\"\nrole = \"deadline\"", "only for date and datetime fields"),
             ("[[field]]\nname = \"a\"\ntype = \"date\"\nrole = \"url\"", "only for string fields"),
+            ("[[field]]\nname = \"a\"\ntype = \"date\"\nrole = \"path\"", "only for string fields"),
             ("[[field]]\nname = \"a\"\ntype = \"date\"\nrole = \"birthday\"", "unknown variant"),
             (
                 "[[field]]\nname = \"a\"\ntype = \"string\"\nrole = \"url\"\n[[field]]\nname = \"b\"\ntype = \"string\"\nrole = \"url\"",
@@ -665,6 +673,17 @@ mod tests {
             let e = with_fields(text).unwrap_err();
             assert!(e.message.contains("'c.toml'") && e.message.contains(want), "{text:?}: {}", e.message);
         }
+    }
+
+    #[test]
+    fn path_role_allows_several_fields_unlike_url() {
+        let c = with_fields(
+            "[[field]]\nname = \"resume_path\"\ntype = \"string\"\nrole = \"path\"\n\
+             [[field]]\nname = \"cover_letter_path\"\ntype = \"string\"\nrole = \"path\"",
+        )
+        .unwrap();
+        assert_eq!(c.field("resume_path").unwrap().role, Some(Role::Path));
+        assert_eq!(c.field("cover_letter_path").unwrap().role, Some(Role::Path));
     }
 
     #[test]

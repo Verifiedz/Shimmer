@@ -13,6 +13,7 @@ use shimmer_core::{Error, ErrorCode, Result};
 use crate::client::Client;
 use crate::csv;
 use crate::editor;
+use crate::opener;
 use crate::render::{self, cell, table, wrap};
 use crate::schedules;
 use crate::style::{paint, Role};
@@ -44,6 +45,9 @@ commands:
                                        a field named like one of these options (limit, sort…):
                                        filter it with --filter FIELD=VALUE
   show COLLECTION/ID                   show one record
+  open COLLECTION/ID [FIELD]           open a 'path'-role field's file with whatever the OS
+                                       opens that file type with; FIELD only needed when more
+                                       than one is set on the record
   update COLLECTION/ID [--FIELD VALUE]… [--unset FIELD]…
                                        change a record's fields
        [--add FIELD VALUE]… [--remove FIELD VALUE]…  change items of a list field
@@ -119,6 +123,13 @@ pub enum RecordsCmd {
     Show {
         collection: String,
         id: String,
+    },
+    /// `field`: which `role = "path"` field to open; `None` when the record has exactly one
+    /// set (ADR 0044).
+    Open {
+        collection: String,
+        id: String,
+        field: Option<String>,
     },
     Update {
         collection: String,
@@ -495,6 +506,31 @@ pub fn parse(words: Vec<String>) -> std::result::Result<RecordsCmd, String> {
                 _ => RecordsCmd::Remove { collection, id, force },
             })
         }
+        "open" => {
+            no_flags()?;
+            let usage = "usage: shimmer records open COLLECTION/ID [FIELD]";
+            let (target_words, field) = match positional.len() {
+                // "COLLECTION/ID": no field named.
+                1 => (positional, None),
+                // "COLLECTION/ID FIELD": the first word already names both.
+                2 if positional[0].contains('/') => {
+                    let mut p = positional;
+                    let field = p.pop();
+                    (p, field)
+                }
+                // "COLLECTION ID": no field named.
+                2 => (positional, None),
+                // "COLLECTION ID FIELD".
+                3 => {
+                    let mut p = positional;
+                    let field = p.pop();
+                    (p, field)
+                }
+                _ => return Err(usage.into()),
+            };
+            let (collection, id) = target(&sub, target_words)?;
+            Ok(RecordsCmd::Open { collection, id, field })
+        }
         other => Err(crate::suggest::unknown_command(Some("records"), other, USAGE)),
     }
 }
@@ -567,6 +603,7 @@ impl RecordsCmd {
             | Self::Rename { collection, .. }
             | Self::List { collection, .. }
             | Self::Show { collection, .. }
+            | Self::Open { collection, .. }
             | Self::Update { collection, .. }
             | Self::Complete { collection, .. }
             | Self::Reopen { collection, .. }
@@ -617,6 +654,7 @@ pub fn request(cmd: &RecordsCmd, schema: &Value) -> Result<(&'static str, Value)
     Ok(match cmd {
         RecordsCmd::Help => return Err(Error::internal("help is not a request")),
         RecordsCmd::Import { .. } => return Err(Error::internal("import reads its file in run")),
+        RecordsCmd::Open { .. } => return Err(Error::internal("open reads records.show and opens the field in run")),
         RecordsCmd::Purge { collection, id, .. } => {
             let mut params = json!({"collection": collection});
             if let Some(id) = id {
@@ -981,6 +1019,14 @@ pub async fn run(client: &mut Client, cmd: &RecordsCmd, json: bool, prompt: &mut
                 ))),
                 Err(e) => Err(e),
             };
+        }
+        // Resolving the field can fail (none set, more than one, an unknown name), so this
+        // doesn't go through `show` either — same reason as `Templates`/`Peek` just below.
+        RecordsCmd::Open { collection, id, field } => {
+            let data = client.call("records.show", json!({"collection": collection, "id": id})).await?;
+            let (_, path) = resolve_path_field(collection, id, &data, &schema, field.as_deref())?;
+            opener::open(path)?;
+            return Ok(format!("✓ opened {path}"));
         }
         // Rendering these can fail (no such template or category), so they don't go through `show`.
         RecordsCmd::Templates { which } => {
@@ -1385,6 +1431,12 @@ pub fn show(cmd: &RecordsCmd, data: &Value, schema: &Value) -> String {
             out
         }
         RecordsCmd::Show { collection, id } => item(collection, id, data, schema),
+        // Never reached through `run` (see the comment there) — only so `resolve_path_field`'s
+        // formatting is directly testable the way `import_summary`'s is through `Import`.
+        RecordsCmd::Open { collection, id, field } => {
+            resolve_path_field(collection, id, data, schema, field.as_deref())
+                .map_or_else(|e| e.message, |(_, p)| p.to_owned())
+        }
         RecordsCmd::List { .. } => list(data, schema),
         RecordsCmd::Import { collection, .. } => import_summary(collection, data, true),
         RecordsCmd::Purge { collection, .. } => match data["purged"].as_u64() {
@@ -1658,6 +1710,62 @@ fn has_status(schema: &Value) -> bool {
     schema["completable"] != false
 }
 
+/// Which `role = "path"` field `records open` means, and its value: `field` if given (it must
+/// be one of the collection's path fields), or the one path field set on the record when
+/// `field` is `None`. Pure (ADR 0044 §3) — resolving this can fail before anything would ever
+/// be spawned, which is exactly why `records open`'s real handling in `run` doesn't go through
+/// `show` (see the comment there), the same way `records templates`/`peek` don't.
+fn resolve_path_field<'a>(
+    collection: &str,
+    id: &str,
+    data: &'a Value,
+    schema: &Value,
+    field: Option<&str>,
+) -> Result<(String, &'a str)> {
+    let path_fields: Vec<&str> = schema["fields"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|f| f["role"] == "path")
+        .filter_map(|f| f["name"].as_str())
+        .collect();
+    let name = match field {
+        Some(f) if path_fields.contains(&f) => f.to_owned(),
+        Some(f) => {
+            return Err(Error::invalid_params(match path_fields.is_empty() {
+                true => format!("{collection} has no 'path' field"),
+                false => format!("'{f}' isn't a path field of {collection}; try: {}", path_fields.join(", ")),
+            }))
+        }
+        None => {
+            let set: Vec<&str> =
+                path_fields.iter().copied().filter(|n| data[*n].as_str().is_some_and(|s| !s.is_empty())).collect();
+            match set.as_slice() {
+                [one] => one.to_string(),
+                [] if path_fields.is_empty() => {
+                    return Err(Error::invalid_params(format!("{collection} has no 'path' field")))
+                }
+                [] => {
+                    return Err(Error::invalid_params(format!(
+                        "none of {collection}/{id}'s path field(s) are set: {}",
+                        path_fields.join(", ")
+                    )))
+                }
+                many => {
+                    return Err(Error::invalid_params(format!(
+                        "{collection}/{id} has more than one path set; name one: {}",
+                        many.join(", ")
+                    )))
+                }
+            }
+        }
+    };
+    let path = data[name.as_str()]
+        .as_str()
+        .ok_or_else(|| Error::invalid_params(format!("'{name}' isn't set on {collection}/{id}")))?;
+    Ok((name, path))
+}
+
 fn item(collection: &str, id: &str, data: &Value, schema: &Value) -> String {
     let name = paint(Role::Name, &format!("{collection}/{id}"));
     let mut out = match has_status(schema) {
@@ -1667,7 +1775,14 @@ fn item(collection: &str, id: &str, data: &Value, schema: &Value) -> String {
     let keys = columns(data, schema);
     let width = keys.iter().map(|k| k.chars().count()).max().unwrap_or(0);
     for key in keys {
-        let _ = write!(out, "\n  {}  {}", crate::style::label(&key, width), shown(schema, &key, &data[key.as_str()]));
+        let mut value = shown(schema, &key, &data[key.as_str()]);
+        // A set `role = "path"` field is also a clickable link to the file it names (ADR 0044 §2).
+        if field(schema, &key).is_some_and(|f| f["role"] == "path") {
+            if let Some(path) = data[key.as_str()].as_str() {
+                value = render::hyperlink(path, &value);
+            }
+        }
+        let _ = write!(out, "\n  {}  {}", crate::style::label(&key, width), value);
     }
     out
 }
@@ -1805,6 +1920,20 @@ mod tests {
         assert_eq!(parse_words(&["complete", "leetcode", "two-sum"]).unwrap(), want);
         for bad in [&["complete"][..], &["complete", "leetcode"], &["complete", "/x"], &["complete", "a", "b", "c"]] {
             assert!(parse_words(bad).unwrap_err().contains("COLLECTION/ID"), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn open_parses_both_target_forms_with_and_without_a_field() {
+        let no_field = RecordsCmd::Open { collection: "jobs".into(), id: "amazon".into(), field: None };
+        assert_eq!(parse_words(&["open", "jobs/amazon"]).unwrap(), no_field);
+        assert_eq!(parse_words(&["open", "jobs", "amazon"]).unwrap(), no_field);
+        let with_field =
+            RecordsCmd::Open { collection: "jobs".into(), id: "amazon".into(), field: Some("resume_path".into()) };
+        assert_eq!(parse_words(&["open", "jobs/amazon", "resume_path"]).unwrap(), with_field);
+        assert_eq!(parse_words(&["open", "jobs", "amazon", "resume_path"]).unwrap(), with_field);
+        for bad in [&["open"][..], &["open", "jobs"], &["open", "a", "b", "c", "d"]] {
+            assert!(parse_words(bad).unwrap_err().contains("usage: shimmer records open"), "{bad:?}");
         }
     }
 
@@ -2681,6 +2810,60 @@ lru-cache  todo    LRU Cache  medium      -            2         true
 
         let get = RecordsCmd::Show { collection: "leetcode".into(), id: "two-sum".into() };
         assert!(show(&get, &item, &leetcode()).starts_with("leetcode/two-sum  (done)\n  title        Two Sum\n"));
+    }
+
+    #[test]
+    fn open_resolves_the_set_path_field_or_says_why_it_cant() {
+        let one_path_field = json!({"fields": [
+            {"name": "company", "type": "string", "required": true},
+            {"name": "resume_path", "type": "string", "role": "path"}
+        ]});
+        let open = |field: Option<&str>| RecordsCmd::Open {
+            collection: "jobs".into(),
+            id: "amazon".into(),
+            field: field.map(String::from),
+        };
+        let set = json!({"id": "amazon", "company": "Amazon", "resume_path": "/home/me/resume.pdf"});
+        // The one set path field, found without naming it.
+        assert_eq!(show(&open(None), &set, &one_path_field), "/home/me/resume.pdf");
+        // Naming it explicitly works the same way.
+        assert_eq!(show(&open(Some("resume_path")), &set, &one_path_field), "/home/me/resume.pdf");
+        // A field that isn't a path field of the collection.
+        assert_eq!(
+            show(&open(Some("company")), &set, &one_path_field),
+            "'company' isn't a path field of jobs; try: resume_path"
+        );
+        // Unset: nothing to open.
+        let unset = json!({"id": "amazon", "company": "Amazon", "resume_path": null});
+        assert_eq!(
+            show(&open(None), &unset, &one_path_field),
+            "none of jobs/amazon's path field(s) are set: resume_path"
+        );
+        // No path field on the collection at all.
+        let no_path_field = json!({"fields": [{"name": "company", "type": "string"}]});
+        assert_eq!(show(&open(None), &set, &no_path_field), "jobs has no 'path' field");
+        assert_eq!(show(&open(Some("company")), &set, &no_path_field), "jobs has no 'path' field");
+        // More than one set: must be named.
+        let two_path_fields = json!({"fields": [
+            {"name": "resume_path", "type": "string", "role": "path"},
+            {"name": "cover_letter_path", "type": "string", "role": "path"}
+        ]});
+        let both_set = json!({"id": "amazon", "resume_path": "/r.pdf", "cover_letter_path": "/c.pdf"});
+        let out = show(&open(None), &both_set, &two_path_fields);
+        assert!(
+            out.contains("more than one path set") && out.contains("resume_path") && out.contains("cover_letter_path"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_path_field_shows_its_value_in_records_show() {
+        // Hyperlink wrapping only kicks in on a real terminal (style::hyperlinks_on), which a
+        // test never is, so this checks the field still shows its plain value.
+        let schema = json!({"fields": [{"name": "resume_path", "type": "string", "role": "path"}]});
+        let item = json!({"id": "x", "status": "todo", "resume_path": "/home/me/resume.pdf"});
+        let out = show(&RecordsCmd::Show { collection: "jobs".into(), id: "x".into() }, &item, &schema);
+        assert!(out.contains("resume_path  /home/me/resume.pdf"), "{out}");
     }
 
     #[test]

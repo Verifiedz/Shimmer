@@ -178,6 +178,18 @@ pub fn wrap(text: &str, width: usize, indent: &str) -> String {
     lines.join(&format!("\n{indent}"))
 }
 
+/// `label` wrapped as a clickable OSC 8 hyperlink to `path`, for a `role = "path"` field in
+/// `records show` (ADR 0044 §2) — plain text when `style::hyperlinks_on` says output isn't
+/// going to an interactive terminal (a pipe, `--json`, `NO_COLOR`/`--no-color`, a "dumb"
+/// `TERM`). A terminal that doesn't understand OSC 8 shows `label` unchanged; the escape codes
+/// carry no visible characters of their own.
+pub fn hyperlink(path: &str, label: &str) -> String {
+    if !crate::style::hyperlinks_on() {
+        return label.to_owned();
+    }
+    format!("\x1b]8;;file://{path}\x1b\\{label}\x1b]8;;\x1b\\")
+}
+
 /// Ids as a list shows them (ADR 0031 §4): a long id (a ULID, or `usr-` plus one) as its last six
 /// characters, or more where that's needed to tell it from another id in the same list, which is
 /// what the daemon accepts back. Short ids (`digest`, a test's `usr-1`) are shown whole.
@@ -313,6 +325,13 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn hyperlinks_degrade_to_plain_text_off_a_terminal() {
+        // `style::hyperlinks_on` reads the same global as colour, never set in a test run, so
+        // this is the branch every test (and every piped/`--json` run) actually takes.
+        assert_eq!(hyperlink("/home/me/resume.pdf", "resume_path"), "resume_path");
+    }
 
     #[test]
     fn long_ids_show_their_unique_ending() {
