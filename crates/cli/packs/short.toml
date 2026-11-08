@@ -69,6 +69,7 @@ label = "Short"
 "rpeek"      = "records.peek"
 "rcpcol"     = "records.copy_collection"
 "redit"      = "records.edit"
+"ropen"      = "records.open"  # open a 'path'-role field's file (ADR 0044)
 # fetchers (ADR 0028, ADR 0029)
 "flist"      = "fetchers.list"
 "fstat"      = "fetchers.status"

@@ -94,6 +94,7 @@ belongs to this machine, so copying your Shimmer folder elsewhere doesn't bring 
 | records peek | `hora` | `preview` | `probe` | `rpeek` |
 | records copy-collection | `futago` | `copy-pasta` | `twin-fleet` | `rcpcol` |
 | records edit | `kaizou` | `tweak-schema` | `drydock` | `redit` |
+| records open | `akero` | `crack-open` | `docking-bay` | `ropen` |
 | fetchers list | `sagasu` | `sources` | `scan-sector` | `flist` |
 | fetchers status | `machiawase` | `crawler-status` | `sensor-status` | `fstat` |
 | fetchers test | `teisatsu` | `smoke-test` | `trial-run` | `ftest` |
@@ -174,7 +175,7 @@ On the right of each alias goes the command it runs, by its op name:
 | `core.ping`, `core.shutdown`, `core.manifest` | `shimmer ping`, `shutdown`, `manifest` |
 | `records.collections`, `.add`, `.list`, `.show`, `.update`, `.complete`, `.reopen`, `.rename`, `.remove`, `.restore`, `.purge`, `.import`, `.export`, `.check`, `.templates`, `.new` | `shimmer records <verb>` |
 | `records.rename_field`, `.rename_collection`, `.remove_collection`, `.restore_collection`, `.purge_collection` | `shimmer records rename-field`, `rename-collection`, `remove-collection`, `restore-collection`, `purge-collection` |
-| `records.peek`, `.copy_collection`, `.edit` | `shimmer records peek`, `copy-collection`, `edit` |
+| `records.peek`, `.copy_collection`, `.edit`, `.open` | `shimmer records peek`, `copy-collection`, `edit`, `open` |
 | `workspaces.list`, `.show`, `.activate`, `.cleanup`, `.reset`, `.stop`, `.remove`, `.restore`, `.purge`, `.rename`, `.copy`, `.reconfigure`, `.edit`, `.templates`, `.peek`, `.new` | `shimmer workspaces <verb>` |
 | `workspaces.force_relaunch` | `shimmer workspaces force-relaunch` |
 | `queue.list`, `.show`, `.cancel`, `.move` | `shimmer queue <verb>` |

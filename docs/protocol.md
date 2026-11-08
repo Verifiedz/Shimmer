@@ -494,7 +494,8 @@ back to the id. ADR 0019. Each collection in
 `reopen`, and filtering or sorting on `status` are `invalid_params`), and,
 when set, `description`, `title` (e.g. `"{company}: {position}"`), `related` (collection ids),
 `extra` (`[extra.<name>]` tables, passed through untouched) and per field `role` (`"deadline"`
-on a date or datetime, `"url"` on a string), `unique`, `of` (what a `list` holds: `string`,
+on a date or datetime, `"url"` or `"path"` on a string — `"path"`, unlike `"url"`, may be set on
+more than one field of the same collection, ADR 0044), `unique`, `of` (what a `list` holds: `string`,
 `enum` or `ref`) and `collection` (where a `ref` points). Field types (ADR 0024): `string`,
 `int`, `bool`, `date` (`"2026-10-20"`), `enum`, `datetime` (UTC RFC 3339 like
 `"2026-10-21T06:59:00Z"`, or a plain date; input without an offset is read in the configured

@@ -138,6 +138,14 @@ fn out() -> Option<&'static Palette> {
     OUT.get().and_then(Option::as_ref)
 }
 
+/// Whether standard output gets escape codes at all right now — the same gate `paint` uses for
+/// colour (a real terminal, not `--json`, not `--no-color`/`NO_COLOR`, not a "dumb" `TERM`),
+/// reused for the OSC 8 hyperlinks `render::hyperlink` wraps a `role = "path"` field in
+/// (ADR 0044 §2): escape codes of any kind only belong on an interactive terminal.
+pub fn hyperlinks_on() -> bool {
+    out().is_some()
+}
+
 /// `text` in `role`'s colour, for standard output.
 pub fn paint(role: Role, text: &str) -> String {
     paint_with(out(), role, text)

@@ -27,8 +27,8 @@ commands:
 
 An alias stands for shimmer plus a whole command. In pack.toml it names one of these:
   core.ping  core.shutdown  core.manifest
-  records.collections  records.add  records.list  records.show  records.update
-  records.complete  records.reopen  records.rename  records.remove  records.restore
+  records.collections  records.add  records.list  records.show  records.open
+  records.update  records.complete  records.reopen  records.rename  records.remove  records.restore
   records.templates  records.new  records.purge
   records.import  records.export  records.check  records.rename_field
   records.rename_collection  records.remove_collection  records.restore_collection
