@@ -25,6 +25,7 @@ const BUILTIN: &[(&str, &str)] = &[
     ("lever", include_str!("../templates/lever.toml")),
     ("rss", include_str!("../templates/rss.toml")),
     ("jobbank-canada", include_str!("../templates/jobbank-canada.toml")),
+    ("json-api-keyed", include_str!("../templates/json-api-keyed.toml")),
 ];
 
 /// What an answer may be -- only what the five starters need, not automations' full set.
@@ -44,6 +45,10 @@ pub enum Kind {
     /// or `&` in the answer can never break the url or smuggle in another query parameter. The
     /// template's own line still quotes it (`url = "...${NAME}..."`), same as `Name`/`Url`.
     Query,
+    /// A JSON field name or dot path into one (`json-api`'s own `id_field`/`items_path`, ADR
+    /// 0028 §15) -- freer than `Name` (a real field can be camelCase, or nested), but still
+    /// plain enough to sit inside a quoted TOML string without escaping.
+    Field,
 }
 
 impl Kind {
@@ -51,6 +56,7 @@ impl Kind {
         match self {
             Kind::Name => "name",
             Kind::Url => "url",
+            Kind::Field => "field",
             Kind::Filter => "filter",
             Kind::Query => "query",
         }
@@ -257,6 +263,14 @@ impl Question {
                 }
                 Ok(url::form_urlencoded::byte_serialize(a.as_bytes()).collect())
             }
+            Kind::Field => {
+                let ok = !a.is_empty() && a.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+                if ok {
+                    Ok(a.to_owned())
+                } else {
+                    Err(format!("'{a}' isn't a field name: letters, digits, '_', '.' and '-'"))
+                }
+            }
             Kind::Filter => {
                 let words: Vec<&str> = a.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
                 if words.is_empty() {
@@ -338,6 +352,14 @@ mod tests {
         assert_eq!(q(Kind::Url).check("https://example.test/feed.xml"), Ok("https://example.test/feed.xml".into()));
         assert!(q(Kind::Url).check("ftp://example.test/feed.xml").is_err());
         assert!(q(Kind::Url).check("not a url").is_err());
+        assert_eq!(q(Kind::Query).check("software engineer"), Ok("software+engineer".into()));
+        assert_eq!(q(Kind::Query).check("a & b"), Ok("a+%26+b".into()));
+        assert!(q(Kind::Query).check("").is_err());
+        assert_eq!(q(Kind::Field).check("data.jobs"), Ok("data.jobs".into()));
+        assert_eq!(q(Kind::Field).check("jobId"), Ok("jobId".into()));
+        assert!(q(Kind::Field).check("").is_err());
+        assert!(q(Kind::Field).check("has space").is_err());
+        assert!(q(Kind::Field).check("\"quoted\"").is_err());
         assert_eq!(q(Kind::Filter).check("senior"), Ok(r#"{ title = { contains = "senior" } }"#.into()));
         assert_eq!(
             q(Kind::Filter).check("senior, staff"),
