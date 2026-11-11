@@ -1,0 +1,38 @@
+[template]
+label = "Job Bank Canada"
+description = "Job postings from the Government of Canada's Job Bank search"
+category = "job-boards"
+kind = "rss"
+good_to_know = [
+    "A keyword search, not a browse -- broad on purpose: a keyword like \"engineer\" also matches titles like \"sales engineer\" or \"dams engineer\" that have nothing to do with software",
+    "Leave the province blank to search all of Canada",
+    "Combine with the title filter below (e.g. software engineer, swe, -senior, -staff, -principal) to narrow what the keyword search alone can't",
+]
+
+[[question]]
+name = "KEYWORDS"
+prompt = "Search keywords (e.g. software engineer)"
+kind = "query"
+required = true
+
+[[question]]
+name = "PROVINCE"
+prompt = "Limit to one province/territory's two-letter code (e.g. ON for Ontario), or leave blank for all of Canada"
+kind = "query"
+
+[[question]]
+name = "TITLE_FILTER"
+prompt = "Only show titles containing (comma-separated, optional). Prefix a word with - to exclude it, e.g. software engineer, swe, -senior, -staff, -principal"
+kind = "filter"
+
+[source]
+text = '''
+[source]
+enabled = false
+interval = "daily"
+kind = "rss"
+filter = ${TITLE_FILTER} # if TITLE_FILTER
+
+[kind]
+url = "https://www.jobbank.gc.ca/jobsearch/feed/jobSearchRSSfeed?sort=D&rows=100&dkw=${KEYWORDS}&fprov=${PROVINCE}"
+'''

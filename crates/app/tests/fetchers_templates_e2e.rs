@@ -75,7 +75,7 @@ fn redirect_url(home: &Home, id: &str, addr: SocketAddr) {
 fn templates_list_and_peek_show_what_they_make() {
     let home = Home::new();
     let out = ok(&home, &["fetchers", "templates"]);
-    for id in ["greenhouse", "lever", "rss", "wwr", "hn-whoishiring"] {
+    for id in ["greenhouse", "lever", "rss", "wwr", "hn-whoishiring", "jobbank-canada", "json-api-keyed"] {
         assert!(out.contains(id), "{id}: {out}");
     }
     let peek = ok(&home, &["fetchers", "peek", "rss"]);
@@ -145,6 +145,106 @@ fn lever_template_renders_the_real_url_and_fetches_once_redirected() {
     assert_eq!(items.len(), 1, "{items:?}");
     assert_eq!(items[0]["title"], "Platform Engineer");
     assert_eq!(items[0]["url"], "https://jobs.lever.co/acme/abc");
+}
+
+#[test]
+fn jobbank_canada_template_encodes_its_query_and_fetches_once_redirected() {
+    let home = Home::new();
+    let out = ok(
+        &home,
+        &[
+            "fetchers",
+            "new",
+            "ca-jobs",
+            "--from",
+            "jobbank-canada",
+            "--set",
+            "KEYWORDS=software engineer",
+            "--set",
+            "PROVINCE=ON",
+            "--set",
+            "TITLE_FILTER=engineer, -senior",
+            "--yes",
+        ],
+    );
+    assert!(out.contains("✓ made ca-jobs from jobbank-canada, switched off"), "{out}");
+    let text = source_text(&home, "ca-jobs");
+    assert!(
+        text.contains("dkw=software+engineer")
+            && text.contains("fprov=ON")
+            && text.contains("kind = \"rss\"")
+            && text.contains("contains = \"engineer\"")
+            && text.contains("not_contains = \"senior\""),
+        "{text}"
+    );
+
+    let feed = r#"<?xml version="1.0" encoding="utf-8"?><feed xmlns="http://www.w3.org/2005/Atom">
+<entry><id>https://www.jobbank.gc.ca/jobsearch/jobSearchRSSfeed?id=1</id>
+<title>software engineer</title><link href="https://www.jobbank.gc.ca/jobsearch/jobposting/1"/></entry>
+</feed>"#;
+    let addr = stub_server("application/atom+xml", feed);
+    redirect_url(&home, "ca-jobs", addr);
+
+    let items = json(&home, &["fetchers", "test", "ca-jobs"])["items"].as_array().unwrap().clone();
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0]["title"], "software engineer");
+    assert_eq!(items[0]["url"], "https://www.jobbank.gc.ca/jobsearch/jobposting/1");
+}
+
+#[test]
+fn json_api_keyed_template_renders_its_credential_and_optional_items_path() {
+    let home = Home::new();
+    let out = ok(
+        &home,
+        &[
+            "fetchers",
+            "new",
+            "gated",
+            "--from",
+            "json-api-keyed",
+            "--set",
+            "URL=https://api.example.test/jobs",
+            "--set",
+            "ITEMS_PATH=data.jobs",
+            "--set",
+            "CREDENTIAL=my-api-key",
+            "--set",
+            "TITLE_FILTER=engineer, -senior",
+            "--yes",
+        ],
+    );
+    assert!(out.contains("✓ made gated from json-api-keyed, switched off"), "{out}");
+    let text = source_text(&home, "gated");
+    assert!(
+        text.contains("url = \"https://api.example.test/jobs\"")
+            && text.contains("items_path = \"data.jobs\"")
+            && text.contains("id_field = \"id\"")
+            && text.contains("title_field = \"title\"")
+            && text.contains("url_field = \"url\"")
+            && text.contains("credential = \"my-api-key\"")
+            && text.contains("contains = \"engineer\"")
+            && text.contains("not_contains = \"senior\""),
+        "{text}"
+    );
+
+    // No ITEMS_PATH at all: the optional "# if ITEMS_PATH" line is dropped, not written with
+    // an empty path (which `json-api`'s own kind would otherwise reject as blank-but-present).
+    ok(
+        &home,
+        &[
+            "fetchers",
+            "new",
+            "gated2",
+            "--from",
+            "json-api-keyed",
+            "--set",
+            "URL=https://api.example.test/jobs",
+            "--set",
+            "CREDENTIAL=my-api-key",
+            "--yes",
+        ],
+    );
+    assert!(!source_text(&home, "gated2").contains("items_path"), "{}", source_text(&home, "gated2"));
 }
 
 #[test]

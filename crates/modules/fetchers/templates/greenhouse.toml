@@ -5,6 +5,7 @@ category = "job-boards"
 kind = "json-api"
 good_to_know = [
     "Works for any public Greenhouse board -- the board token is usually the company's name as it appears in its own careers url, after /boards/",
+    "Checked against the title only, since that's all this board's listing gives before you click in",
 ]
 
 [[question]]
@@ -13,12 +14,18 @@ prompt = "The company's Greenhouse board token (e.g. figma)"
 kind = "name"
 required = true
 
+[[question]]
+name = "TITLE_FILTER"
+prompt = "Only show titles containing (comma-separated, optional). Prefix a word with - to exclude it, e.g. software engineer, swe, -senior, -staff, -principal"
+kind = "filter"
+
 [source]
 text = '''
 [source]
 enabled = false
 interval = "daily"
 kind = "json-api"
+filter = ${TITLE_FILTER} # if TITLE_FILTER
 
 [kind]
 url = "https://boards-api.greenhouse.io/v1/boards/${BOARD}/jobs"

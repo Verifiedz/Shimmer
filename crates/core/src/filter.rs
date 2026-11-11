@@ -25,9 +25,11 @@ pub enum Op {
     Set(bool),
     /// Text containing this, ignoring case; kept lowercase.
     Contains(String),
-    /// Text not containing this, ignoring case; kept lowercase. Unset or non-text passes, the
-    /// same "the negative condition isn't violated" reasoning as `Ne` (ADR 0028 §8, fetchers).
-    NotContains(String),
+    /// Text containing none of these, ignoring case; kept lowercase. Unset or non-text passes,
+    /// the same "the negative condition isn't violated" reasoning as `Ne` (ADR 0028 §8,
+    /// fetchers). One word or several -- `excludes senior, staff, principal` is one condition,
+    /// not three competing for the same key.
+    NotContains(Vec<String>),
     /// A list holding this item (text ignoring case).
     Has(Value),
 }
@@ -54,12 +56,25 @@ impl Op {
                 Some(s) if !s.is_empty() => Op::Contains(s.to_lowercase()),
                 _ => return Err("'contains' takes some text".into()),
             },
-            "not_contains" => match arg.as_str() {
-                Some(s) if !s.is_empty() => Op::NotContains(s.to_lowercase()),
-                _ => return Err("'not_contains' takes some text".into()),
-            },
+            "not_contains" => Op::NotContains(Self::not_contains_words(arg)?),
             other => return Err(format!("unknown operator '{other}'")),
         })
+    }
+
+    /// `arg` as one or more lowercase words: a non-empty string, or a non-empty list of
+    /// non-empty strings. Either way, excluded if the text contains *any* of them.
+    fn not_contains_words(arg: &Value) -> Result<Vec<String>, String> {
+        match arg {
+            Value::String(s) if !s.is_empty() => Ok(vec![s.to_lowercase()]),
+            Value::Array(items) if !items.is_empty() => items
+                .iter()
+                .map(|v| match v.as_str() {
+                    Some(s) if !s.is_empty() => Ok(s.to_lowercase()),
+                    _ => Err("'not_contains' takes text or a list of text".to_owned()),
+                })
+                .collect(),
+            _ => Err("'not_contains' takes some text, or a non-empty list of text".into()),
+        }
     }
 
     /// The same operator with each value it compares against passed through `f` (records turns
@@ -92,7 +107,10 @@ impl Op {
             Op::In(list) => is_set(got) && list.contains(got),
             Op::Set(want) => is_set(got) == *want,
             Op::Contains(needle) => got.as_str().is_some_and(|s| s.to_lowercase().contains(needle)),
-            Op::NotContains(needle) => !got.as_str().is_some_and(|s| s.to_lowercase().contains(needle)),
+            Op::NotContains(needles) => !got.as_str().is_some_and(|s| {
+                let s = s.to_lowercase();
+                needles.iter().any(|n| s.contains(n))
+            }),
             Op::Has(want) => got.as_array().is_some_and(|items| items.iter().any(|i| same(i, want))),
         }
     }
@@ -350,6 +368,18 @@ mod tests {
         assert!(passes(f.clone(), json!({"title": "Senior Engineer"})));
         assert!(!passes(f.clone(), json!({"title": "Senior Engineer Intern"})), "excluded, even though included");
         assert!(!passes(f, json!({"title": "Backend Engineer"})), "matches neither include term");
+    }
+
+    /// `not_contains` also takes a list: excluded if the text contains *any* of them, so a
+    /// title filter can exclude several seniority words with one condition on one key.
+    #[test]
+    fn not_contains_takes_a_list_and_excludes_on_any_match() {
+        assert!(filter(json!({"title": {"not_contains": []}})).is_err());
+        let f = json!({"title": {"not_contains": ["senior", "mid", "principal"]}});
+        assert!(passes(f.clone(), json!({"title": "Software Engineer"})));
+        assert!(!passes(f.clone(), json!({"title": "Senior Software Engineer"})));
+        assert!(!passes(f.clone(), json!({"title": "Mid-level Software Engineer"})));
+        assert!(!passes(f, json!({"title": "Principal Software Engineer"})));
     }
 
     #[test]

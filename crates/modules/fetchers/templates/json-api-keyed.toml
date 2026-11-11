@@ -1,0 +1,70 @@
+[template]
+label = "A key-gated JSON job API"
+description = "Any JSON job endpoint that needs an API key or bearer token to answer"
+category = "job-boards"
+kind = "json-api"
+good_to_know = [
+    "LinkedIn has no self-serve job search API at all -- its Jobs/Talent Solutions access is partner-only, so this template can't reach LinkedIn itself. It's for any board that *does* hand out a key: talent.com's publisher API, Adzuna, a company's own gated careers API",
+    "Set up the credential first: a [credentials.<name>] entry in config.toml (module, host, header, ADR 0036 §2) and its value in ~/.config/shimmer/secrets.toml, mode 0600, read only by the daemon. This template only points a source at that name -- it never sees or writes the secret itself",
+    "Works like the plain json-api kind otherwise: any endpoint answering with a flat JSON array (or one array nested under a path) of job-shaped objects",
+]
+
+[[question]]
+name = "URL"
+prompt = "The endpoint's url"
+kind = "url"
+required = true
+
+[[question]]
+name = "ITEMS_PATH"
+prompt = "Dot path from the response root to the array of jobs (leave blank if the response root is already that array)"
+kind = "field"
+
+[[question]]
+name = "ID_FIELD"
+prompt = "Field holding each job's unique id"
+kind = "field"
+required = true
+default = "id"
+
+[[question]]
+name = "TITLE_FIELD"
+prompt = "Field holding each job's title"
+kind = "field"
+required = true
+default = "title"
+
+[[question]]
+name = "URL_FIELD"
+prompt = "Field holding each job's own url"
+kind = "field"
+required = true
+default = "url"
+
+[[question]]
+name = "CREDENTIAL"
+prompt = "The credential's name, from its [credentials.<name>] entry in config.toml"
+kind = "name"
+required = true
+
+[[question]]
+name = "TITLE_FILTER"
+prompt = "Only show titles containing (comma-separated, optional). Prefix a word with - to exclude it, e.g. software engineer, swe, -senior, -staff, -principal"
+kind = "filter"
+
+[source]
+text = '''
+[source]
+enabled = false
+interval = "daily"
+kind = "json-api"
+filter = ${TITLE_FILTER} # if TITLE_FILTER
+
+[kind]
+url = "${URL}"
+items_path = "${ITEMS_PATH}" # if ITEMS_PATH
+id_field = "${ID_FIELD}"
+title_field = "${TITLE_FIELD}"
+url_field = "${URL_FIELD}"
+credential = "${CREDENTIAL}"
+'''

@@ -2,12 +2,12 @@
 //! whose text takes the answers as `${NAME}`. Mirrors `automations::template`'s format
 //! (header/questions/`${NAME}`/`# if NAME`/`# unless NAME`), but modules may not depend on each
 //! other (CLAUDE.md §3), so this is its own, smaller copy: exactly one source per template, never
-//! several, so there is no `${RULE}`-style generated id and no `suffix`; and only the three
-//! question kinds a starter template actually needs, not automations' six.
+//! several, so there is no `${RULE}`-style generated id and no `suffix`; and only the question
+//! kinds a starter template actually needs, not automations' six.
 //!
-//! `builtin()` is the five starters (§10's table): each one's `[kind]` table names only fields
-//! `crate::kind` already validates, so a broken template is a bug this crate's own tests catch,
-//! the same posture `automations::template::builtin` already takes.
+//! `builtin()` is every starter (§10's table, plus later additions): each one's `[kind]` table
+//! names only fields `crate::kind` already validates, so a broken template is a bug this crate's
+//! own tests catch, the same posture `automations::template::builtin` already takes.
 
 use std::collections::BTreeMap;
 
@@ -24,6 +24,8 @@ const BUILTIN: &[(&str, &str)] = &[
     ("greenhouse", include_str!("../templates/greenhouse.toml")),
     ("lever", include_str!("../templates/lever.toml")),
     ("rss", include_str!("../templates/rss.toml")),
+    ("jobbank-canada", include_str!("../templates/jobbank-canada.toml")),
+    ("json-api-keyed", include_str!("../templates/json-api-keyed.toml")),
 ];
 
 /// What an answer may be -- only what the five starters need, not automations' full set.
@@ -38,6 +40,15 @@ pub enum Kind {
     /// becomes a whole filter *value*, not plain text, so the template's own line is
     /// `filter = ${NAME}`, never `filter = "${NAME}"`.
     Filter,
+    /// Free text going into a url's query string (a search keyword, say) -- kept as typed, but
+    /// `application/x-www-form-urlencoded` when it lands in the template's own line, so a space
+    /// or `&` in the answer can never break the url or smuggle in another query parameter. The
+    /// template's own line still quotes it (`url = "...${NAME}..."`), same as `Name`/`Url`.
+    Query,
+    /// A JSON field name or dot path into one (`json-api`'s own `id_field`/`items_path`, ADR
+    /// 0028 §15) -- freer than `Name` (a real field can be camelCase, or nested), but still
+    /// plain enough to sit inside a quoted TOML string without escaping.
+    Field,
 }
 
 impl Kind {
@@ -45,7 +56,9 @@ impl Kind {
         match self {
             Kind::Name => "name",
             Kind::Url => "url",
+            Kind::Field => "field",
             Kind::Filter => "filter",
+            Kind::Query => "query",
         }
     }
 }
@@ -241,6 +254,23 @@ impl Question {
                 Ok(u) if u.scheme() == "http" || u.scheme() == "https" => Ok(a.to_owned()),
                 _ => Err(format!("'{a}' isn't a well-formed http:// or https:// url")),
             },
+            Kind::Query => {
+                if a.is_empty() {
+                    return Err("write some search text".into());
+                }
+                if a.chars().any(char::is_control) {
+                    return Err("can't contain a control character".into());
+                }
+                Ok(url::form_urlencoded::byte_serialize(a.as_bytes()).collect())
+            }
+            Kind::Field => {
+                let ok = !a.is_empty() && a.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+                if ok {
+                    Ok(a.to_owned())
+                } else {
+                    Err(format!("'{a}' isn't a field name: letters, digits, '_', '.' and '-'"))
+                }
+            }
             Kind::Filter => {
                 let words: Vec<&str> = a.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
                 if words.is_empty() {
@@ -251,11 +281,47 @@ impl Question {
                 if words.iter().any(|w| w.chars().any(|c| c.is_control() || "\"\\{}[]".contains(c))) {
                     return Err("can't contain a quote, backslash, bracket or control character".into());
                 }
-                let cond = |w: &str| format!("{{ title = {{ contains = \"{w}\" }} }}");
-                Ok(if words.len() == 1 {
-                    cond(words[0])
-                } else {
-                    format!("{{ or = [{}] }}", words.iter().map(|w| cond(w)).collect::<Vec<_>>().join(", "))
+                // A word prefixed with '-' excludes rather than includes -- "junior, -senior,
+                // -staff" keeps junior titles while dropping senior and staff ones, combining
+                // `or` (ADR 0028 §8) and `not_contains` (now list-capable) in one answer rather
+                // than needing a second question.
+                let mut includes = Vec::new();
+                let mut excludes = Vec::new();
+                for w in &words {
+                    match w.strip_prefix('-').map(str::trim) {
+                        Some(rest) if !rest.is_empty() => excludes.push(rest),
+                        Some(_) => return Err("write a word after '-' to exclude it".into()),
+                        None => includes.push(*w),
+                    }
+                }
+                // `not_contains`' own value: one quoted word, or a list of them (ADR 0028 §8,
+                // `core::filter::Op::NotContains` now takes either).
+                let not_contains = |xs: &[&str]| {
+                    if xs.len() == 1 {
+                        format!("\"{}\"", xs[0])
+                    } else {
+                        format!("[{}]", xs.iter().map(|w| format!("\"{w}\"")).collect::<Vec<_>>().join(", "))
+                    }
+                };
+                let or_fragment = |xs: &[&str]| {
+                    format!(
+                        "[{}]",
+                        xs.iter()
+                            .map(|w| format!("{{ title = {{ contains = \"{w}\" }} }}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                Ok(match (includes.as_slice(), excludes.as_slice()) {
+                    ([], nc) => format!("{{ title = {{ not_contains = {} }} }}", not_contains(nc)),
+                    ([one], []) => format!("{{ title = {{ contains = \"{one}\" }} }}"),
+                    ([one], nc) => {
+                        format!("{{ title = {{ contains = \"{one}\", not_contains = {} }} }}", not_contains(nc))
+                    }
+                    (many, []) => format!("{{ or = {} }}", or_fragment(many)),
+                    (many, nc) => {
+                        format!("{{ or = {}, title = {{ not_contains = {} }} }}", or_fragment(many), not_contains(nc))
+                    }
                 })
             }
         }
@@ -286,6 +352,14 @@ mod tests {
         assert_eq!(q(Kind::Url).check("https://example.test/feed.xml"), Ok("https://example.test/feed.xml".into()));
         assert!(q(Kind::Url).check("ftp://example.test/feed.xml").is_err());
         assert!(q(Kind::Url).check("not a url").is_err());
+        assert_eq!(q(Kind::Query).check("software engineer"), Ok("software+engineer".into()));
+        assert_eq!(q(Kind::Query).check("a & b"), Ok("a+%26+b".into()));
+        assert!(q(Kind::Query).check("").is_err());
+        assert_eq!(q(Kind::Field).check("data.jobs"), Ok("data.jobs".into()));
+        assert_eq!(q(Kind::Field).check("jobId"), Ok("jobId".into()));
+        assert!(q(Kind::Field).check("").is_err());
+        assert!(q(Kind::Field).check("has space").is_err());
+        assert!(q(Kind::Field).check("\"quoted\"").is_err());
         assert_eq!(q(Kind::Filter).check("senior"), Ok(r#"{ title = { contains = "senior" } }"#.into()));
         assert_eq!(
             q(Kind::Filter).check("senior, staff"),
@@ -295,6 +369,29 @@ mod tests {
         for bad in ["se\"nior", "se\\nior", "se{nior", "se}nior", "se[nior", "se]nior", "se\nior"] {
             assert!(q(Kind::Filter).check(bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// A word prefixed with '-' excludes rather than includes: `junior, -senior` keeps junior
+    /// titles while dropping senior ones, whichever combination of include/exclude counts.
+    #[test]
+    fn a_filter_answer_combines_dash_prefixed_excludes_with_plain_includes() {
+        assert_eq!(q(Kind::Filter).check("-senior"), Ok(r#"{ title = { not_contains = "senior" } }"#.into()));
+        assert_eq!(
+            q(Kind::Filter).check("-senior, -staff, -principal"),
+            Ok(r#"{ title = { not_contains = ["senior", "staff", "principal"] } }"#.into())
+        );
+        assert_eq!(
+            q(Kind::Filter).check("engineer, -senior"),
+            Ok(r#"{ title = { contains = "engineer", not_contains = "senior" } }"#.into())
+        );
+        assert_eq!(
+            q(Kind::Filter).check("engineer, swe, -senior, -staff"),
+            Ok(
+                r#"{ or = [{ title = { contains = "engineer" } }, { title = { contains = "swe" } }], title = { not_contains = ["senior", "staff"] } }"#
+                    .into()
+            )
+        );
+        assert!(q(Kind::Filter).check("-").is_err(), "nothing to exclude after '-'");
     }
 
     #[test]
