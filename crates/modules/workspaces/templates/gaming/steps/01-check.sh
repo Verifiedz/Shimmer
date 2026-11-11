@@ -7,9 +7,17 @@ problem=$(shimmer_display_problem)
 
 shimmer_warn_if_place STEAM_COMMAND "$STEAM_COMMAND" STEAM_PLACE
 shimmer_warn_if_place GAME_COMMAND "$GAME_COMMAND" GAME_PLACE
+shimmer_warn_if_place SYSTEM_MONITOR_COMMAND "$SYSTEM_MONITOR_COMMAND" MONITORS_PLACE
+shimmer_warn_if_place GPU_MONITOR_COMMAND "$GPU_MONITOR_COMMAND" MONITORS_PLACE
+shimmer_warn_if_place BROWSER_COMMAND "$BROWSER_COMMAND" BROWSER_PLACE
 
 if [ -n "$STEAM_COMMAND" ]; then
     shimmer_has "${STEAM_COMMAND%% *}" || shimmer_fail "STEAM_COMMAND's ${STEAM_COMMAND%% *} isn't installed"
+fi
+
+if [ -n "$GAME_PRELAUNCH_COMMAND" ]; then
+    shimmer_has "${GAME_PRELAUNCH_COMMAND%% *}" ||
+        shimmer_fail "GAME_PRELAUNCH_COMMAND's ${GAME_PRELAUNCH_COMMAND%% *} isn't installed"
 fi
 
 if [ -n "$GAME_LIBRARY" ]; then
@@ -33,9 +41,30 @@ if [ -n "$VM_NAME" ]; then
     shimmer_has virt-manager || shimmer_fail "VM_NAME is set, but virt-manager isn't installed"
 fi
 
+if [ -n "$SYSTEM_MONITOR_COMMAND" ] || [ -n "$GPU_MONITOR_COMMAND" ]; then
+    shimmer_has_terminal "${TERMINAL_APP:-none}" || shimmer_fail "the terminal '$TERMINAL_APP' isn't installed here"
+    [ "${TERMINAL_APP:-none}" != "none" ] ||
+        shimmer_fail "TERMINAL_APP is none, but a monitor command is set: set TERMINAL_APP to auto or a terminal"
+fi
+
+if [ -n "$SYSTEM_MONITOR_COMMAND" ]; then
+    shimmer_has "${SYSTEM_MONITOR_COMMAND%% *}" ||
+        shimmer_fail "SYSTEM_MONITOR_COMMAND's ${SYSTEM_MONITOR_COMMAND%% *} isn't installed"
+fi
+
+if [ -n "$GPU_MONITOR_COMMAND" ]; then
+    shimmer_has "${GPU_MONITOR_COMMAND%% *}" ||
+        shimmer_fail "GPU_MONITOR_COMMAND's ${GPU_MONITOR_COMMAND%% *} isn't installed"
+fi
+
+if [ -n "$BROWSER_COMMAND" ]; then
+    shimmer_has "${BROWSER_COMMAND%% *}" || shimmer_fail "BROWSER_COMMAND's ${BROWSER_COMMAND%% *} isn't installed"
+fi
+
 # Every *_PLACE answer: a valid "WORKSPACE:KEY" shape, and its monitor question filled in. A
 # typo here should stop the launch, not silently open unplaced.
-for pair in "STEAM_PLACE:$STEAM_PLACE" "GAME_PLACE:$GAME_PLACE" "VM_PLACE:$VM_PLACE"; do
+for pair in "STEAM_PLACE:$STEAM_PLACE" "GAME_PLACE:$GAME_PLACE" "VM_PLACE:$VM_PLACE" \
+    "MONITORS_PLACE:$MONITORS_PLACE" "BROWSER_PLACE:$BROWSER_PLACE"; do
     name=${pair%%:*}
     value=${pair#*:}
     [ -n "$value" ] || continue
@@ -53,4 +82,4 @@ if [ -n "$GAME_LIBRARY" ]; then
 else
     game_summary="${GAME_COMMAND:+, game: $GAME_COMMAND}"
 fi
-echo "ok${STEAM_COMMAND:+, steam: $STEAM_COMMAND}${game_summary}${VM_NAME:+, vm: $VM_NAME}"
+echo "ok${STEAM_COMMAND:+, steam: $STEAM_COMMAND}${game_summary}${VM_NAME:+, vm: $VM_NAME}${SYSTEM_MONITOR_COMMAND:+, monitor: $SYSTEM_MONITOR_COMMAND}${GPU_MONITOR_COMMAND:+, gpu: $GPU_MONITOR_COMMAND}${BROWSER_COMMAND:+, browser: $BROWSER_COMMAND}"
