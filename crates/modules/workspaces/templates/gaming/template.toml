@@ -1,26 +1,33 @@
 [template]
 label = "Gaming"
-description = "Steam, a game of your choice (or a picker over several), and a VM, opened together"
+description = "Steam, a game of your choice (or a picker over several), monitors, a browser, and a VM, opened together"
 category = "daily"
 needs = [
     "Steam, if you keep STEAM_COMMAND",
     "Whatever GAME_COMMAND (or each entry of GAME_LIBRARY) launches, if you keep one",
+    "Whatever GAME_PRELAUNCH_COMMAND runs, if you keep one",
     "rofi, wofi or fuzzel, only if you fill in GAME_LIBRARY (the game picker)",
     "virt-manager, only if you fill in VM_NAME",
+    "A terminal (TERMINAL_APP), only if you keep a monitor command",
+    "A system monitor (SYSTEM_MONITOR_COMMAND), if you keep it, e.g. btop or htop",
+    "A GPU monitor (GPU_MONITOR_COMMAND), if you keep it, e.g. nvtop",
+    "Whatever BROWSER_COMMAND opens, if you keep it",
     "hyprctl and jq, only if you fill in a *_PLACE question (Hyprland placement)",
 ]
 good_to_know = [
     "Every app is optional: leave a question empty and that step does nothing",
-    "GAME_COMMAND is the whole launch line for one specific game, e.g. steam -applaunch 105600 for a Steam game (its app id, from its store page's url), or a direct path for anything else",
+    "GAME_COMMAND is the whole launch line for one specific game, e.g. steam -applaunch 105600 for a Steam game (its app id, from its store page's url), or a direct path for anything else (a native port with its own binary, say)",
+    "GAME_PRELAUNCH_COMMAND runs once, supervised, right before the game: a fixup some games need every time (e.g. deleting a settings file that regenerates fresh, to clear a glitched one from the last session). A failure here is only a note -- it never stops the launch",
     "GAME_LIBRARY, if you fill it in, replaces GAME_COMMAND with a picker over several games: Label=command pairs separated by |, e.g. Terraria=steam -applaunch 105600|Hollow Knight=steam -applaunch 367520. GAME_PICKER chooses the tool (auto: the first of rofi, wofi, fuzzel found)",
     "VM_NAME, if you fill it in, opens Virtual Machine Manager (virt-manager) on that libvirt VM's console, starting it first if it isn't running already",
+    "The system and GPU monitors each open in their own terminal (TERMINAL_APP); your browser tabs open as arguments to BROWSER_COMMAND only if you fill in BROWSER_URLS",
     "A *_PLACE question (e.g. STEAM_PLACE = \"1:main\") puts that app on a workspace and monitor with hyprctl dispatch exec, the same technique the daily-dev template uses: nothing is ever read from or written to your Hyprland config",
-    "Placement needs HYPRLAND_MAIN_MONITOR / HYPRLAND_SECOND_MONITOR filled in too (a substring of hyprctl monitors -j's description for each)",
+    "Placement needs HYPRLAND_MAIN_MONITOR / HYPRLAND_SECOND_MONITOR filled in too (a substring of hyprctl monitors -j's description for each), and only works for the monitors when TERMINAL_APP is kitty; everything else falls back to opening unplaced, with a note saying why",
     "workspaces stop closes a placed app by the exact window it remembers putting there (CLOSE_ON_STOP permitting), never by guessing from class or title. An app you left unplaced (no *_PLACE answer) is always left open instead. For VM_NAME this only closes the virt-manager window: the VM itself is never suspended or shut down by this template",
     "Run it again while it's still active and it reuses what it already placed instead of piling up more",
     "Every placement decision is logged to logs/<id>-hyprland.log in your Shimmer folder: a detached step has no other log, so tail -f that file during activate to watch it live",
 ]
-on_stop = "Closes every window it placed with Hyprland (CLOSE_ON_STOP permitting), by the exact window it remembers. An app you left unplaced (no *_PLACE answer) is always left open. The VM itself (if VM_NAME is set) is never suspended or shut down, only its virt-manager window closed."
+on_stop = "Closes every window it placed with Hyprland (CLOSE_ON_STOP permitting), by the exact window it remembers, and the terminals it opened for the monitors. An app you left unplaced (no *_PLACE answer) is always left open. The VM itself (if VM_NAME is set) is never suspended or shut down, only its virt-manager window closed."
 
 [[question]]
 name = "STEAM_COMMAND"
@@ -60,6 +67,56 @@ name = "GAME_PLACE"
 prompt = "Your game's workspace:monitor"
 kind = "text"
 help = "e.g. 2:second. Applies whichever game is launched, fixed or picked. Leave empty for no placement."
+
+[[question]]
+name = "GAME_PRELAUNCH_COMMAND"
+prompt = "A command to run, and wait for, right before the game launches (optional)"
+kind = "command"
+help = "e.g. a fixup some games need every time before they start cleanly. Runs once, supervised: a failure is printed as a note but never stops the launch. Leave empty to skip."
+
+[[question]]
+name = "SYSTEM_MONITOR_COMMAND"
+prompt = "System monitor command"
+kind = "command"
+help = "Runs in its own terminal, e.g. btop, htop, glances. Leave empty to skip."
+
+[[question]]
+name = "GPU_MONITOR_COMMAND"
+prompt = "GPU monitor command"
+kind = "command"
+help = "Runs in its own terminal, e.g. nvtop, nvidia-smi -l 1, radeontop. Leave empty to skip."
+
+[[question]]
+name = "MONITORS_PLACE"
+prompt = "The system and GPU monitors' workspace:monitor"
+kind = "text"
+help = "e.g. 4:second. Both land together, same as a hand-written Hyprland script would put them. Only takes effect when TERMINAL_APP is kitty. Leave empty for no placement."
+
+[[question]]
+name = "BROWSER_COMMAND"
+prompt = "Command to open your browser"
+kind = "command"
+help = "Whatever you installed it as, e.g. zen-browser, firefox, brave. Leave empty to skip the browser step entirely."
+
+[[question]]
+name = "BROWSER_URLS"
+prompt = "Startup tabs for your browser (optional)"
+kind = "urls"
+help = "Passed as arguments to BROWSER_COMMAND. Separated by spaces. Leave empty if your browser already restores its own tabs."
+
+[[question]]
+name = "BROWSER_PLACE"
+prompt = "Your browser's workspace:monitor"
+kind = "text"
+help = "e.g. 2:second. Leave empty for no placement."
+
+[[question]]
+name = "TERMINAL_APP"
+prompt = "Terminal for the system and GPU monitors"
+kind = "choice"
+choices = ["auto", "kitty", "foot", "alacritty", "wezterm", "ghostty", "gnome-terminal", "konsole", "terminal", "iterm", "none"]
+default = "auto"
+help = "auto: Terminal on macOS, the first one found on Linux. terminal and iterm are macOS only. Hyprland placement (MONITORS_PLACE) only works when this is kitty."
 
 [[question]]
 name = "VM_NAME"

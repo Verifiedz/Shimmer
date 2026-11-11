@@ -1,6 +1,6 @@
-# Gaming: Steam, a game of your choice (or a picker over several, GAME_LIBRARY), and a VM
-# (VM_NAME, opened in Virtual Machine Manager), opened together. Created from Shimmer's gaming
-# template. It's your folder now: edit it freely.
+# Gaming: Steam, a game of your choice (or a picker over several, GAME_LIBRARY), system/GPU
+# monitors, a browser, and a VM (VM_NAME, opened in Virtual Machine Manager), opened together.
+# Created from Shimmer's gaming template. It's your folder now: edit it freely.
 #
 #   shimmer workspaces activate <id> --wait     open it all
 #   shimmer workspaces stop <id> --wait         close what it placed, and list what it left open
@@ -16,7 +16,7 @@
 
 [workspace]
 label = "Gaming"
-description = "Steam, a game, and a VM, opened together"
+description = "Steam, a game, monitors, a browser, and a VM, opened together"
 
 [[step]]
 name = "check"
@@ -30,8 +30,29 @@ description = "Open Steam, placed by STEAM_PLACE if set"
 mode = "detached"
 
 [[step]]
+name = "game-prelaunch"
+description = "Run GAME_PRELAUNCH_COMMAND, if set, and wait for it"
+mode = "supervised"
+timeout_s = 30
+
+[[step]]
 name = "game"
 description = "Launch your game (or the GAME_LIBRARY picker), placed by GAME_PLACE if set"
+mode = "detached"
+
+[[step]]
+name = "system-monitor"
+description = "Open the system monitor, in its own terminal, placed by MONITORS_PLACE if set"
+mode = "detached"
+
+[[step]]
+name = "gpu-monitor"
+description = "Open the GPU monitor, in its own terminal, placed by MONITORS_PLACE if set"
+mode = "detached"
+
+[[step]]
+name = "browser"
+description = "Open your browser, placed by BROWSER_PLACE if set"
 mode = "detached"
 
 [[step]]
