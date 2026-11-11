@@ -251,11 +251,47 @@ impl Question {
                 if words.iter().any(|w| w.chars().any(|c| c.is_control() || "\"\\{}[]".contains(c))) {
                     return Err("can't contain a quote, backslash, bracket or control character".into());
                 }
-                let cond = |w: &str| format!("{{ title = {{ contains = \"{w}\" }} }}");
-                Ok(if words.len() == 1 {
-                    cond(words[0])
-                } else {
-                    format!("{{ or = [{}] }}", words.iter().map(|w| cond(w)).collect::<Vec<_>>().join(", "))
+                // A word prefixed with '-' excludes rather than includes -- "junior, -senior,
+                // -staff" keeps junior titles while dropping senior and staff ones, combining
+                // `or` (ADR 0028 §8) and `not_contains` (now list-capable) in one answer rather
+                // than needing a second question.
+                let mut includes = Vec::new();
+                let mut excludes = Vec::new();
+                for w in &words {
+                    match w.strip_prefix('-').map(str::trim) {
+                        Some(rest) if !rest.is_empty() => excludes.push(rest),
+                        Some(_) => return Err("write a word after '-' to exclude it".into()),
+                        None => includes.push(*w),
+                    }
+                }
+                // `not_contains`' own value: one quoted word, or a list of them (ADR 0028 §8,
+                // `core::filter::Op::NotContains` now takes either).
+                let not_contains = |xs: &[&str]| {
+                    if xs.len() == 1 {
+                        format!("\"{}\"", xs[0])
+                    } else {
+                        format!("[{}]", xs.iter().map(|w| format!("\"{w}\"")).collect::<Vec<_>>().join(", "))
+                    }
+                };
+                let or_fragment = |xs: &[&str]| {
+                    format!(
+                        "[{}]",
+                        xs.iter()
+                            .map(|w| format!("{{ title = {{ contains = \"{w}\" }} }}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                Ok(match (includes.as_slice(), excludes.as_slice()) {
+                    ([], nc) => format!("{{ title = {{ not_contains = {} }} }}", not_contains(nc)),
+                    ([one], []) => format!("{{ title = {{ contains = \"{one}\" }} }}"),
+                    ([one], nc) => {
+                        format!("{{ title = {{ contains = \"{one}\", not_contains = {} }} }}", not_contains(nc))
+                    }
+                    (many, []) => format!("{{ or = {} }}", or_fragment(many)),
+                    (many, nc) => {
+                        format!("{{ or = {}, title = {{ not_contains = {} }} }}", or_fragment(many), not_contains(nc))
+                    }
                 })
             }
         }
@@ -295,6 +331,29 @@ mod tests {
         for bad in ["se\"nior", "se\\nior", "se{nior", "se}nior", "se[nior", "se]nior", "se\nior"] {
             assert!(q(Kind::Filter).check(bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// A word prefixed with '-' excludes rather than includes: `junior, -senior` keeps junior
+    /// titles while dropping senior ones, whichever combination of include/exclude counts.
+    #[test]
+    fn a_filter_answer_combines_dash_prefixed_excludes_with_plain_includes() {
+        assert_eq!(q(Kind::Filter).check("-senior"), Ok(r#"{ title = { not_contains = "senior" } }"#.into()));
+        assert_eq!(
+            q(Kind::Filter).check("-senior, -staff, -principal"),
+            Ok(r#"{ title = { not_contains = ["senior", "staff", "principal"] } }"#.into())
+        );
+        assert_eq!(
+            q(Kind::Filter).check("engineer, -senior"),
+            Ok(r#"{ title = { contains = "engineer", not_contains = "senior" } }"#.into())
+        );
+        assert_eq!(
+            q(Kind::Filter).check("engineer, swe, -senior, -staff"),
+            Ok(
+                r#"{ or = [{ title = { contains = "engineer" } }, { title = { contains = "swe" } }], title = { not_contains = ["senior", "staff"] } }"#
+                    .into()
+            )
+        );
+        assert!(q(Kind::Filter).check("-").is_err(), "nothing to exclude after '-'");
     }
 
     #[test]
