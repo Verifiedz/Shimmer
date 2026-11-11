@@ -2,12 +2,12 @@
 //! whose text takes the answers as `${NAME}`. Mirrors `automations::template`'s format
 //! (header/questions/`${NAME}`/`# if NAME`/`# unless NAME`), but modules may not depend on each
 //! other (CLAUDE.md §3), so this is its own, smaller copy: exactly one source per template, never
-//! several, so there is no `${RULE}`-style generated id and no `suffix`; and only the three
-//! question kinds a starter template actually needs, not automations' six.
+//! several, so there is no `${RULE}`-style generated id and no `suffix`; and only the question
+//! kinds a starter template actually needs, not automations' six.
 //!
-//! `builtin()` is the five starters (§10's table): each one's `[kind]` table names only fields
-//! `crate::kind` already validates, so a broken template is a bug this crate's own tests catch,
-//! the same posture `automations::template::builtin` already takes.
+//! `builtin()` is every starter (§10's table, plus later additions): each one's `[kind]` table
+//! names only fields `crate::kind` already validates, so a broken template is a bug this crate's
+//! own tests catch, the same posture `automations::template::builtin` already takes.
 
 use std::collections::BTreeMap;
 
@@ -24,6 +24,7 @@ const BUILTIN: &[(&str, &str)] = &[
     ("greenhouse", include_str!("../templates/greenhouse.toml")),
     ("lever", include_str!("../templates/lever.toml")),
     ("rss", include_str!("../templates/rss.toml")),
+    ("jobbank-canada", include_str!("../templates/jobbank-canada.toml")),
 ];
 
 /// What an answer may be -- only what the five starters need, not automations' full set.
@@ -38,6 +39,11 @@ pub enum Kind {
     /// becomes a whole filter *value*, not plain text, so the template's own line is
     /// `filter = ${NAME}`, never `filter = "${NAME}"`.
     Filter,
+    /// Free text going into a url's query string (a search keyword, say) -- kept as typed, but
+    /// `application/x-www-form-urlencoded` when it lands in the template's own line, so a space
+    /// or `&` in the answer can never break the url or smuggle in another query parameter. The
+    /// template's own line still quotes it (`url = "...${NAME}..."`), same as `Name`/`Url`.
+    Query,
 }
 
 impl Kind {
@@ -46,6 +52,7 @@ impl Kind {
             Kind::Name => "name",
             Kind::Url => "url",
             Kind::Filter => "filter",
+            Kind::Query => "query",
         }
     }
 }
@@ -241,6 +248,15 @@ impl Question {
                 Ok(u) if u.scheme() == "http" || u.scheme() == "https" => Ok(a.to_owned()),
                 _ => Err(format!("'{a}' isn't a well-formed http:// or https:// url")),
             },
+            Kind::Query => {
+                if a.is_empty() {
+                    return Err("write some search text".into());
+                }
+                if a.chars().any(char::is_control) {
+                    return Err("can't contain a control character".into());
+                }
+                Ok(url::form_urlencoded::byte_serialize(a.as_bytes()).collect())
+            }
             Kind::Filter => {
                 let words: Vec<&str> = a.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
                 if words.is_empty() {

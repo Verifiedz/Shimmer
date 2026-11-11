@@ -75,7 +75,7 @@ fn redirect_url(home: &Home, id: &str, addr: SocketAddr) {
 fn templates_list_and_peek_show_what_they_make() {
     let home = Home::new();
     let out = ok(&home, &["fetchers", "templates"]);
-    for id in ["greenhouse", "lever", "rss", "wwr", "hn-whoishiring"] {
+    for id in ["greenhouse", "lever", "rss", "wwr", "hn-whoishiring", "jobbank-canada"] {
         assert!(out.contains(id), "{id}: {out}");
     }
     let peek = ok(&home, &["fetchers", "peek", "rss"]);
@@ -145,6 +145,50 @@ fn lever_template_renders_the_real_url_and_fetches_once_redirected() {
     assert_eq!(items.len(), 1, "{items:?}");
     assert_eq!(items[0]["title"], "Platform Engineer");
     assert_eq!(items[0]["url"], "https://jobs.lever.co/acme/abc");
+}
+
+#[test]
+fn jobbank_canada_template_encodes_its_query_and_fetches_once_redirected() {
+    let home = Home::new();
+    let out = ok(
+        &home,
+        &[
+            "fetchers",
+            "new",
+            "ca-jobs",
+            "--from",
+            "jobbank-canada",
+            "--set",
+            "KEYWORDS=software engineer",
+            "--set",
+            "PROVINCE=ON",
+            "--set",
+            "TITLE_FILTER=engineer, -senior",
+            "--yes",
+        ],
+    );
+    assert!(out.contains("✓ made ca-jobs from jobbank-canada, switched off"), "{out}");
+    let text = source_text(&home, "ca-jobs");
+    assert!(
+        text.contains("dkw=software+engineer")
+            && text.contains("fprov=ON")
+            && text.contains("kind = \"rss\"")
+            && text.contains("contains = \"engineer\"")
+            && text.contains("not_contains = \"senior\""),
+        "{text}"
+    );
+
+    let feed = r#"<?xml version="1.0" encoding="utf-8"?><feed xmlns="http://www.w3.org/2005/Atom">
+<entry><id>https://www.jobbank.gc.ca/jobsearch/jobSearchRSSfeed?id=1</id>
+<title>software engineer</title><link href="https://www.jobbank.gc.ca/jobsearch/jobposting/1"/></entry>
+</feed>"#;
+    let addr = stub_server("application/atom+xml", feed);
+    redirect_url(&home, "ca-jobs", addr);
+
+    let items = json(&home, &["fetchers", "test", "ca-jobs"])["items"].as_array().unwrap().clone();
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0]["title"], "software engineer");
+    assert_eq!(items[0]["url"], "https://www.jobbank.gc.ca/jobsearch/jobposting/1");
 }
 
 #[test]
