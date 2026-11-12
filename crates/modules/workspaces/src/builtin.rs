@@ -199,6 +199,7 @@ const BUILTINS: &[(&str, &[(&str, &str)])] = &[
             file!("cleanup.sh", "vm/cleanup.sh"),
             HELPER,
             VM_HELPER,
+            HYPRLAND_HELPER,
         ],
     ),
     (

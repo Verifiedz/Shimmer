@@ -1,6 +1,7 @@
 # Supervised: stop with one clear sentence before anything starts.
 . "$SHIMMER_WORKSPACE_DIR/lib/shimmer-open.sh"
 . "$SHIMMER_WORKSPACE_DIR/lib/shimmer-vm.sh"
+. "$SHIMMER_WORKSPACE_DIR/lib/shimmer-hyprland.sh"
 
 problem=$(shimmer_display_problem)
 [ -z "$problem" ] || shimmer_fail "$problem"
@@ -23,6 +24,21 @@ if [ "$REMOTE_EDITOR" != "none" ]; then
     [ -n "$(shimmer_remote_editor_cli "$REMOTE_EDITOR")" ] || shimmer_fail "$REMOTE_EDITOR isn't installed"
 fi
 shimmer_has_terminal "${TERMINAL_APP:-none}" || shimmer_fail "the terminal '$TERMINAL_APP' isn't installed here"
+
+# Every *_PLACE answer: a valid "WORKSPACE:KEY" shape, and its monitor question filled in. A
+# typo here should stop the launch, not silently open unplaced.
+for pair in "EDITOR_PLACE:$EDITOR_PLACE" "TERMINAL_PLACE:$TERMINAL_PLACE"; do
+    name=${pair%%:*}
+    value=${pair#*:}
+    [ -n "$value" ] || continue
+    shimmer_hyprland_place_ok "$value" ||
+        shimmer_fail "$name must look like 1:main or 4:second (a workspace number, a colon, then main or second), got '$value'"
+    key=${value#*:}
+    case "$key" in
+        main) [ -n "$HYPRLAND_MAIN_MONITOR" ] || shimmer_fail "$name uses the main monitor, but HYPRLAND_MAIN_MONITOR is empty" ;;
+        second) [ -n "$HYPRLAND_SECOND_MONITOR" ] || shimmer_fail "$name uses the second monitor, but HYPRLAND_SECOND_MONITOR is empty" ;;
+    esac
+done
 
 if [ -n "$SSH_PASSWORD_ITEM" ]; then
     if shimmer_macos; then
