@@ -980,7 +980,7 @@ pub(crate) fn answers(
                 out.insert(name.to_owned(), json!(fix(name, &answer)));
                 break;
             }
-            if q["required"] != true {
+            if q["required"] != true || q["default"].as_str().is_some() {
                 break;
             }
             eprintln!("  this one is required");
@@ -1826,6 +1826,20 @@ mod tests {
         assert_eq!(got.len(), 1);
         let e = how_to_answer(Error::invalid_params("PROJECT_DIR (Project folder) is required"), &p);
         assert!(e.message.ends_with("answer it with --set PROJECT_DIR=…"), "{}", e.message);
+    }
+
+    #[test]
+    fn a_required_question_with_a_current_answer_keeps_it_on_enter() {
+        // reconfigure fills `default` with the current answer even for a required question
+        // (with_current_answers), so "Enter keeps an answer" must hold for those too, not just
+        // optional ones: pressing Enter must not re-ask forever (#?).
+        let questions = json!([
+            {"name": "VM_SOFTWARE", "prompt": "VM software", "kind": "choice", "required": true, "default": "libvirt"},
+        ]);
+        let mut p = Typist { lines: vec![""], asked: Vec::new() };
+        let got = answers(&questions, &[], &mut p, &paths()).unwrap();
+        assert_eq!(Value::Object(got), json!({}), "empty = keep the current answer, not re-sent");
+        assert_eq!(p.asked.len(), 1, "asked exactly once, never looped");
     }
 
     #[test]
