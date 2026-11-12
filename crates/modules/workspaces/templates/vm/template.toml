@@ -88,6 +88,12 @@ kind = "text"
 help = "e.g. /home/me/code/project. Used by both the editor and the SSH terminal. Leave empty for your home folder."
 
 [[question]]
+name = "REMOTE_COMMAND"
+prompt = "Command to run inside the VM's SSH terminal"
+kind = "command"
+help = "e.g. claude or claude --resume. Runs in REMOTE_FOLDER (or your home folder), before dropping to a shell. Leave empty for just a shell."
+
+[[question]]
 name = "TERMINAL_APP"
 prompt = "Terminal for an SSH session into the VM"
 kind = "choice"
