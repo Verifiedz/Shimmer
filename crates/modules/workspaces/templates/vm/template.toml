@@ -85,7 +85,7 @@ default = "none"
 name = "REMOTE_FOLDER"
 prompt = "Folder inside the VM to open"
 kind = "text"
-help = "e.g. /home/me/code/project. Leave empty for your home folder."
+help = "e.g. /home/me/code/project. Used by both the editor and the SSH terminal. Leave empty for your home folder."
 
 [[question]]
 name = "TERMINAL_APP"

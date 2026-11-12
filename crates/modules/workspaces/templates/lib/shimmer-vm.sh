@@ -170,10 +170,15 @@ shimmer_askpass() {
 }
 
 # The ssh command for a terminal: plain `ssh` (a key, or ssh asks you itself), or with the
-# keychain entry handed to ssh through SSH_ASKPASS.
+# keychain entry handed to ssh through SSH_ASKPASS. Lands in REMOTE_FOLDER when it's set, the
+# same question the editor step already uses, instead of always the VM's home folder.
 shimmer_ssh_command() {
     target=$1
     cmd="ssh -p $(shimmer_quote "${SSH_PORT:-22}") $(shimmer_quote "$target")"
+    if [ -n "$REMOTE_FOLDER" ]; then
+        remote="cd $(shimmer_quote "$REMOTE_FOLDER") && exec \$SHELL -l"
+        cmd="$cmd -t $(shimmer_quote "$remote")"
+    fi
     if [ -n "$SSH_PASSWORD_ITEM" ]; then
         askpass=$(shimmer_askpass "$SSH_PASSWORD_ITEM")
         cmd="SSH_ASKPASS=$(shimmer_quote "$askpass") SSH_ASKPASS_REQUIRE=force $cmd"
