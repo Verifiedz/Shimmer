@@ -84,8 +84,9 @@ shimmer_hyprland_ensure_workspace() {
     class=$2
     label=$3
     before=$4
+    tries=${5:-16}
     i=0
-    while [ "$i" -lt 16 ]; do
+    while [ "$i" -lt "$tries" ]; do
         # CLASS is only a guess (the launching command's own first word), and several real
         # classes don't match their command at all (zen-browser's window reports "zen",
         # Obsidian's reports "md.obsidian.Obsidian") -- matched either direction as a
@@ -112,7 +113,7 @@ shimmer_hyprland_ensure_workspace() {
         sleep 0.5
         i=$((i + 1))
     done
-    shimmer_hyprland_log "$label: no new window matching class '$class' appeared within 8s, gave up correcting its workspace"
+    shimmer_hyprland_log "$label: no new window matching class '$class' appeared within $((tries / 2))s, gave up correcting its workspace"
     return 1
 }
 
@@ -201,11 +202,17 @@ shimmer_hyprland_close_all() {
 # one looks exactly like "already placed" to a check that isn't keyed on the specific window
 # this exact SLOT created last time. The marker remembers that window's address; only that
 # address still being alive counts as "already open".
+#
+# TRIES overrides how many ~0.5s rounds shimmer_hyprland_ensure_workspace polls for the new
+# window before giving up (default 16, ~8s) -- pass a bigger one for something known to be
+# slow to map its first window (a game, especially through Steam/Proton), since giving up too
+# early means no address ever gets recorded, and stop can then never close it.
 shimmer_hyprland_launch() {
     place=$1
     command=$2
     label=$3
     slot=$4
+    tries=$5
     marker="$SHIMMER_STATE_DIR/hyprland-placed-$slot"
     if [ -z "$place" ]; then
         shimmer_hyprland_log "$label: no placement set, opening plainly ($command)"
@@ -247,7 +254,7 @@ shimmer_hyprland_launch() {
     shimmer_hyprland_log "$label: placing on workspace $ws ($key monitor = $mon), class guess '$class': $command"
     hyprctl dispatch exec "[workspace $ws; monitor $mon] $command" >/dev/null 2>&1
     shimmer_record_left_open "$label (placed: workspace $ws, $key monitor)"
-    addr=$(shimmer_hyprland_ensure_workspace "$ws" "$class" "$label" "$before")
+    addr=$(shimmer_hyprland_ensure_workspace "$ws" "$class" "$label" "$before" "$tries")
     shimmer_hyprland_ensure_monitor "$ws" "$mon" "$label"
     shimmer_hyprland_unlock "$class"
     if [ -n "$addr" ]; then
