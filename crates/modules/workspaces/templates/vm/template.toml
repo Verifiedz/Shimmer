@@ -12,8 +12,11 @@ good_to_know = [
     "Starts the VM only if it isn't running, then waits (up to 5 minutes) until it answers on its SSH port",
     "Run Shimmer on the computer that hosts the VM",
     "On macOS, the first time it opens a Terminal or iTerm window, macOS asks whether the program that started Shimmer (Terminal, iTerm, or sshd-keygen-wrapper over SSH) may control it: allow it, or no window can open. You can change it later in System Settings › Privacy & Security › Automation",
+    "A *_PLACE question (e.g. TERMINAL_PLACE = \"1:main\") puts that window on a workspace and monitor with hyprctl dispatch exec, the same technique the daily-dev/gaming templates use: nothing is ever read from or written to your Hyprland config. The terminal only takes placement when TERMINAL_APP is kitty; everything else falls back to opening unplaced, with a note saying why. The editor (whichever one REMOTE_EDITOR names) takes placement either way",
+    "Placement needs HYPRLAND_MAIN_MONITOR / HYPRLAND_SECOND_MONITOR filled in too (a substring of hyprctl monitors -j's description for each)",
+    "workspaces stop closes a placed window by the exact window it remembers putting there (CLOSE_ON_STOP permitting), never by guessing from class or title -- that includes the editor when EDITOR_PLACE is set, even though it normally shares one program with your other editor windows",
 ]
-on_stop = "Suspends it, shuts it down or leaves it running, as you chose (ON_STOP), but only if this workspace started it: a VM you started yourself is left running. Closes the SSH terminal (and virt-viewer) where it can. Your editor stays open."
+on_stop = "Suspends it, shuts it down or leaves it running, as you chose (ON_STOP), but only if this workspace started it: a VM you started yourself is left running. Closes the SSH terminal (and virt-viewer) where it can, and the editor window too if EDITOR_PLACE is set; otherwise your editor stays open."
 
 [[question]]
 name = "VM_SOFTWARE"
@@ -88,12 +91,36 @@ kind = "text"
 help = "e.g. /home/me/code/project. Leave empty for your home folder."
 
 [[question]]
+name = "EDITOR_PLACE"
+prompt = "The editor's workspace:monitor"
+kind = "text"
+help = "e.g. 3:main. main/second match HYPRLAND_MAIN_MONITOR/HYPRLAND_SECOND_MONITOR below. Leave empty for no placement."
+
+[[question]]
 name = "TERMINAL_APP"
 prompt = "Terminal for an SSH session into the VM"
 kind = "choice"
 choices = ["auto", "kitty", "foot", "alacritty", "wezterm", "ghostty", "gnome-terminal", "konsole", "terminal", "iterm", "none"]
 default = "none"
 help = "auto: Terminal on macOS, the first one found on Linux. terminal and iterm are macOS only. none: no SSH terminal."
+
+[[question]]
+name = "TERMINAL_PLACE"
+prompt = "The SSH terminal's workspace:monitor"
+kind = "text"
+help = "e.g. 1:main. Only takes effect when TERMINAL_APP is kitty. Leave empty for no placement."
+
+[[question]]
+name = "HYPRLAND_MAIN_MONITOR"
+prompt = "Main monitor (for *_PLACE = N:main)"
+kind = "text"
+help = "A substring of that monitor's description, as `hyprctl monitors -j` reports it, e.g. Odyssey G60SD. Leave empty if you're not using any *_PLACE question."
+
+[[question]]
+name = "HYPRLAND_SECOND_MONITOR"
+prompt = "Second monitor (for *_PLACE = N:second)"
+kind = "text"
+help = "A substring of that monitor's description, e.g. M27Q. Leave empty if you're not using any *_PLACE question."
 
 [[question]]
 name = "OPEN_ON"
@@ -117,4 +144,4 @@ prompt = "Close what it opened when you run workspaces stop"
 kind = "choice"
 choices = ["yes", "no"]
 default = "yes"
-help = "Closed: kitty/foot/alacritty/wezterm/ghostty/konsole/xterm terminals. Never closed: the editor, GNOME Terminal and macOS Terminal/iTerm windows (they share a program with your other work). stop lists exactly what it closed and what it left."
+help = "Closed: kitty/foot/alacritty/wezterm/ghostty/konsole/xterm terminals, and any window placed with Hyprland (including the editor, when EDITOR_PLACE is set). Never closed: an unplaced editor, GNOME Terminal and macOS Terminal/iTerm windows (they share a program with your other work). stop lists exactly what it closed and what it left."
