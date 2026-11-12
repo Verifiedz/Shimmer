@@ -1,4 +1,5 @@
-# Detached: a terminal on this computer, logged into the VM over SSH. With no key and no
+# Detached: a terminal on this computer, logged into the VM over SSH, landing in REMOTE_FOLDER
+# when it's set (shimmer_ssh_command), the VM's home folder otherwise. With no key and no
 # keychain entry, ssh asks for the password in that window: Shimmer never sees it. Placed by
 # TERMINAL_PLACE, but only when TERMINAL_APP resolves to kitty -- the same restriction the
 # daily-dev/gaming templates' own monitor steps use, since placement needs to build the exact
